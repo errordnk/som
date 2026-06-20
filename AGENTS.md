@@ -207,29 +207,45 @@ assets/
 
 ---
 
-### Phase 4 — Tab icons через Nerd Font unicode
+### Phase 4 — Профили табов через Nerd Font unicode
 
 **Концепция:**
-- Nerd Font иконки — unicode символы в Private Use Area (PUA), например:
-  - `` ()  — иконка терминала
-  - `` ()  — папка
-  - `` ()  — файл
-- Никакого SVG, никаких asset-файлов, просто unicode string в настройках
+- Иконки табов — unicode codepoints из FiraCode Nerd Font, рендерятся как обычный текст
+- Никакого SVG pipeline, никаких asset-файлов с иконками
+- Профили задаются в `settings.json` как массив `"tabs"`
 
-**Поле в settings.json:**
+**Формат `settings.json`:**
 ```json
 {
-  "tabs": {
-    "terminal_icon": ""
-  }
+  "tabs": [
+    { "name": "PowerShell", "icon": "", "shell": "pwsh.exe" },
+    { "name": "CMD",        "icon": "", "shell": "cmd.exe"  },
+    { "name": "WSL",        "icon": "", "shell": "wsl.exe"  }
+  ]
 }
 ```
 
-**План:**
-1. Добавить поле `terminal_icon: Option<String>` в `WorkspaceSettingsContent` (или `ItemSettingsContent`)
-2. Дефолт из platform default.json: `"terminal_icon": ""`
-3. В `terminal_view` при создании таба передавать этот символ как label/icon
-4. Нет SVG pipeline вообще — просто рендерится как текст через FiraCode Nerd Font
+**Правила:**
+- Первый элемент массива — дефолт (открывается по Ctrl+T / "New Tab")
+- Остальные элементы доступны в меню "New" -> выбор профиля
+- Пользователь полностью контролирует порядок и содержимое
+
+**Фаллбек в коде** (если `tabs` пуст или settings не загрузились):
+- Windows: `pwsh.exe` -> если не найден -> `cmd.exe`
+- macOS/Linux: `$SHELL` -> если пусто -> `/bin/sh`
+
+**Платформенные дефолты в `assets/settings/default-{platform}.json`:**
+
+`default-windows.json` задаёт tabs с PowerShell и CMD.
+`default-macos.json` задаёт tabs с zsh и bash (shell: null = использовать $SHELL).
+`default-linux.json` задаёт один таб Shell (shell: null).
+
+**План реализации:**
+1. Добавить `TabProfile` struct в `settings_content` (поля: `name: String`, `icon: Option<String>`, `shell: Option<String>`)
+2. Добавить `terminal_tabs: Option<Vec<TabProfile>>` в `TerminalSettingsContent`
+3. В `terminal_view` при открытии таба: читать первый профиль, передавать `icon` как prefix к заголовку
+4. В `workspace` меню "New": строить список из профилей
+5. Иконка рендерится как обычный текст (FiraCode Nerd Font покрывает PUA codepoints)
 
 ---
 

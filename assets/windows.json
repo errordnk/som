@@ -28,6 +28,6 @@
     "max_scroll_history_lines": 9999999
   },
   "tabs": [
-    { "name": "PowerShell", "icon": "", "shell": "pwsh.exe" }
+    { "name": "CMD", "icon": "", "shell": "cmd.exe" }
   ]
 }

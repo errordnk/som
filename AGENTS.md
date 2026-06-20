@@ -248,9 +248,14 @@ assets/
 
 **Платформенные дефолты в `assets/settings/default-{platform}.json`:**
 
-`default-windows.json` задаёт tabs с PowerShell и CMD.
-`default-macos.json` задаёт tabs с zsh и bash (shell: null = использовать $SHELL).
-`default-linux.json` задаёт один таб Shell (shell: null).
+`assets/windows.json` — фаллбек если нет пользовательского settings.json: один таб PowerShell.
+`assets/darwin.json` — фаллбек: один таб $SHELL.
+`assets/linux.json` — фаллбек: один таб $SHELL.
+
+**Логика загрузки при старте:**
+1. Есть `~/.config/som/settings.json` → использовать его целиком
+2. Нет → загрузить `assets/{platform}.json` как дефолт
+Пользователь сам добавляет профили в свой settings.json.
 
 **План реализации:**
 1. Добавить `TabProfile` struct в `settings_content` (поля: `name: String`, `icon: Option<String>`, `shell: Option<String>`)

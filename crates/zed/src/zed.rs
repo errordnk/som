@@ -11,7 +11,6 @@ pub use open_listener::{
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub use open_listener::listen_for_cli_connections;
-use fs::Fs;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use gpui::{
     Action, App, Context, DismissEvent, Focusable, KeyBinding,
@@ -42,13 +41,7 @@ use workspace::{
     open_new, with_active_or_new_workspace,
     CloseIntent, OpenLog, RestoreBanner,
 };
-use zed_actions::{
-    About, OpenBrowser, OpenDocs, OpenSettingsFile,
-    OpenStatusPage, OpenZedUrl, Quit,
-};
-
-const DOCS_URL: &str = "https://zed.dev/docs/";
-const STATUS_URL: &str = "https://status.zed.dev";
+use zed_actions::{About, OpenBrowser, OpenSettingsFile, OpenZedUrl, Quit};
 
 actions!(
     zed,
@@ -441,8 +434,6 @@ fn register_actions(
     _cx: &mut Context<Workspace>,
 ) {
     workspace
-        .register_action(|_, _: &OpenDocs, _, cx| cx.open_url(DOCS_URL))
-        .register_action(|_, _: &OpenStatusPage, _, cx| cx.open_url(STATUS_URL))
         .register_action(|_, _: &Minimize, window, _| window.minimize_window())
         .register_action(|_, _: &Zoom, window, _| window.zoom_window())
         .register_action(|_, _: &ToggleFullScreen, window, _| window.toggle_fullscreen())
@@ -803,4 +794,3 @@ pub fn load_default_keymap(cx: &mut App) {
     }
 }
 
-pub(crate) fn eager_load_active_theme_and_icon_theme(_fs: Arc<dyn Fs>, _cx: &mut App) {}

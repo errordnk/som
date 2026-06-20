@@ -3,7 +3,8 @@
     "face": "FiraCode Nerd Font",
     "features": {},
     "size": 11,
-    "weight": "normal"
+    "weight": "normal",
+    "lineHeight": 1.2
   },
   "uiFont": {
     "face": "Segoe UI",
@@ -38,7 +39,6 @@
     "blinking": "on"
   },
   "terminal": {
-    "lineHeight": 1.2,
     "copyOnSelect": true,
     "scrollMultiplier": 3.0,
     "maxScrollHistory": 10000,

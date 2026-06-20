@@ -1106,11 +1106,6 @@ pub enum Event {
         save_intent: SaveIntent,
     },
     WorkspaceCreated(WeakEntity<Workspace>),
-    OpenBundledFile {
-        text: Cow<'static, str>,
-        title: &'static str,
-        language: &'static str,
-    },
     ZoomChanged,
     ModalOpened,
     Activate,
@@ -7238,14 +7233,6 @@ actions!(
         CopyRoomId,
     ]
 );
-
-/// Opens the channel notes for a specific channel by its ID.
-#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
-#[action(namespace = collab)]
-#[serde(deny_unknown_fields)]
-pub struct OpenChannelNotesById {
-    pub channel_id: u64,
-}
 
 actions!(
     zed,

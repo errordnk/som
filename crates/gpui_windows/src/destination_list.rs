@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use anyhow::Context as _;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use windows::{
@@ -71,10 +72,12 @@ pub(crate) fn update_jump_list(
     // Jump List COM objects require STA; background threads may not have COM initialized.
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
     let result = (|| {
-        let (list, removed) = create_destination_list()?;
-        add_recent_folders(&list, recent_workspaces, removed.as_ref())?;
-        add_dock_menu(&list, dock_menus)?;
-        unsafe { list.CommitList() }?;
+        let (list, removed) =
+            create_destination_list().context("create_destination_list")?;
+        add_recent_folders(&list, recent_workspaces, removed.as_ref())
+            .context("add_recent_folders")?;
+        add_dock_menu(&list, dock_menus).context("add_dock_menu")?;
+        unsafe { list.CommitList() }.context("CommitList")?;
         Ok(removed)
     })();
     if com_initialized {
@@ -130,6 +133,9 @@ fn add_dock_menu(
     list: &ICustomDestinationList,
     dock_menus: &[(SharedString, SharedString)],
 ) -> anyhow::Result<()> {
+    if dock_menus.is_empty() {
+        return Ok(());
+    }
     unsafe {
         let tasks: IObjectCollection =
             CoCreateInstance(&EnumerableObjectCollection, None, CLSCTX_INPROC_SERVER)?;

@@ -118,7 +118,7 @@ If it returns nothing, the crate is not in the production tree.
 ```
 assets/
   fonts/
-    FiraCodeNerdFont-Regular.ttf   ← единственный embedded шрифт
+    FiraCodeNerdFont-Regular.ttf   ← единственный embedded шрифт (терминал + иконки табов; UI — системный)
   settings/
     default-windows.json           ← дефолты для Windows
     default-macos.json             ← дефолты для macOS
@@ -142,8 +142,8 @@ assets/
 - Aliases: `crates/gpui/src/text_system.rs` строки 1185–1203
 
 **План:**
-1. Скачать `FiraCodeNerdFont-Regular.ttf` (один файл, ~3.5MB, содержит и моно и Nerd Font иконки)
-   и положить в `assets/fonts/FiraCodeNerdFont-Regular.ttf`
+1. `FiraCodeNerdFont-Regular.ttf` уже лежит в `assets/` (2.6MB)
+   Используется только для терминала и иконок табов. UI шрифт — системный, не embedded.
 2. Удалить `assets/fonts/ibm-plex-sans/` и `assets/fonts/lilex/`
 3. В `text_system.rs` изменить alias-разрешение:
    - `.ZedMono` / `Zed Plex Mono` → `"FiraCode Nerd Font"`

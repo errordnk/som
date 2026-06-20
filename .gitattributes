@@ -4,3 +4,10 @@
 *.metal linguist-vendored
 *.wgsl linguist-vendored
 *.hlsl linguist-vendored
+*.json linguist-vendored
+*.svg linguist-vendored
+*.sh linguist-vendored
+*.toml linguist-vendored
+*.lock linguist-vendored
+assets/** linguist-vendored
+tooling/** linguist-vendored

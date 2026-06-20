@@ -1,0 +1,6 @@
+# Tell GitHub Linguist to exclude non-Rust files from language stats
+*.iss linguist-vendored
+*.hbs linguist-vendored
+*.metal linguist-vendored
+*.wgsl linguist-vendored
+*.hlsl linguist-vendored

@@ -6,7 +6,10 @@ use windows::{
     Win32::{
         Foundation::PROPERTYKEY,
         Globalization::u_strlen,
-        System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, StructuredStorage::PROPVARIANT},
+        System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize, StructuredStorage::PROPVARIANT,
+        },
         UI::{
             Controls::INFOTIPSIZE,
             Shell::{
@@ -65,11 +68,19 @@ pub(crate) fn update_jump_list(
     recent_workspaces: &[SmallVec<[PathBuf; 2]>],
     dock_menus: &[(SharedString, SharedString)],
 ) -> anyhow::Result<Vec<SmallVec<[PathBuf; 2]>>> {
-    let (list, removed) = create_destination_list()?;
-    add_recent_folders(&list, recent_workspaces, removed.as_ref())?;
-    add_dock_menu(&list, dock_menus)?;
-    unsafe { list.CommitList() }?;
-    Ok(removed)
+    // Jump List COM objects require STA; background threads may not have COM initialized.
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
+    let result = (|| {
+        let (list, removed) = create_destination_list()?;
+        add_recent_folders(&list, recent_workspaces, removed.as_ref())?;
+        add_dock_menu(&list, dock_menus)?;
+        unsafe { list.CommitList() }?;
+        Ok(removed)
+    })();
+    if com_initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
 }
 
 // Copied from:

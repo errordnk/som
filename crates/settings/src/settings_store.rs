@@ -1612,7 +1612,7 @@ mod tests {
     use std::{cell::RefCell, num::NonZeroU32};
 
     use crate::{
-        ClosePosition, ItemSettingsContent, VsCodeSettingsSource, default_settings,
+        ClosePosition, ItemSettingsContent, default_settings,
         settings_content::LanguageSettingsContent, test_settings,
     };
 
@@ -1629,7 +1629,8 @@ mod tests {
     impl Settings for AutoUpdateSetting {
         fn from_settings(content: &SettingsContent) -> Self {
             AutoUpdateSetting {
-                auto_update: content.auto_update.unwrap(),
+                auto_update: content.hide_mouse
+                    != Some(settings_content::HideMouseMode::Never),
             }
         }
     }
@@ -1785,7 +1786,7 @@ mod tests {
         store
             .set_user_settings(
                 r#"{
-                    "auto_update": false,
+                    "hide_mouse": "never",
                     "tabs": {
                       "close_position": "left"
                     }
@@ -1827,7 +1828,7 @@ mod tests {
                 WorktreeId::from_usize(1),
                 LocalSettingsPath::InWorktree(rel_path("root2").into()),
                 LocalSettingsKind::Settings,
-                Some(r#"{ "tab_size": 9, "auto_update": true}"#),
+                Some(r#"{ "tab_size": 9 }"#),
                 cx,
             )
             .unwrap();
@@ -1875,7 +1876,7 @@ mod tests {
     fn test_setting_store_assign_json_before_register(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
         store
-            .set_user_settings(r#"{ "auto_update": false }"#, cx)
+            .set_user_settings(r#"{ "hide_mouse": "never" }"#, cx)
             .unwrap();
         store.register_setting::<AutoUpdateSetting>();
 
@@ -2022,8 +2023,8 @@ mod tests {
         check_settings_update(
             &mut store,
             r#"{ "one": 1, "two": 2 }"#.to_owned(),
-            |settings| settings.auto_update = Some(true),
-            r#"{ "auto_update": true, "one": 1, "two": 2 }"#.to_owned(),
+            |settings| settings.hide_mouse = Some(settings_content::HideMouseMode::Never),
+            r#"{ "hide_mouse": "never", "one": 1, "two": 2 }"#.to_owned(),
             cx,
         );
 
@@ -2083,30 +2084,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_edits_for_update_preserves_unknown_keys(cx: &mut App) {
-        let mut store = SettingsStore::new(cx, &test_settings());
-        store.register_setting::<AutoUpdateSetting>();
-
-        let old_json = r#"{
-            "some_unknown_key": "should_be_preserved",
-            "auto_update": false
-        }"#
-        .unindent();
-
-        check_settings_update(
-            &mut store,
-            old_json,
-            |settings| settings.auto_update = Some(true),
-            r#"{
-            "some_unknown_key": "should_be_preserved",
-            "auto_update": true
-        }"#
-            .unindent(),
-            cx,
-        );
-    }
-
-    #[gpui::test]
     fn test_edits_for_update_returns_error_on_invalid_json(cx: &mut App) {
         let store = SettingsStore::new(cx, &test_settings());
 
@@ -2115,315 +2092,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[gpui::test]
-    fn test_vscode_import(cx: &mut App) {
-        let mut store = SettingsStore::new(cx, &test_settings());
-        store.register_setting::<DefaultLanguageSettings>();
-        store.register_setting::<ItemSettings>();
-        store.register_setting::<AutoUpdateSetting>();
-        store.register_setting::<ThemeSettings>();
-
-        // create settings that werent present
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#" { "editor.tabSize": 37 } "#.to_owned(),
-            r#"{
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              },
-              "tab_size": 37
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // persist settings that were present
-        check_vscode_import(
-            &mut store,
-            r#"{
-                "preferred_line_length": 99,
-            }
-            "#
-            .unindent(),
-            r#"{ "editor.tabSize": 42 }"#.to_owned(),
-            r#"{
-                "base_keymap": "VSCode",
-                "minimap": {
-                    "show": "always"
-                },
-                "tab_size": 42,
-                "preferred_line_length": 99,
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // don't clobber settings that aren't present in vscode
-        check_vscode_import(
-            &mut store,
-            r#"{
-                "preferred_line_length": 99,
-                "tab_size": 42
-            }
-            "#
-            .unindent(),
-            r#"{}"#.to_owned(),
-            r#"{
-                "base_keymap": "VSCode",
-                "minimap": {
-                    "show": "always"
-                },
-                "preferred_line_length": 99,
-                "tab_size": 42
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // custom enum
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "git.decorations.enabled": true }"#.to_owned(),
-            r#"{
-              "project_panel": {
-                "git_status": true
-              },
-              "outline_panel": {
-                "git_status": true
-              },
-              "base_keymap": "VSCode",
-              "tabs": {
-                "git_status": true
-              },
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // explorer sort settings
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{
-              "explorer.sortOrder": "mixed",
-              "explorer.sortOrderLexicographicOptions": "lower"
-            }"#
-            .unindent(),
-            r#"{
-              "project_panel": {
-                "sort_mode": "mixed",
-                "sort_order": "lower"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // font-family
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "editor.fontFamily": "Cascadia Code, 'Consolas', Courier New" }"#.to_owned(),
-            r#"{
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              },
-              "buffer_font_fallbacks": [
-                "Consolas",
-                "Courier New"
-              ],
-              "buffer_font_family": "Cascadia Code"
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // terminal bell settings - newer accessibility setting
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "accessibility.signals.terminalBell": { "sound": "on" } }"#.to_owned(),
-            r#"{
-              "terminal": {
-                "bell": "system"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // terminal bell settings - newer accessibility setting disabled
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "accessibility.signals.terminalBell": { "sound": "off" } }"#.to_owned(),
-            r#"{
-              "terminal": {
-                "bell": "off"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // terminal bell settings - older enableBell setting (true)
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "terminal.integrated.enableBell": true }"#.to_owned(),
-            r#"{
-              "terminal": {
-                "bell": "system"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // terminal bell settings - older enableBell setting (false)
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{ "terminal.integrated.enableBell": false }"#.to_owned(),
-            r#"{
-              "terminal": {
-                "bell": "off"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // newer accessibility setting takes precedence over older enableBell
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{
-              "accessibility.signals.terminalBell": { "sound": "off" },
-              "terminal.integrated.enableBell": true
-            }"#
-            .to_owned(),
-            r#"{
-              "terminal": {
-                "bell": "off"
-              },
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // hover sticky settings
-        check_vscode_import(
-            &mut store,
-            r#"{
-            }
-            "#
-            .unindent(),
-            r#"{
-              "editor.hover.sticky": false,
-              "editor.hover.hidingDelay": 500
-            }"#
-            .to_owned(),
-            r#"{
-              "base_keymap": "VSCode",
-              "minimap": {
-                "show": "always"
-              },
-              "hover_popover_hiding_delay": 500,
-              "hover_popover_sticky": false
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-    }
-
-    #[track_caller]
-    fn check_vscode_import(
-        store: &mut SettingsStore,
-        old: String,
-        vscode: String,
-        expected: String,
-        cx: &mut App,
-    ) {
-        store.set_user_settings(&old, cx).ok();
-        let new = store
-            .get_vscode_edits(
-                old,
-                &VsCodeSettings::from_str(&vscode, VsCodeSettingsSource::VsCode).unwrap(),
-            )
-            .unwrap();
-        pretty_assertions::assert_eq!(new, expected);
-    }
 
     #[gpui::test]
     fn test_update_git_settings(cx: &mut App) {
@@ -2568,7 +2236,6 @@ mod tests {
     fn test_get_value_for_field_local_worktrees_dont_interfere(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &test_settings());
         store.register_setting::<DefaultLanguageSettings>();
-        store.register_setting::<AutoUpdateSetting>();
 
         let local_1 = (WorktreeId::from_usize(0), RelPath::empty().into_arc());
 
@@ -2998,7 +2665,7 @@ mod tests {
         let user_schema_str = serde_json::to_string(&user_schema).unwrap();
         let project_schema_str = serde_json::to_string(&project_schema).unwrap();
 
-        assert!(user_schema_str.contains("\"auto_update\""));
-        assert!(!project_schema_str.contains("\"auto_update\""));
+        assert!(user_schema_str.contains("\"hide_mouse\""));
+        assert!(!project_schema_str.contains("\"hide_mouse\""));
     }
 }

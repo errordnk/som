@@ -110,13 +110,121 @@ cargo tree -p som --invert <crate-name> -e no-dev 2>&1
 ```
 If it returns nothing, the crate is not in the production tree.
 
-## What to work on next (open tasks)
+## What to work on next — main roadmap
 
-- Size goal: ~20MB release binary (currently ~38MB dev, smaller with release LTO)
+### Goal: eliminate `assets/` directory, single `settings.json` for everything
+
+**Settings philosophy:** one file `~/.config/som/settings.json` (or platform equivalent) controls
+everything — fonts, theme, keybindings, tab icons. No separate keymap file. No embedded assets.
+
+---
+
+### Phase 1 — Kill embedded fonts (assets/fonts/)
+
+**Current state:**
+- `assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf` — UI font alias `.ZedSans`
+- `assets/fonts/lilex/Lilex-Regular.ttf` — mono font alias `.ZedMono`
+- Loaded via `Assets::load_fonts()` in `main.rs`, embedded via `RustEmbed` in `crates/assets`
+- Aliases resolved in `crates/gpui/src/text_system.rs` lines 1185–1203
+
+**Plan:**
+1. Remove `assets/fonts/` directory entirely
+2. In `text_system.rs` change alias resolution: `.ZedMono` → system mono per platform, `.ZedSans` → system sans per platform
+3. Platform defaults (hardcoded fallback when no user setting):
+   - Windows:  UI = `Segoe UI`,  mono = `Cascadia Code` (fallback: `Consolas`)
+   - macOS:    UI = `SF Pro`,    mono = `SF Mono` (fallback: `Menlo`)
+   - Linux:    UI = `sans-serif`, mono = `monospace`
+4. User overrides via `settings.json`:
+   ```json
+   { "ui_font_family": "My Font", "buffer_font_family": "My Mono" }
+   ```
+5. Remove `Assets::load_fonts()` call from `main.rs`
+6. Remove font paths from `RustEmbed` in `crates/assets/src/assets.rs`
+
+---
+
+### Phase 2 — Merge keymap into settings.json
+
+**Current state:**
+- Platform keymap loaded from `assets/keymaps/default-{platform}.json` via `SettingsAssets` (RustEmbed)
+- User can have separate `keymap.json` file
+- `base_keymap` field in `SettingsContent` selects a base preset (VSCode/JetBrains/etc.)
+
+**Plan:**
+1. Move platform keymap JSON content from files into `const &str` per platform in `crates/settings/src/settings.rs`
+   (inline the file content, delete `assets/keymaps/`)
+2. Add `keybindings` array field to `settings.json`:
+   ```json
+   {
+     "keybindings": [
+       { "context": "Terminal", "bindings": { "ctrl-shift-c": "terminal::Copy" } }
+     ]
+   }
+   ```
+3. Wire `keybindings` from `SettingsContent` into the keymap reload path in `zed.rs`
+   (currently watches separate keymap file — redirect to watch settings file instead)
+4. Keep `base_keymap` field for preset selection
+5. Remove `OpenKeymapFile` / `OpenKeymap` menu items (already in settings)
+6. Delete `assets/keymaps/` directory
+
+---
+
+### Phase 3 — Tab icons without assets/icons/
+
+**Current state:**
+- `assets/icons/` has 295 SVG files, almost all AI/editor-specific, none terminal-relevant
+- Icon theme loaded via Assets/RustEmbed
+- Tabs in `workspace` use icon theme paths
+
+**Plan:**
+1. Remove `assets/icons/` entirely (delete `icon_theme` from settings too, or make it no-op)
+2. Tab icon configured in `settings.json` as unicode char or external SVG path:
+   ```json
+   {
+     "tabs": {
+       "terminal_icon": "▶",
+       "terminal_icon_svg": "/path/to/icon.svg"
+     }
+   }
+   ```
+3. Default: unicode `▶` (no asset dependency)
+4. External SVG: loaded from filesystem path at runtime (not embedded)
+5. Add `terminal_icon` / `terminal_icon_svg` fields to `SettingsContent` → `WorkspaceSettingsContent`
+
+---
+
+### Phase 4 — Kill remaining assets/ subdirectories
+
+After phases 1–3:
+- `assets/images/` — delete (app icons handled by platform-specific resources)
+- `assets/sounds/` — delete (bell sound; terminal bell can use system bell)
+- `assets/prompts/` — delete (AI prompts)
+- `assets/settings/initial_*.json` — delete (only `default.json` and `default_semantic_token_rules.json` remain)
+- `assets/themes/` — **keep** (themes still loaded via RustEmbed, user can switch via settings)
+
+After phase 4, `RustEmbed` in `crates/assets` covers only `themes/**` and `settings/default*.json`.
+
+---
+
+### Phase 5 — Slim `assets/settings/default.json`
+
+Remove all fields that reference deleted functionality:
+- `icon_theme`, `auto_update`, `agent_*`, `git_*`, `collaboration_panel`, etc.
+- Keep: `theme`, `buffer_font_*`, `ui_font_*`, `terminal`, `tabs`, `base_keymap`, `keybindings`
+
+---
+
+### Size goal
+
+~20MB release binary (currently ~38MB dev build, release with LTO will be smaller).
+Main wins: removing embedded fonts (~2MB), removing 295 SVG icons (~1MB embedded strings).
+
+---
 
 ## Development rules
 
 - **No stubs** — delete code entirely, never replace with empty impls
-- **Do not touch:** `terminal`, `terminal_view` (except dead code removal), `gpui`, `ui`, `settings`, `theme`
+- **gpui and terminal are now touchable** (confirmed by user) for bug fixes and asset removal
+- **Do not restructure** `terminal_view`, `ui`, `settings`, `theme` — only remove dead code
 - **After every change block:** `cargo check -p som`
 - **Release builds:** run manually by the developer, never automated

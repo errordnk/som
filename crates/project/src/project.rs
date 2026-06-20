@@ -39,7 +39,6 @@ use std::{
 };
 
 use terminals::Terminals;
-use text::BufferId;
 use util::{
     path_list::PathList,
     paths::{PathStyle, SanitizedPath, is_absolute},
@@ -78,13 +77,6 @@ pub trait ProjectItem: 'static {
     fn entry_id(&self, cx: &App) -> Option<ProjectEntryId>;
     fn project_path(&self, cx: &App) -> Option<ProjectPath>;
     fn is_dirty(&self) -> bool;
-}
-
-#[derive(Clone)]
-pub enum OpenedBufferEvent {
-    Disconnected,
-    Ok(BufferId),
-    Err(BufferId, Arc<anyhow::Error>),
 }
 
 /// Semantics-aware entity that is relevant to one or more [`Worktree`] with the files.
@@ -158,54 +150,6 @@ impl ProjectPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum InlayId {
-    Hint(usize),
-    Color(usize),
-    EditPrediction(usize),
-    DebuggerValue(usize),
-    ReplResult(usize),
-}
-
-impl InlayId {
-    pub fn id(&self) -> usize {
-        match self {
-            Self::Hint(id) => *id,
-            Self::Color(id) => *id,
-            Self::EditPrediction(id) => *id,
-            Self::DebuggerValue(id) => *id,
-            Self::ReplResult(id) => *id,
-        }
-    }
-}
-
-/// The user's intent behind a given completion confirmation.
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
-pub enum CompletionIntent {
-    /// The user intends to 'commit' this result, if possible.
-    /// Completion confirmations should run side effects.
-    ///
-    /// For LSP completions, will respect the setting `completions.lsp_insert_mode`.
-    Complete,
-    /// Similar to [Self::Complete], but behaves like `lsp_insert_mode` is set to `insert`.
-    CompleteWithInsert,
-    /// Similar to [Self::Complete], but behaves like `lsp_insert_mode` is set to `replace`.
-    CompleteWithReplace,
-    /// The user intends to continue 'composing' this completion.
-    /// Completion confirmations should not run side effects and
-    /// let the user continue composing their action.
-    Compose,
-}
-
-impl CompletionIntent {
-    pub fn is_complete(&self) -> bool {
-        self == &Self::Complete
-    }
-
-    pub fn is_compose(&self) -> bool {
-        self == &Self::Compose
-    }
-}
 
 
 #[derive(Debug, Clone)]

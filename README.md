@@ -1,10 +1,10 @@
 # Som
 
-A minimal terminal emulator with tabs, forked from [Zed](https://github.com/zed-industries/zed).
+A minimal terminal emulator with tabs&&ligatures, forked from [Zed](https://github.com/zed-industries/zed).
 
 ## What it is
 
-Som is Zed stripped down to just the terminal. No editor, no LSP, no AI, no collaboration. Just a fast GPU-accelerated Windows/MacOS/Linux terminal with tabs, ligatures powered by GPUI.
+Som is Zed stripped down to just the terminal. No editor, no LSP, no AI, no collaboration. Just a fast GPU-accelerated Windows/MacOS/Linux terminal powered by GPUI.
 
 ## What was removed from Zed
 
@@ -41,5 +41,3 @@ Everything that isn't the terminal:
 ```
 cargo build -p som --release
 ```
-
-Release builds use LTO=thin.

@@ -12,32 +12,41 @@
   "theme": {
     "name": "Nord",
     "mode": "dark",
-    "background":    "#2E3440",
-    "foreground":    "#D8DEE9",
-    "black":         "#3B4252",
-    "brightBlack":   "#4C566A",
-    "red":           "#BF616A",
-    "brightRed":     "#BF616A",
-    "green":         "#A3BE8C",
-    "brightGreen":   "#A3BE8C",
-    "yellow":        "#EBCB8B",
-    "brightYellow":  "#EBCB8B",
-    "blue":          "#81A1C1",
-    "brightBlue":    "#81A1C1",
-    "purple":        "#B48EAD",
-    "brightPurple":  "#B48EAD",
-    "cyan":          "#88C0D0",
-    "brightCyan":    "#8FBCBB",
-    "white":         "#E5E9F0",
-    "brightWhite":   "#ECEFF4",
-    "selection":     "#88C0D0"
+    "background":   "#2E3440",
+    "foreground":   "#D8DEE9",
+    "black":        "#3B4252",
+    "brightBlack":  "#4C566A",
+    "red":          "#BF616A",
+    "brightRed":    "#BF616A",
+    "green":        "#A3BE8C",
+    "brightGreen":  "#A3BE8C",
+    "yellow":       "#EBCB8B",
+    "brightYellow": "#EBCB8B",
+    "blue":         "#81A1C1",
+    "brightBlue":   "#81A1C1",
+    "purple":       "#B48EAD",
+    "brightPurple": "#B48EAD",
+    "cyan":         "#88C0D0",
+    "brightCyan":   "#8FBCBB",
+    "white":        "#E5E9F0",
+    "brightWhite":  "#ECEFF4",
+    "selection":    "#88C0D0"
   },
   "cursor": {
     "shape": "underline",
     "color": "#90ee90",
     "blinking": "on"
   },
+  "terminal": {
+    "lineHeight": 1.2,
+    "copyOnSelect": true,
+    "scrollMultiplier": 3.0,
+    "maxScrollHistory": 10000,
+    "bell": "off",
+    "alternateScroll": "on",
+    "env": {}
+  },
   "tabs": [
-    { "name": "CMD", "icon": "", "shell": "cmd.exe" }
+    { "name": "CMD", "icon": "", "shell": "cmd.exe", "workingDir": "~" }
   ]
 }

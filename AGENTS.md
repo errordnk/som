@@ -112,7 +112,6 @@ If it returns nothing, the crate is not in the production tree.
 
 ## What to work on next (open tasks)
 
-- Dead code audit in `workspace` and `project` (may still have editor references)
 - `migrator` — simplify: remove migrations for editor/LSP/AI keymaps, keep only relevant ones
 - Size goal: ~20MB release binary (currently ~38MB dev, smaller with release LTO)
 

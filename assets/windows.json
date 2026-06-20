@@ -24,10 +24,16 @@
   "terminal": {
     "cursor_shape": "underline",
     "cursor_blink": true,
-    "line_height": { "custom": 1.2 },
+    "line_height": {
+      "custom": 1.2
+    },
     "max_scroll_history_lines": 9999999
   },
   "tabs": [
-    { "name": "CMD", "icon": "", "shell": "cmd.exe" }
+    {
+      "name": "CMD",
+      "icon": "",
+      "shell": "cmd.exe"
+    }
   ]
 }

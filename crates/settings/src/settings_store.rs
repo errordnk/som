@@ -34,7 +34,7 @@ use crate::editorconfig_store::EditorconfigStore;
 use crate::{
     ActiveSettingsProfileName, FontFamilyName, IconThemeName, LanguageSettingsContent,
     LanguageToSettingsMap, LspSettings, LspSettingsMap, SemanticTokenRules, ThemeName,
-    UserSettingsContentExt, VsCodeSettings, WorktreeId,
+    UserSettingsContentExt, WorktreeId,
     settings_content::{
         ExtensionsSettingsContent, ProfileBase, ProjectSettingsContent, RootUserSettings,
         SettingsContent, UserSettingsContent, merge_from::MergeFrom,
@@ -621,18 +621,6 @@ impl SettingsStore {
         })
     }
 
-    pub fn import_vscode_settings(
-        &self,
-        fs: Arc<dyn Fs>,
-        vscode_settings: VsCodeSettings,
-    ) -> oneshot::Receiver<Result<()>> {
-        self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
-            cx.read_global(|store: &SettingsStore, _cx| {
-                store.get_vscode_edits(old_text, &vscode_settings)
-            })
-        })
-    }
-
     pub fn get_all_files(&self) -> Vec<SettingsFile> {
         let mut files = Vec::from_iter(
             self.local_settings
@@ -827,12 +815,6 @@ impl SettingsStore {
             new_text.replace_range(range, &replacement);
         }
         Ok(new_text)
-    }
-
-    pub fn get_vscode_edits(&self, old_text: String, vscode: &VsCodeSettings) -> Result<String> {
-        self.new_text_for_update(old_text, |content| {
-            content.merge_from(&vscode.settings_content())
-        })
     }
 
     /// Updates the value of a setting in a JSON file, returning a list

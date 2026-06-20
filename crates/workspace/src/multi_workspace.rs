@@ -15,11 +15,6 @@ use std::path::PathBuf;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
-use zed_actions::agents_sidebar::ToggleThreadSwitcher;
-
-use settings::SidebarDockPosition;
-use ui::{ContextMenu, right_click_menu};
-
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
 use crate::{
@@ -56,40 +51,6 @@ actions!(
 pub struct SidebarRenderState {
     pub open: bool,
     pub side: SidebarSide,
-}
-
-pub fn sidebar_side_context_menu(
-    id: impl Into<ElementId>,
-    _cx: &App,
-) -> ui::RightClickMenu<ContextMenu> {
-    let current_position = SidebarDockPosition::Right;
-    right_click_menu(id).menu(move |window, cx| {
-        let fs = <dyn fs::Fs>::global(cx);
-        ContextMenu::build(window, cx, move |mut menu, _, _cx| {
-            let positions: [(SidebarDockPosition, &str); 2] = [
-                (SidebarDockPosition::Left, "Left"),
-                (SidebarDockPosition::Right, "Right"),
-            ];
-            for (position, label) in positions {
-                let fs = fs.clone();
-                menu = menu.toggleable_entry(
-                    label,
-                    position == current_position,
-                    IconPosition::Start,
-                    None,
-                    move |_window, cx| {
-                        settings::update_settings_file(fs.clone(), cx, move |settings, _cx| {
-                            settings
-                                .agent
-                                .get_or_insert_default()
-                                .set_sidebar_side(position);
-                        });
-                    },
-                );
-            }
-            menu
-        })
-    })
 }
 
 pub enum MultiWorkspaceEvent {
@@ -1979,13 +1940,6 @@ impl Render for MultiWorkspace {
                     .on_action(cx.listener(
                         |this: &mut Self, _: &FocusWorkspaceSidebar, window, cx| {
                             this.focus_sidebar(window, cx);
-                        },
-                    ))
-                    .on_action(cx.listener(
-                        |this: &mut Self, action: &ToggleThreadSwitcher, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
-                                sidebar.toggle_thread_switcher(action.select_last, window, cx);
-                            }
                         },
                     ))
                     .on_action(cx.listener(|this: &mut Self, _: &NextProject, window, cx| {

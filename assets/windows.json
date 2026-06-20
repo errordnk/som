@@ -1,0 +1,40 @@
+{
+  "theme": {
+    "mode": "dark",
+    "light": "Nord Light",
+    "dark": "Nord Dark"
+  },
+  "buffer_font_family": "FiraCode Nerd Font",
+  "buffer_font_size": 11,
+  "buffer_font_features": {
+    "cv02": true,
+    "cv14": true,
+    "cv25": true,
+    "cv26": true,
+    "cv28": true,
+    "cv32": true,
+    "ss02": true,
+    "ss03": true,
+    "ss05": true,
+    "ss07": true,
+    "ss09": true
+  },
+  "terminal": {
+    "cursor_shape": "underline",
+    "cursor_blink": true,
+    "line_height": { "custom": 1.2 },
+    "max_scroll_history_lines": 9999999
+  },
+  "tabs": [
+    { "name": "wsl",  "icon": "", "shell": "wsl.exe --cd ~" },
+    { "name": "dnk",  "icon": "", "shell": "C:\\Program Files\\PowerShell\\7\\pwsh.exe" },
+    { "name": "pve",  "icon": "", "shell": "ssh dnk@192.168.50.3" },
+    { "name": "deb",  "icon": "", "shell": "ssh 192.168.50.65" },
+    { "name": "pi5",  "icon": "", "shell": "ssh 192.168.50.5" },
+    { "name": "mac",  "icon": "", "shell": "ssh 192.168.50.6" },
+    { "name": "usa",  "icon": "", "shell": "ssh 204.12.230.122" },
+    { "name": "asus", "icon": "", "shell": "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null dnk@192.168.50.1" },
+    { "name": "root", "icon": "", "shell": "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "elevate": true },
+    { "name": "vpn",  "icon": "", "shell": "ssh 192.168.50.8" }
+  ]
+}

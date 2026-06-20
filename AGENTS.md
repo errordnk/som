@@ -112,48 +112,87 @@ If it returns nothing, the crate is not in the production tree.
 
 ## What to work on next — main roadmap
 
-### Goal: eliminate `assets/` directory, single `settings.json` for everything
+### Goal: `assets/` contains exactly 4 files, single `settings.json` for everything
 
-**Settings philosophy:** one file `~/.config/som/settings.json` (or platform equivalent) controls
-everything — fonts, theme, keybindings, tab icons. No separate keymap file. No embedded assets.
+**Final `assets/` layout:**
+```
+assets/
+  fonts/
+    FiraCodeNerdFont-Regular.ttf   ← единственный embedded шрифт
+  settings/
+    default-windows.json           ← дефолты для Windows
+    default-macos.json             ← дефолты для macOS
+    default-linux.json             ← дефолты для Linux
+```
+
+**Settings philosophy:**
+- Один файл `~/.config/som/settings.json` (или платформенный эквивалент) — всё в нём:
+  шрифты, тема, кеймапы, иконки табов.
+- Иконки табов — unicode codepoints из FiraCode Nerd Font (например `` = ).
+- Нет отдельного keymap-файла. Нет SVG иконок.
 
 ---
 
-### Phase 1 — Kill embedded fonts (assets/fonts/)
+### Phase 1 — Единственный шрифт: FiraCode Nerd Font
 
-**Current state:**
-- `assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf` — UI font alias `.ZedSans`
-- `assets/fonts/lilex/Lilex-Regular.ttf` — mono font alias `.ZedMono`
-- Loaded via `Assets::load_fonts()` in `main.rs`, embedded via `RustEmbed` in `crates/assets`
-- Aliases resolved in `crates/gpui/src/text_system.rs` lines 1185–1203
+**Текущее состояние:**
+- `assets/fonts/ibm-plex-sans/` — UI шрифт, alias `.ZedSans`
+- `assets/fonts/lilex/` — моно шрифт, alias `.ZedMono`
+- Loaded via `Assets::load_fonts()` → `main.rs`, embedded через `RustEmbed` в `crates/assets`
+- Aliases: `crates/gpui/src/text_system.rs` строки 1185–1203
 
-**Plan:**
-1. Remove `assets/fonts/` directory entirely
-2. In `text_system.rs` change alias resolution: `.ZedMono` → system mono per platform, `.ZedSans` → system sans per platform
-3. Platform defaults (hardcoded fallback when no user setting):
-   - Windows:  UI = `Segoe UI`,  mono = `Cascadia Code` (fallback: `Consolas`)
-   - macOS:    UI = `SF Pro`,    mono = `SF Mono` (fallback: `Menlo`)
-   - Linux:    UI = `sans-serif`, mono = `monospace`
-4. User overrides via `settings.json`:
-   ```json
-   { "ui_font_family": "My Font", "buffer_font_family": "My Mono" }
+**План:**
+1. Скачать `FiraCodeNerdFont-Regular.ttf` (один файл, ~3.5MB, содержит и моно и Nerd Font иконки)
+   и положить в `assets/fonts/FiraCodeNerdFont-Regular.ttf`
+2. Удалить `assets/fonts/ibm-plex-sans/` и `assets/fonts/lilex/`
+3. В `text_system.rs` изменить alias-разрешение:
+   - `.ZedMono` / `Zed Plex Mono` → `"FiraCode Nerd Font"`
+   - `.ZedSans` / `Zed Plex Sans` → системный UI шрифт по платформе (не embedded):
+     - Windows: `"Segoe UI"`
+     - macOS: `"SF Pro"`  (или `".AppleSystemUIFont"`)
+     - Linux: `"sans-serif"`
+4. `Assets::load_fonts()` теперь грузит только один `.ttf`
+5. `buffer_font_family` в default.json → `"FiraCode Nerd Font"`
+6. `ui_font_family` в default.json → платформо-зависимый системный шрифт (убрать из embedded defaults, задать через platform-specific default.json)
+
+---
+
+### Phase 2 — Три платформенных default.json вместо одного
+
+**Текущее состояние:**
+- `assets/settings/default.json` — один файл для всех платформ, загружается через `SettingsAssets`
+- `crates/settings/src/settings.rs`: `pub fn default_settings()` → `asset_str("settings/default.json")`
+
+**План:**
+1. Разбить `default.json` на три файла: `default-windows.json`, `default-macos.json`, `default-linux.json`
+2. В `crates/settings/src/settings.rs` добавить `#[cfg(target_os = ...)]` аналогично `DEFAULT_KEYMAP_PATH`:
+   ```rust
+   #[cfg(target_os = "windows")]
+   pub fn default_settings() -> Cow<'static, str> {
+       asset_str::<SettingsAssets>("settings/default-windows.json")
+   }
    ```
-5. Remove `Assets::load_fonts()` call from `main.rs`
-6. Remove font paths from `RustEmbed` in `crates/assets/src/assets.rs`
+3. Удалить `assets/settings/default.json`
+4. Каждый платформенный файл задаёт:
+   - `ui_font_family` — системный для платформы
+   - `buffer_font_family` — `"FiraCode Nerd Font"`
+   - `terminal.font_family` — `"FiraCode Nerd Font"`
+   - `theme` — тема по умолчанию
+   - `base_keymap` — `"None"` (кеймапы встроены inline, см. Phase 3)
 
 ---
 
-### Phase 2 — Merge keymap into settings.json
+### Phase 3 — Убрать keymap-файлы, встроить keybindings в settings.json
 
-**Current state:**
-- Platform keymap loaded from `assets/keymaps/default-{platform}.json` via `SettingsAssets` (RustEmbed)
-- User can have separate `keymap.json` file
-- `base_keymap` field in `SettingsContent` selects a base preset (VSCode/JetBrains/etc.)
+**Текущее состояние:**
+- `assets/keymaps/default-{platform}.json` — базовые кеймапы, загружаются через `SettingsAssets`
+- `assets/keymaps/vim.json`, `assets/keymaps/storybook.json` и пр.
+- `base_keymap` поле выбирает пресет (VSCode/JetBrains/etc.)
 
-**Plan:**
-1. Move platform keymap JSON content from files into `const &str` per platform in `crates/settings/src/settings.rs`
-   (inline the file content, delete `assets/keymaps/`)
-2. Add `keybindings` array field to `settings.json`:
+**План:**
+1. Содержимое `assets/keymaps/default-{platform}.json` перенести в `const &str` прямо в
+   `crates/settings/src/settings.rs` (три константы, `#[cfg]` по платформе)
+2. Добавить поле `keybindings` в `settings.json` и `SettingsContent`:
    ```json
    {
      "keybindings": [
@@ -161,70 +200,75 @@ everything — fonts, theme, keybindings, tab icons. No separate keymap file. No
      ]
    }
    ```
-3. Wire `keybindings` from `SettingsContent` into the keymap reload path in `zed.rs`
-   (currently watches separate keymap file — redirect to watch settings file instead)
-4. Keep `base_keymap` field for preset selection
-5. Remove `OpenKeymapFile` / `OpenKeymap` menu items (already in settings)
-6. Delete `assets/keymaps/` directory
+3. В `crates/zed/src/zed.rs`: переключить watch с отдельного keymap-файла на settings-файл
+4. Убрать пункты меню `Open Keymap` / `Open Keymap File` (всё в settings)
+5. Удалить `assets/keymaps/`
+6. Удалить `OpenKeymap`, `OpenKeymapFile` action handlers из `zed.rs`
 
 ---
 
-### Phase 3 — Tab icons without assets/icons/
+### Phase 4 — Tab icons через Nerd Font unicode
 
-**Current state:**
-- `assets/icons/` has 295 SVG files, almost all AI/editor-specific, none terminal-relevant
-- Icon theme loaded via Assets/RustEmbed
-- Tabs in `workspace` use icon theme paths
+**Концепция:**
+- Nerd Font иконки — unicode символы в Private Use Area (PUA), например:
+  - `` ()  — иконка терминала
+  - `` ()  — папка
+  - `` ()  — файл
+- Никакого SVG, никаких asset-файлов, просто unicode string в настройках
 
-**Plan:**
-1. Remove `assets/icons/` entirely (delete `icon_theme` from settings too, or make it no-op)
-2. Tab icon configured in `settings.json` as unicode char or external SVG path:
-   ```json
-   {
-     "tabs": {
-       "terminal_icon": "▶",
-       "terminal_icon_svg": "/path/to/icon.svg"
-     }
-   }
-   ```
-3. Default: unicode `▶` (no asset dependency)
-4. External SVG: loaded from filesystem path at runtime (not embedded)
-5. Add `terminal_icon` / `terminal_icon_svg` fields to `SettingsContent` → `WorkspaceSettingsContent`
+**Поле в settings.json:**
+```json
+{
+  "tabs": {
+    "terminal_icon": ""
+  }
+}
+```
 
----
-
-### Phase 4 — Kill remaining assets/ subdirectories
-
-After phases 1–3:
-- `assets/images/` — delete (app icons handled by platform-specific resources)
-- `assets/sounds/` — delete (bell sound; terminal bell can use system bell)
-- `assets/prompts/` — delete (AI prompts)
-- `assets/settings/initial_*.json` — delete (only `default.json` and `default_semantic_token_rules.json` remain)
-- `assets/themes/` — **keep** (themes still loaded via RustEmbed, user can switch via settings)
-
-After phase 4, `RustEmbed` in `crates/assets` covers only `themes/**` and `settings/default*.json`.
+**План:**
+1. Добавить поле `terminal_icon: Option<String>` в `WorkspaceSettingsContent` (или `ItemSettingsContent`)
+2. Дефолт из platform default.json: `"terminal_icon": ""`
+3. В `terminal_view` при создании таба передавать этот символ как label/icon
+4. Нет SVG pipeline вообще — просто рендерится как текст через FiraCode Nerd Font
 
 ---
 
-### Phase 5 — Slim `assets/settings/default.json`
+### Phase 5 — Удалить всё остальное из assets/
 
-Remove all fields that reference deleted functionality:
-- `icon_theme`, `auto_update`, `agent_*`, `git_*`, `collaboration_panel`, etc.
-- Keep: `theme`, `buffer_font_*`, `ui_font_*`, `terminal`, `tabs`, `base_keymap`, `keybindings`
+После фаз 1–4 удалить:
+- `assets/icons/` (296 SVG)
+- `assets/images/` (app icons — остаются в платформенных ресурсах вне assets/)
+- `assets/sounds/` (bell.ogg — заменить системным bell или убрать)
+- `assets/prompts/` (AI prompts)
+- `assets/themes/` — **пока оставить** или решить отдельно
+- `assets/settings/initial_*.json`, `assets/settings/default_semantic_token_rules.json` — удалить или inline
+
+**После фазы 5 в assets/ останется:**
+```
+assets/fonts/FiraCodeNerdFont-Regular.ttf
+assets/settings/default-windows.json
+assets/settings/default-macos.json
+assets/settings/default-linux.json
+```
+`RustEmbed` в `crates/assets` и `crates/settings` будет включать только эти 4 файла.
 
 ---
 
-### Size goal
+### Размер бинаря
 
-~20MB release binary (currently ~38MB dev build, release with LTO will be smaller).
-Main wins: removing embedded fonts (~2MB), removing 295 SVG icons (~1MB embedded strings).
+Цель: ~20MB release. Текущий dev: ~38MB.
+Основная экономия:
+- Удаление 296 SVG иконок (~1MB embedded)
+- Замена двух TTF шрифтов (IBM Plex Sans + Lilex ~2MB) одним FiraCode Nerd Font (~3.5MB)
+  — чистая потеря ~1.5MB, но выигрыш в функциональности (Nerd Font иконки)
+- Удаление неиспользуемых крейтов из дерева зависимостей
 
 ---
 
 ## Development rules
 
 - **No stubs** — delete code entirely, never replace with empty impls
-- **gpui and terminal are now touchable** (confirmed by user) for bug fixes and asset removal
-- **Do not restructure** `terminal_view`, `ui`, `settings`, `theme` — only remove dead code
-- **After every change block:** `cargo check -p som`
-- **Release builds:** run manually by the developer, never automated
+- **gpui и terminal — трогать можно** (подтверждено пользователем)
+- **Не реструктурировать** `terminal_view`, `ui`, `settings`, `theme` — только мёртвый код
+- **После каждого блока изменений:** `cargo check -p som`
+- **Release builds:** запускает разработчик вручную, никогда не автоматизировать

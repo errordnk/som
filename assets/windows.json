@@ -1,19 +1,7 @@
 {
   "font": {
     "face": "FiraCode Nerd Font",
-    "features": {
-      "cv02": 1,
-      "cv14": 1,
-      "cv25": 1,
-      "cv26": 1,
-      "cv28": 1,
-      "cv32": 1,
-      "ss02": 1,
-      "ss03": 1,
-      "ss05": 1,
-      "ss07": 1,
-      "ss09": 1
-    },
+    "features": {},
     "size": 11,
     "weight": "normal"
   },
@@ -22,9 +10,28 @@
     "size": 13
   },
   "theme": {
+    "name": "Nord",
     "mode": "dark",
-    "light": "Nord Light",
-    "dark": "Nord Dark"
+    "background":    "#2E3440",
+    "foreground":    "#D8DEE9",
+    "black":         "#3B4252",
+    "brightBlack":   "#4C566A",
+    "red":           "#BF616A",
+    "brightRed":     "#BF616A",
+    "green":         "#A3BE8C",
+    "brightGreen":   "#A3BE8C",
+    "yellow":        "#EBCB8B",
+    "brightYellow":  "#EBCB8B",
+    "blue":          "#81A1C1",
+    "brightBlue":    "#81A1C1",
+    "purple":        "#B48EAD",
+    "brightPurple":  "#B48EAD",
+    "cyan":          "#88C0D0",
+    "brightCyan":    "#8FBCBB",
+    "white":         "#E5E9F0",
+    "brightWhite":   "#ECEFF4",
+    "selection":     "#88C0D0",
+    "cursor":        "#D8DEE9"
   },
   "cursor": {
     "shape": "underline",

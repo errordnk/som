@@ -1667,22 +1667,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq)]
-    struct ThemeSettings {
-        buffer_font_family: FontFamilyName,
-        buffer_font_fallbacks: Vec<FontFamilyName>,
-    }
-
-    impl Settings for ThemeSettings {
-        fn from_settings(content: &SettingsContent) -> Self {
-            let content = content.theme.clone();
-            ThemeSettings {
-                buffer_font_family: content.buffer_font_family.unwrap(),
-                buffer_font_fallbacks: content.buffer_font_fallbacks.unwrap(),
-            }
-        }
-    }
-
     #[gpui::test]
     async fn test_update_settings_file_updates_store_before_watcher(cx: &mut gpui::TestAppContext) {
         let fs = FakeFs::new(cx.background_executor.clone());

@@ -1,0 +1,1328 @@
+pub mod project_settings;
+pub mod search;
+pub mod terminals;
+pub mod trusted_worktrees;
+pub mod worktree_store;
+
+mod environment;
+pub use environment::ProjectEnvironmentEvent;
+
+use itertools::Itertools;
+
+use crate::{
+    worktree_store::WorktreeIdCounter,
+};
+pub use worktree_store::WorktreePaths;
+
+use anyhow::{Context as _, Result, anyhow};
+use clock::ReplicaId;
+
+use collections::HashMap;
+
+pub use environment::ProjectEnvironment;
+
+use futures::StreamExt;
+
+use gpui::{
+    App, AppContext, Context, Entity, EventEmitter, SharedString,
+    Task,
+};
+use parking_lot::Mutex;
+use project_settings::{SettingsObserver, SettingsObserverEvent};
+use settings::{InvalidSettingsError, SettingsLocation};
+use std::{
+    borrow::Cow,
+    future::Future,
+    path::{Path, PathBuf},
+    str::self,
+    sync::Arc,
+};
+
+use terminals::Terminals;
+use text::BufferId;
+use util::{
+    path_list::PathList,
+    paths::{PathStyle, SanitizedPath, is_absolute},
+    rel_path::RelPath,
+};
+use worktree::CreatedEntry;
+pub use worktree::{
+    Entry, EntryKind, FS_WATCH_LATENCY, LocalWorktree, PathChange, ProjectEntryId,
+    UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
+};
+use worktree_store::{WorktreeStore, WorktreeStoreEvent};
+
+pub use fs::*;
+
+#[derive(Clone, Copy, Debug)]
+pub struct LocalProjectFlags {
+    pub init_worktree_trust: bool,
+}
+
+impl Default for LocalProjectFlags {
+    fn default() -> Self {
+        Self {
+            init_worktree_trust: true,
+        }
+    }
+}
+
+pub trait ProjectItem: 'static {
+    fn try_open(
+        project: &Entity<Project>,
+        path: &ProjectPath,
+        cx: &mut App,
+    ) -> Option<Task<Result<Entity<Self>>>>
+    where
+        Self: Sized;
+    fn entry_id(&self, cx: &App) -> Option<ProjectEntryId>;
+    fn project_path(&self, cx: &App) -> Option<ProjectPath>;
+    fn is_dirty(&self) -> bool;
+}
+
+#[derive(Clone)]
+pub enum OpenedBufferEvent {
+    Disconnected,
+    Ok(BufferId),
+    Err(BufferId, Arc<anyhow::Error>),
+}
+
+/// Semantics-aware entity that is relevant to one or more [`Worktree`] with the files.
+/// `Project` is responsible for tasks, LSP and collab queries, synchronizing worktree states accordingly.
+/// Maps [`Worktree`] entries with its own logic using [`ProjectEntryId`] and [`ProjectPath`] structs.
+///
+/// Can be either local (for the project opened on the same host) or remote.(for collab projects, browsed by multiple remote users).
+pub struct Project {
+    active_entry: Option<ProjectEntryId>,
+    fs: Arc<dyn Fs>,
+    worktree_store: Entity<WorktreeStore>,
+    _subscriptions: Vec<gpui::Subscription>,
+    terminals: Terminals,
+    environment: Entity<ProjectEnvironment>,
+    _settings_observer: Entity<SettingsObserver>,
+    last_worktree_paths: WorktreePaths,
+}
+
+
+/// A link to display in a toast notification, useful to point to documentation.
+#[derive(PartialEq, Debug, Clone)]
+pub struct ToastLink {
+    pub label: &'static str,
+    pub url: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Event {
+    Toast {
+        notification_id: SharedString,
+        message: String,
+        /// Optional link to display as a button in the toast.
+        link: Option<ToastLink>,
+    },
+    HideToast {
+        notification_id: SharedString,
+    },
+    ActiveEntryChanged(Option<ProjectEntryId>),
+    ActivateProjectPanel,
+    WorktreeAdded(WorktreeId),
+    WorktreeOrderChanged,
+    WorktreeRemoved(WorktreeId),
+    WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
+    WorktreeUpdatedRootRepoCommonDir(WorktreeId),
+    WorktreePathsChanged {
+        old_worktree_paths: WorktreePaths,
+    },
+    Closed,
+    DeletedEntry(WorktreeId, ProjectEntryId),
+    RevealInProjectPanel(ProjectEntryId),
+    ExpandedAllForEntry(WorktreeId, ProjectEntryId),
+    EntryRenamed(ProjectPath, PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct ProjectPath {
+    pub worktree_id: WorktreeId,
+    pub path: Arc<RelPath>,
+}
+
+impl ProjectPath {
+    pub fn root_path(worktree_id: WorktreeId) -> Self {
+        Self {
+            worktree_id,
+            path: RelPath::empty().into(),
+        }
+    }
+
+    pub fn starts_with(&self, other: &ProjectPath) -> bool {
+        self.worktree_id == other.worktree_id && self.path.starts_with(&other.path)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InlayId {
+    Hint(usize),
+    Color(usize),
+    EditPrediction(usize),
+    DebuggerValue(usize),
+    ReplResult(usize),
+}
+
+impl InlayId {
+    pub fn id(&self) -> usize {
+        match self {
+            Self::Hint(id) => *id,
+            Self::Color(id) => *id,
+            Self::EditPrediction(id) => *id,
+            Self::DebuggerValue(id) => *id,
+            Self::ReplResult(id) => *id,
+        }
+    }
+}
+
+/// The user's intent behind a given completion confirmation.
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+pub enum CompletionIntent {
+    /// The user intends to 'commit' this result, if possible.
+    /// Completion confirmations should run side effects.
+    ///
+    /// For LSP completions, will respect the setting `completions.lsp_insert_mode`.
+    Complete,
+    /// Similar to [Self::Complete], but behaves like `lsp_insert_mode` is set to `insert`.
+    CompleteWithInsert,
+    /// Similar to [Self::Complete], but behaves like `lsp_insert_mode` is set to `replace`.
+    CompleteWithReplace,
+    /// The user intends to continue 'composing' this completion.
+    /// Completion confirmations should not run side effects and
+    /// let the user continue composing their action.
+    Compose,
+}
+
+impl CompletionIntent {
+    pub fn is_complete(&self) -> bool {
+        self == &Self::Complete
+    }
+
+    pub fn is_compose(&self) -> bool {
+        self == &Self::Compose
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct DirectoryItem {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+#[derive(Clone)]
+pub enum DirectoryLister {
+    Project(Entity<Project>),
+    Local(Entity<Project>, Arc<dyn Fs>),
+}
+
+impl std::fmt::Debug for DirectoryLister {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirectoryLister::Project(project) => {
+                write!(f, "DirectoryLister::Project({project:?})")
+            }
+            DirectoryLister::Local(project, _) => {
+                write!(f, "DirectoryLister::Local({project:?})")
+            }
+        }
+    }
+}
+
+impl DirectoryLister {
+    pub fn is_local(&self, cx: &App) -> bool {
+        match self {
+            DirectoryLister::Local(..) => true,
+            DirectoryLister::Project(project) => project.read(cx).is_local(),
+        }
+    }
+
+    pub fn resolve_tilde<'a>(&self, path: &'a String, cx: &App) -> Cow<'a, str> {
+        if self.is_local(cx) {
+            shellexpand::tilde(path)
+        } else {
+            Cow::from(path)
+        }
+    }
+
+    pub fn default_query(&self, cx: &mut App) -> String {
+        let project = match self {
+            DirectoryLister::Project(project) => project,
+            DirectoryLister::Local(project, _) => project,
+        }
+        .read(cx);
+        let path_style = project.path_style(cx);
+        project
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+            .or_else(|| std::env::home_dir().map(|dir| dir.to_string_lossy().into_owned()))
+            .map(|mut s| {
+                s.push_str(path_style.primary_separator());
+                s
+            })
+            .unwrap_or_else(|| {
+                if path_style.is_windows() {
+                    "C:\\"
+                } else {
+                    "~/"
+                }
+                .to_string()
+            })
+    }
+
+    pub fn list_directory(&self, path: String, cx: &mut App) -> Task<Result<Vec<DirectoryItem>>> {
+        match self {
+            DirectoryLister::Project(project) => {
+                project.update(cx, |project, cx| project.list_directory(path, cx))
+            }
+            DirectoryLister::Local(_, fs) => {
+                let fs = fs.clone();
+                cx.background_spawn(async move {
+                    let mut results = vec![];
+                    let expanded = shellexpand::tilde(&path);
+                    let query = Path::new(expanded.as_ref());
+                    let mut response = fs.read_dir(query).await?;
+                    while let Some(path) = response.next().await {
+                        let path = path?;
+                        if let Some(file_name) = path.file_name() {
+                            results.push(DirectoryItem {
+                                path: PathBuf::from(file_name.to_os_string()),
+                                is_dir: fs.is_dir(&path).await,
+                            });
+                        }
+                    }
+                    Ok(results)
+                })
+            }
+        }
+    }
+
+    pub fn path_style(&self, cx: &App) -> PathStyle {
+        match self {
+            Self::Local(project, ..) | Self::Project(project, ..) => {
+                project.read(cx).path_style(cx)
+            }
+        }
+    }
+}
+
+pub const CURRENT_PROJECT_FEATURES: &[&str] = &["new-style-anchors"];
+
+impl Project {
+    pub fn init(_cx: &mut App) {
+    }
+
+    pub fn is_local(&self) -> bool {
+        true
+    }
+
+    pub fn is_via_collab(&self) -> bool {
+        false
+    }
+
+    pub fn is_via_remote_server(&self) -> bool {
+        false
+    }
+
+    pub fn local(
+        fs: Arc<dyn Fs>,
+        env: Option<HashMap<String, String>>,
+        flags: LocalProjectFlags,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx: &mut Context<Self>| {
+            let worktree_store =
+                cx.new(|cx| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::get(cx)));
+            if flags.init_worktree_trust {
+                trusted_worktrees::track_worktree_trust(
+                    worktree_store.clone(),
+                    None,
+                    cx,
+                );
+            }
+            cx.subscribe(&worktree_store, Self::on_worktree_store_event)
+                .detach();
+
+            let environment = cx.new(|cx| {
+                ProjectEnvironment::new(env, worktree_store.downgrade(), cx)
+            });
+
+            let settings_observer = cx.new(|cx| {
+                SettingsObserver::new_local(
+                    fs.clone(),
+                    worktree_store.clone(),
+                    cx,
+                )
+            });
+            cx.subscribe(&settings_observer, Self::on_settings_observer_event)
+                .detach();
+
+            Self {
+                worktree_store,
+                _subscriptions: vec![cx.on_release(Self::release)],
+                active_entry: None,
+                _settings_observer: settings_observer,
+                fs,
+                terminals: Terminals {
+                    local_handles: Vec::new(),
+                },
+                environment,
+                last_worktree_paths: WorktreePaths::default(),
+            }
+        })
+    }
+
+
+    fn release(&mut self, _cx: &mut App) {
+    }
+
+
+    #[inline]
+    pub fn worktree_store(&self) -> Entity<WorktreeStore> {
+        self.worktree_store.clone()
+    }
+
+    /// Returns a future that resolves when all visible worktrees have completed
+    /// their initial scan.
+    pub fn wait_for_initial_scan(&self, cx: &App) -> impl Future<Output = ()> + use<> {
+        self.worktree_store.read(cx).wait_for_initial_scan()
+    }
+
+    #[inline]
+    pub fn environment(&self) -> &Entity<ProjectEnvironment> {
+        &self.environment
+    }
+
+    #[inline]
+    pub fn cli_environment(&self, cx: &App) -> Option<HashMap<String, String>> {
+        self.environment.read(cx).get_cli_environment()
+    }
+
+    #[inline]
+    pub fn peek_environment_error<'a>(&'a self, cx: &'a App) -> Option<&'a String> {
+        self.environment.read(cx).peek_environment_error()
+    }
+
+    #[inline]
+    pub fn pop_environment_error(&mut self, cx: &mut Context<Self>) {
+        self.environment.update(cx, |environment, _| {
+            environment.pop_environment_error();
+        });
+    }
+
+    #[inline]
+    pub fn fs(&self) -> &Arc<dyn Fs> {
+        &self.fs
+    }
+
+    #[inline]
+    pub fn remote_id(&self) -> Option<u64> {
+        None
+    }
+
+    #[inline]
+    pub fn supports_terminal(&self, _cx: &App) -> bool {
+        true
+    }
+
+    pub fn reveal_path(&self, path: &Path, cx: &mut Context<Self>) {
+        cx.reveal_path(path);
+    }
+
+    #[inline]
+    pub fn replica_id(&self) -> ReplicaId {
+        ReplicaId::LOCAL
+    }
+
+    /// Collect all worktrees, including ones that don't appear in the project panel
+    #[inline]
+    pub fn worktrees<'a>(
+        &self,
+        cx: &'a App,
+    ) -> impl 'a + DoubleEndedIterator<Item = Entity<Worktree>> {
+        self.worktree_store.read(cx).worktrees()
+    }
+
+    /// Collect all user-visible worktrees, the ones that appear in the project panel.
+    #[inline]
+    pub fn visible_worktrees<'a>(
+        &'a self,
+        cx: &'a App,
+    ) -> impl 'a + DoubleEndedIterator<Item = Entity<Worktree>> {
+        self.worktree_store.read(cx).visible_worktrees(cx)
+    }
+
+    pub(crate) fn default_visible_worktree_paths(
+        worktree_store: &WorktreeStore,
+        cx: &App,
+    ) -> Vec<PathBuf> {
+        worktree_store
+            .visible_worktrees(cx)
+            .sorted_by(|left, right| {
+                left.read(cx)
+                    .is_single_file()
+                    .cmp(&right.read(cx).is_single_file())
+            })
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                let path = worktree.abs_path();
+                if worktree.is_single_file() {
+                    Some(path.parent()?.to_path_buf())
+                } else {
+                    Some(path.to_path_buf())
+                }
+            })
+            .collect()
+    }
+
+    pub fn default_path_list(&self, cx: &App) -> PathList {
+        let worktree_roots =
+            Self::default_visible_worktree_paths(&self.worktree_store.read(cx), cx);
+
+        if worktree_roots.is_empty() {
+            PathList::new(&[paths::home_dir().as_path()])
+        } else {
+            PathList::new(&worktree_roots)
+        }
+    }
+
+    #[inline]
+    pub fn worktree_for_root_name(&self, root_name: &str, cx: &App) -> Option<Entity<Worktree>> {
+        self.visible_worktrees(cx)
+            .find(|tree| tree.read(cx).root_name() == root_name)
+    }
+
+    fn emit_group_key_changed_if_needed(&mut self, cx: &mut Context<Self>) {
+        let new_worktree_paths = self.worktree_paths(cx);
+        if new_worktree_paths != self.last_worktree_paths {
+            let old_worktree_paths =
+                std::mem::replace(&mut self.last_worktree_paths, new_worktree_paths);
+            cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
+        }
+    }
+
+    #[inline]
+    pub fn worktree_root_names<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a str> {
+        self.visible_worktrees(cx)
+            .map(|tree| tree.read(cx).root_name().as_unix_str())
+    }
+
+    #[inline]
+    pub fn worktree_for_id(&self, id: WorktreeId, cx: &App) -> Option<Entity<Worktree>> {
+        self.worktree_store.read(cx).worktree_for_id(id, cx)
+    }
+
+    pub fn worktree_for_entry(
+        &self,
+        entry_id: ProjectEntryId,
+        cx: &App,
+    ) -> Option<Entity<Worktree>> {
+        self.worktree_store
+            .read(cx)
+            .worktree_for_entry(entry_id, cx)
+    }
+
+    #[inline]
+    pub fn worktree_id_for_entry(&self, entry_id: ProjectEntryId, cx: &App) -> Option<WorktreeId> {
+        self.worktree_for_entry(entry_id, cx)
+            .map(|worktree| worktree.read(cx).id())
+    }
+
+    /// Checks if the entry is the root of a worktree.
+    #[inline]
+    pub fn entry_is_worktree_root(&self, entry_id: ProjectEntryId, cx: &App) -> bool {
+        self.worktree_for_entry(entry_id, cx)
+            .map(|worktree| {
+                worktree
+                    .read(cx)
+                    .root_entry()
+                    .is_some_and(|e| e.id == entry_id)
+            })
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn visibility_for_paths(
+        &self,
+        paths: &[PathBuf],
+        exclude_sub_dirs: bool,
+        cx: &App,
+    ) -> Option<bool> {
+        paths
+            .iter()
+            .map(|path| self.visibility_for_path(path, exclude_sub_dirs, cx))
+            .max()
+            .flatten()
+    }
+
+    pub fn visibility_for_path(
+        &self,
+        path: &Path,
+        exclude_sub_dirs: bool,
+        cx: &App,
+    ) -> Option<bool> {
+        let path = SanitizedPath::new(path).as_path();
+        let path_style = self.path_style(cx);
+        self.worktrees(cx)
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                let abs_path = worktree.abs_path();
+                let relative_path = path_style.strip_prefix(path, abs_path.as_ref());
+                let is_dir = relative_path
+                    .as_ref()
+                    .and_then(|p| worktree.entry_for_path(p))
+                    .is_some_and(|e| e.is_dir());
+                // Don't exclude the worktree root itself, only actual subdirectories
+                let is_subdir = relative_path
+                    .as_ref()
+                    .is_some_and(|p| !p.as_ref().as_unix_str().is_empty());
+                let contains =
+                    relative_path.is_some() && (!exclude_sub_dirs || !is_dir || !is_subdir);
+                contains.then(|| worktree.is_visible())
+            })
+            .max()
+    }
+
+    pub fn create_entry(
+        &mut self,
+        project_path: impl Into<ProjectPath>,
+        is_directory: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CreatedEntry>> {
+        let project_path = project_path.into();
+        let Some(worktree) = self.worktree_for_id(project_path.worktree_id, cx) else {
+            return Task::ready(Err(anyhow!(format!(
+                "No worktree for path {project_path:?}"
+            ))));
+        };
+        worktree.update(cx, |worktree, cx| {
+            worktree.create_entry(project_path.path, is_directory, None, cx)
+        })
+    }
+
+    #[inline]
+    pub fn copy_entry(
+        &mut self,
+        entry_id: ProjectEntryId,
+        new_project_path: ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Entry>>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.copy_entry(entry_id, new_project_path, cx)
+        })
+    }
+
+    /// Renames the project entry with given `entry_id`.
+    ///
+    /// `new_path` is a relative path to worktree root.
+    /// If root entry is renamed then its new root name is used instead.
+    pub fn rename_entry(
+        &mut self,
+        entry_id: ProjectEntryId,
+        new_path: ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CreatedEntry>> {
+        let worktree_store = self.worktree_store.clone();
+        let Some((worktree, _old_path, _is_dir)) = worktree_store
+            .read(cx)
+            .worktree_and_entry_for_id(entry_id, cx)
+            .map(|(worktree, entry)| (worktree, entry.path.clone(), entry.is_dir()))
+        else {
+            return Task::ready(Err(anyhow!(format!("No worktree for entry {entry_id:?}"))));
+        };
+
+        let is_root_entry = self.entry_is_worktree_root(entry_id, cx);
+
+        cx.spawn(async move |project, cx| {
+            let new_abs_path = {
+                let root_path = worktree.read_with(cx, |this, _| this.abs_path());
+                if is_root_entry {
+                    root_path
+                        .parent()
+                        .unwrap()
+                        .join(new_path.path.as_std_path())
+                } else {
+                    root_path.join(&new_path.path.as_std_path())
+                }
+            };
+
+            let entry = worktree_store
+                .update(cx, |worktree_store, cx| {
+                    worktree_store.rename_entry(entry_id, new_path.clone(), cx)
+                })
+                .await?;
+
+            project
+                .update(cx, |_, cx| {
+                    cx.emit(Event::EntryRenamed(
+                        new_path.clone(),
+                        new_abs_path.clone(),
+                    ));
+                })
+                .ok();
+
+            Ok(entry)
+        })
+    }
+
+    #[inline]
+    pub fn delete_file(
+        &mut self,
+        path: ProjectPath,
+        trash: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Option<TrashedEntry>>>> {
+        let entry = self.entry_for_path(&path, cx)?;
+        self.delete_entry(entry.id, trash, cx)
+    }
+
+    #[inline]
+    pub fn delete_entry(
+        &mut self,
+        entry_id: ProjectEntryId,
+        trash: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Option<TrashedEntry>>>> {
+        let worktree = self.worktree_for_entry(entry_id, cx)?;
+        cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id));
+        worktree.update(cx, |worktree, cx| {
+            worktree.delete_entry(entry_id, trash, cx)
+        })
+    }
+
+    #[inline]
+    pub fn restore_entry(
+        &self,
+        worktree_id: WorktreeId,
+        trash_entry: TrashedEntry,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<Result<ProjectPath>> {
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return Task::ready(Err(anyhow!("No worktree for id {worktree_id:?}")));
+        };
+
+        cx.spawn(async move |_, cx| {
+            Worktree::restore_entry(trash_entry, worktree, cx)
+                .await
+                .map(|rel_path_buf| ProjectPath {
+                    worktree_id: worktree_id,
+                    path: Arc::from(rel_path_buf.as_rel_path()),
+                })
+        })
+    }
+
+    #[inline]
+    pub fn expand_entry(
+        &mut self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let worktree = self.worktree_for_id(worktree_id, cx)?;
+        worktree.update(cx, |worktree, cx| worktree.expand_entry(entry_id, cx))
+    }
+
+    pub fn expand_all_for_entry(
+        &mut self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let worktree = self.worktree_for_id(worktree_id, cx)?;
+        let task = worktree.update(cx, |worktree, cx| {
+            worktree.expand_all_for_entry(entry_id, cx)
+        });
+        Some(cx.spawn(async move |this, cx| {
+            task.context("no task")?.await?;
+            this.update(cx, |_, cx| {
+                cx.emit(Event::ExpandedAllForEntry(worktree_id, entry_id));
+            })?;
+            Ok(())
+        }))
+    }
+
+
+    fn on_settings_observer_event(
+        &mut self,
+        _: Entity<SettingsObserver>,
+        event: &SettingsObserverEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SettingsObserverEvent::LocalSettingsUpdated(result) => match result {
+                Err(InvalidSettingsError::LocalSettings { message, path }) => {
+                    let message = format!("Failed to set local settings in {path:?}:\n{message}");
+                    cx.emit(Event::Toast {
+                        notification_id: format!("local-settings-{path:?}").into(),
+                        link: None,
+                        message,
+                    });
+                }
+                Ok(path) => cx.emit(Event::HideToast {
+                    notification_id: format!("local-settings-{path:?}").into(),
+                }),
+                Err(_) => {}
+            },
+            SettingsObserverEvent::LocalTasksUpdated(result) => match result {
+                Err(InvalidSettingsError::Tasks { message, path }) => {
+                    let message = format!("Failed to set local tasks in {path:?}:\n{message}");
+                    cx.emit(Event::Toast {
+                        notification_id: format!("local-tasks-{path:?}").into(),
+                        link: Some(ToastLink {
+                            label: "Open Tasks Documentation",
+                            url: "https://zed.dev/docs/tasks",
+                        }),
+                        message,
+                    });
+                }
+                Ok(path) => cx.emit(Event::HideToast {
+                    notification_id: format!("local-tasks-{path:?}").into(),
+                }),
+                Err(_) => {}
+            },
+            SettingsObserverEvent::LocalDebugScenariosUpdated(result) => match result {
+                Err(InvalidSettingsError::Debug { message, path }) => {
+                    let message =
+                        format!("Failed to set local debug scenarios in {path:?}:\n{message}");
+                    cx.emit(Event::Toast {
+                        notification_id: format!("local-debug-scenarios-{path:?}").into(),
+                        link: None,
+                        message,
+                    });
+                }
+                Ok(path) => cx.emit(Event::HideToast {
+                    notification_id: format!("local-debug-scenarios-{path:?}").into(),
+                }),
+                Err(_) => {}
+            },
+        }
+    }
+
+    fn on_worktree_store_event(
+        &mut self,
+        _: Entity<WorktreeStore>,
+        event: &WorktreeStoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                self.on_worktree_added(worktree, cx);
+                cx.emit(Event::WorktreeAdded(worktree.read(cx).id()));
+                self.emit_group_key_changed_if_needed(cx);
+            }
+            WorktreeStoreEvent::WorktreeRemoved(_, id) => {
+                cx.emit(Event::WorktreeRemoved(*id));
+                self.emit_group_key_changed_if_needed(cx);
+            }
+            WorktreeStoreEvent::WorktreeReleased(_, id) => {
+                self.on_worktree_released(*id, cx);
+            }
+            WorktreeStoreEvent::WorktreeOrderChanged => cx.emit(Event::WorktreeOrderChanged),
+            WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                cx.emit(Event::WorktreeUpdatedEntries(*worktree_id, changes.clone()))
+            }
+            WorktreeStoreEvent::WorktreeDeletedEntry(worktree_id, id) => {
+                cx.emit(Event::DeletedEntry(*worktree_id, *id))
+            }
+            WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _) => {}
+            WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(worktree_id) => {
+                cx.emit(Event::WorktreeUpdatedRootRepoCommonDir(*worktree_id));
+                self.emit_group_key_changed_if_needed(cx);
+            }
+        }
+    }
+
+    fn on_worktree_added(&mut self, _worktree: &Entity<Worktree>, _: &mut Context<Self>) {
+    }
+
+    fn on_worktree_released(&mut self, _id_to_remove: WorktreeId, _cx: &mut Context<Self>) {
+    }
+
+    /// Move a worktree to a new position in the worktree order.
+    ///
+    /// The worktree will moved to the opposite side of the destination worktree.
+    ///
+    /// # Example
+    ///
+    /// Given the worktree order `[11, 22, 33]` and a call to move worktree `22` to `33`,
+    /// worktree_order will be updated to produce the indexes `[11, 33, 22]`.
+    ///
+    /// Given the worktree order `[11, 22, 33]` and a call to move worktree `22` to `11`,
+    /// worktree_order will be updated to produce the indexes `[22, 11, 33]`.
+    ///
+    /// # Errors
+    ///
+    /// An error will be returned if the worktree or destination worktree are not found.
+    pub fn move_worktree(
+        &mut self,
+        source: WorktreeId,
+        destination: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.move_worktree(source, destination, cx)
+        })
+    }
+
+    /// Attempts to convert the input path to a WSL path if this is a wsl remote project and the input path is a host windows path.
+    pub fn try_windows_path_to_wsl(
+        &self,
+        abs_path: &Path,
+        _cx: &App,
+    ) -> impl Future<Output = Result<PathBuf>> + use<> {
+        let path = abs_path.to_owned();
+        async move { Ok(path) }
+    }
+
+    pub fn find_or_create_worktree(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree(abs_path, visible, cx)
+        })
+    }
+
+    pub fn find_worktree(
+        &self,
+        abs_path: &Path,
+        cx: &App,
+    ) -> Option<(Entity<Worktree>, Arc<RelPath>)> {
+        self.worktree_store.read(cx).find_worktree(abs_path, cx)
+    }
+
+    pub fn is_shared(&self) -> bool {
+        false
+    }
+
+    pub fn resolve_abs_file_path(
+        &self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<ResolvedPath>> {
+        let resolve_task = self.resolve_abs_path(path, cx);
+        cx.background_spawn(async move {
+            let resolved_path = resolve_task.await;
+            resolved_path.filter(|path| path.is_file())
+        })
+    }
+
+    pub fn resolve_abs_path(&self, path: &str, cx: &App) -> Task<Option<ResolvedPath>> {
+        let expanded = PathBuf::from(shellexpand::tilde(&path).into_owned());
+        let fs = self.fs.clone();
+        cx.background_spawn(async move {
+            let metadata = fs.metadata(&expanded).await.ok().flatten();
+
+            metadata.map(|metadata| ResolvedPath::AbsPath {
+                path: expanded.to_string_lossy().into_owned(),
+                is_dir: metadata.is_dir,
+            })
+        })
+    }
+
+    pub fn list_directory(
+        &self,
+        query: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<DirectoryItem>>> {
+        DirectoryLister::Local(cx.entity(), self.fs.clone()).list_directory(query, cx)
+    }
+
+    pub fn create_worktree(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.create_worktree(abs_path, visible, cx)
+        })
+    }
+
+    /// Returns a task that resolves when the given worktree's `Entity` is
+    /// fully dropped (all strong references released), not merely when
+    /// `remove_worktree` is called. `remove_worktree` drops the store's
+    /// reference and emits `WorktreeRemoved`, but other code may still
+    /// hold a strong handle — the worktree isn't safe to delete from
+    /// disk until every handle is gone.
+    ///
+    /// We use `observe_release` on the specific entity rather than
+    /// listening for `WorktreeReleased` events because it's simpler at
+    /// the call site (one awaitable task, no subscription / channel /
+    /// ID filtering).
+    pub fn wait_for_worktree_release(
+        &mut self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return Task::ready(Ok(()));
+        };
+
+        let (released_tx, released_rx) = futures::channel::oneshot::channel();
+        let released_tx = std::sync::Arc::new(Mutex::new(Some(released_tx)));
+        let release_subscription =
+            cx.observe_release(&worktree, move |_project, _released_worktree, _cx| {
+                if let Some(released_tx) = released_tx.lock().take() {
+                    let _ = released_tx.send(());
+                }
+            });
+
+        cx.spawn(async move |_project, _cx| {
+            let _release_subscription = release_subscription;
+            released_rx
+                .await
+                .map_err(|_| anyhow!("worktree release observer dropped before release"))?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.remove_worktree(id_to_remove, cx);
+        });
+    }
+
+    pub fn remove_worktree_for_main_worktree_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.as_ref();
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            if let Some(worktree) = worktree_store.worktree_for_main_worktree_path(path, cx) {
+                worktree_store.remove_worktree(worktree.read(cx).id(), cx);
+            }
+        });
+    }
+
+    pub fn set_active_path(&mut self, entry: Option<ProjectPath>, cx: &mut Context<Self>) {
+        let new_active_entry = entry.and_then(|project_path| {
+            let worktree = self.worktree_for_id(project_path.worktree_id, cx)?;
+            let entry = worktree.read(cx).entry_for_path(&project_path.path)?;
+            Some(entry.id)
+        });
+        if new_active_entry != self.active_entry {
+            self.active_entry = new_active_entry;
+            cx.emit(Event::ActiveEntryChanged(new_active_entry));
+        }
+    }
+
+    pub fn active_entry(&self) -> Option<ProjectEntryId> {
+        self.active_entry
+    }
+
+    pub fn entry_for_path<'a>(&'a self, path: &ProjectPath, cx: &'a App) -> Option<&'a Entry> {
+        self.worktree_store.read(cx).entry_for_path(path, cx)
+    }
+
+    pub fn path_for_entry(&self, entry_id: ProjectEntryId, cx: &App) -> Option<ProjectPath> {
+        let worktree = self.worktree_for_entry(entry_id, cx)?;
+        let worktree = worktree.read(cx);
+        let worktree_id = worktree.id();
+        let path = worktree.entry_for_id(entry_id)?.path.clone();
+        Some(ProjectPath { worktree_id, path })
+    }
+
+    pub fn absolute_path(&self, project_path: &ProjectPath, cx: &App) -> Option<PathBuf> {
+        Some(
+            self.worktree_for_id(project_path.worktree_id, cx)?
+                .read(cx)
+                .absolutize(&project_path.path),
+        )
+    }
+
+    /// Attempts to find a `ProjectPath` corresponding to the given path. If the path
+    /// is a *full path*, meaning it starts with the root name of a worktree, we'll locate
+    /// it in that worktree. Otherwise, we'll attempt to find it as a relative path in
+    /// the first visible worktree that has an entry for that relative path.
+    ///
+    /// We use this to resolve edit steps, when there's a chance an LLM may omit the workree
+    /// root name from paths.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - An absolute path, or a full path that starts with a worktree root name, or a
+    ///   relative path within a visible worktree.
+    /// * `cx` - A reference to the `AppContext`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(ProjectPath)` if a matching worktree is found, otherwise `None`.
+    pub fn find_project_path(&self, path: impl AsRef<Path>, cx: &App) -> Option<ProjectPath> {
+        let path_style = self.path_style(cx);
+        let path = path.as_ref();
+        let worktree_store = self.worktree_store.read(cx);
+
+        if is_absolute(&path.to_string_lossy(), path_style) {
+            for worktree in worktree_store.visible_worktrees(cx) {
+                let worktree_abs_path = worktree.read(cx).abs_path();
+
+                if let Ok(relative_path) = path.strip_prefix(worktree_abs_path)
+                    && let Ok(path) = RelPath::new(relative_path, path_style)
+                {
+                    return Some(ProjectPath {
+                        worktree_id: worktree.read(cx).id(),
+                        path: path.into_arc(),
+                    });
+                }
+            }
+        } else {
+            // First pass: for each worktree, try two interpretations of the path and
+            // return whichever finds an existing entry first:
+            //   (a) Strip the worktree root name as a prefix.
+            //   (b) Treat the path as a literal worktree-relative path.
+            for worktree in worktree_store.visible_worktrees(cx) {
+                let worktree = worktree.read(cx);
+                if let Ok(relative_path) = path.strip_prefix(worktree.root_name().as_std_path())
+                    && let Ok(rel_path) = RelPath::new(relative_path, path_style)
+                    && let Some(entry) = worktree.entry_for_path(&rel_path)
+                {
+                    return Some(ProjectPath {
+                        worktree_id: worktree.id(),
+                        path: entry.path.clone(),
+                    });
+                }
+                if let Ok(rel_path) = RelPath::new(path, path_style)
+                    && let Some(entry) = worktree.entry_for_path(&rel_path)
+                {
+                    return Some(ProjectPath {
+                        worktree_id: worktree.id(),
+                        path: entry.path.clone(),
+                    });
+                }
+            }
+
+            // Second pass: strip the worktree root name prefix without requiring the
+            // entry to exist, to allow resolving paths that don't exist yet.
+            for worktree in worktree_store.visible_worktrees(cx) {
+                let worktree_root_name = worktree.read(cx).root_name();
+                if let Ok(relative_path) = path.strip_prefix(worktree_root_name.as_std_path())
+                    && let Ok(path) = RelPath::new(relative_path, path_style)
+                {
+                    return Some(ProjectPath {
+                        worktree_id: worktree.read(cx).id(),
+                        path: path.into_arc(),
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// If there's only one visible worktree, returns the given worktree-relative path with no prefix.
+    ///
+    /// Otherwise, returns the full path for the project path (obtained by prefixing the worktree-relative path with the name of the worktree).
+    pub fn short_full_path_for_project_path(
+        &self,
+        project_path: &ProjectPath,
+        cx: &App,
+    ) -> Option<String> {
+        let path_style = self.path_style(cx);
+        if self.visible_worktrees(cx).take(2).count() < 2 {
+            return Some(project_path.path.display(path_style).to_string());
+        }
+        self.worktree_for_id(project_path.worktree_id, cx)
+            .map(|worktree| {
+                let worktree_name = worktree.read(cx).root_name();
+                worktree_name
+                    .join(&project_path.path)
+                    .display(path_style)
+                    .to_string()
+            })
+    }
+
+    pub fn project_path_for_absolute_path(&self, abs_path: &Path, cx: &App) -> Option<ProjectPath> {
+        self.worktree_store
+            .read(cx)
+            .project_path_for_absolute_path(abs_path, cx)
+    }
+
+    pub fn get_workspace_root(&self, project_path: &ProjectPath, cx: &App) -> Option<PathBuf> {
+        Some(
+            self.worktree_for_id(project_path.worktree_id, cx)?
+                .read(cx)
+                .abs_path()
+                .to_path_buf(),
+        )
+    }
+
+    pub fn path_style(&self, cx: &App) -> PathStyle {
+        self.worktree_store.read(cx).path_style()
+    }
+
+    pub fn contains_local_settings_file(
+        &self,
+        worktree_id: WorktreeId,
+        rel_path: &RelPath,
+        cx: &App,
+    ) -> bool {
+        self.worktree_for_id(worktree_id, cx)
+            .map_or(false, |worktree| {
+                worktree.read(cx).entry_for_path(rel_path).is_some()
+            })
+    }
+
+    pub fn worktree_paths(&self, cx: &App) -> WorktreePaths {
+        self.worktree_store.read(cx).paths(cx)
+    }
+
+    pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {
+        ProjectGroupKey::from_project(self, cx)
+    }
+}
+
+/// Identifies a project group by a set of paths the workspaces in this group
+/// have.
+///
+/// Paths are mapped to their main worktree path first so we can group
+/// workspaces by main repos.
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Default)]
+pub struct ProjectGroupKey {
+    paths: PathList,
+}
+
+impl ProjectGroupKey {
+    pub fn new(_host: Option<()>, paths: PathList) -> Self {
+        Self { paths }
+    }
+
+    pub fn from_project(project: &Project, cx: &App) -> Self {
+        let paths = project.worktree_paths(cx);
+        Self {
+            paths: paths.main_worktree_path_list().clone(),
+        }
+    }
+
+    pub fn from_worktree_paths(paths: &WorktreePaths) -> Self {
+        Self {
+            paths: paths.main_worktree_path_list().clone(),
+        }
+    }
+
+    pub fn path_list(&self) -> &PathList {
+        &self.paths
+    }
+
+    pub fn display_name(
+        &self,
+        path_detail_map: &std::collections::HashMap<PathBuf, usize>,
+    ) -> SharedString {
+        let mut names = Vec::with_capacity(self.paths.paths().len());
+        for abs_path in self.paths.ordered_paths() {
+            let detail = path_detail_map.get(abs_path).copied().unwrap_or(0);
+            let display_path = if abs_path.extension() == Some(std::ffi::OsStr::new("git")) {
+                std::borrow::Cow::Owned(abs_path.with_extension(""))
+            } else {
+                std::borrow::Cow::Borrowed(abs_path.as_path())
+            };
+            let suffix = path_suffix(&display_path, detail);
+            if !suffix.is_empty() {
+                names.push(suffix);
+            }
+        }
+        if names.is_empty() {
+            "Empty Workspace".into()
+        } else {
+            names.join(", ").into()
+        }
+    }
+
+    pub fn matches(&self, other: &ProjectGroupKey) -> bool {
+        self.paths == other.paths
+    }
+}
+
+pub fn path_suffix(path: &Path, detail: usize) -> String {
+    let mut components: Vec<_> = path
+        .components()
+        .rev()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .take(detail + 1)
+        .collect();
+    components.reverse();
+    components.join("/")
+}
+
+impl EventEmitter<Event> for Project {}
+
+impl<'a> From<&'a ProjectPath> for SettingsLocation<'a> {
+    fn from(val: &'a ProjectPath) -> Self {
+        SettingsLocation {
+            worktree_id: val.worktree_id,
+            path: val.path.as_ref(),
+        }
+    }
+}
+
+impl<P: Into<Arc<RelPath>>> From<(WorktreeId, P)> for ProjectPath {
+    fn from((worktree_id, path): (WorktreeId, P)) -> Self {
+        Self {
+            worktree_id,
+            path: path.into(),
+        }
+    }
+}
+
+/// ResolvedPath is a path that has been resolved to either a ProjectPath
+/// or an AbsPath and that *exists*.
+#[derive(Debug, Clone)]
+pub enum ResolvedPath {
+    ProjectPath {
+        project_path: ProjectPath,
+        is_dir: bool,
+    },
+    AbsPath {
+        path: String,
+        is_dir: bool,
+    },
+}
+
+impl ResolvedPath {
+    pub fn abs_path(&self) -> Option<&str> {
+        match self {
+            Self::AbsPath { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn into_abs_path(self) -> Option<String> {
+        match self {
+            Self::AbsPath { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn project_path(&self) -> Option<&ProjectPath> {
+        match self {
+            Self::ProjectPath { project_path, .. } => Some(project_path),
+            _ => None,
+        }
+    }
+
+    pub fn is_file(&self) -> bool {
+        !self.is_dir()
+    }
+
+    pub fn is_dir(&self) -> bool {
+        match self {
+            Self::ProjectPath { is_dir, .. } => *is_dir,
+            Self::AbsPath { is_dir, .. } => *is_dir,
+        }
+    }
+}
+
+
+
+

@@ -1,0 +1,54 @@
+[package]
+name = "title_bar"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/title_bar.rs"
+doctest = false
+
+[features]
+default = []
+
+test-support = [
+    "gpui/test-support",
+    "project/test-support",
+    "util/test-support",
+    "workspace/test-support",
+]
+
+[dependencies]
+anyhow.workspace = true
+fs.workspace = true
+platform_title_bar.workspace = true
+chrono.workspace = true
+db.workspace = true
+gpui = { workspace = true, features = ["screen-capture"] }
+project.workspace = true
+schemars.workspace = true
+serde.workspace = true
+settings.workspace = true
+smallvec.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+arrayvec = "0.7.6"
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+semver.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

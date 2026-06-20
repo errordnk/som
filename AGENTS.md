@@ -112,7 +112,6 @@ If it returns nothing, the crate is not in the production tree.
 
 ## What to work on next (open tasks)
 
-- `migrator` — simplify: remove migrations for editor/LSP/AI keymaps, keep only relevant ones
 - Size goal: ~20MB release binary (currently ~38MB dev, smaller with release LTO)
 
 ## Development rules

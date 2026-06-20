@@ -4,6 +4,8 @@
     "light": "Nord Light",
     "dark": "Nord Dark"
   },
+  "ui_font_family": "Segoe UI",
+  "ui_font_size": 13,
   "buffer_font_family": "FiraCode Nerd Font",
   "buffer_font_size": 11,
   "buffer_font_features": {

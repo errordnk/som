@@ -1,39 +1,37 @@
 {
-  "ui_font_family": "Segoe UI",
-  "ui_font_size": 13,
-  "buffer_font_family": "FiraCode Nerd Font",
-  "buffer_font_size": 11,
-  "buffer_font_features": {
-    "cv02": true,
-    "cv14": true,
-    "cv25": true,
-    "cv26": true,
-    "cv28": true,
-    "cv32": true,
-    "ss02": true,
-    "ss03": true,
-    "ss05": true,
-    "ss07": true,
-    "ss09": true
+  "font": {
+    "face": "FiraCode Nerd Font",
+    "features": {
+      "cv02": 1,
+      "cv14": 1,
+      "cv25": 1,
+      "cv26": 1,
+      "cv28": 1,
+      "cv32": 1,
+      "ss02": 1,
+      "ss03": 1,
+      "ss05": 1,
+      "ss07": 1,
+      "ss09": 1
+    },
+    "size": 11,
+    "weight": "normal"
+  },
+  "uiFont": {
+    "face": "Segoe UI",
+    "size": 13
   },
   "theme": {
     "mode": "dark",
     "light": "Nord Light",
     "dark": "Nord Dark"
   },
-  "terminal": {
-    "cursor_shape": "underline",
-    "cursor_blink": true,
-    "line_height": {
-      "custom": 1.2
-    },
-    "max_scroll_history_lines": 9999999
+  "cursor": {
+    "shape": "underline",
+    "color": "#90ee90",
+    "blinking": "on"
   },
   "tabs": [
-    {
-      "name": "CMD",
-      "icon": "",
-      "shell": "cmd.exe"
-    }
+    { "name": "CMD", "icon": "", "shell": "cmd.exe" }
   ]
 }

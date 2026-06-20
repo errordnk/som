@@ -642,9 +642,8 @@ impl WindowsWindowInner {
                     .log_err();
             } else {
                 if let Some(ctx) = ImeContext::get(handle) {
-                    ImmNotifyIME(*ctx, NI_COMPOSITIONSTR, CPS_COMPLETE, 0)
-                        .ok()
-                        .log_err();
+                    // FALSE just means no active composition — not an error, no log needed.
+                    let _ = ImmNotifyIME(*ctx, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
                 }
                 ImmAssociateContextEx(handle, HIMC::default(), 0)
                     .ok()

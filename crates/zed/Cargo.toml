@@ -1,0 +1,135 @@
+[package]
+description = "The fast, collaborative code editor."
+edition.workspace = true
+name = "som"
+version = "1.6.0"
+publish.workspace = true
+license = "GPL-3.0-or-later"
+authors = ["Zed Team <hi@zed.dev>"]
+default-run = "som"
+
+[lints]
+workspace = true
+
+[features]
+tracy = ["ztracing/tracy"]
+track-project-leak = ["gpui/leak-detection"]
+test-support = [
+    "gpui/test-support",
+    "gpui_platform/screen-capture",
+    "workspace/test-support",
+    "project/test-support",
+    "terminal_view/test-support",
+    "title_bar/test-support",
+]
+
+[[bin]]
+name = "som"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+assets.workspace = true
+clap.workspace = true
+collections.workspace = true
+http_client.workspace = true
+db.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui = { workspace = true, features = ["input-latency-histogram"] }
+gpui_platform = {workspace = true, features=["screen-capture", "font-kit", "wayland", "x11"]}
+gpui_tokio.workspace = true
+log.workspace = true
+menu.workspace = true
+mimalloc = { version = "0.1", optional = true }
+parking_lot.workspace = true
+paths.workspace = true
+project.workspace = true
+rayon.workspace = true
+release_channel.workspace = true
+reqwest_client.workspace = true
+rope.workspace = true
+session.workspace = true
+settings.workspace = true
+terminal_view.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+title_bar.workspace = true
+ui.workspace = true
+ui_prompt.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+util.workspace = true
+uuid.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+zed_env_vars.workspace = true
+zlog.workspace = true
+zlog_settings.workspace = true
+ztracing.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+gpui = { workspace = true, features = [
+    "input-latency-histogram",
+    "windows-manifest",
+] }
+
+[build-dependencies]
+windows_resources = { path = "../windows_resources" }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui = { workspace = true, features = [
+    "input-latency-histogram",
+    "wayland",
+    "x11",
+] }
+ashpd.workspace = true
+image.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.build-dependencies]
+image.workspace = true
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+pkg-config = "0.3.22"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["input-latency-histogram", "test-support"] }
+project = { workspace = true, features = ["test-support"] }
+terminal_view = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
+
+[package.metadata.bundle-dev]
+icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
+identifier = "dev.som.Som-Dev"
+name = "Som Dev"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["som"]
+
+[package.metadata.bundle-nightly]
+icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
+identifier = "dev.som.Som-Nightly"
+name = "Som Nightly"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["som"]
+
+[package.metadata.bundle-preview]
+icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
+identifier = "dev.som.Som-Preview"
+name = "Som Preview"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["som"]
+
+[package.metadata.bundle-stable]
+icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+identifier = "dev.som.Som"
+name = "Som"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["som"]
+
+[package.metadata.cargo-machete]
+ignored = ["profiling", "zstd", "tracing"]

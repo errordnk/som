@@ -305,27 +305,17 @@ impl TitleBar {
                     })),
             )
             .when(!profiles.is_empty(), |this| {
-                let handle = self.profiles_menu_handle.clone();
                 this.child(
-                    div()
-                        .id("terminal-profiles-wrap")
-                        .w(px(36.))
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .occlude()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(hover_bg))
-                        .active(|s| s.bg(active_bg))
-                        .on_click(move |_, window, cx| handle.toggle(window, cx))
-                        .child(div().text_size(px(10.)).text_color(cx.theme().colors().text).child("∨"))
-                        .child(
                     ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)
                         .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
+                        .trigger(
+                            ui::Button::new("terminal-profiles-trigger", "∨")
+                                .style(ui::ButtonStyle::Subtle)
+                                .label_size(ui::LabelSize::Large)
+                        )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
                             Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
@@ -364,7 +354,6 @@ impl TitleBar {
                                 menu
                             }))
                         }),
-                    )
                 )
             })
     }

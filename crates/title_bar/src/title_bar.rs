@@ -359,7 +359,7 @@ impl TitleBar {
             )
             .when(!profiles.is_empty(), |this| {
                 this.child(
-                    div().h_full().child(ui::PopoverMenu::new("terminal-profiles")
+                    div().h(titlebar_height).child(ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)

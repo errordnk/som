@@ -109,14 +109,18 @@ impl SomConfig {
         }
 
         let json = format!("[{}]", entries.join(", "));
+        eprintln!("[som_config] apply_keys json: {}", json);
         match KeymapFile::load(&json, cx) {
-            KeymapFileLoadResult::Success { key_bindings } => cx.bind_keys(key_bindings),
+            KeymapFileLoadResult::Success { key_bindings } => {
+                eprintln!("[som_config] loaded {} bindings OK", key_bindings.len());
+                cx.bind_keys(key_bindings);
+            }
             KeymapFileLoadResult::SomeFailedToLoad { key_bindings, error_message } => {
-                log::warn!("Some keybindings failed to load: {}", error_message.0);
+                eprintln!("[som_config] partial load, error: {}", error_message.0);
                 cx.bind_keys(key_bindings);
             }
             KeymapFileLoadResult::JsonParseFailure { error } => {
-                log::warn!("Failed to parse som keybindings: {error}");
+                eprintln!("[som_config] json parse failure: {error}");
             }
         }
     }

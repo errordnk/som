@@ -17,16 +17,16 @@ pub struct TitleBarSettings {
 
 impl Settings for TitleBarSettings {
     fn from_settings(s: &SettingsContent) -> Self {
-        let content = s.title_bar.clone().unwrap();
+        let content = s.title_bar.clone().unwrap_or_default();
         TitleBarSettings {
-            show_branch_status_icon: content.show_branch_status_icon.unwrap(),
-            show_onboarding_banner: content.show_onboarding_banner.unwrap(),
-            show_user_picture: content.show_user_picture.unwrap(),
-            show_branch_name: content.show_branch_name.unwrap(),
-            show_project_items: content.show_project_items.unwrap(),
-            show_sign_in: content.show_sign_in.unwrap(),
-            show_user_menu: content.show_user_menu.unwrap(),
-            show_menus: content.show_menus.unwrap(),
+            show_branch_status_icon: content.show_branch_status_icon.unwrap_or(false),
+            show_onboarding_banner: content.show_onboarding_banner.unwrap_or(false),
+            show_user_picture: content.show_user_picture.unwrap_or(false),
+            show_branch_name: content.show_branch_name.unwrap_or(true),
+            show_project_items: content.show_project_items.unwrap_or(true),
+            show_sign_in: content.show_sign_in.unwrap_or(false),
+            show_user_menu: content.show_user_menu.unwrap_or(false),
+            show_menus: content.show_menus.unwrap_or(false),
             button_layout: content.button_layout.unwrap_or_default().into_layout(),
         }
     }

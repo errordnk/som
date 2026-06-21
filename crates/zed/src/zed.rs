@@ -1,5 +1,4 @@
 mod app_menus;
-pub(crate) mod windows_only_instance;
 pub(crate) mod open_listener;
 
 use anyhow::Context as _;
@@ -781,7 +780,7 @@ fn reload_keymaps(cx: &mut App, mut user_key_bindings: Vec<KeyBinding>) {
 
 pub fn load_default_keymap(cx: &mut App) {
     let base_keymap = *BaseKeymap::get_global(cx);
-    if base_keymap == BaseKeymap::None {
+    if base_keymap == BaseKeymap::None || DEFAULT_KEYMAP_PATH.is_empty() {
         return;
     }
     cx.bind_keys(

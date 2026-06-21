@@ -49,11 +49,12 @@ pub struct SessionSettings {
 impl Settings for ProjectSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let project = &content.project.clone();
+        let session = content.session.unwrap_or_default();
         Self {
-            load_direnv: project.load_direnv.clone().unwrap(),
+            load_direnv: project.load_direnv.clone().unwrap_or_default(),
             session: SessionSettings {
-                restore_unsaved_buffers: content.session.unwrap().restore_unsaved_buffers.unwrap(),
-                trust_all_worktrees: content.session.unwrap().trust_all_worktrees.unwrap(),
+                restore_unsaved_buffers: session.restore_unsaved_buffers.unwrap_or(false),
+                trust_all_worktrees: session.trust_all_worktrees.unwrap_or(false),
             },
         }
     }

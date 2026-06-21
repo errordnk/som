@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 pub use settings::{FontFamilyName, IconThemeName, ThemeAppearanceMode, ThemeName};
 use settings::{IntoGpui, RegisterSetting, Settings, SettingsContent};
+use settings::{CodeFade, FontSize};
 use std::sync::Arc;
 use theme::{Appearance, DEFAULT_ICON_THEME_NAME, SyntaxTheme, Theme, UiDensity};
 
@@ -664,35 +665,63 @@ fn font_fallbacks_from_settings(
 impl settings::Settings for ThemeSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let content = &content.theme;
-        let theme_selection: ThemeSelection = content.theme.clone().unwrap().into();
-        let icon_theme_selection: IconThemeSelection = content.icon_theme.clone().unwrap().into();
+        let theme_selection: ThemeSelection = content.theme.clone().unwrap_or_default().into();
+        let icon_theme_selection: IconThemeSelection = content
+            .icon_theme
+            .clone()
+            .map(Into::into)
+            .unwrap_or(IconThemeSelection::Static(IconThemeName(Arc::from(
+                DEFAULT_ICON_THEME_NAME,
+            ))));
         Self {
-            ui_font_size: clamp_font_size(content.ui_font_size.unwrap().into_gpui()),
+            ui_font_size: clamp_font_size(
+                content
+                    .ui_font_size
+                    .unwrap_or(FontSize(14.0))
+                    .into_gpui(),
+            ),
             ui_font: Font {
-                family: content.ui_font_family.as_ref().unwrap().0.clone().into(),
-                features: content.ui_font_features.clone().unwrap().into_gpui(),
+                family: content
+                    .ui_font_family
+                    .as_ref()
+                    .map(|f| f.0.clone().into())
+                    .unwrap_or_else(|| "Segoe UI".into()),
+                features: content
+                    .ui_font_features
+                    .clone()
+                    .unwrap_or_default()
+                    .into_gpui(),
                 fallbacks: font_fallbacks_from_settings(content.ui_font_fallbacks.clone()),
-                weight: content.ui_font_weight.unwrap().into_gpui(),
+                weight: content.ui_font_weight.unwrap_or_default().into_gpui(),
                 style: Default::default(),
             },
             buffer_font: Font {
                 family: content
                     .buffer_font_family
                     .as_ref()
-                    .unwrap()
-                    .0
+                    .map(|f| f.0.clone().into())
+                    .unwrap_or_else(|| "FiraCode Nerd Font".into()),
+                features: content
+                    .buffer_font_features
                     .clone()
-                    .into(),
-                features: content.buffer_font_features.clone().unwrap().into_gpui(),
+                    .unwrap_or_default()
+                    .into_gpui(),
                 fallbacks: font_fallbacks_from_settings(content.buffer_font_fallbacks.clone()),
-                weight: content.buffer_font_weight.unwrap().into_gpui(),
+                weight: content.buffer_font_weight.unwrap_or_default().into_gpui(),
                 style: FontStyle::default(),
             },
-            buffer_font_size: clamp_font_size(content.buffer_font_size.unwrap().into_gpui()),
-            buffer_line_height: content.buffer_line_height.unwrap().into(),
+            buffer_font_size: clamp_font_size(
+                content
+                    .buffer_font_size
+                    .unwrap_or(FontSize(14.0))
+                    .into_gpui(),
+            ),
+            buffer_line_height: content.buffer_line_height.unwrap_or_default().into(),
             agent_ui_font_size: content.agent_ui_font_size.map(|s| s.into_gpui()),
             agent_buffer_font_size: content.agent_buffer_font_size.map(|s| s.into_gpui()),
-            git_commit_buffer_font_size: content.git_commit_buffer_font_size.map(|s| s.into_gpui()),
+            git_commit_buffer_font_size: content
+                .git_commit_buffer_font_size
+                .map(|s| s.into_gpui()),
             markdown_preview_font_family: content
                 .markdown_preview_font_family
                 .as_ref()
@@ -710,7 +739,11 @@ impl settings::Settings for ThemeSettings {
             theme_overrides: content.theme_overrides.clone(),
             icon_theme: icon_theme_selection,
             ui_density: ui_density_from_settings(content.ui_density.unwrap_or_default()),
-            unnecessary_code_fade: content.unnecessary_code_fade.unwrap().0.clamp(0.0, 0.9),
+            unnecessary_code_fade: content
+                .unnecessary_code_fade
+                .unwrap_or(CodeFade(0.0))
+                .0
+                .clamp(0.0, 0.9),
         }
     }
 }

@@ -20,6 +20,7 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     Styled, Subscription, WeakEntity, Window, actions, div,
 };
+use ui::PopoverMenuHandle;
 use project::{
     Project,
     trusted_worktrees::TrustedWorktrees,
@@ -28,7 +29,7 @@ use settings::Settings as _;
 
 use title_bar_settings::TitleBarSettings;
 use ui::{
-    ButtonStyle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use util::ResultExt;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
@@ -126,6 +127,7 @@ pub struct TitleBar {
     workspace: WeakEntity<Workspace>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     application_menu: Option<Entity<ApplicationMenu>>,
+    profiles_menu_handle: PopoverMenuHandle<ui::ContextMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -266,6 +268,7 @@ impl TitleBar {
             workspace: workspace.weak_handle(),
             multi_workspace,
             project,
+            profiles_menu_handle: PopoverMenuHandle::default(),
             _subscriptions: subscriptions,
         };
 
@@ -302,6 +305,7 @@ impl TitleBar {
                     })),
             )
             .when(!profiles.is_empty(), |this| {
+                let handle = self.profiles_menu_handle.clone();
                 this.child(
                     div()
                         .id("terminal-profiles-wrap")
@@ -311,23 +315,51 @@ impl TitleBar {
                         .items_center()
                         .justify_center()
                         .occlude()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(hover_bg))
+                        .active(|s| s.bg(active_bg))
+                        .on_click(move |_, window, cx| handle.toggle(window, cx))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::Small).color(Color::Default))
                         .child(
                     ui::PopoverMenu::new("terminal-profiles")
-                        .trigger(
-                            IconButton::new("terminal-profiles-btn", IconName::ChevronDown)
-                                .icon_size(IconSize::Small)
-                                .style(ButtonStyle::Transparent)
-                        )
+                        .with_handle(self.profiles_menu_handle.clone())
+                        .anchor(gpui::Anchor::TopRight)
+                        .attach(gpui::Anchor::BottomRight)
+                        .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
-                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
                                 for (name, _shell) in &profiles {
-                                    menu = menu.entry(name.clone(), None, move |window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(workspace::NewTerminal::default()),
-                                            cx,
-                                        );
-                                    });
+                                    let name = name.clone();
+                                    let binding = ui::KeyBinding::for_action(
+                                        &workspace::NewTerminal::default(),
+                                        cx,
+                                    );
+                                    menu = menu.custom_entry(
+                                        {
+                                            let name = name.clone();
+                                            let binding = binding.clone();
+                                            move |_window, _cx| {
+                                                h_flex()
+                                                    .w_full()
+                                                    .justify_between()
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .child(Icon::new(IconName::Terminal).size(IconSize::Small).color(Color::Default))
+                                                            .child(Label::new(name.clone()))
+                                                    )
+                                                    .child(div().ml_4().child(binding.clone()))
+                                                    .into_any_element()
+                                            }
+                                        },
+                                        move |window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(workspace::NewTerminal::default()),
+                                                cx,
+                                            );
+                                        },
+                                    );
                                 }
                                 menu
                             }))

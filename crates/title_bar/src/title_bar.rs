@@ -44,11 +44,12 @@ struct TitleBarButton {
     active_bg: gpui::Hsla,
     icon: ui::IconName,
     click_handler: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    height: gpui::Pixels,
 }
 
 impl TitleBarButton {
-    fn new(id: impl Into<gpui::ElementId>, hover_bg: gpui::Hsla, active_bg: gpui::Hsla, icon: ui::IconName) -> Self {
-        Self { id: id.into(), hover_bg, active_bg, icon, click_handler: None }
+    fn new(id: impl Into<gpui::ElementId>, hover_bg: gpui::Hsla, active_bg: gpui::Hsla, icon: ui::IconName, height: gpui::Pixels) -> Self {
+        Self { id: id.into(), hover_bg, active_bg, icon, click_handler: None, height }
     }
 }
 
@@ -72,7 +73,7 @@ impl IntoElement for TitleBarButton {
         let mut el = div()
             .id(self.id)
             .w(gpui::px(36.))
-            .h_full()
+            .h(self.height)
             .flex()
             .items_center()
             .justify_center()
@@ -216,7 +217,7 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
-        children.push(self.render_tab_controls(cx).into_any_element());
+        children.push(self.render_tab_controls(window, cx).into_any_element());
 
 
         if show_menus {
@@ -326,7 +327,7 @@ impl TitleBar {
         this
     }
 
-    fn render_tab_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_controls(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let profiles = cx
             .try_global::<TabProfiles>()
             .cloned()
@@ -336,6 +337,7 @@ impl TitleBar {
         let profiles2 = profiles.clone();
         let hover_bg = cx.theme().colors().ghost_element_hover;
         let active_bg = cx.theme().colors().ghost_element_active;
+        let titlebar_height = platform_title_bar_height(window);
         h_flex()
             .h_full()
             .child(
@@ -357,13 +359,13 @@ impl TitleBar {
             )
             .when(!profiles.is_empty(), |this| {
                 this.child(
-                    ui::PopoverMenu::new("terminal-profiles")
+                    div().h_full().child(ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)
                         .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
                         .trigger(
-                            TitleBarButton::new("terminal-profiles-trigger", hover_bg, active_bg, IconName::ChevronDown)
+                            TitleBarButton::new("terminal-profiles-trigger", hover_bg, active_bg, IconName::ChevronDown, titlebar_height)
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
@@ -403,6 +405,7 @@ impl TitleBar {
                                 menu
                             }))
                         }),
+                    )
                 )
             })
     }

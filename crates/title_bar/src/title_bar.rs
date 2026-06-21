@@ -299,7 +299,7 @@ impl TitleBar {
                     .cursor_pointer()
                     .hover(|s| s.bg(hover_bg))
                     .active(|s| s.bg(active_bg))
-                    .child(div().text_size(px(10.)).text_color(cx.theme().colors().text).child("+"))
+                    .child(Icon::new(IconName::Plus).size(IconSize::Medium).color(Color::Default))
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(workspace::NewTerminal::default()), cx);
                     })),
@@ -313,7 +313,7 @@ impl TitleBar {
                         .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
                         .trigger(
                             ui::IconButton::new("terminal-profiles-trigger", IconName::ChevronDown)
-                                .icon_size(IconSize::Small)
+                                .icon_size(IconSize::Medium)
                                 .style(ui::ButtonStyle::Subtle)
                         )
                         .menu(move |window, cx| {

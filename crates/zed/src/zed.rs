@@ -774,6 +774,9 @@ fn reload_keymaps(cx: &mut App, mut user_key_bindings: Vec<KeyBinding>) {
     }
     cx.bind_keys(user_key_bindings);
 
+    // Re-apply som custom bindings after every keymap reload, since clear_key_bindings wipes them.
+    crate::som_config::SomConfig::load_embedded().apply_keys(cx);
+
     let menus = app_menus(cx);
     cx.set_menus(menus);
 }

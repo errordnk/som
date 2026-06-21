@@ -32,6 +32,7 @@ use ui::{
     TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use util::ResultExt;
+use gpui::Focusable as _;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
 
 
@@ -338,6 +339,8 @@ impl TitleBar {
         let hover_bg = cx.theme().colors().ghost_element_hover;
         let active_bg = cx.theme().colors().ghost_element_active;
         let titlebar_height = platform_title_bar_height(window);
+        let workspace_focus = self.workspace.upgrade()
+            .map(|ws| ws.read(cx).focus_handle(cx).clone());
         h_flex()
             .h_full()
             .child(
@@ -359,7 +362,7 @@ impl TitleBar {
             )
             .when(!profiles.is_empty(), |this| {
                 this.child(
-                    div().h(titlebar_height).child(ui::PopoverMenu::new("terminal-profiles")
+                    ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)
@@ -369,7 +372,11 @@ impl TitleBar {
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
+                            let focus = workspace_focus.clone();
                             Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                                if let Some(focus) = focus.clone() {
+                                    menu = menu.context(focus);
+                                }
                                 for (name, _shell) in &profiles {
                                     menu = menu.action(
                                         name.clone(),
@@ -378,8 +385,7 @@ impl TitleBar {
                                 }
                                 menu
                             }))
-                        }),
-                    )
+                        })
                 )
             })
     }

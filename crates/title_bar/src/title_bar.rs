@@ -299,7 +299,7 @@ impl TitleBar {
                     .cursor_pointer()
                     .hover(|s| s.bg(hover_bg))
                     .active(|s| s.bg(active_bg))
-                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Default))
+                    .child(div().text_size(px(10.)).text_color(cx.theme().colors().text).child("+"))
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(workspace::NewTerminal::default()), cx);
                     })),
@@ -319,7 +319,7 @@ impl TitleBar {
                         .hover(|s| s.bg(hover_bg))
                         .active(|s| s.bg(active_bg))
                         .on_click(move |_, window, cx| handle.toggle(window, cx))
-                        .child(Icon::new(IconName::ChevronDown).size(IconSize::Small).color(Color::Default))
+                        .child(div().text_size(px(10.)).text_color(cx.theme().colors().text).child("∨"))
                         .child(
                     ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())

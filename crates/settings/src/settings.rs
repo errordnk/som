@@ -114,9 +114,10 @@ impl fmt::Display for WorktreeId {
 
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
-#[include = "settings/*"]
-#[include = "keymaps/*"]
-#[exclude = "*.DS_Store"]
+#[include = "windows.json"]
+#[include = "darwin.json"]
+#[include = "linux.json"]
+#[include = "nord.json"]
 pub struct SettingsAssets;
 
 pub fn init(cx: &mut App) {
@@ -126,38 +127,29 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn default_settings() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default.json")
+    Cow::Borrowed("{}")
 }
 
 pub fn default_semantic_token_rules() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default_semantic_token_rules.json")
+    Cow::Borrowed("{}")
 }
 
-#[cfg(target_os = "macos")]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-macos.json";
-
-#[cfg(target_os = "windows")]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.json";
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.json";
+pub const DEFAULT_KEYMAP_PATH: &str = "";
 
 pub fn default_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
+    Cow::Borrowed("[]")
 }
 
-pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
-
 pub fn vim_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(VIM_KEYMAP_PATH)
+    Cow::Borrowed("[]")
 }
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_user_settings.json")
+    Cow::Borrowed("{}")
 }
 
 pub fn initial_server_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_server_settings.json")
+    Cow::Borrowed("{}")
 }
 
 pub fn initial_project_settings_content() -> Cow<'static, str> {

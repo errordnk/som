@@ -6,15 +6,13 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
-#[include = "fonts/**/*"]
-#[include = "icons/**/*"]
-#[include = "images/**/*"]
-#[include = "themes/**/*"]
-#[exclude = "themes/src/*"]
-#[include = "sounds/**/*"]
-#[include = "prompts/**/*"]
-#[include = "*.md"]
-#[exclude = "*.DS_Store"]
+#[include = "windows.json"]
+#[include = "darwin.json"]
+#[include = "linux.json"]
+#[include = "nord.json"]
+#[include = "Lilex-Regular.ttf"]
+#[include = "IBMPlexSans-Regular.ttf"]
+#[include = "icons/*.svg"]
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -38,9 +36,8 @@ impl AssetSource for Assets {
 }
 
 impl Assets {
-    /// Populate the [`TextSystem`] of the given [`AppContext`] with all `.ttf` fonts in the `fonts` directory.
     pub fn load_fonts(&self, cx: &App) -> anyhow::Result<()> {
-        let font_paths = self.list("fonts")?;
+        let font_paths = self.list("")?;
         let mut embedded_fonts = Vec::new();
         for font_path in font_paths {
             if font_path.ends_with(".ttf") {
@@ -58,7 +55,7 @@ impl Assets {
     pub fn load_test_fonts(&self, cx: &App) {
         cx.text_system()
             .add_fonts(vec![
-                self.load("fonts/lilex/Lilex-Regular.ttf").unwrap().unwrap(),
+                self.load("Lilex-Regular.ttf").unwrap().unwrap(),
             ])
             .unwrap()
     }

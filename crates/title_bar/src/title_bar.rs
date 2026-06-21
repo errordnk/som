@@ -16,7 +16,7 @@ use crate::application_menu::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity,
+    AnyElement, App, Context, Entity, Global,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     Styled, Subscription, WeakEntity, Window, actions, div,
 };
@@ -28,13 +28,25 @@ use settings::Settings as _;
 
 use title_bar_settings::TitleBarSettings;
 use ui::{
-    TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    ButtonStyle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use util::ResultExt;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
 
 
 pub use onboarding_banner::restore_banner;
+
+/// Tab profiles loaded from som config (name, shell).
+#[derive(Clone, Default)]
+pub struct TabProfiles(pub Vec<(String, Option<String>)>);
+
+impl Global for TabProfiles {}
+
+impl TabProfiles {
+    pub fn set(profiles: Vec<(String, Option<String>)>, cx: &mut App) {
+        cx.set_global(TabProfiles(profiles));
+    }
+}
 
 actions!(
     collab,
@@ -151,6 +163,8 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
+        children.push(self.render_tab_controls(cx).into_any_element());
+
 
         if show_menus {
             self.platform_titlebar.update(cx, |this, _| {
@@ -256,6 +270,71 @@ impl TitleBar {
         };
 
         this
+    }
+
+    fn render_tab_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let profiles = cx
+            .try_global::<TabProfiles>()
+            .cloned()
+            .unwrap_or_default()
+            .0;
+
+        let profiles2 = profiles.clone();
+        let hover_bg = cx.theme().colors().ghost_element_hover;
+        let active_bg = cx.theme().colors().ghost_element_active;
+        h_flex()
+            .h_full()
+            .child(
+                div()
+                    .id("new-terminal")
+                    .w(px(36.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover_bg))
+                    .active(|s| s.bg(active_bg))
+                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Default))
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.dispatch_action(Box::new(workspace::NewTerminal::default()), cx);
+                    })),
+            )
+            .when(!profiles.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("terminal-profiles-wrap")
+                        .w(px(36.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .occlude()
+                        .child(
+                    ui::PopoverMenu::new("terminal-profiles")
+                        .trigger(
+                            IconButton::new("terminal-profiles-btn", IconName::ChevronDown)
+                                .icon_size(IconSize::Small)
+                                .style(ButtonStyle::Transparent)
+                        )
+                        .menu(move |window, cx| {
+                            let profiles = profiles2.clone();
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                                for (name, _shell) in &profiles {
+                                    menu = menu.entry(name.clone(), None, move |window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(workspace::NewTerminal::default()),
+                                            cx,
+                                        );
+                                    });
+                                }
+                                menu
+                            }))
+                        }),
+                    )
+                )
+            })
     }
 
     pub fn render_restricted_mode(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

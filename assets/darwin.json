@@ -2,9 +2,10 @@
   "env": {},
   "bell": "off",
   "copyOnSelect": true,
+  "selection": "#88c0d0",
   "theme": "Nord Dark",
   "font": {
-    "face": "FiraCode Nerd Font",
+    "face": "Lilex",
     "features": {},
     "size": 11,
     "weight": "normal",
@@ -23,18 +24,16 @@
   "tabs": [
     {
       "name": "Shell",
-      "icon": "",
-      "shell": "cmd.exe",
+      "icon": "",
+      "shell": "$SHELL",
       "workingDir": "~"
     }
   ],
   "keys": {
-    "ctrl-insert": "Copy",
-    "ctrl-shift-c": "Copy",
-    "shift-insert": "Paste",
-    "ctrl-v": "Paste",
-    "ctrl-n": "New",
-    "ctrl-shift-1": "New",
-    "alt-f4": "Quit"
+    "cmd-c": "Copy",
+    "cmd-v": "Paste",
+    "cmd-n": "New",
+    "cmd-shift-1": "New",
+    "cmd-q": "Quit"
   }
 }

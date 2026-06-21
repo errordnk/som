@@ -17,6 +17,7 @@ use terminal::{
     alacritty_terminal::{
         grid::Dimensions,
         index::Point as AlacPoint,
+        selection::SelectionRange,
         term::{TermMode, cell::Flags},
         vte::ansi::{
             Color::{self as AnsiColor, Named},
@@ -333,11 +334,14 @@ impl TerminalElement {
         start_line_offset: i32,
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
+        selection: Option<SelectionRange>,
         minimum_contrast: f32,
         cx: &App,
     ) -> (Vec<LayoutRect>, Vec<BatchedTextRun>) {
         let start_time = Instant::now();
         let theme = cx.theme();
+        let sel_bg_color = theme.colors().text_accent;
+        let sel_fg_color = if sel_bg_color.l > 0.5 { gpui::black() } else { gpui::white() };
 
         // Pre-allocate with estimated capacity to reduce reallocations
         let estimated_cells = grid.size_hint().0;
@@ -370,9 +374,19 @@ impl TerminalElement {
                     mem::swap(&mut fg, &mut bg);
                 }
 
+                let is_selected = selection.is_some_and(|sel| {
+                    sel.contains(AlacPoint::new(cell.point.line, cell.point.column))
+                });
+
                 // Collect background regions (skip default background)
-                if !matches!(bg, Named(NamedColor::Background)) {
-                    let color = convert_color(&bg, theme);
+                let effective_bg_color = if is_selected {
+                    Some(sel_bg_color)
+                } else if !matches!(bg, Named(NamedColor::Background)) {
+                    Some(convert_color(&bg, theme))
+                } else {
+                    None
+                };
+                if let Some(color) = effective_bg_color {
                     let col = cell.point.column.0 as i32;
 
                     // Try to extend the last region if it's on the same line with the same color
@@ -405,7 +419,7 @@ impl TerminalElement {
                 {
                     if !is_blank(&cell) {
                         cell_count += 1;
-                        let cell_style = TerminalElement::cell_style(
+                        let mut cell_style = TerminalElement::cell_style(
                             &cell,
                             fg,
                             bg,
@@ -414,6 +428,9 @@ impl TerminalElement {
                             hyperlink,
                             minimum_contrast,
                         );
+                        if is_selected {
+                            cell_style.color = sel_fg_color;
+                        }
 
                         let cell_point = AlacPoint::new(alac_line, cell.point.column.0 as i32);
                         let zero_width_chars = cell.zerowidth();
@@ -964,7 +981,6 @@ impl Element for TerminalElement {
                 };
 
                 let text_system = cx.text_system();
-                let player_color = theme.players().local();
                 let match_color = theme.colors().search_match_background;
                 let gutter;
                 let (dimensions, line_height_px) = {
@@ -1094,10 +1110,7 @@ impl Element for TerminalElement {
                 for search_match in search_matches {
                     relative_highlighted_ranges.push((search_match, match_color))
                 }
-                if let Some(selection) = selection {
-                    relative_highlighted_ranges
-                        .push((selection.start..=selection.end, player_color.selection));
-                }
+                // Selection is rendered via fg/bg inversion in layout_grid, no overlay needed.
 
                 // then have that representation be converted to the appropriate highlight data structure
 
@@ -1133,6 +1146,7 @@ impl Element for TerminalElement {
                         last_hovered_word
                             .as_ref()
                             .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                        *selection,
                         minimum_contrast,
                         cx,
                     )
@@ -1165,6 +1179,7 @@ impl Element for TerminalElement {
                         last_hovered_word
                             .as_ref()
                             .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                        *selection,
                         minimum_contrast,
                         cx,
                     )

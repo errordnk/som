@@ -3,9 +3,8 @@ use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
 use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
-const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
-const IBM_PLEX: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+const LILEX: &[u8] = include_bytes!("../../../assets/Lilex-Regular.ttf");
+const IBM_PLEX: &[u8] = include_bytes!("../../../assets/IBMPlexSans-Regular.ttf");
 
 // ~4 000 chars of typical ASCII code text.
 fn code_text() -> String {

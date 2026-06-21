@@ -1,6 +1,21 @@
 use gpui::{Hsla, Rgba, WindowControlArea, prelude::*};
-
+use std::sync::OnceLock;
 use ui::prelude::*;
+
+fn is_windows_11() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        use windows::Win32::System::SystemInformation::GetVersionExW;
+        use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        unsafe { let _ = GetVersionExW(&mut info); }
+        // Windows 11 is build 22000+
+        info.dwBuildNumber >= 22000
+    })
+}
 
 #[derive(IntoElement)]
 pub struct WindowsWindowControls {
@@ -11,32 +26,12 @@ impl WindowsWindowControls {
     pub fn new(button_height: Pixels) -> Self {
         Self { button_height }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    fn get_font() -> &'static str {
-        "Segoe Fluent Icons"
-    }
-
-    #[cfg(target_os = "windows")]
-    fn get_font() -> &'static str {
-        use windows::Wdk::System::SystemServices::RtlGetVersion;
-
-        let mut version = unsafe { std::mem::zeroed() };
-        let status = unsafe { RtlGetVersion(&mut version) };
-
-        if status.is_ok() && version.dwBuildNumber >= 22000 {
-            "Segoe Fluent Icons"
-        } else {
-            "Segoe MDL2 Assets"
-        }
-    }
 }
 
 impl RenderOnce for WindowsWindowControls {
     fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
         div()
             .id("windows-window-controls")
-            .font_family(Self::get_font())
             .flex()
             .flex_row()
             .justify_center()
@@ -76,11 +71,20 @@ impl WindowsCaptionButton {
 
     #[inline]
     fn icon(&self) -> &'static str {
-        match self {
-            Self::Minimize => "\u{e921}",
-            Self::Restore => "\u{e923}",
-            Self::Maximize => "\u{e922}",
-            Self::Close => "\u{e8bb}",
+        if is_windows_11() {
+            match self {
+                Self::Minimize => "\u{e921}",
+                Self::Restore => "\u{e923}",
+                Self::Maximize => "\u{e922}",
+                Self::Close => "\u{e8bb}",
+            }
+        } else {
+            match self {
+                Self::Minimize => "─",
+                Self::Restore => "◱",
+                Self::Maximize => "□",
+                Self::Close => "✕",
+            }
         }
     }
 
@@ -129,6 +133,12 @@ impl RenderOnce for WindowsCaptionButton {
             .w(px(36.))
             .h_full()
             .text_size(px(10.0))
+            .when(is_windows_11(), |this| {
+                this.font(gpui::Font {
+                    family: "Segoe Fluent Icons".into(),
+                    ..Default::default()
+                })
+            })
             .hover(|style| style.bg(hover_bg).text_color(hover_fg))
             .active(|style| style.bg(active_bg).text_color(active_fg))
             .window_control_area(self.control_area())

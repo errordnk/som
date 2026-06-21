@@ -1,0 +1,39 @@
+{
+  "env": {},
+  "bell": "off",
+  "copyOnSelect": true,
+  "selection": "#88c0d0",
+  "theme": "Nord Dark",
+  "font": {
+    "face": "Lilex",
+    "features": {},
+    "size": 11,
+    "weight": "normal",
+    "lineHeight": 1.2
+  },
+  "cursor": {
+    "shape": "underline",
+    "color": "#90ee90",
+    "blinking": "on"
+  },
+  "scroll": {
+    "scrollMultiplier": 3.0,
+    "maxScrollHistory": 10000,
+    "alternateScroll": "on"
+  },
+  "tabs": [
+    {
+      "name": "Shell",
+      "icon": "",
+      "shell": "$SHELL",
+      "workingDir": "~"
+    }
+  ],
+  "keys": {
+    "cmd-c": "Copy",
+    "cmd-v": "Paste",
+    "cmd-n": "New",
+    "cmd-shift-1": "New",
+    "cmd-q": "Quit"
+  }
+}

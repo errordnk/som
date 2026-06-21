@@ -1152,7 +1152,7 @@ impl Item for TerminalView {
             .when(!params.selected, |this| {
                 this.track_focus(&self.focus_handle)
             })
-            .child(Icon::new(IconName::Terminal).color(Color::Muted))
+            .child(Icon::new(IconName::Terminal).color(params.text_color()))
             .child(Label::new(title).color(params.text_color()))
             .into_any()
     }

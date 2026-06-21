@@ -1,6 +1,7 @@
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod som_config;
 mod zed;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
@@ -30,7 +31,6 @@ use gpui_tokio::Tokio;
 use reqwest_client::ReqwestClient;
 
 use assets::Assets;
-use parking_lot::Mutex;
 use project::trusted_worktrees;
 use release_channel::{AppCommitSha, AppVersion};
 use session::{AppSession, Session};
@@ -299,29 +299,6 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS {
-        false
-    } else {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        {
-            crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            !crate::zed::windows_only_instance::handle_single_instance(open_listener.clone(), &args)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            use zed::mac_only_instance::*;
-            ensure_only_instance() != IsOnlyInstance::Yes
-        }
-    };
-    if failed_single_instance_check {
-        println!("zed is already running");
-        return;
-    }
 
     let fs = Arc::new(RealFs::new(None, app.background_executor()));
     let (user_keymap_file_rx, user_keymap_watcher) = watch_config_file(
@@ -416,6 +393,16 @@ fn main() {
 
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         load_embedded_fonts(cx);
+
+        let som_config = som_config::SomConfig::load_embedded();
+        som_config.apply(cx);
+
+        let profiles: Vec<(String, Option<String>)> = som_config
+            .tabs
+            .iter()
+            .map(|t| (t.name.clone(), t.shell.clone()))
+            .collect();
+        title_bar::TabProfiles::set(profiles, cx);
 
         title_bar::init(cx);
 
@@ -893,26 +880,19 @@ fn parse_url_arg(arg: &str, _cx: &App) -> String {
 
 fn load_embedded_fonts(cx: &App) {
     let asset_source = cx.asset_source();
-    let font_paths = asset_source.list("fonts").unwrap();
-    let embedded_fonts = Mutex::new(Vec::new());
-    let executor = cx.background_executor();
-
-    cx.foreground_executor().block_on(executor.scoped(|scope| {
-        for font_path in &font_paths {
-            if !font_path.ends_with(".ttf") {
-                continue;
-            }
-
-            scope.spawn(async {
-                let font_bytes = asset_source.load(font_path).unwrap().unwrap();
-                embedded_fonts.lock().push(font_bytes);
-            });
+    let mut fonts = Vec::new();
+    for name in &[
+        "FiraCodeNerdFont-Regular.ttf",
+        "Lilex-Regular.ttf",
+        "IBMPlexSans-Regular.ttf",
+    ] {
+        if let Some(bytes) = asset_source.load(name).log_err().flatten() {
+            fonts.push(bytes);
         }
-    }));
-
-    cx.text_system()
-        .add_fonts(embedded_fonts.into_inner())
-        .unwrap();
+    }
+    if !fonts.is_empty() {
+        cx.text_system().add_fonts(fonts).log_err();
+    }
 }
 
 /// Spawns a background task to load the user themes from the themes directory.

@@ -8,7 +8,7 @@ fn som_action_to_gpui(action: &str) -> Option<&'static str> {
         "Copy"  => Some("terminal::Copy"),
         "Paste" => Some("terminal::Paste"),
         "New"   => Some("workspace::NewTerminal"),
-        "Quit"  => Some("gpui::Quit"),
+        "Quit"  => Some("zed::Quit"),
         _ => None,
     }
 }
@@ -86,9 +86,9 @@ impl SomConfig {
 
         // Built-in font size bindings
         let font_bindings = [
-            ("ctrl-=", "zed_actions::IncreaseBufferFontSize"),
-            ("ctrl-+", "zed_actions::IncreaseBufferFontSize"),
-            ("ctrl--", "zed_actions::DecreaseBufferFontSize"),
+            ("ctrl-=", "zed::IncreaseBufferFontSize"),
+            ("ctrl-+", "zed::IncreaseBufferFontSize"),
+            ("ctrl--", "zed::DecreaseBufferFontSize"),
         ];
         for (keystroke, action) in &font_bindings {
             entries.push(format!("{{ \"bindings\": {{ \"{keystroke}\": \"{action}\" }} }}"));

@@ -76,44 +76,47 @@ pub struct PreviewTabsSettings {
 
 impl Settings for ItemSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        let tabs = content.tabs.as_ref().unwrap();
+        let tabs = content.tabs.as_ref();
+        let git_enabled = content
+            .git
+            .as_ref()
+            .and_then(|g| g.enabled.as_ref())
+            .map(|e| e.is_git_status_enabled())
+            .unwrap_or(false);
         Self {
-            git_status: tabs.git_status.unwrap()
-                && content
-                    .git
-                    .as_ref()
-                    .unwrap()
-                    .enabled
-                    .unwrap()
-                    .is_git_status_enabled(),
-            close_position: tabs.close_position.unwrap(),
-            activate_on_close: tabs.activate_on_close.unwrap(),
-            file_icons: tabs.file_icons.unwrap(),
-            show_diagnostics: tabs.show_diagnostics.unwrap(),
-            show_close_button: tabs.show_close_button.unwrap(),
+            git_status: tabs.and_then(|t| t.git_status).unwrap_or(false) && git_enabled,
+            close_position: tabs.and_then(|t| t.close_position).unwrap_or_default(),
+            activate_on_close: tabs.and_then(|t| t.activate_on_close).unwrap_or_default(),
+            file_icons: tabs.and_then(|t| t.file_icons).unwrap_or(false),
+            show_diagnostics: tabs.and_then(|t| t.show_diagnostics).unwrap_or_default(),
+            show_close_button: tabs.and_then(|t| t.show_close_button).unwrap_or_default(),
         }
     }
 }
 
 impl Settings for PreviewTabsSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        let preview_tabs = content.preview_tabs.as_ref().unwrap();
+        let preview_tabs = content.preview_tabs.as_ref();
         Self {
-            enabled: preview_tabs.enabled.unwrap(),
+            enabled: preview_tabs.and_then(|p| p.enabled).unwrap_or(false),
             enable_preview_from_project_panel: preview_tabs
-                .enable_preview_from_project_panel
-                .unwrap(),
-            enable_preview_from_file_finder: preview_tabs.enable_preview_from_file_finder.unwrap(),
-            enable_preview_from_multibuffer: preview_tabs.enable_preview_from_multibuffer.unwrap(),
+                .and_then(|p| p.enable_preview_from_project_panel)
+                .unwrap_or(false),
+            enable_preview_from_file_finder: preview_tabs
+                .and_then(|p| p.enable_preview_from_file_finder)
+                .unwrap_or(false),
+            enable_preview_from_multibuffer: preview_tabs
+                .and_then(|p| p.enable_preview_from_multibuffer)
+                .unwrap_or(false),
             enable_preview_multibuffer_from_code_navigation: preview_tabs
-                .enable_preview_multibuffer_from_code_navigation
-                .unwrap(),
+                .and_then(|p| p.enable_preview_multibuffer_from_code_navigation)
+                .unwrap_or(false),
             enable_preview_file_from_code_navigation: preview_tabs
-                .enable_preview_file_from_code_navigation
-                .unwrap(),
+                .and_then(|p| p.enable_preview_file_from_code_navigation)
+                .unwrap_or(false),
             enable_keep_preview_on_code_navigation: preview_tabs
-                .enable_keep_preview_on_code_navigation
-                .unwrap(),
+                .and_then(|p| p.enable_keep_preview_on_code_navigation)
+                .unwrap_or(false),
         }
     }
 }

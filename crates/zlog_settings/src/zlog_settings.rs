@@ -24,7 +24,7 @@ pub struct ZlogSettings {
 impl Settings for ZlogSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         ZlogSettings {
-            scopes: content.log.clone().unwrap(),
+            scopes: content.log.clone().unwrap_or_default(),
         }
     }
 }

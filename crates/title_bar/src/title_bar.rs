@@ -312,9 +312,9 @@ impl TitleBar {
                         .attach(gpui::Anchor::BottomRight)
                         .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
                         .trigger(
-                            ui::Button::new("terminal-profiles-trigger", "∨")
+                            ui::IconButton::new("terminal-profiles-trigger", IconName::ChevronDown)
+                                .icon_size(IconSize::Small)
                                 .style(ui::ButtonStyle::Subtle)
-                                .label_size(ui::LabelSize::Large)
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();

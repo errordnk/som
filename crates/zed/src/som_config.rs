@@ -3,13 +3,13 @@ use serde::Deserialize;
 use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
 use std::collections::HashMap;
 
-fn som_action_to_gpui(action: &str) -> Option<(&'static str, bool)> {
-    // Returns (gpui_action_name, needs_terminal_context)
+fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str>)> {
+    // Returns (gpui_action_name, optional_context)
     match action {
-        "Copy"  => Some(("terminal::Copy",       true)),
-        "Paste" => Some(("terminal::Paste",      true)),
-        "New"   => Some(("workspace::NewTerminal", false)),
-        "Quit"  => Some(("zed::Quit",            false)),
+        "Copy"  => Some(("terminal::Copy",          Some("Terminal"))),
+        "Paste" => Some(("terminal::Paste",         Some("Terminal"))),
+        "New"   => Some(("workspace::NewTerminal",  None)),
+        "Quit"  => Some(("zed::Quit",               None)),
         _ => None,
     }
 }
@@ -79,6 +79,20 @@ impl SomConfig {
     pub fn apply_keys(&self, cx: &mut App) {
         let mut entries: Vec<String> = Vec::new();
 
+        // Essential menu navigation bindings (no default keymap file in som)
+        let menu_bindings = [
+            ("up",     "menu", "menu::SelectPrevious"),
+            ("down",   "menu", "menu::SelectNext"),
+            ("tab",    "menu", "menu::SelectNext"),
+            ("enter",  "menu", "menu::Confirm"),
+            ("escape", "menu", "menu::Cancel"),
+        ];
+        for (keystroke, ctx, action) in &menu_bindings {
+            entries.push(format!(
+                "{{ \"context\": \"{ctx}\", \"bindings\": {{ \"{keystroke}\": \"{action}\" }} }}"
+            ));
+        }
+
         // Built-in font size bindings
         let font_bindings = [
             ("ctrl-=", "zed::IncreaseBufferFontSize"),
@@ -91,10 +105,10 @@ impl SomConfig {
 
         // User-defined bindings from windows.json "keys"
         for (keystroke, action_name) in &self.keys {
-            if let Some((gpui_action, needs_ctx)) = som_action_to_gpui(action_name) {
-                if needs_ctx {
+            if let Some((gpui_action, ctx)) = som_action_to_gpui(action_name) {
+                if let Some(ctx) = ctx {
                     entries.push(format!(
-                        "{{ \"context\": \"Terminal\", \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
+                        "{{ \"context\": \"{ctx}\", \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
                     ));
                 } else {
                     entries.push(format!(

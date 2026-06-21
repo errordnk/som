@@ -76,13 +76,7 @@ impl SomConfig {
             .unwrap_or_default()
     }
 
-    pub fn apply(&self, cx: &mut App) {
-        self.load_nord_theme(cx);
-        self.apply_settings(cx);
-        self.apply_keys(cx);
-    }
-
-    fn apply_keys(&self, cx: &mut App) {
+    pub fn apply_keys(&self, cx: &mut App) {
         let mut entries: Vec<String> = Vec::new();
 
         // Built-in font size bindings
@@ -127,7 +121,7 @@ impl SomConfig {
         }
     }
 
-    fn load_nord_theme(&self, cx: &mut App) {
+    pub fn load_nord_theme(&self, cx: &mut App) {
         if let Some(data) = assets::Assets::get("nord.json") {
             let registry = theme::ThemeRegistry::global(cx);
             if let Err(e) = theme_settings::load_user_theme(&registry, &data.data) {
@@ -136,7 +130,7 @@ impl SomConfig {
         }
     }
 
-    fn apply_settings(&self, cx: &mut App) {
+    pub fn apply_settings(&self, cx: &mut App) {
         let mut parts: Vec<String> = Vec::new();
         let mut terminal_parts: Vec<String> = Vec::new();
 

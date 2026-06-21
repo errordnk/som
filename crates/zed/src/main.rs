@@ -395,7 +395,8 @@ fn main() {
         load_embedded_fonts(cx);
 
         let som_config = som_config::SomConfig::load_embedded();
-        som_config.apply(cx);
+        som_config.apply_settings(cx);
+        som_config.load_nord_theme(cx);
 
         let profiles: Vec<(String, Option<String>)> = som_config
             .tabs
@@ -410,6 +411,9 @@ fn main() {
         ui_prompt::init(cx);
 
         terminal_view::init(cx);
+
+        // Apply keybindings after all actions are registered
+        som_config.apply_keys(cx);
 
         cx.observe_global::<SettingsStore>(move |cx| {
             for &mut window in cx.windows().iter_mut() {

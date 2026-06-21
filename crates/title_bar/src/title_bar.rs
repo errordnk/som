@@ -369,37 +369,11 @@ impl TitleBar {
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
-                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
                                 for (name, _shell) in &profiles {
-                                    let name = name.clone();
-                                    let binding = ui::KeyBinding::for_action(
-                                        &workspace::NewTerminal::default(),
-                                        cx,
-                                    );
-                                    menu = menu.custom_entry(
-                                        {
-                                            let name = name.clone();
-                                            let binding = binding.clone();
-                                            move |_window, _cx| {
-                                                h_flex()
-                                                    .w_full()
-                                                    .justify_between()
-                                                    .child(
-                                                        h_flex()
-                                                            .gap_1()
-                                                            .child(Icon::new(IconName::Terminal).size(IconSize::Small).color(Color::Default))
-                                                            .child(Label::new(name.clone()))
-                                                    )
-                                                    .child(div().ml_4().child(binding.clone()))
-                                                    .into_any_element()
-                                            }
-                                        },
-                                        move |window, cx| {
-                                            window.dispatch_action(
-                                                Box::new(workspace::NewTerminal::default()),
-                                                cx,
-                                            );
-                                        },
+                                    menu = menu.action(
+                                        name.clone(),
+                                        Box::new(workspace::NewTerminal::default()),
                                     );
                                 }
                                 menu

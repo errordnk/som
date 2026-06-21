@@ -16,7 +16,7 @@ use crate::application_menu::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity, Global,
+    AnyElement, App, ClickEvent, Context, Entity, Global,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     Styled, Subscription, WeakEntity, Window, actions, div,
 };
@@ -36,6 +36,57 @@ use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
 
 
 pub use onboarding_banner::restore_banner;
+
+/// A plain div-based button for use as PopoverMenu trigger, matching window control hover style.
+struct TitleBarButton {
+    id: gpui::ElementId,
+    hover_bg: gpui::Hsla,
+    active_bg: gpui::Hsla,
+    icon: ui::IconName,
+    click_handler: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+}
+
+impl TitleBarButton {
+    fn new(id: impl Into<gpui::ElementId>, hover_bg: gpui::Hsla, active_bg: gpui::Hsla, icon: ui::IconName) -> Self {
+        Self { id: id.into(), hover_bg, active_bg, icon, click_handler: None }
+    }
+}
+
+impl ui::Clickable for TitleBarButton {
+    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.click_handler = Some(Box::new(handler));
+        self
+    }
+    fn cursor_style(self, _: gpui::CursorStyle) -> Self { self }
+}
+
+impl ui::Toggleable for TitleBarButton {
+    fn toggle_state(self, _selected: bool) -> Self { self }
+}
+
+impl IntoElement for TitleBarButton {
+    type Element = gpui::AnyElement;
+    fn into_element(self) -> Self::Element {
+        let hover_bg = self.hover_bg;
+        let active_bg = self.active_bg;
+        let mut el = div()
+            .id(self.id)
+            .w(gpui::px(36.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .active(move |s| s.bg(active_bg))
+            .child(ui::Icon::new(self.icon).size(ui::IconSize::Medium).color(ui::Color::Default));
+        if let Some(handler) = self.click_handler {
+            el = el.on_click(handler);
+        }
+        el.into_any_element()
+    }
+}
 
 /// Tab profiles loaded from som config (name, shell).
 #[derive(Clone, Default)]
@@ -312,9 +363,7 @@ impl TitleBar {
                         .attach(gpui::Anchor::BottomRight)
                         .offset(gpui::point(gpui::px(0.), gpui::px(0.)))
                         .trigger(
-                            ui::IconButton::new("terminal-profiles-trigger", IconName::ChevronDown)
-                                .icon_size(IconSize::Medium)
-                                .style(ui::ButtonStyle::Subtle)
+                            TitleBarButton::new("terminal-profiles-trigger", hover_bg, active_bg, IconName::ChevronDown)
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();

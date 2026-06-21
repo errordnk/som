@@ -3,12 +3,13 @@ use serde::Deserialize;
 use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
 use std::collections::HashMap;
 
-fn som_action_to_gpui(action: &str) -> Option<&'static str> {
+fn som_action_to_gpui(action: &str) -> Option<(&'static str, bool)> {
+    // Returns (gpui_action_name, needs_terminal_context)
     match action {
-        "Copy"  => Some("terminal::Copy"),
-        "Paste" => Some("terminal::Paste"),
-        "New"   => Some("workspace::NewTerminal"),
-        "Quit"  => Some("zed::Quit"),
+        "Copy"  => Some(("terminal::Copy",       true)),
+        "Paste" => Some(("terminal::Paste",      true)),
+        "New"   => Some(("workspace::NewTerminal", false)),
+        "Quit"  => Some(("zed::Quit",            false)),
         _ => None,
     }
 }
@@ -96,10 +97,16 @@ impl SomConfig {
 
         // User-defined bindings from windows.json "keys"
         for (keystroke, action_name) in &self.keys {
-            if let Some(gpui_action) = som_action_to_gpui(action_name) {
-                entries.push(format!(
-                    "{{ \"context\": \"Terminal\", \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
-                ));
+            if let Some((gpui_action, needs_ctx)) = som_action_to_gpui(action_name) {
+                if needs_ctx {
+                    entries.push(format!(
+                        "{{ \"context\": \"Terminal\", \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
+                    ));
+                } else {
+                    entries.push(format!(
+                        "{{ \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
+                    ));
+                }
             }
         }
 

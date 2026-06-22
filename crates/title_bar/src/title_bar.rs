@@ -3,8 +3,7 @@ pub mod collab;
 mod onboarding_banner;
 mod title_bar_settings;
 
-use crate::application_menu::{ApplicationMenu, show_menus};
-use arrayvec::ArrayVec;
+use crate::application_menu::ApplicationMenu;
 pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
@@ -17,7 +16,7 @@ use crate::application_menu::{
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    InteractiveElement, IntoElement, ParentElement, Render,
     Styled, Subscription, WeakEntity, Window, actions, div,
 };
 use ui::PopoverMenuHandle;
@@ -190,60 +189,14 @@ impl Render for TitleBar {
         let title_bar_settings = *TitleBarSettings::get_global(cx);
         let button_layout = title_bar_settings.button_layout;
 
-        let show_menus = show_menus(cx);
+        // Single row: [tabs...flex][drag zone][+][v][─][□][✕]
+        let content = self.render_tab_controls(window, cx).into_any_element();
 
-        let mut children = <ArrayVec<_, 5>>::new();
-
-        children.push(
-            h_flex()
-                .h_full()
-                .gap_0p5()
-                .map(|title_bar| {
-                    title_bar
-                        .children(self.render_restricted_mode(cx))
-                })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .into_any_element(),
-        );
-
-        children.push(self.render_tab_controls(window, cx).into_any_element());
-
-
-        if show_menus {
-            self.platform_titlebar.update(cx, |this, _| {
-                this.set_button_layout(button_layout);
-                this.set_children(
-                    self.application_menu
-                        .clone()
-                        .map(|menu| menu.into_any_element()),
-                );
-            });
-
-            let height = platform_title_bar_height(window);
-            let title_bar_color = self.platform_titlebar.update(cx, |platform_titlebar, cx| {
-                platform_titlebar.title_bar_color(window, cx)
-            });
-
-            v_flex()
-                .w_full()
-                .child(self.platform_titlebar.clone().into_any_element())
-                .child(
-                    h_flex()
-                        .bg(title_bar_color)
-                        .h(height)
-                        .pl_2()
-                        .justify_between()
-                        .w_full()
-                        .children(children),
-                )
-                .into_any_element()
-        } else {
-            self.platform_titlebar.update(cx, |this, _| {
-                this.set_button_layout(button_layout);
-                this.set_children(children);
-            });
-            self.platform_titlebar.clone().into_any_element()
-        }
+        self.platform_titlebar.update(cx, |this, _| {
+            this.set_button_layout(button_layout);
+            this.set_children([content]);
+        });
+        self.platform_titlebar.clone().into_any_element()
     }
 }
 
@@ -328,8 +281,41 @@ impl TitleBar {
         let active_bg = cx.theme().colors().ghost_element_active;
         let titlebar_height = platform_title_bar_height(window);
         let workspace_focus = self.workspace.upgrade().map(|ws| ws.focus_handle(cx));
+
+        // Render tabs from active pane
+        let tabs_element = self.workspace.upgrade().map(|ws| {
+            let pane = ws.read(cx).active_pane().clone();
+            pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(window, cx))
+        });
+
         h_flex()
             .h_full()
+            .w_full()
+            // Tabs fill available space on the left
+            .when_some(tabs_element, |this, tabs| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .h_full()
+                        .overflow_x_hidden()
+                        .child(tabs)
+                )
+            })
+            // Drag zone: fills remaining space, double-click = maximize
+            .child(
+                div()
+                    .id("titlebar-drag-zone")
+                    .flex_1()
+                    .min_w(px(40.))
+                    .h_full()
+                    .on_click(|ev: &ClickEvent, window, _cx| {
+                        if ev.click_count() == 2 {
+                            window.zoom_window();
+                        }
+                    }),
+            )
+            // + button
             .child(
                 div()
                     .id("new-terminal")
@@ -346,6 +332,7 @@ impl TitleBar {
                         window.dispatch_action(Box::new(workspace::NewTerminal::default()), cx);
                     })),
             )
+            // v button (single profile = opens that profile, multiple = popover menu)
             .when(profiles.len() == 1, |this| {
                 let tab_name = profiles[0].0.clone();
                 this.child(

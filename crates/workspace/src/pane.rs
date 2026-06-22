@@ -3006,6 +3006,30 @@ impl Pane {
         }
     }
 
+    /// Render tabs for the title bar (no nav buttons, no pinned-row logic).
+    pub fn render_tabs_for_titlebar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
+        let focus_handle = self.focus_handle.clone();
+        let tab_items = self
+            .items
+            .iter()
+            .enumerate()
+            .zip(tab_details(&self.items, window, cx))
+            .map(|((ix, item), detail)| {
+                self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("titlebar-tabs")
+            .flex()
+            .flex_row()
+            .h_full()
+            .overflow_x_hidden()
+            .children(tab_items)
+            .into_any_element()
+    }
+
     fn configure_tab_bar_start(
         &mut self,
         tab_bar: TabBar,

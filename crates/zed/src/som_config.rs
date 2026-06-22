@@ -283,6 +283,9 @@ impl SomConfig {
             parts.push(format!("\"terminal\": {{ {} }}", terminal_parts.join(", ")));
         }
 
+        // Always hide the pane tab bar — tabs live in the title bar
+        parts.push("\"tab_bar\": { \"show\": false }".to_string());
+
         if parts.is_empty() {
             return;
         }

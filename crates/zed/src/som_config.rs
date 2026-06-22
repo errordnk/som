@@ -26,15 +26,39 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
 #[serde(rename_all = "camelCase", default)]
 pub struct SomConfig {
     pub env: HashMap<String, String>,
-    pub bell: Option<String>,
-    pub copy_on_select: Option<bool>,
+    pub general: GeneralConfig,
+    pub window: WindowConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
     pub scroll: ScrollConfig,
     pub log: LogConfig,
     pub tabs: Vec<TabProfile>,
     pub keys: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GeneralConfig {
+    pub bell: Option<String>,
+    pub copy_on_select: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WindowConfig {
     pub theme: Option<String>,
+    pub mode: Option<String>,
+    pub opacity: Option<f32>,
+    pub padding: Option<PaddingConfig>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PaddingConfig {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
 }
 
 #[derive(Deserialize, Clone)]
@@ -232,7 +256,7 @@ impl SomConfig {
         let mut parts: Vec<String> = Vec::new();
         let mut terminal_parts: Vec<String> = Vec::new();
 
-        if let Some(theme) = &self.theme {
+        if let Some(theme) = &self.window.theme {
             parts.push(format!("\"theme\": \"{}\"", theme));
         }
 
@@ -275,7 +299,7 @@ impl SomConfig {
         if let Some(alt) = &self.scroll.alternate_scroll {
             terminal_parts.push(format!("\"alternate_scroll\": \"{}\"", alt));
         }
-        if let Some(copy) = self.copy_on_select {
+        if let Some(copy) = self.general.copy_on_select {
             terminal_parts.push(format!("\"copy_on_select\": {}", copy));
         }
 

@@ -89,6 +89,36 @@ impl IntoElement for TitleBarButton {
 
 pub use workspace::TabProfiles;
 
+struct TitlebarTabStrip {
+    pane: gpui::Entity<workspace::Pane>,
+    titlebar_height: gpui::Pixels,
+    _subscription: Subscription,
+}
+
+impl TitlebarTabStrip {
+    fn new(pane: gpui::Entity<workspace::Pane>, titlebar_height: gpui::Pixels, cx: &mut Context<Self>) -> Self {
+        let sub = cx.observe(&pane, |_, _, cx| cx.notify());
+        Self { pane, titlebar_height, _subscription: sub }
+    }
+}
+
+impl Render for TitlebarTabStrip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let height = self.titlebar_height;
+        let tabs = self.pane.update(cx, |pane, cx| {
+            pane.render_tabs_for_titlebar(height, window, cx)
+        });
+        div()
+            .id("titlebar-tabs")
+            .flex()
+            .flex_row()
+            .h_full()
+            .overflow_x_hidden()
+            .occlude()
+            .children(tabs)
+    }
+}
+
 actions!(
     collab,
     [
@@ -168,6 +198,7 @@ pub struct TitleBar {
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     application_menu: Option<Entity<ApplicationMenu>>,
     profiles_menu_handle: PopoverMenuHandle<ui::ContextMenu>,
+    tab_strip: Option<Entity<TitlebarTabStrip>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -183,6 +214,16 @@ impl Render for TitleBar {
                 self.platform_titlebar.update(cx, |titlebar, _cx| {
                     titlebar.set_multi_workspace(mw);
                 });
+            }
+        }
+
+        // Lazily create tab_strip once panes[0] is available
+        if self.tab_strip.is_none() {
+            if let Some(pane) = self.workspace.upgrade()
+                .and_then(|ws| ws.read(cx).panes().first().cloned())
+            {
+                let height = ui::utils::platform_title_bar_height(window);
+                self.tab_strip = Some(cx.new(|cx| TitlebarTabStrip::new(pane, height, cx)));
             }
         }
 
@@ -263,6 +304,7 @@ impl TitleBar {
             multi_workspace,
             project,
             profiles_menu_handle: PopoverMenuHandle::default(),
+            tab_strip: None,
             _subscriptions: subscriptions,
         };
 
@@ -282,25 +324,13 @@ impl TitleBar {
         let titlebar_height = platform_title_bar_height(window);
         let workspace_focus = self.workspace.upgrade().map(|ws| ws.focus_handle(cx));
 
-        // Render tabs from the main pane (panes[0]) — always the primary tab container
-        let tabs_element = self.workspace.upgrade().and_then(|ws| {
-            let pane = ws.read(cx).panes().first()?.clone();
-Some(pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(titlebar_height, window, cx)))
+        let tabs_element: Option<gpui::AnyElement> = self.tab_strip.as_ref().map(|strip| {
+            strip.clone().into_any_element()
         });
-
-        // Debug overlay: pane count and item count per pane
-        let debug_label = self.workspace.upgrade().map(|ws| {
-            let info = ws.read(cx).panes().iter().enumerate()
-                .map(|(i, p)| format!("p{}:{}", i, p.read(cx).items().count()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            info
-        }).unwrap_or_default();
 
         h_flex()
             .h_full()
             .w_full()
-            // Tabs fill available space on the left
             .when_some(tabs_element, |this, tabs| this.child(tabs))
             // Drag zone: fills remaining space, double-click = maximize
             .child(
@@ -309,10 +339,6 @@ Some(pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(titlebar_height, w
                     .flex_1()
                     .min_w(px(40.))
                     .h_full()
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .child(Label::new(debug_label).size(LabelSize::Small).color(Color::Muted))
                     .on_click(|ev: &ClickEvent, window, _cx| {
                         if ev.click_count() == 2 {
                             window.zoom_window();

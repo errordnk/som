@@ -38,6 +38,8 @@ pub struct Tab {
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
+    height_override: Option<Pixels>,
+    no_left_padding: bool,
 }
 
 impl Tab {
@@ -53,7 +55,14 @@ impl Tab {
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
+            height_override: None,
+            no_left_padding: false,
         }
+    }
+
+    pub fn no_left_padding(mut self) -> Self {
+        self.no_left_padding = true;
+        self
     }
 
     pub fn position(mut self, position: TabPosition) -> Self {
@@ -73,6 +82,11 @@ impl Tab {
 
     pub fn end_slot<E: IntoElement>(mut self, element: impl Into<Option<E>>) -> Self {
         self.end_slot = element.into().map(IntoElement::into_any_element);
+        self
+    }
+
+    pub fn height(mut self, height: Pixels) -> Self {
+        self.height_override = Some(height);
         self
     }
 
@@ -141,16 +155,19 @@ impl RenderOnce for Tab {
             }
         };
 
+        let has_height_override = self.height_override.is_some();
         self.div
-            .h(Tab::container_height(cx))
+            .h(self.height_override.unwrap_or_else(|| Tab::container_height(cx)))
+            .flex()
+            .items_center()
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| match self.position {
                 TabPosition::First => {
                     if self.selected {
-                        this.pl_px().border_r_1().pb_px()
+                        if self.no_left_padding { this.border_r_1().pb_px() } else { this.pl_px().border_r_1().pb_px() }
                     } else {
-                        this.pl_px().pr_px().border_b_1()
+                        if self.no_left_padding { this.pr_px().border_b_1() } else { this.pl_px().pr_px().border_b_1() }
                     }
                 }
                 TabPosition::Last => {
@@ -169,7 +186,12 @@ impl RenderOnce for Tab {
                 h_flex()
                     .group("")
                     .relative()
-                    .h(Tab::content_height(cx))
+                    .map(|this| if has_height_override {
+                        this.h_full()
+                    } else {
+                        this.h(Tab::content_height(cx))
+                    })
+                    .items_center()
                     .px(DynamicSpacing::Base04.px(cx))
                     .gap(DynamicSpacing::Base04.rems(cx))
                     .text_color(text_color)

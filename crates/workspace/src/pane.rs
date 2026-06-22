@@ -2729,15 +2729,27 @@ impl Pane {
                 let item_handle = item.boxed_clone();
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {
                     if event.click_count() > 1 {
+                        // Double-click on already-active tab: Som split/unsplit
+                        if ix == pane.active_item_index {
+                            if event.modifiers().shift {
+                                window.dispatch_action(
+                                    Box::new(crate::SomUnsplitPane),
+                                    cx,
+                                );
+                            } else {
+                                window.dispatch_action(
+                                    Box::new(crate::SomSplitPane),
+                                    cx,
+                                );
+                            }
+                            return;
+                        }
                         pane.unpreview_item_if_preview(item_id);
                         let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
                         if let Some((_, action)) = extra_actions
                             .into_iter()
                             .find(|(label, _)| label.as_ref() == "Rename")
                         {
-                            // Dispatch action directly through the focus handle to avoid
-                            // relay_action's intermediate focus step which can interfere
-                            // with inline editors.
                             let focus_handle = item_handle.item_focus_handle(cx);
                             focus_handle.dispatch_action(&*action, window, cx);
                             return;

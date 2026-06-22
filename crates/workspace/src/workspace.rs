@@ -443,6 +443,18 @@ impl TabProfiles {
     }
 }
 
+/// Splits the active pane by cloning the active terminal (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomSplitPane;
+
+/// Removes the last split pane (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomUnsplitPane;
+
 /// Increases size of a currently focused dock by a given amount of pixels.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -1192,6 +1204,7 @@ pub struct Workspace {
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
     last_active_center_pane: Option<WeakEntity<Pane>>,
+    som_split_panes: Vec<WeakEntity<Pane>>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1460,6 +1473,7 @@ impl Workspace {
             panes_by_item: Default::default(),
             active_pane: center_pane.clone(),
             last_active_center_pane: Some(center_pane.downgrade()),
+            som_split_panes: Vec::new(),
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4939,6 +4953,53 @@ impl Workspace {
         })
     }
 
+    fn som_split_pane(&mut self, _: &SomSplitPane, window: &mut Window, cx: &mut Context<Self>) {
+        // Cleanup dead pane references
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+
+        let level = self.som_split_panes.len();
+        if level >= 3 {
+            return;
+        }
+
+        let directions = [
+            SplitDirection::Right,
+            SplitDirection::Down,
+            SplitDirection::Right,
+        ];
+        let direction = directions[level];
+
+        // Which pane to split: level 0 → active (left), level 1 → split[0] (right), level 2 → split[1] (right-bottom)
+        let pane_to_split = if level == 0 {
+            self.active_pane.clone()
+        } else {
+            match self.som_split_panes[level - 1].upgrade() {
+                Some(p) => p,
+                None => return,
+            }
+        };
+
+        let task = self.split_and_clone(pane_to_split, direction, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(new_pane) = task.await {
+                this.update(cx, |this, _| {
+                    this.som_split_panes.push(new_pane.downgrade());
+                }).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn som_unsplit_pane(&mut self, _: &SomUnsplitPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+
+        if let Some(last) = self.som_split_panes.pop() {
+            if let Some(pane) = last.upgrade() {
+                self.remove_pane(pane, None, window, cx);
+            }
+        }
+    }
+
     pub fn join_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_item = self.active_pane.read(cx).active_item();
         for pane in &self.panes {
@@ -6041,6 +6102,8 @@ impl Workspace {
             .on_action(cx.listener(|workspace, _: &FocusCenterPane, window, cx| {
                 workspace.focus_center_pane(window, cx);
             }))
+            .on_action(cx.listener(Workspace::som_split_pane))
+            .on_action(cx.listener(Workspace::som_unsplit_pane))
             .on_action(cx.listener(Workspace::cancel))
     }
 

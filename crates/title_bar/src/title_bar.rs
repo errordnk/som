@@ -346,7 +346,29 @@ impl TitleBar {
                         window.dispatch_action(Box::new(workspace::NewTerminal::default()), cx);
                     })),
             )
-            .when(!profiles.is_empty(), |this| {
+            .when(profiles.len() == 1, |this| {
+                let tab_name = profiles[0].0.clone();
+                this.child(
+                    div()
+                        .id("new-terminal-profile")
+                        .w(px(36.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .occlude()
+                        .hover(|s| s.bg(hover_bg))
+                        .active(|s| s.bg(active_bg))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::Medium).color(Color::Default))
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            window.dispatch_action(Box::new(workspace::NewTerminal {
+                                local: false,
+                                tab_name: Some(tab_name.clone()),
+                            }), cx);
+                        })),
+                )
+            })
+            .when(profiles.len() > 1, |this| {
                 this.child(
                     div().h_full().child(ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())

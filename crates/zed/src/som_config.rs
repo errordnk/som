@@ -6,16 +6,18 @@ use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
 use std::{collections::HashMap, sync::Arc};
 use paths;
 
-fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str>)> {
-    // Returns (gpui_action_name, optional_context)
+fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str>, bool)> {
+    // Returns (gpui_action_name, optional_context, needs_object_syntax)
     match action {
-        "Copy"         => Some(("terminal::Copy",                   Some("Terminal"))),
-        "Paste"        => Some(("terminal::Paste",                  Some("Terminal"))),
-        "New"          => Some(("workspace::NewTerminal",           None)),
-        "Quit"         => Some(("zed::Quit",                        None)),
-        "FontIncrease" => Some(("zed::IncreaseBufferFontSize",      None)),
-        "FontDecrease" => Some(("zed::DecreaseBufferFontSize",      None)),
-        "FontReset"    => Some(("zed::ResetBufferFontSize",         None)),
+        "Copy"         => Some(("terminal::Copy",                   Some("Terminal"), false)),
+        "Paste"        => Some(("terminal::Paste",                  Some("Terminal"), false)),
+        "CloseTab"     => Some(("pane::CloseActiveItem",            None,            false)),
+        "SplitTab"     => Some(("workspace::SomSplitPane",          None,            false)),
+        "UnSplitTab"   => Some(("workspace::SomUnsplitPane",        None,            false)),
+        "Quit"         => Some(("zed::Quit",                        None,            false)),
+        "FontIncrease" => Some(("zed::IncreaseBufferFontSize",      None,            true)),
+        "FontDecrease" => Some(("zed::DecreaseBufferFontSize",      None,            true)),
+        "FontReset"    => Some(("zed::ResetBufferFontSize",         None,            true)),
         _ => None,
     }
 }
@@ -137,26 +139,55 @@ impl SomConfig {
             ));
         }
 
-        // Built-in font size bindings
+        // Built-in font size bindings (persist:false = session only)
         let font_bindings = [
             ("ctrl-=", "zed::IncreaseBufferFontSize"),
-            ("ctrl-+", "zed::IncreaseBufferFontSize"),
             ("ctrl--", "zed::DecreaseBufferFontSize"),
         ];
         for (keystroke, action) in &font_bindings {
-            entries.push(format!("{{ \"bindings\": {{ \"{keystroke}\": \"{action}\" }} }}"));
+            entries.push(format!(
+                "{{ \"bindings\": {{ \"{keystroke}\": [\"{action}\", {{ \"persist\": false }}] }} }}"
+            ));
         }
 
         // User-defined bindings from windows.json "keys"
-        for (keystroke, action_name) in &self.keys {
-            if let Some((gpui_action, ctx)) = som_action_to_gpui(action_name) {
+        for (keystroke_raw, action_name) in &self.keys {
+            let keystroke = keystroke_raw.replace('\\', "\\\\");
+            // New / New1..New9 → open tabs[0]..tabs[8] by name
+            if action_name == "New" || action_name.strip_prefix("New").map_or(false, |s| s.parse::<usize>().is_ok()) {
+                let idx = if action_name == "New" {
+                    1
+                } else {
+                    action_name["New".len()..].parse::<usize>().unwrap_or(1)
+                };
+                if idx >= 1 && idx <= 9 {
+                    if let Some(tab) = self.tabs.get(idx - 1) {
+                        let name = tab.name.replace('"', "\\\"");
+                        entries.push(format!(
+                            "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\" }}] }} }}"
+                        ));
+                        continue;
+                    }
+                }
+                // fallback — no tab defined, use plain NewTerminal
+                entries.push(format!(
+                    "{{ \"bindings\": {{ \"{keystroke}\": \"workspace::NewTerminal\" }} }}"
+                ));
+                continue;
+            }
+            if let Some((gpui_action, ctx, as_obj)) = som_action_to_gpui(action_name) {
+                let binding = if as_obj {
+                    format!("[\"{gpui_action}\", {{ \"persist\": false }}]")
+                } else {
+                    format!("\"{gpui_action}\"")
+                };
                 if let Some(ctx) = ctx {
                     entries.push(format!(
-                        "{{ \"context\": \"{ctx}\", \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
+                        "{{ \"context\": \"{ctx}\", \"bindings\": {{ \"{keystroke}\": {binding} }} }}"
                     ));
                 } else {
                     entries.push(format!(
-                        "{{ \"bindings\": {{ \"{keystroke}\": \"{gpui_action}\" }} }}"
+                        "{{ \"bindings\": {{ \"{keystroke}\": {binding} }} }}"
                     ));
                 }
             }

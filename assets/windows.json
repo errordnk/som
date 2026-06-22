@@ -38,11 +38,21 @@
     "shift-insert": "Paste",
     "ctrl-v": "Paste",
     "ctrl-n": "New",
-    "ctrl-shift-1": "New",
+    "ctrl-shift-1": "New1",
+    "ctrl-shift-2": "New2",
+    "ctrl-shift-3": "New3",
+    "ctrl-shift-4": "New4",
+    "ctrl-shift-5": "New5",
+    "ctrl-shift-6": "New6",
+    "ctrl-shift-7": "New7",
+    "ctrl-shift-8": "New8",
+    "ctrl-shift-9": "New9",
     "ctrl-=": "FontIncrease",
-    "ctrl-+": "FontIncrease",
     "ctrl--": "FontDecrease",
     "ctrl-0": "FontReset",
+    "ctrl-f4": "CloseTab",
+    "ctrl-\\": "SplitTab",
+    "ctrl-shift-\\": "UnSplitTab",
     "alt-f4": "Quit"
   }
 }

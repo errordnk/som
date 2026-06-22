@@ -282,11 +282,20 @@ impl TitleBar {
         let titlebar_height = platform_title_bar_height(window);
         let workspace_focus = self.workspace.upgrade().map(|ws| ws.focus_handle(cx));
 
-        // Render tabs from active pane
-        let tabs_element = self.workspace.upgrade().map(|ws| {
-            let pane = ws.read(cx).active_pane().clone();
-            pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(window, cx))
+        // Render tabs from the main pane (panes[0]) — always the primary tab container
+        let tabs_element = self.workspace.upgrade().and_then(|ws| {
+            let pane = ws.read(cx).panes().first()?.clone();
+            Some(pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(window, cx)))
         });
+
+        // Debug overlay: pane count and item count per pane
+        let debug_label = self.workspace.upgrade().map(|ws| {
+            let info = ws.read(cx).panes().iter().enumerate()
+                .map(|(i, p)| format!("p{}:{}", i, p.read(cx).items().count()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info
+        }).unwrap_or_default();
 
         h_flex()
             .h_full()
@@ -309,6 +318,10 @@ impl TitleBar {
                     .flex_1()
                     .min_w(px(40.))
                     .h_full()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .child(Label::new(debug_label).size(LabelSize::Small).color(Color::Muted))
                     .on_click(|ev: &ClickEvent, window, _cx| {
                         if ev.click_count() == 2 {
                             window.zoom_window();

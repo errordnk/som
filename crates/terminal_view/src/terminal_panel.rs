@@ -633,7 +633,7 @@ impl TerminalPanel {
                         cx,
                     )
                 });
-                workspace.add_item_to_active_pane(Box::new(terminal_view), None, true, window, cx);
+                workspace.add_item_to_main_pane(Box::new(terminal_view), window, cx);
             })?;
             Ok(terminal.downgrade())
         })

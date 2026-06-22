@@ -1205,6 +1205,7 @@ pub struct Workspace {
     active_pane: Entity<Pane>,
     last_active_center_pane: Option<WeakEntity<Pane>>,
     som_split_panes: Vec<WeakEntity<Pane>>,
+    som_split_in_progress: bool,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1474,6 +1475,7 @@ impl Workspace {
             active_pane: center_pane.clone(),
             last_active_center_pane: Some(center_pane.downgrade()),
             som_split_panes: Vec::new(),
+            som_split_in_progress: false,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4968,7 +4970,10 @@ impl Workspace {
         })
     }
 
-    fn som_split_pane(&mut self, _: &SomSplitPane, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn som_split_pane(&mut self, _: &SomSplitPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.som_split_in_progress {
+            return;
+        }
         // Cleanup dead pane references
         self.som_split_panes.retain(|p| p.upgrade().is_some());
 
@@ -4994,18 +4999,24 @@ impl Workspace {
             }
         };
 
+        self.som_split_in_progress = true;
         let task = self.split_and_clone(pane_to_split, direction, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(new_pane) = task.await {
                 this.update(cx, |this, _| {
                     this.som_split_panes.push(new_pane.downgrade());
+                    this.som_split_in_progress = false;
+                }).ok();
+            } else {
+                this.update(cx, |this, _| {
+                    this.som_split_in_progress = false;
                 }).ok();
             }
         })
         .detach();
     }
 
-    fn som_unsplit_pane(&mut self, _: &SomUnsplitPane, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn som_unsplit_pane(&mut self, _: &SomUnsplitPane, window: &mut Window, cx: &mut Context<Self>) {
         self.som_split_panes.retain(|p| p.upgrade().is_some());
 
         if let Some(last) = self.som_split_panes.pop() {

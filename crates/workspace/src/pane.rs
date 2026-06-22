@@ -2728,32 +2728,20 @@ impl Pane {
             .on_click(cx.listener({
                 let item_handle = item.boxed_clone();
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {
-                    if event.click_count() > 1 {
-                        // Double-click on already-active tab: Som split/unsplit
-                        if ix == pane.active_item_index {
-                            if event.modifiers().shift {
-                                window.dispatch_action(
-                                    Box::new(crate::SomUnsplitPane),
-                                    cx,
-                                );
-                            } else {
-                                window.dispatch_action(
-                                    Box::new(crate::SomSplitPane),
-                                    cx,
-                                );
-                            }
-                            return;
+                    if event.modifiers().control && ix == pane.active_item_index {
+                        let shift = event.modifiers().shift;
+                        if let Some(workspace) = pane.workspace.upgrade() {
+                            window.defer(cx, move |window, cx| {
+                                workspace.update(cx, |ws, cx| {
+                                    if shift {
+                                        ws.som_unsplit_pane(&crate::SomUnsplitPane, window, cx);
+                                    } else {
+                                        ws.som_split_pane(&crate::SomSplitPane, window, cx);
+                                    }
+                                });
+                            });
                         }
-                        pane.unpreview_item_if_preview(item_id);
-                        let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
-                        if let Some((_, action)) = extra_actions
-                            .into_iter()
-                            .find(|(label, _)| label.as_ref() == "Rename")
-                        {
-                            let focus_handle = item_handle.item_focus_handle(cx);
-                            focus_handle.dispatch_action(&*action, window, cx);
-                            return;
-                        }
+                        return;
                     }
                     pane.activate_item(ix, true, true, window, cx)
                 }
@@ -3007,10 +2995,14 @@ impl Pane {
     }
 
     /// Render tabs for the title bar (no nav buttons, no pinned-row logic).
-    pub fn render_tabs_for_titlebar(&mut self, titlebar_height: gpui::Pixels, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
+    pub fn render_tabs_for_titlebar(
+        &mut self,
+        titlebar_height: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> Vec<AnyElement> {
         let focus_handle = self.focus_handle.clone();
-        let tab_items = self
-            .items
+        let tabs: Vec<AnyElement> = self.items
             .iter()
             .enumerate()
             .zip(tab_details(&self.items, window, cx))
@@ -3022,17 +3014,8 @@ impl Pane {
                 }
                 tab.into_any_element()
             })
-            .collect::<Vec<_>>();
-
-        div()
-            .id("titlebar-tabs")
-            .flex()
-            .flex_row()
-            .h_full()
-            .overflow_x_hidden()
-            .occlude()
-            .children(tab_items)
-            .into_any_element()
+            .collect();
+        tabs
     }
 
     fn configure_tab_bar_start(
@@ -3918,7 +3901,6 @@ impl Render for Pane {
                     .relative()
                     .group("")
                     .overflow_hidden()
-                    .on_drag_move::<DraggedTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
                     .when(is_local, |div| {
                         div.on_drag_move::<ExternalPaths>(cx.listener(Self::handle_drag_move))
@@ -3956,7 +3938,6 @@ impl Render for Pane {
                             .invisible()
                             .absolute()
                             .bg(cx.theme().colors().drop_target_background)
-                            .group_drag_over::<DraggedTab>("", |style| style.visible())
                             .group_drag_over::<DraggedSelection>("", |style| style.visible())
                             .when(is_local, |div| {
                                 div.group_drag_over::<ExternalPaths>("", |style| style.visible())
@@ -3964,15 +3945,6 @@ impl Render for Pane {
                             .when_some(self.can_drop_predicate.clone(), |this, p| {
                                 this.can_drop(move |a, window, cx| p(a, window, cx))
                             })
-                            .on_drop(cx.listener(move |this, dragged_tab, window, cx| {
-                                this.handle_tab_drop(
-                                    dragged_tab,
-                                    this.active_item_index(),
-                                    true,
-                                    window,
-                                    cx,
-                                )
-                            }))
                             .on_drop(cx.listener(
                                 move |this, selection: &DraggedSelection, window, cx| {
                                     this.handle_dragged_selection_drop(selection, None, window, cx)

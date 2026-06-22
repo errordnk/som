@@ -1,8 +1,20 @@
 {
   "env": {},
-  "bell": "off",
-  "copyOnSelect": true,
-  "theme": "Nord Dark",
+  "general": {
+    "bell": "off",
+    "copyOnSelect": true
+  },
+  "window": {
+    "theme": "Nord Dark",
+    "mode": "windowed",
+    "padding": {
+      "top": 0,
+      "bottom": 0,
+      "left": 0,
+      "right": 0
+    },
+    "opacity": 1.0
+  },
   "log": {
     "level": "trace",
     "days": 7
@@ -26,7 +38,7 @@
   },
   "tabs": [
     {
-      "name": "Shell",
+      "name": "shell",
       "icon": "",
       "shell": "$SHELL",
       "workingDir": "~"

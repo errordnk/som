@@ -377,6 +377,7 @@ impl RenderOnce for Key {
             .size
             .unwrap_or_else(|| TextSize::default().rems(cx).into());
 
+        let color = self.color.unwrap_or(Color::Muted).color(cx);
         div()
             .py_0()
             .map(|this| {
@@ -389,7 +390,7 @@ impl RenderOnce for Key {
             .h(size)
             .text_size(size)
             .line_height(relative(1.))
-            .text_color(self.color.unwrap_or(Color::Muted).color(cx))
+            .text_color(color)
             .child(self.key)
     }
 }

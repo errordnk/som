@@ -52,6 +52,7 @@ pub struct WindowsWindowState {
     pub background_appearance: Cell<WindowBackgroundAppearance>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    pub start_minimized: Cell<bool>,
 
     pub callbacks: Callbacks,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
@@ -132,6 +133,7 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
+        let start_minimized = false;
         let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
             .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
@@ -157,6 +159,7 @@ impl WindowsWindowState {
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
+            start_minimized: Cell::new(start_minimized),
             min_size,
             callbacks,
             input_handler: Cell::new(input_handler),
@@ -355,6 +358,12 @@ impl WindowsWindowInner {
                 SetWindowPlacement(self.hwnd, &open_status.placement)
                     .context("failed to set window placement")?;
             },
+            WindowOpenState::Minimized => unsafe {
+                self.state.start_minimized.set(true);
+                SetWindowPlacement(self.hwnd, &open_status.placement)
+                    .context("failed to set window placement")?;
+                ShowWindowAsync(self.hwnd, SW_SHOWMINNOACTIVE).ok()?;
+            },
         }
         Ok(())
     }
@@ -447,7 +456,7 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+        let (mut dwexstyle, mut dwstyle) = if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -468,6 +477,9 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
+        if params.start_minimized {
+            dwstyle |= WS_MINIMIZE;
+        }
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
@@ -535,7 +547,12 @@ impl WindowsWindow {
             this.state.scale_factor.get(),
             &this.state.border_offset,
         )?;
-        if params.show {
+        if params.start_minimized {
+            this.state.initial_placement.set(Some(WindowOpenStatus {
+                placement,
+                state: WindowOpenState::Minimized,
+            }));
+        } else if params.show {
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
             this.state.initial_placement.set(Some(WindowOpenStatus {
@@ -759,6 +776,10 @@ impl PlatformWindow for WindowsWindow {
             .executor
             .spawn(async move {
                 this.set_window_placement().log_err();
+
+                if this.state.start_minimized.get() {
+                    return;
+                }
 
                 unsafe {
                     // If the window is minimized, restore it.
@@ -1317,6 +1338,7 @@ enum WindowOpenState {
     Maximized,
     Fullscreen,
     Windowed,
+    Minimized,
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");

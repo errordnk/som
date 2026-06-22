@@ -27,7 +27,7 @@ use workspace::{
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
     PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    SwapPaneLeft, SwapPaneRight, SwapPaneUp, TabProfiles, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -540,10 +540,15 @@ impl TerminalPanel {
             .active_item()
             .is_some_and(|item| item.downcast::<TerminalView>().is_some());
 
+        let default_tab_name = cx
+            .try_global::<TabProfiles>()
+            .and_then(|p| p.0.first().map(|(name, _)| name.clone()));
+        let tab_name = action.tab_name.clone().or(default_tab_name);
+
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = default_working_directory(workspace, cx);
             let local = action.local;
-            Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+            Self::add_center_terminal_named(workspace, tab_name, window, cx, move |project, cx| {
                 if local {
                     project.create_local_terminal(cx)
                 } else {
@@ -558,12 +563,21 @@ impl TerminalPanel {
             return;
         };
 
+        let local = action.local;
         terminal_panel
             .update(cx, |this, cx| {
-                if action.local {
-                    this.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                if local {
+                    this.add_terminal_shell_internal(
+                        true,
+                        tab_name,
+                        None,
+                        RevealStrategy::Always,
+                        window,
+                        cx,
+                    )
                 } else {
-                    this.add_terminal_shell(
+                    this.add_terminal_shell_named(
+                        tab_name,
                         default_working_directory(workspace, cx),
                         RevealStrategy::Always,
                         window,
@@ -584,6 +598,20 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        Self::add_center_terminal_named(workspace, None, window, cx, create_terminal)
+    }
+
+    pub fn add_center_terminal_named(
+        workspace: &mut Workspace,
+        tab_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
@@ -595,11 +623,12 @@ impl TerminalPanel {
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new(
+                    TerminalView::new_with_title(
                         terminal.clone(),
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
+                        tab_name.clone(),
                         window,
                         cx,
                     )
@@ -617,7 +646,18 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(false, cwd, reveal_strategy, window, cx)
+        self.add_terminal_shell_with_name(None, cwd, reveal_strategy, window, cx)
+    }
+
+    fn add_terminal_shell_named(
+        &mut self,
+        tab_name: Option<String>,
+        cwd: Option<PathBuf>,
+        reveal_strategy: RevealStrategy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.add_terminal_shell_with_name(tab_name, cwd, reveal_strategy, window, cx)
     }
 
     fn add_local_terminal_shell(
@@ -626,12 +666,24 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(true, None, reveal_strategy, window, cx)
+        self.add_terminal_shell_internal(true, None, None, reveal_strategy, window, cx)
+    }
+
+    fn add_terminal_shell_with_name(
+        &mut self,
+        tab_name: Option<String>,
+        cwd: Option<PathBuf>,
+        reveal_strategy: RevealStrategy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.add_terminal_shell_internal(false, tab_name, cwd, reveal_strategy, window, cx)
     }
 
     fn add_terminal_shell_internal(
         &mut self,
         force_local: bool,
+        tab_name: Option<String>,
         cwd: Option<PathBuf>,
         reveal_strategy: RevealStrategy,
         window: &mut Window,
@@ -662,11 +714,12 @@ impl TerminalPanel {
                 Ok(terminal) => {
                     let result = workspace.update_in(cx, |workspace, window, cx| {
                         let terminal_view = Box::new(cx.new(|cx| {
-                            TerminalView::new(
+                            TerminalView::new_with_title(
                                 terminal.clone(),
                                 workspace.weak_handle(),
                                 workspace.database_id(),
                                 workspace.project().downgrade(),
+                                tab_name.clone(),
                                 window,
                                 cx,
                             )
@@ -874,7 +927,7 @@ pub fn new_terminal_pane(
             project.clone(),
             Default::default(),
             None,
-            workspace::NewTerminal::default().boxed_clone(),
+            None,
             false,
             window,
             cx,
@@ -1251,8 +1304,11 @@ impl Panel for TerminalPanel {
             else {
                 return;
             };
+            let first_profile_name = cx
+                .try_global::<TabProfiles>()
+                .and_then(|p| p.0.first().map(|(name, _)| name.clone()));
 
-            this.add_terminal_shell(kind, RevealStrategy::Always, window, cx)
+            this.add_terminal_shell_named(first_profile_name, kind, RevealStrategy::Always, window, cx)
                 .detach_and_log_err(cx)
         })
     }

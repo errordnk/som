@@ -3,10 +3,14 @@
   "bell": "off",
   "copyOnSelect": true,
   "theme": "Nord Dark",
+  "log": {
+    "level": "trace",
+    "days": 7
+  },
   "font": {
     "face": "FiraCode Nerd Font",
     "features": {},
-    "size": 11,
+    "size": 13,
     "weight": "normal",
     "lineHeight": 1.2
   },
@@ -24,7 +28,7 @@
     {
       "name": "Shell",
       "icon": "",
-      "shell": "cmd.exe",
+      "shell": "$SHELL",
       "workingDir": "~"
     }
   ],
@@ -35,6 +39,10 @@
     "ctrl-v": "Paste",
     "ctrl-n": "New",
     "ctrl-shift-1": "New",
+    "ctrl-=": "FontIncrease",
+    "ctrl-+": "FontIncrease",
+    "ctrl--": "FontDecrease",
+    "ctrl-0": "FontReset",
     "alt-f4": "Quit"
   }
 }

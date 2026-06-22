@@ -13,13 +13,13 @@ pub use open_listener::listen_for_cli_connections;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use gpui::{
     Action, App, Context, DismissEvent, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, ReadGlobal as _, SharedString, Task, UpdateGlobal as _,
+    PathPromptOptions, PromptLevel, ReadGlobal as _, SharedString, Task,
     Window, WindowHandle, WindowKind, WindowOptions,
     actions, point, px,
 };
 use settings::{
-    BaseKeymap, DEFAULT_KEYMAP_PATH, InvalidSettingsError, KeybindSource, KeymapFile,
-    KeymapFileLoadResult, Settings, SettingsFile, SettingsStore,
+    BaseKeymap, DEFAULT_KEYMAP_PATH, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, Settings, SettingsStore,
     update_settings_file,
 };
 use std::{
@@ -262,6 +262,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
             None
         },
         app_id: Some("dev.som.Som".to_owned()),
+        start_minimized: crate::START_MINIMIZED.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     }
 }
@@ -510,6 +511,21 @@ fn register_actions(
             }
         })
         .register_action(
+            |_, _: &zed_actions::IncreaseBufferFontSize, _window, cx| {
+                theme_settings::increase_buffer_font_size(cx);
+            },
+        )
+        .register_action(
+            |_, _: &zed_actions::DecreaseBufferFontSize, _window, cx| {
+                theme_settings::decrease_buffer_font_size(cx);
+            },
+        )
+        .register_action(
+            |_, _: &zed_actions::ResetBufferFontSize, _window, cx| {
+                theme_settings::reset_buffer_font_size(cx);
+            },
+        )
+        .register_action(
             |workspace: &mut Workspace,
              _: &terminal_panel::ToggleFocus,
              window: &mut Window,
@@ -572,46 +588,6 @@ fn open_settings_file(
     .detach_and_log_err(cx);
 }
 
-fn notify_settings_errors(result: settings::SettingsParseResult, is_user: bool, cx: &mut App) {
-    if let settings::ParseStatus::Failed { error: err } = &result.parse_status {
-        let settings_type = if is_user { "user" } else { "global" };
-        log::error!("Failed to load {} settings: {err}", settings_type);
-    }
-
-    let error = match result.parse_status {
-        settings::ParseStatus::Failed { error } => Some(anyhow::format_err!(error)),
-        settings::ParseStatus::Success => None,
-        settings::ParseStatus::Unchanged => return,
-    };
-    let id = NotificationId::Named(format!("failed-to-parse-settings-{is_user}").into());
-
-    match error {
-        Some(error) => {
-            if let Some(InvalidSettingsError::LocalSettings { .. }) =
-                error.downcast_ref::<InvalidSettingsError>()
-            {
-            } else {
-                show_app_notification(id, cx, move |cx| {
-                    cx.new(|cx| {
-                        MessageNotification::new(format!("Invalid settings file\n{error}"), cx)
-                            .primary_message("Open Settings File")
-                            .primary_icon(IconName::Settings)
-                            .primary_on_click(|window, cx| {
-                                window.dispatch_action(
-                                    zed_actions::OpenSettingsFile.boxed_clone(),
-                                    cx,
-                                );
-                                cx.emit(DismissEvent);
-                            })
-                    })
-                });
-            }
-        }
-        None => {
-            dismiss_app_notification(&id, cx);
-        }
-    };
-}
 
 #[derive(Copy, Clone, Debug, settings::RegisterSetting)]
 struct CursorHideModeSetting(gpui::CursorHideMode);
@@ -632,13 +608,9 @@ fn init_cursor_hide_mode(cx: &mut App) {
     cx.observe_global::<SettingsStore>(apply).detach();
 }
 
-pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {
-    SettingsStore::update_global(cx, move |store, cx| {
-        store.watch_settings_files(fs, cx, |settings_file, result, cx| {
-            let is_user = matches!(settings_file, SettingsFile::User);
-            notify_settings_errors(result, is_user, cx);
-        });
-    });
+pub fn watch_settings_files(_fs: Arc<dyn fs::Fs>, _cx: &mut App) {
+    // Som manages settings.json itself via SomConfig — SettingsStore must not
+    // parse it, since the file contains Som-specific fields unknown to Zed.
 }
 
 pub fn handle_keymap_file_changes(

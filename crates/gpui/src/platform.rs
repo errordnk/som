@@ -1461,6 +1461,9 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Start the window minimized to taskbar (no focus, no visible window)
+    pub start_minimized: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1515,6 +1518,9 @@ pub struct WindowParams {
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    /// Whether to start the window minimized (taskbar only, no focus)
+    pub start_minimized: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1574,6 +1580,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            start_minimized: false,
         }
     }
 }

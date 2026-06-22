@@ -229,15 +229,15 @@ impl Render for ToastLayer {
             return div();
         };
 
-        div().absolute().size_full().bottom_0().left_0().child(
+        div().absolute().inset_0().child(
             v_flex()
                 .id(("toast-layer-container", active_toast.id))
                 .absolute()
-                .w_full()
-                .bottom(px(0.))
+                .bottom(px(32.))
+                .right(px(32.))
                 .flex()
                 .flex_col()
-                .items_center()
+                .items_end()
                 .track_focus(&active_toast.focus_handle)
                 .child(
                     h_flex()

@@ -285,7 +285,7 @@ impl TitleBar {
         // Render tabs from the main pane (panes[0]) — always the primary tab container
         let tabs_element = self.workspace.upgrade().and_then(|ws| {
             let pane = ws.read(cx).panes().first()?.clone();
-            Some(pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(window, cx)))
+Some(pane.update(cx, |pane, cx| pane.render_tabs_for_titlebar(titlebar_height, window, cx)))
         });
 
         // Debug overlay: pane count and item count per pane
@@ -301,16 +301,7 @@ impl TitleBar {
             .h_full()
             .w_full()
             // Tabs fill available space on the left
-            .when_some(tabs_element, |this, tabs| {
-                this.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .h_full()
-                        .overflow_x_hidden()
-                        .child(tabs)
-                )
-            })
+            .when_some(tabs_element, |this, tabs| this.child(tabs))
             // Drag zone: fills remaining space, double-click = maximize
             .child(
                 div()

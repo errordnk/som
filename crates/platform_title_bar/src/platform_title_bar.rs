@@ -254,7 +254,7 @@ impl Render for PlatformTitleBar {
                 {
                     this.child(controls)
                 } else {
-                    this.pl_2()
+                    this
                 }
             })
             .map(|el| match decorations {
@@ -283,7 +283,7 @@ impl Render for PlatformTitleBar {
                     .id(self.id.clone())
                     .flex()
                     .flex_row()
-                    .items_center()
+                    .items_stretch()
                     .justify_between()
                     .overflow_x_hidden()
                     .w_full()

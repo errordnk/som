@@ -2676,7 +2676,7 @@ impl Pane {
         focus_handle: &FocusHandle,
         window: &mut Window,
         cx: &mut Context<Pane>,
-    ) -> impl IntoElement + use<> {
+    ) -> ui::Tab {
         let is_active = ix == self.active_item_index;
         let is_preview = self
             .preview_item_id
@@ -3007,7 +3007,7 @@ impl Pane {
     }
 
     /// Render tabs for the title bar (no nav buttons, no pinned-row logic).
-    pub fn render_tabs_for_titlebar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
+    pub fn render_tabs_for_titlebar(&mut self, titlebar_height: gpui::Pixels, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
         let focus_handle = self.focus_handle.clone();
         let tab_items = self
             .items
@@ -3015,8 +3015,12 @@ impl Pane {
             .enumerate()
             .zip(tab_details(&self.items, window, cx))
             .map(|((ix, item), detail)| {
-                self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
-                    .into_any_element()
+                let mut tab = self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
+                    .height(titlebar_height);
+                if ix == 0 {
+                    tab = tab.no_left_padding();
+                }
+                tab.into_any_element()
             })
             .collect::<Vec<_>>();
 

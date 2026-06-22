@@ -16,7 +16,7 @@ use crate::application_menu::{
 };
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, Global,
+    AnyElement, App, ClickEvent, Context, Entity, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     Styled, Subscription, WeakEntity, Window, actions, div,
 };
@@ -32,7 +32,6 @@ use ui::{
     TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use util::ResultExt;
-use gpui::Focusable as _;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
 
 
@@ -79,7 +78,6 @@ impl IntoElement for TitleBarButton {
             .items_center()
             .justify_center()
             .occlude()
-            .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
             .active(move |s| s.bg(active_bg))
             .child(ui::Icon::new(self.icon).size(ui::IconSize::Medium).color(ui::Color::Default));
@@ -90,17 +88,7 @@ impl IntoElement for TitleBarButton {
     }
 }
 
-/// Tab profiles loaded from som config (name, shell).
-#[derive(Clone, Default)]
-pub struct TabProfiles(pub Vec<(String, Option<String>)>);
-
-impl Global for TabProfiles {}
-
-impl TabProfiles {
-    pub fn set(profiles: Vec<(String, Option<String>)>, cx: &mut App) {
-        cx.set_global(TabProfiles(profiles));
-    }
-}
+pub use workspace::TabProfiles;
 
 actions!(
     collab,
@@ -339,8 +327,7 @@ impl TitleBar {
         let hover_bg = cx.theme().colors().ghost_element_hover;
         let active_bg = cx.theme().colors().ghost_element_active;
         let titlebar_height = platform_title_bar_height(window);
-        let workspace_focus = self.workspace.upgrade()
-            .map(|ws| ws.read(cx).focus_handle(cx).clone());
+        let workspace_focus = self.workspace.upgrade().map(|ws| ws.focus_handle(cx));
         h_flex()
             .h_full()
             .child(
@@ -352,7 +339,6 @@ impl TitleBar {
                     .items_center()
                     .justify_center()
                     .occlude()
-                    .cursor_pointer()
                     .hover(|s| s.bg(hover_bg))
                     .active(|s| s.bg(active_bg))
                     .child(Icon::new(IconName::Plus).size(IconSize::Medium).color(Color::Default))
@@ -362,7 +348,7 @@ impl TitleBar {
             )
             .when(!profiles.is_empty(), |this| {
                 this.child(
-                    ui::PopoverMenu::new("terminal-profiles")
+                    div().h_full().child(ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)
@@ -372,20 +358,55 @@ impl TitleBar {
                         )
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
-                            let focus = workspace_focus.clone();
-                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                                if let Some(focus) = focus.clone() {
-                                    menu = menu.context(focus);
-                                }
+                            let workspace_focus = workspace_focus.clone();
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
                                 for (name, _shell) in &profiles {
-                                    menu = menu.action(
-                                        name.clone(),
-                                        Box::new(workspace::NewTerminal::default()),
+                                    let name = name.clone();
+                                    let binding = ui::KeyBinding::for_action(
+                                        &workspace::NewTerminal::default(),
+                                        cx,
+                                    );
+                                    let name_for_action = name.clone();
+                                    let workspace_focus = workspace_focus.clone();
+                                    menu = menu.custom_entry(
+                                        {
+                                            let name = name.clone();
+                                            let binding = binding.clone();
+                                            move |_window, _cx| {
+                                                h_flex()
+                                                    .w_full()
+                                                    .justify_between()
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_2()
+                                                            .child(Icon::new(IconName::Terminal).size(IconSize::Small).color(Color::Default))
+                                                            .child(Label::new(name.clone()))
+                                                    )
+                                                    .child(div().ml_4().child(binding.clone()))
+                                                    .into_any_element()
+                                            }
+                                        },
+                                        {
+                                            let name_for_action = name_for_action.clone();
+                                            move |window, cx| {
+                                                if let Some(ref focus) = workspace_focus {
+                                                    window.focus(focus, cx);
+                                                }
+                                                window.dispatch_action(
+                                                    Box::new(workspace::NewTerminal {
+                                                        local: false,
+                                                        tab_name: Some(name_for_action.clone()),
+                                                    }),
+                                                    cx,
+                                                );
+                                            }
+                                        },
                                     );
                                 }
                                 menu
                             }))
-                        })
+                        }),
+                    )
                 )
             })
     }

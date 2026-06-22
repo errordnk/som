@@ -276,9 +276,10 @@ impl WindowsPlatform {
             .collect::<Vec<_>>();
         let recent_workspaces = jump_list.recent_workspaces.clone();
         self.background_executor.spawn(async move {
-            update_jump_list(&recent_workspaces, &dock_menus)
-                .log_err()
-                .unwrap_or_default()
+            if let Err(e) = update_jump_list(&recent_workspaces, &dock_menus) {
+                log::debug!("update_jump_list: {e}");
+            }
+            Vec::new()
         })
     }
 

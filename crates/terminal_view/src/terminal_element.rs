@@ -313,7 +313,7 @@ impl TerminalElement {
         block_below_cursor: Option<Rc<BlockProperties>>,
         mode: TerminalMode,
     ) -> TerminalElement {
-        TerminalElement {
+        let mut el = TerminalElement {
             terminal,
             terminal_view,
             workspace,
@@ -324,7 +324,9 @@ impl TerminalElement {
             mode,
             interactivity: Default::default(),
         }
-        .track_focus(&focus)
+        .track_focus(&focus);
+        el.interactivity.base_style.mouse_cursor = Some(gpui::CursorStyle::Arrow);
+        el
     }
 
     //Vec<Range<AlacPoint>> -> Clip out the parts of the ranges

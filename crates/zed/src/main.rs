@@ -16,6 +16,9 @@ const _: () = assert!(
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static START_MINIMIZED: AtomicBool = AtomicBool::new(false);
 use http_client::read_proxy_from_env;
 use collections::HashMap;
 use db::kvp::KeyValueStore;
@@ -37,7 +40,7 @@ use session::{AppSession, Session};
 use settings::{Settings, SettingsStore, watch_config_file};
 use std::{
     env,
-    io::{self, IsTerminal},
+    io,
     path::Path,
     process,
     sync::{Arc, OnceLock},
@@ -175,6 +178,12 @@ fn open_terminal_in_workspace(
     window: &mut gpui::Window,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
+    let tab_name = cx
+        .try_global::<workspace::TabProfiles>()
+        .and_then(|p| p.0.first())
+        .map(|(name, _)| name.clone())
+        .filter(|n| !n.trim().is_empty());
+
     let project = workspace.project().clone();
     let terminal_task = project.update(cx, |project, cx| project.create_local_terminal(cx));
     let workspace_handle = workspace.weak_handle();
@@ -184,11 +193,12 @@ fn open_terminal_in_workspace(
         let terminal = terminal_task.await?;
         workspace.update_in(cx, |workspace, window, cx| {
             let terminal_view = cx.new(|cx| {
-                terminal_view::TerminalView::new(
+                terminal_view::TerminalView::new_with_title(
                     terminal,
                     workspace_handle,
                     workspace_id,
                     project_weak,
+                    tab_name,
                     window,
                     cx,
                 )
@@ -215,12 +225,20 @@ fn main() {
         let _ = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(
             release_channel::RELEASE_CHANNEL.app_id(),
         ));
+        // Detach from the parent console (e.g. FAR Manager) so the launcher
+        // does not block waiting for Som to exit.
+        use windows::Win32::System::Console::FreeConsole;
+        let _ = FreeConsole();
     }
 
     #[cfg(unix)]
     util::prevent_root_execution();
 
     let args = Args::parse();
+
+    if args.minimized {
+        START_MINIMIZED.store(true, Ordering::Relaxed);
+    }
 
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     unsafe {
@@ -251,10 +269,28 @@ fn main() {
 
     zlog::init();
 
+    let som_log = som_config::SomConfig::load_embedded().log;
+    let log_filter = match som_log.level.to_ascii_lowercase().as_str() {
+        "" => None,
+        level => Some(level.to_string()),
+    };
+    zlog::process_env(log_filter);
+
+    #[cfg(target_os = "windows")]
+    {
+        cleanup_old_logs(som_log.days);
+        let result = zlog::init_output_file(paths::log_file(), None);
+        if let Err(err) = result {
+            eprintln!("Could not open log file: {}... Defaulting to stdout", err);
+            zlog::init_output_stdout();
+        };
+    }
+    #[cfg(not(target_os = "windows"))]
     if stdout_is_a_pty() {
         zlog::init_output_stdout();
     } else {
-        let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
+        cleanup_old_logs(som_log.days);
+        let result = zlog::init_output_file(paths::log_file(), None);
         if let Err(err) = result {
             eprintln!("Could not open log file: {}... Defaulting to stdout", err);
             zlog::init_output_stdout();
@@ -447,6 +483,8 @@ fn main() {
         cx.set_dock_menu(vec![]);
 
         initialize_workspace(app_state.clone(), cx);
+
+        som_config::SomConfig::watch(fs.clone(), cx);
 
         cx.activate(true);
 
@@ -809,8 +847,31 @@ fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn stdout_is_a_pty() -> bool {
     io::stdout().is_terminal()
+}
+
+fn cleanup_old_logs(days: u64) {
+    let logs_dir = paths::logs_dir();
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(days * 24 * 3600))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    if modified < cutoff {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -862,6 +923,9 @@ struct Args {
     #[arg(long, hide = true)]
     printenv: bool,
 
+    /// Start Som minimized to the taskbar
+    #[arg(long)]
+    minimized: bool,
 }
 
 fn parse_url_arg(arg: &str, _cx: &App) -> String {
@@ -890,7 +954,7 @@ fn load_embedded_fonts(cx: &App) {
         "Lilex-Regular.ttf",
         "IBMPlexSans-Regular.ttf",
     ] {
-        if let Some(bytes) = asset_source.load(name).log_err().flatten() {
+        if let Some(bytes) = asset_source.load(name).ok().flatten() {
             fonts.push(bytes);
         }
     }

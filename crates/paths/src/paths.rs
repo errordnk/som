@@ -124,9 +124,7 @@ pub fn config_dir() -> &'static PathBuf {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
         } else if cfg!(target_os = "windows") {
-            dirs::config_dir()
-                .expect("failed to determine RoamingAppData directory")
-                .join(APP_NAME)
+            home_dir().join(".config").join(APP_NAME_LOWERCASE)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
@@ -157,9 +155,7 @@ pub fn data_dir() -> &'static PathBuf {
             }
             .join(APP_NAME_LOWERCASE)
         } else if cfg!(target_os = "windows") {
-            dirs::config_dir()
-                .expect("failed to determine RoamingAppData directory")
-                .join(APP_NAME)
+            home_dir().join(".config").join(APP_NAME_LOWERCASE)
         } else {
             config_dir().clone() // Fallback
         }
@@ -182,9 +178,7 @@ pub fn state_dir() -> &'static PathBuf {
             .join(APP_NAME_LOWERCASE);
         } else {
             // Windows
-            return dirs::data_local_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
+            return home_dir().join(".local").join("state").join(APP_NAME_LOWERCASE);
         }
     })
 }
@@ -200,9 +194,7 @@ pub fn temp_dir() -> &'static PathBuf {
         }
 
         if cfg!(target_os = "windows") {
-            return dirs::cache_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
+            return home_dir().join(".cache").join(APP_NAME_LOWERCASE);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -242,16 +234,44 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
-/// Returns the path to the `Zed.log` file.
+/// Returns the path to today's log file (`YYYY-MM-DD.log`).
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
+    LOG_FILE.get_or_init(|| {
+        let date = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let days = secs / 86400;
+            // days since epoch → year/month/day (Gregorian, no external dep)
+            let (y, m, d) = days_to_ymd(days);
+            format!("{:04}-{:02}-{:02}", y, m, d)
+        };
+        logs_dir().join(format!("{}.log", date))
+    })
 }
 
-/// Returns the path to the `Zed.log.old` file.
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Not used for rotation anymore, kept for compatibility.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join("old.log"))
 }
 
 /// Returns the path to the database directory.

@@ -33,7 +33,7 @@
         "ghost_element.disabled": "#d8dee933",
 
         "text": "#eceff4",
-        "text.muted": "#d8dee9",
+        "text.muted": "#8090a8",
         "text.placeholder": "#d8dee966",
         "text.disabled": "#d8dee966",
         "text.accent": "#88C0D0",
@@ -344,7 +344,7 @@
         "ghost_element.selected": "#6c99a666",
         "ghost_element.disabled": "#d8dee933",
         "text": "#eceff4",
-        "text.muted": "#d8dee9",
+        "text.muted": "#8090a8",
         "text.placeholder": "#d8dee966",
         "text.disabled": "#d8dee966",
         "text.accent": "#88C0D0",
@@ -926,7 +926,7 @@
         "ghost_element.disabled": "#d8dee933",
 
         "text": "#eceff4",
-        "text.muted": "#d8dee9",
+        "text.muted": "#8090a8",
         "text.placeholder": "#d8dee966",
         "text.disabled": "#d8dee966",
         "text.accent": "#88C0D0",

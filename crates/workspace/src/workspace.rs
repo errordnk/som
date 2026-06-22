@@ -426,6 +426,21 @@ pub struct NewTerminal {
     /// If true, creates a local terminal even in remote projects.
     #[serde(default)]
     pub local: bool,
+    /// Optional tab name to set as the custom title.
+    #[serde(default)]
+    pub tab_name: Option<String>,
+}
+
+/// Global list of tab profiles loaded from som config (name, shell).
+#[derive(Clone, Default)]
+pub struct TabProfiles(pub Vec<(String, Option<String>)>);
+
+impl gpui::Global for TabProfiles {}
+
+impl TabProfiles {
+    pub fn set(profiles: Vec<(String, Option<String>)>, cx: &mut gpui::App) {
+        cx.set_global(TabProfiles(profiles));
+    }
 }
 
 /// Increases size of a currently focused dock by a given amount of pixels.
@@ -1354,7 +1369,7 @@ impl Workspace {
                 project.clone(),
                 pane_history_timestamp.clone(),
                 None,
-                NewCenterTerminal::default().boxed_clone(),
+                Some(NewCenterTerminal::default().boxed_clone()),
                 true,
                 window,
                 cx,
@@ -3880,7 +3895,7 @@ impl Workspace {
                 self.project.clone(),
                 self.pane_history_timestamp.clone(),
                 None,
-                NewCenterTerminal::default().boxed_clone(),
+                Some(NewCenterTerminal::default().boxed_clone()),
                 true,
                 window,
                 cx,
@@ -5152,8 +5167,8 @@ impl Workspace {
             Some(
                 div()
                     .absolute()
-                    .right_3()
-                    .bottom_3()
+                    .right_8()
+                    .bottom_8()
                     .w_112()
                     .h_full()
                     .flex()
@@ -7010,8 +7025,8 @@ impl Render for Workspace {
                             }))
                             .children(self.render_notifications(window, cx)),
                     )
-                    .child(self.toast_layer.clone()),
             )
+            .child(self.toast_layer.clone())
     }
 }
 

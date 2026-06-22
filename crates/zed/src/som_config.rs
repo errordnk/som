@@ -1,15 +1,21 @@
-use gpui::{App, UpdateGlobal as _};
+use fs::Fs;
+use futures::StreamExt;
+use gpui::{App, AppContext as _, AsyncApp, UpdateGlobal as _};
 use serde::Deserialize;
 use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+use paths;
 
 fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str>)> {
     // Returns (gpui_action_name, optional_context)
     match action {
-        "Copy"  => Some(("terminal::Copy",          Some("Terminal"))),
-        "Paste" => Some(("terminal::Paste",         Some("Terminal"))),
-        "New"   => Some(("workspace::NewTerminal",  None)),
-        "Quit"  => Some(("zed::Quit",               None)),
+        "Copy"         => Some(("terminal::Copy",                   Some("Terminal"))),
+        "Paste"        => Some(("terminal::Paste",                  Some("Terminal"))),
+        "New"          => Some(("workspace::NewTerminal",           None)),
+        "Quit"         => Some(("zed::Quit",                        None)),
+        "FontIncrease" => Some(("zed::IncreaseBufferFontSize",      None)),
+        "FontDecrease" => Some(("zed::DecreaseBufferFontSize",      None)),
+        "FontReset"    => Some(("zed::ResetBufferFontSize",         None)),
         _ => None,
     }
 }
@@ -23,9 +29,23 @@ pub struct SomConfig {
     pub font: FontConfig,
     pub cursor: CursorConfig,
     pub scroll: ScrollConfig,
+    pub log: LogConfig,
     pub tabs: Vec<TabProfile>,
     pub keys: HashMap<String, String>,
     pub theme: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LogConfig {
+    pub level: String,
+    pub days: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self { level: "all".to_string(), days: 7 }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -66,14 +86,38 @@ pub struct TabProfile {
 impl SomConfig {
     pub fn load_embedded() -> Self {
         #[cfg(target_os = "windows")]
-        let data = assets::Assets::get("windows.json");
+        let asset_name = "windows.json";
         #[cfg(target_os = "macos")]
-        let data = assets::Assets::get("darwin.json");
+        let asset_name = "darwin.json";
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let data = assets::Assets::get("linux.json");
+        let asset_name = "linux.json";
 
-        data.and_then(|f| serde_json::from_slice(&f.data).ok())
-            .unwrap_or_default()
+        let user_config_path = paths::config_dir().join("settings.json");
+
+        // Write default config if missing
+        if !user_config_path.exists() {
+            if let Some(asset) = assets::Assets::get(asset_name) {
+                if let Some(parent) = user_config_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let shell = util::shell::get_windows_system_shell();
+                let escaped = shell.replace('\\', "\\\\").replace('"', "\\\"");
+                let contents = std::str::from_utf8(&asset.data)
+                    .unwrap_or_default()
+                    .replace("\"$SHELL\"", &format!("\"{}\"", escaped));
+                let _ = std::fs::write(&user_config_path, contents.as_bytes());
+            }
+        }
+
+        let from_file = std::fs::read(&user_config_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok());
+
+        from_file.unwrap_or_else(|| {
+            assets::Assets::get(asset_name)
+                .and_then(|f| serde_json::from_slice(&f.data).ok())
+                .unwrap_or_default()
+        })
     }
 
     pub fn apply_keys(&self, cx: &mut App) {
@@ -137,6 +181,15 @@ impl SomConfig {
 
     pub fn load_nord_theme(&self, cx: &mut App) {
         if let Some(data) = assets::Assets::get("nord.json") {
+            let themes_dir = paths::themes_dir();
+            let nord_path = themes_dir.join("nord.json");
+            if !nord_path.exists() {
+                if let Err(e) = std::fs::create_dir_all(themes_dir) {
+                    log::warn!("Failed to create themes dir: {e}");
+                } else if let Err(e) = std::fs::write(&nord_path, &*data.data) {
+                    log::warn!("Failed to write nord.json to themes dir: {e}");
+                }
+            }
             let registry = theme::ThemeRegistry::global(cx);
             if let Err(e) = theme_settings::load_user_theme(&registry, &data.data) {
                 log::warn!("Failed to load Nord theme: {e}");
@@ -207,5 +260,85 @@ impl SomConfig {
         SettingsStore::update_global(cx, |store, cx| {
             let _ = store.set_user_settings(&json, cx);
         });
+    }
+
+    fn parse(content: &str) -> Result<Self, String> {
+        serde_json::from_str(content).map_err(|e| {
+            let line = e.line();
+            let col = e.column();
+            let source_line = content
+                .lines()
+                .nth(line.saturating_sub(1))
+                .unwrap_or("")
+                .trim();
+            format!(
+                "settings.json line {line}, column {col}: {e}\n  → {source_line}"
+            )
+        })
+    }
+
+    pub fn watch(fs: Arc<dyn Fs>, cx: &mut App) {
+        let settings_path = paths::config_dir().join("settings.json");
+        let (mut rx, _watcher) = settings::watch_config_file(
+            &cx.background_executor(),
+            fs,
+            settings_path,
+        );
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            let _watcher = _watcher;
+            while let Some(content) = rx.next().await {
+                match SomConfig::parse(&content) {
+                    Ok(config) => {
+                        cx.update(|cx| {
+                            config.apply_settings(cx);
+                            config.apply_keys(cx);
+                        });
+                    }
+                    Err(err) => {
+                        log::error!("settings.json parse error: {err}");
+                        cx.update(|cx| {
+                            Self::show_parse_error(err, cx);
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn show_parse_error(err: String, cx: &mut App) {
+        use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
+        let id = NotificationId::Named("som-settings-parse-error".into());
+
+        let show = move |ws: &mut workspace::Workspace, cx: &mut gpui::Context<workspace::Workspace>| {
+            let err2 = err.clone();
+            let msg = format!("Invalid settings.json\n{err2}");
+            ws.show_notification(id.clone(), cx, move |cx| {
+                let msg2 = msg.clone();
+                let msg3 = msg.clone();
+                cx.new(|cx| {
+                    MessageNotification::new(msg2, cx)
+                        .primary_message("Copy")
+                        .primary_on_click(move |_window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg3.clone()));
+                        })
+                        .show_suppress_button(false)
+                })
+            });
+        };
+
+        for window in cx.windows() {
+            if let Some(handle) = window.downcast::<workspace::MultiWorkspace>() {
+                handle.update(cx, |mw, _, cx| {
+                    mw.workspace().update(cx, |ws, cx| show(ws, cx));
+                }).ok();
+                return;
+            }
+        }
+
+        cx.observe_new(move |mw: &mut workspace::MultiWorkspace, _, cx| {
+            mw.workspace().update(cx, |ws, cx| show(ws, cx));
+        })
+        .detach();
     }
 }

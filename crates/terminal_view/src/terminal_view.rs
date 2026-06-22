@@ -209,6 +209,18 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_title(terminal, workspace, workspace_id, project, None, window, cx)
+    }
+
+    pub fn new_with_title(
+        terminal: Entity<Terminal>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: Option<WorkspaceId>,
+        project: WeakEntity<Project>,
+        tab_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let workspace_handle = workspace.clone();
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, window, cx);
@@ -266,8 +278,8 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
-            custom_title: None,
+            needs_serialize: tab_name.is_some(),
+            custom_title: tab_name,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
             _subscriptions: subscriptions,
@@ -1049,6 +1061,7 @@ impl Render for TerminalView {
             .id("terminal-view")
             .size_full()
             .relative()
+            .cursor_default()
             .track_focus(&self.focus_handle(cx))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
@@ -1085,6 +1098,7 @@ impl Render for TerminalView {
                 div()
                     .id("terminal-view-container")
                     .size_full()
+                    .cursor_default()
                     .bg(cx.theme().colors().editor_background)
                     .child(TerminalElement::new(
                         terminal_handle,
@@ -1527,18 +1541,15 @@ impl SerializableItem for TerminalView {
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {
-                    let mut view = TerminalView::new(
+                    TerminalView::new_with_title(
                         terminal,
                         workspace,
                         Some(workspace_id),
                         project.downgrade(),
+                        custom_title,
                         window,
                         cx,
-                    );
-                    if custom_title.is_some() {
-                        view.custom_title = custom_title;
-                    }
-                    view
+                    )
                 })
             })
         })

@@ -3026,6 +3026,7 @@ impl Pane {
             .flex_row()
             .h_full()
             .overflow_x_hidden()
+            .occlude()
             .children(tab_items)
             .into_any_element()
     }

@@ -3927,6 +3927,16 @@ impl Workspace {
         pane
     }
 
+    pub fn add_item_to_main_pane(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let main_pane = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
+        self.add_item(main_pane, item, None, true, true, window, cx);
+    }
+
     pub fn add_item_to_center(
         &mut self,
         item: Box<dyn ItemHandle>,
@@ -4826,8 +4836,13 @@ impl Workspace {
                 serialize_workspace = *focus_changed || pane != self.active_pane();
                 if pane == self.active_pane() {
                     self.active_item_path_changed(*focus_changed, window, cx);
-                            } else if *local {
+                } else if *local {
                     self.set_active_pane(pane, window, cx);
+                }
+                // When switching tabs in the main pane, collapse any split panes
+                let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
+                if is_main_pane && *local {
+                    self.som_unsplit_all(window, cx);
                 }
             }
             pane::Event::UserSavedItem { item, save_intent } => {
@@ -4998,6 +5013,18 @@ impl Workspace {
                 self.remove_pane(pane, None, window, cx);
             }
         }
+    }
+
+    pub fn som_unsplit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+        log::warn!("som_unsplit_all: {} split panes, total panes: {}", self.som_split_panes.len(), self.panes.len());
+        let to_remove: Vec<_> = self.som_split_panes.drain(..).collect();
+        for weak in to_remove {
+            if let Some(pane) = weak.upgrade() {
+                self.remove_pane(pane, None, window, cx);
+            }
+        }
+        log::warn!("som_unsplit_all done: total panes: {}", self.panes.len());
     }
 
     pub fn join_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {

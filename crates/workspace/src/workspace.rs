@@ -1210,6 +1210,8 @@ pub struct Workspace {
     som_parked_splits: std::collections::HashMap<usize, (Vec<Entity<Pane>>, Vec<f32>, Option<Entity<Pane>>)>,
     som_active_tab_index: usize,
     som_tab_active_pane: std::collections::HashMap<usize, WeakEntity<Pane>>,
+    som_tab_active_pane_index: std::collections::HashMap<usize, usize>,
+    som_tab_flexes: std::collections::HashMap<usize, Vec<f32>>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1484,6 +1486,8 @@ impl Workspace {
             som_parked_splits: std::collections::HashMap::new(),
             som_active_tab_index: 0,
             som_tab_active_pane: std::collections::HashMap::new(),
+            som_tab_active_pane_index: std::collections::HashMap::new(),
+            som_tab_flexes: std::collections::HashMap::new(),
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -1708,20 +1712,46 @@ impl Workspace {
                 .unwrap_or_default();
 
             // Load and restore som split layout for the active tab at startup
+            let gkvp = db::kvp::GlobalKeyValueStore::global();
             let som_splits: std::collections::HashMap<usize, usize> =
-                db::kvp::GlobalKeyValueStore::global()
-                    .read_kvp("som_tab_splits")
-                    .ok()
-                    .flatten()
+                gkvp.read_kvp("som_tab_splits").ok().flatten()
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
+            let som_active_tab: usize =
+                gkvp.read_kvp("som_active_tab").ok().flatten()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            let som_tab_pane_index: std::collections::HashMap<usize, usize> =
+                gkvp.read_kvp("som_tab_pane_index").ok().flatten()
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
+            let som_tab_flexes: std::collections::HashMap<usize, Vec<f32>> =
+                gkvp.read_kvp("som_tab_flexes").ok().flatten()
                     .and_then(|json| serde_json::from_str(&json).ok())
                     .unwrap_or_default();
             window.update(cx, |_, window, cx| {
                 workspace.update(cx, |ws, cx| {
                     ws.som_tab_splits = som_splits;
+                    ws.som_tab_active_pane_index = som_tab_pane_index;
+                    ws.som_tab_flexes = som_tab_flexes;
+                    ws.som_active_tab_index = som_active_tab;
+
+                    // Activate the saved tab if it differs from current
+                    if let Some(main_pane) = ws.panes.first().cloned() {
+                        let current_tab = main_pane.read(cx).active_item_index();
+                        if som_active_tab != current_tab {
+                            main_pane.update(cx, |pane, cx| {
+                                pane.activate_item(som_active_tab, true, true, window, cx);
+                            });
+                        }
+                    }
+
                     let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
                     let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
                     if count > 0 {
-                        ws.som_restore_splits(count, window, cx);
+                        let pane_index = ws.som_tab_active_pane_index.get(&tab_index).copied().unwrap_or(0);
+                        let flexes = ws.som_tab_flexes.get(&tab_index).cloned().unwrap_or_default();
+                        ws.som_restore_splits_with_focus_and_flexes(count, pane_index, flexes, window, cx);
                     }
                 })
             }).log_err();
@@ -4756,6 +4786,16 @@ impl Workspace {
         // Track which pane was last focused per tab (for split pane memory)
         let tab_index = self.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
         self.som_tab_active_pane.insert(tab_index, pane.downgrade());
+        // Compute pane index: 0=main, 1..=3=splits
+        let pane_index = if self.panes.first().map_or(false, |p| p == &pane) {
+            0usize
+        } else {
+            self.som_split_panes.iter().position(|w| w.upgrade().as_ref() == Some(&pane))
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        };
+        self.som_tab_active_pane_index.insert(tab_index, pane_index);
+        self.som_persist_tab_state(cx);
 
         // If this pane is in a dock, preserve that dock when dismissing zoomed items.
         // This prevents the dock from closing when focus events fire during window activation.
@@ -4886,6 +4926,7 @@ impl Workspace {
                     // We need to find the previous tab index. Use a helper field:
                     let prev_tab_index = self.som_active_tab_index;
                     self.som_active_tab_index = new_tab_index;
+                    self.som_persist_tab_state(cx);
 
                     // Park current split panes under prev_tab_index
                     self.som_split_panes.retain(|p| p.upgrade().is_some());
@@ -4905,7 +4946,10 @@ impl Workspace {
                                 }
                             }
                         }
+                        // Save flexes for the tab we're leaving
+                        self.som_tab_flexes.insert(prev_tab_index, saved_flexes.clone());
                         self.som_parked_splits.insert(prev_tab_index, (to_park_strong, saved_flexes, None));
+                        self.som_persist_tab_state(cx);
                         let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
                         self.set_active_pane(&main, window, cx);
                         cx.notify();
@@ -4913,7 +4957,7 @@ impl Workspace {
 
                     // Unpark split panes for new_tab_index
                     let needed = self.som_tab_splits.get(&new_tab_index).copied().unwrap_or(0);
-                    if let Some((parked, saved_flexes, saved_active)) = self.som_parked_splits.remove(&new_tab_index) {
+                    if let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&new_tab_index) {
                         let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
                         let mut prev: Option<Entity<Pane>> = None;
                         for (i, p) in parked.iter().enumerate() {
@@ -4924,7 +4968,10 @@ impl Workspace {
                             prev = Some(p.clone());
                         }
                         som_apply_flexes(&self.center.root, &saved_flexes);
+                        // Update flexes map for new tab and persist all tabs
+                        self.som_tab_flexes.insert(new_tab_index, saved_flexes);
                         self.som_split_panes = parked.iter().map(|p| p.downgrade()).collect();
+                        self.som_persist_tab_state(cx);
                         // Restore last-focused pane for this tab (may be a split pane)
                         let weak_active = self.som_tab_active_pane.get(&new_tab_index).cloned();
                         cx.notify();
@@ -4939,7 +4986,9 @@ impl Workspace {
                             }).detach();
                         }
                     } else if needed > 0 {
-                        self.som_restore_splits(needed, window, cx);
+                        let flexes = self.som_tab_flexes.get(&new_tab_index).cloned().unwrap_or_default();
+                        let pane_index = self.som_tab_active_pane_index.get(&new_tab_index).copied().unwrap_or(0);
+                        self.som_restore_splits_then(needed, flexes, pane_index, window, cx);
                     }
                 }
             }
@@ -5144,11 +5193,41 @@ impl Workspace {
         }
     }
 
-    fn som_persist_tab_splits(&self, cx: &mut Context<Self>) {
-        let json = serde_json::to_string(&self.som_tab_splits).unwrap_or_default();
+    fn som_persist_tab_splits(&mut self, cx: &mut Context<Self>) {
+        self.som_persist_tab_state(cx);
+    }
+
+    fn som_snapshot_active_tab_flexes(&mut self) {
+        // Snapshot active tab's flexes from live layout tree — only if non-default
+        if !self.som_split_panes.is_empty() {
+            if let Some(flexes) = som_try_collect_flexes(&self.center.root) {
+                let is_default = flexes.iter().all(|&f| (f - 1.0).abs() < 0.001);
+                if !is_default {
+                    self.som_tab_flexes.insert(self.som_active_tab_index, flexes);
+                }
+            }
+        }
+        // Sync flexes from all parked tabs
+        for (tab_idx, (_, parked_flexes, _)) in &self.som_parked_splits {
+            self.som_tab_flexes.insert(*tab_idx, parked_flexes.clone());
+        }
+    }
+
+    fn som_persist_tab_state(&mut self, cx: &mut Context<Self>) {
+        // Only sync parked tabs — active tab flexes are snapshotted explicitly at parking/close
+        for (tab_idx, (_, parked_flexes, _)) in &self.som_parked_splits {
+            self.som_tab_flexes.insert(*tab_idx, parked_flexes.clone());
+        }
+        let splits_json = serde_json::to_string(&self.som_tab_splits).unwrap_or_default();
+        let active_tab = self.som_active_tab_index;
+        let pane_index_json = serde_json::to_string(&self.som_tab_active_pane_index).unwrap_or_default();
+        let flexes_json = serde_json::to_string(&self.som_tab_flexes).unwrap_or_default();
         cx.background_spawn(async move {
             let kvp = db::kvp::GlobalKeyValueStore::global();
-            kvp.write_kvp("som_tab_splits".into(), json).await.log_err();
+            kvp.write_kvp("som_tab_splits".into(), splits_json).await.log_err();
+            kvp.write_kvp("som_active_tab".into(), active_tab.to_string()).await.log_err();
+            kvp.write_kvp("som_tab_pane_index".into(), pane_index_json).await.log_err();
+            kvp.write_kvp("som_tab_flexes".into(), flexes_json).await.log_err();
         }).detach();
     }
 
@@ -5187,6 +5266,93 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    fn som_restore_splits_with_focus_and_flexes(&mut self, count: usize, pane_index: usize, flexes: Vec<f32>, window: &mut Window, cx: &mut Context<Self>) {
+        if count == 0 {
+            return;
+        }
+        self.som_restore_splits_then(count, flexes, pane_index, window, cx);
+    }
+
+    fn som_restore_splits_then(&mut self, remaining: usize, flexes: Vec<f32>, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if remaining == 0 || self.som_split_in_progress {
+            if remaining == 0 {
+                // All splits created — apply flexes and focus now
+                if !flexes.is_empty() {
+                    som_apply_flexes(&self.center.root, &flexes);
+                }
+                let target = if pane_index == 0 {
+                    self.panes.first().cloned()
+                } else {
+                    self.som_split_panes.get(pane_index - 1).and_then(|w| w.upgrade())
+                };
+                if let Some(p) = target {
+                    self.set_active_pane(&p, window, cx);
+                    p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                }
+                cx.notify();
+            }
+            return;
+        }
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+        let level = self.som_split_panes.len();
+        if level >= 3 {
+            return;
+        }
+        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
+        let direction = directions[level];
+        let pane_to_split = if level == 0 {
+            self.active_pane.clone()
+        } else {
+            match self.som_split_panes[level - 1].upgrade() {
+                Some(p) => p,
+                None => return,
+            }
+        };
+        let main_pane = self.panes.first().cloned();
+        let main_tab_index = main_pane.as_ref().map(|p| p.read(cx).active_item_index());
+        self.som_split_in_progress = true;
+        let task = self.split_and_clone(pane_to_split, direction, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(new_pane) = task.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.som_split_panes.push(new_pane.downgrade());
+                    this.som_split_in_progress = false;
+                    this.som_restore_splits_then(remaining - 1, flexes, pane_index, window, cx);
+                }).ok();
+            } else {
+                this.update(cx, |this, _| {
+                    this.som_split_in_progress = false;
+                }).ok();
+            }
+        }).detach();
+    }
+
+    fn som_restore_splits_with_focus(&mut self, count: usize, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if count == 0 {
+            return;
+        }
+        self.som_restore_splits(count, window, cx);
+        if pane_index == 0 {
+            return;
+        }
+        // After splits are created (async), focus the right pane
+        cx.spawn_in(window, async move |this, cx| {
+            // Wait a tick for splits to finish creating
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            this.update_in(cx, |ws, window, cx| {
+                let target = if pane_index == 0 {
+                    ws.panes.first().cloned()
+                } else {
+                    ws.som_split_panes.get(pane_index - 1).and_then(|w| w.upgrade())
+                };
+                if let Some(p) = target {
+                    ws.set_active_pane(&p, window, cx);
+                    p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                }
+            }).log_err();
+        }).detach();
     }
 
     pub fn som_unsplit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5602,6 +5768,8 @@ impl Workspace {
                         .timer(SERIALIZATION_THROTTLE_TIME)
                         .await;
                     this.update_in(cx, |this, window, cx| {
+                        this.som_snapshot_active_tab_flexes();
+                        this.som_persist_tab_state(cx);
                         this._serialize_workspace_task =
                             Some(this.serialize_workspace_internal(window, cx));
                         this._schedule_serialize_workspace.take();
@@ -7843,20 +8011,45 @@ pub fn open_workspace_by_id(
             .await?;
 
         // Load and restore som split layout for the active tab at startup
-        let som_splits: std::collections::HashMap<usize, usize> =
-            db::kvp::GlobalKeyValueStore::global()
-                .read_kvp("som_tab_splits")
-                .ok()
-                .flatten()
+        let kvp2 = db::kvp::GlobalKeyValueStore::global();
+        let som_splits2: std::collections::HashMap<usize, usize> =
+            kvp2.read_kvp("som_tab_splits").ok().flatten()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+        let som_active_tab2: usize =
+            kvp2.read_kvp("som_active_tab").ok().flatten()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        let som_tab_pane_index2: std::collections::HashMap<usize, usize> =
+            kvp2.read_kvp("som_tab_pane_index").ok().flatten()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+        let som_tab_flexes2: std::collections::HashMap<usize, Vec<f32>> =
+            kvp2.read_kvp("som_tab_flexes").ok().flatten()
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default();
         window.update(cx, |_, window, cx| {
             workspace.update(cx, |ws, cx| {
-                ws.som_tab_splits = som_splits;
+                ws.som_tab_splits = som_splits2;
+                ws.som_tab_active_pane_index = som_tab_pane_index2;
+                ws.som_tab_flexes = som_tab_flexes2;
+                ws.som_active_tab_index = som_active_tab2;
+
+                if let Some(main_pane) = ws.panes.first().cloned() {
+                    let current_tab = main_pane.read(cx).active_item_index();
+                    if som_active_tab2 != current_tab {
+                        main_pane.update(cx, |pane, cx| {
+                            pane.activate_item(som_active_tab2, true, true, window, cx);
+                        });
+                    }
+                }
+
                 let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
                 let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
                 if count > 0 {
-                    ws.som_restore_splits(count, window, cx);
+                    let pane_index = ws.som_tab_active_pane_index.get(&tab_index).copied().unwrap_or(0);
+                    let flexes = ws.som_tab_flexes.get(&tab_index).cloned().unwrap_or_default();
+                    ws.som_restore_splits_with_focus_and_flexes(count, pane_index, flexes, window, cx);
                 }
             })
         }).log_err();
@@ -8054,6 +8247,26 @@ fn som_collect_flexes_inner(member: &Member, out: &mut Vec<f32>) {
     }
 }
 
+fn som_try_collect_flexes(member: &Member) -> Option<Vec<f32>> {
+    let mut result = Vec::new();
+    som_try_collect_flexes_inner(member, &mut result)?;
+    Some(result)
+}
+
+fn som_try_collect_flexes_inner(member: &Member, out: &mut Vec<f32>) -> Option<()> {
+    match member {
+        Member::Pane(_) => {}
+        Member::Axis(axis) => {
+            let flexes = axis.flexes.try_lock()?.clone();
+            out.extend_from_slice(&flexes);
+            for child in &axis.members {
+                som_try_collect_flexes_inner(child, out)?;
+            }
+        }
+    }
+    Some(())
+}
+
 fn som_apply_flexes(member: &Member, flexes: &[f32]) {
     let mut offset = 0usize;
     som_apply_flexes_inner(member, flexes, &mut offset);
@@ -8069,7 +8282,6 @@ fn som_apply_flexes_inner(member: &Member, flexes: &[f32], offset: &mut usize) {
                 let slice = &flexes[*offset..end];
                 let sum: f32 = slice.iter().sum();
                 let expected = len as f32;
-                // Only apply if the flex count matches and sum is close to expected
                 if slice.len() == len && (sum - expected).abs() < 0.01 {
                     *axis.flexes.lock() = slice.to_vec();
                 }

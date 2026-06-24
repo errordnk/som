@@ -62,7 +62,16 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, cx)
+        self.create_terminal_shell_internal(cwd, None, cx)
+    }
+
+    pub fn create_terminal_with_shell(
+        &mut self,
+        cwd: Option<PathBuf>,
+        shell_cmd: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, Some(shell_cmd), cx)
     }
 
     pub fn create_local_terminal(
@@ -70,12 +79,13 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let working_directory = self.active_project_directory(cx).map(|p| p.to_path_buf());
-        self.create_terminal_shell_internal(working_directory, cx)
+        self.create_terminal_shell_internal(working_directory, None, cx)
     }
 
     fn create_terminal_shell_internal(
         &mut self,
         cwd: Option<PathBuf>,
+        shell_override: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -102,12 +112,25 @@ impl Project {
 
             let activation_script: Vec<String> = Vec::new();
 
+            let shell = if let Some(cmd) = shell_override {
+                let mut parts = cmd.split_whitespace();
+                let program = parts.next().unwrap_or("").to_string();
+                let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+                if args.is_empty() {
+                    Shell::Program(program)
+                } else {
+                    Shell::WithArguments { program, args, title_override: None }
+                }
+            } else {
+                settings.shell
+            };
+
             let builder = project
                 .update(cx, move |_, cx| {
                     anyhow::Ok(TerminalBuilder::new(
                         path.map(|path| path.to_path_buf()),
                         None,
-                        settings.shell,
+                        shell,
                         env,
                         settings.cursor_shape,
                         settings.alternate_scroll,

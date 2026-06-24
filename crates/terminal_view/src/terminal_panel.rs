@@ -545,12 +545,21 @@ impl TerminalPanel {
             .and_then(|p| p.0.first().map(|(name, _)| name.clone()));
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
+        // Resolve shell from action or from TabProfiles by name
+        let shell_override = action.shell.clone().or_else(|| {
+            let wanted = tab_name.as_deref()?;
+            cx.try_global::<TabProfiles>()
+                .and_then(|p| p.0.iter().find(|(name, _)| name == wanted).and_then(|(_, sh)| sh.clone()))
+        });
+
         if center_pane_has_focus && active_center_item_is_terminal {
             let working_directory = default_working_directory(workspace, cx);
             let local = action.local;
             Self::add_center_terminal_named(workspace, tab_name, window, cx, move |project, cx| {
                 if local {
                     project.create_local_terminal(cx)
+                } else if let Some(cmd) = shell_override {
+                    project.create_terminal_with_shell(working_directory, cmd, cx)
                 } else {
                     project.create_terminal_shell(working_directory, cx)
                 }
@@ -571,14 +580,16 @@ impl TerminalPanel {
                         true,
                         tab_name,
                         None,
+                        shell_override,
                         RevealStrategy::Always,
                         window,
                         cx,
                     )
                 } else {
-                    this.add_terminal_shell_named(
+                    this.add_terminal_shell_named_with_shell(
                         tab_name,
                         default_working_directory(workspace, cx),
+                        shell_override,
                         RevealStrategy::Always,
                         window,
                         cx,
@@ -657,7 +668,19 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_with_name(tab_name, cwd, reveal_strategy, window, cx)
+        self.add_terminal_shell_internal(false, tab_name, cwd, None, reveal_strategy, window, cx)
+    }
+
+    fn add_terminal_shell_named_with_shell(
+        &mut self,
+        tab_name: Option<String>,
+        cwd: Option<PathBuf>,
+        shell_override: Option<String>,
+        reveal_strategy: RevealStrategy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.add_terminal_shell_internal(false, tab_name, cwd, shell_override, reveal_strategy, window, cx)
     }
 
     fn add_local_terminal_shell(
@@ -666,7 +689,7 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(true, None, None, reveal_strategy, window, cx)
+        self.add_terminal_shell_internal(true, None, None, None, reveal_strategy, window, cx)
     }
 
     fn add_terminal_shell_with_name(
@@ -677,7 +700,7 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(false, tab_name, cwd, reveal_strategy, window, cx)
+        self.add_terminal_shell_internal(false, tab_name, cwd, None, reveal_strategy, window, cx)
     }
 
     fn add_terminal_shell_internal(
@@ -685,6 +708,7 @@ impl TerminalPanel {
         force_local: bool,
         tab_name: Option<String>,
         cwd: Option<PathBuf>,
+        shell_override: Option<String>,
         reveal_strategy: RevealStrategy,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -703,6 +727,10 @@ impl TerminalPanel {
             let terminal = if force_local {
                 project
                     .update(cx, |project, cx| project.create_local_terminal(cx))
+                    .await
+            } else if let Some(cmd) = shell_override {
+                project
+                    .update(cx, |project, cx| project.create_terminal_with_shell(cwd, cmd, cx))
                     .await
             } else {
                 project

@@ -429,6 +429,9 @@ pub struct NewTerminal {
     /// Optional tab name to set as the custom title.
     #[serde(default)]
     pub tab_name: Option<String>,
+    /// Optional shell command override (e.g. "wsl --cd ~").
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 /// Global list of tab profiles loaded from som config (name, shell).

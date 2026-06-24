@@ -191,9 +191,16 @@ impl SomConfig {
                 if idx >= 1 && idx <= 9 {
                     if let Some(tab) = self.tabs.get(idx - 1) {
                         let name = tab.name.replace('"', "\\\"");
-                        entries.push(format!(
-                            "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\" }}] }} }}"
-                        ));
+                        if let Some(shell) = &tab.shell {
+                            let shell_escaped = shell.replace('\\', "\\\\").replace('"', "\\\"");
+                            entries.push(format!(
+                                "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\", \"shell\": \"{shell_escaped}\" }}] }} }}"
+                            ));
+                        } else {
+                            entries.push(format!(
+                                "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\" }}] }} }}"
+                            ));
+                        }
                         continue;
                     }
                 }

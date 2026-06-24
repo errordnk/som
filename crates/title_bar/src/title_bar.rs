@@ -446,6 +446,7 @@ impl TitleBar {
                             window.dispatch_action(Box::new(workspace::NewTerminal {
                                 local: false,
                                 tab_name: Some(tab_name.clone()),
+                                shell: None,
                             }), cx);
                         })),
                 )
@@ -500,6 +501,7 @@ impl TitleBar {
                                                     Box::new(workspace::NewTerminal {
                                                         local: false,
                                                         tab_name: Some(name_for_action.clone()),
+                                                        shell: None,
                                                     }),
                                                     cx,
                                                 );

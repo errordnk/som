@@ -5044,6 +5044,19 @@ impl Workspace {
                 cx.emit(Event::ItemRemoved {
                     item_id: item.item_id(),
                 });
+                // When a tab is closed in the main pane, clean up split/flex/pane state
+                // for that tab index to prevent the next tab at the same index inheriting splits.
+                let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
+                if is_main_pane {
+                    let new_count = pane.read(cx).items_len();
+                    // Remove state for any index >= new_count (tabs that no longer exist)
+                    self.som_tab_splits.retain(|&k, _| k < new_count);
+                    self.som_parked_splits.retain(|&k, _| k < new_count);
+                    self.som_tab_flexes.retain(|&k, _| k < new_count);
+                    self.som_tab_active_pane.retain(|&k, _| k < new_count);
+                    self.som_tab_active_pane_index.retain(|&k, _| k < new_count);
+                    self.som_persist_tab_state(cx);
+                }
             }
             pane::Event::Focus => {
                 window.invalidate_character_coordinates();

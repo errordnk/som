@@ -65,6 +65,10 @@
     "ctrl-f4": "CloseTab",
     "ctrl-\\": "SplitTab",
     "ctrl-shift-\\": "UnSplitTab",
+    "ctrl-left": "PrevPane",
+    "ctrl-right": "NextPane",
+    "ctrl-shift-left": "PrevTab",
+    "ctrl-shift-right": "NextTab",
     "alt-f4": "Quit"
   }
 }

@@ -455,6 +455,30 @@ pub struct SomSplitPane;
 #[serde(deny_unknown_fields)]
 pub struct SomUnsplitPane;
 
+/// Activates the next split pane (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomActivateNextPane;
+
+/// Activates the previous split pane (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomActivatePrevPane;
+
+/// Activates the next tab (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomActivateNextTab;
+
+/// Activates the previous tab (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomActivatePrevTab;
+
 /// Increases size of a currently focused dock by a given amount of pixels.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -5193,6 +5217,66 @@ impl Workspace {
         }
     }
 
+    pub fn som_activate_next_pane(&mut self, _: &SomActivateNextPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+        let all_panes: Vec<Entity<Pane>> = std::iter::once(self.panes.first().cloned())
+            .flatten()
+            .chain(self.som_split_panes.iter().filter_map(|w| w.upgrade()))
+            .collect();
+        if all_panes.len() < 2 {
+            return;
+        }
+        let current = &self.active_pane;
+        let idx = all_panes.iter().position(|p| p == current).unwrap_or(0);
+        let next = &all_panes[(idx + 1) % all_panes.len()];
+        self.set_active_pane(next, window, cx);
+        next.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+    }
+
+    pub fn som_activate_prev_pane(&mut self, _: &SomActivatePrevPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+        let all_panes: Vec<Entity<Pane>> = std::iter::once(self.panes.first().cloned())
+            .flatten()
+            .chain(self.som_split_panes.iter().filter_map(|w| w.upgrade()))
+            .collect();
+        if all_panes.len() < 2 {
+            return;
+        }
+        let current = &self.active_pane;
+        let idx = all_panes.iter().position(|p| p == current).unwrap_or(0);
+        let prev = &all_panes[(idx + all_panes.len() - 1) % all_panes.len()];
+        self.set_active_pane(prev, window, cx);
+        prev.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+    }
+
+    pub fn som_activate_next_tab(&mut self, _: &SomActivateNextTab, window: &mut Window, cx: &mut Context<Self>) {
+        let main_pane = match self.panes.first() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let count = main_pane.read(cx).items_len();
+        if count < 2 {
+            return;
+        }
+        let current = main_pane.read(cx).active_item_index();
+        let next = (current + 1) % count;
+        main_pane.update(cx, |pane, cx| pane.activate_item(next, true, true, window, cx));
+    }
+
+    pub fn som_activate_prev_tab(&mut self, _: &SomActivatePrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        let main_pane = match self.panes.first() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let count = main_pane.read(cx).items_len();
+        if count < 2 {
+            return;
+        }
+        let current = main_pane.read(cx).active_item_index();
+        let prev = (current + count - 1) % count;
+        main_pane.update(cx, |pane, cx| pane.activate_item(prev, true, true, window, cx));
+    }
+
     fn som_persist_tab_splits(&mut self, cx: &mut Context<Self>) {
         self.som_persist_tab_state(cx);
     }
@@ -6479,6 +6563,10 @@ impl Workspace {
             }))
             .on_action(cx.listener(Workspace::som_split_pane))
             .on_action(cx.listener(Workspace::som_unsplit_pane))
+            .on_action(cx.listener(Workspace::som_activate_next_pane))
+            .on_action(cx.listener(Workspace::som_activate_prev_pane))
+            .on_action(cx.listener(Workspace::som_activate_next_tab))
+            .on_action(cx.listener(Workspace::som_activate_prev_tab))
             .on_action(cx.listener(Workspace::cancel))
     }
 

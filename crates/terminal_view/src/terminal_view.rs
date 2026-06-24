@@ -50,6 +50,7 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     DraggedSelection, NewCenterTerminal, Pane,
+    SomActivateNextPane, SomActivatePrevPane, SomActivateNextTab, SomActivatePrevTab,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
@@ -1000,6 +1001,21 @@ impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
+
+        let ks = &event.keystroke;
+        if ks.modifiers.control && !ks.modifiers.alt {
+            if ks.key == "left" || ks.key == "right" {
+                let is_right = ks.key == "right";
+                let action: Box<dyn gpui::Action> = if ks.modifiers.shift {
+                    if is_right { Box::new(SomActivateNextTab) } else { Box::new(SomActivatePrevTab) }
+                } else {
+                    if is_right { Box::new(SomActivateNextPane) } else { Box::new(SomActivatePrevPane) }
+                };
+                window.dispatch_action(action, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
 
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();

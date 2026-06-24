@@ -1207,6 +1207,9 @@ pub struct Workspace {
     som_split_panes: Vec<WeakEntity<Pane>>,
     som_split_in_progress: bool,
     som_tab_splits: std::collections::HashMap<usize, usize>,
+    som_parked_splits: std::collections::HashMap<usize, (Vec<Entity<Pane>>, Vec<f32>, Option<Entity<Pane>>)>,
+    som_active_tab_index: usize,
+    som_tab_active_pane: std::collections::HashMap<usize, WeakEntity<Pane>>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1478,6 +1481,9 @@ impl Workspace {
             som_split_panes: Vec::new(),
             som_split_in_progress: false,
             som_tab_splits: std::collections::HashMap::new(),
+            som_parked_splits: std::collections::HashMap::new(),
+            som_active_tab_index: 0,
+            som_tab_active_pane: std::collections::HashMap::new(),
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4747,6 +4753,10 @@ impl Workspace {
             self.last_active_center_pane = Some(pane.downgrade());
         }
 
+        // Track which pane was last focused per tab (for split pane memory)
+        let tab_index = self.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
+        self.som_tab_active_pane.insert(tab_index, pane.downgrade());
+
         // If this pane is in a dock, preserve that dock when dismissing zoomed items.
         // This prevents the dock from closing when focus events fire during window activation.
         // We also preserve any dock whose active panel itself has focus — this covers
@@ -4862,23 +4872,74 @@ impl Workspace {
                 } else if *local {
                     self.set_active_pane(pane, window, cx);
                 }
-                // When switching tabs in the main pane: adjust split count only
+                // When switching tabs in the main pane: park/unpark split panes per tab
                 let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
                 if is_main_pane && *local {
-                    let tab_index = pane.read(cx).active_item_index();
-                    let needed = self.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
-                    self.som_split_panes.retain(|p| p.upgrade().is_some());
-                    let current = self.som_split_panes.len();
+                    let new_tab_index = pane.read(cx).active_item_index();
 
-                    if needed < current {
-                        let to_remove: Vec<_> = self.som_split_panes.drain(needed..).collect();
-                        for weak in to_remove {
+                    // Find old tab index (the one we're leaving) — it's the previous active item
+                    // We track it via som_split_panes ownership: current splits belong to prev tab.
+                    // Get old tab index by finding which tab was active before this event.
+                    // We don't have prev index directly, so we park all current splits under
+                    // their tab index, which we stored when they were created.
+                    // Actually: park current splits under the PREVIOUS tab.
+                    // We need to find the previous tab index. Use a helper field:
+                    let prev_tab_index = self.som_active_tab_index;
+                    self.som_active_tab_index = new_tab_index;
+
+                    // Park current split panes under prev_tab_index
+                    self.som_split_panes.retain(|p| p.upgrade().is_some());
+                    if !self.som_split_panes.is_empty() {
+                        // Snapshot flexes from the layout tree before removing panes
+                        let saved_flexes = som_collect_flexes(&self.center.root);
+                        let to_park_strong: Vec<Entity<Pane>> = self.som_split_panes.iter()
+                            .filter_map(|w| w.upgrade())
+                            .collect();
+                        let to_park_weak: Vec<WeakEntity<Pane>> = self.som_split_panes.drain(..).collect();
+                        for weak in &to_park_weak {
                             if let Some(p) = weak.upgrade() {
-                                self.remove_pane(p, None, window, cx);
+                                self.panes.retain(|x| x != &p);
+                                self.center.remove(&p, cx).log_err();
+                                if self.last_active_center_pane == Some(p.downgrade()) {
+                                    self.last_active_center_pane = None;
+                                }
                             }
                         }
-                    } else if needed > current {
-                        self.som_restore_splits(needed - current, window, cx);
+                        self.som_parked_splits.insert(prev_tab_index, (to_park_strong, saved_flexes, None));
+                        let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
+                        self.set_active_pane(&main, window, cx);
+                        cx.notify();
+                    }
+
+                    // Unpark split panes for new_tab_index
+                    let needed = self.som_tab_splits.get(&new_tab_index).copied().unwrap_or(0);
+                    if let Some((parked, saved_flexes, saved_active)) = self.som_parked_splits.remove(&new_tab_index) {
+                        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
+                        let mut prev: Option<Entity<Pane>> = None;
+                        for (i, p) in parked.iter().enumerate() {
+                            let split_from = prev.as_ref().unwrap_or_else(|| self.panes.first().unwrap());
+                            let dir = directions[i.min(2)];
+                            self.center.split(split_from, p, dir, cx);
+                            self.panes.push(p.clone());
+                            prev = Some(p.clone());
+                        }
+                        som_apply_flexes(&self.center.root, &saved_flexes);
+                        self.som_split_panes = parked.iter().map(|p| p.downgrade()).collect();
+                        // Restore last-focused pane for this tab (may be a split pane)
+                        let weak_active = self.som_tab_active_pane.get(&new_tab_index).cloned();
+                        cx.notify();
+                        if let Some(weak_active) = weak_active {
+                            cx.spawn_in(window, async move |this, cx| {
+                                this.update_in(cx, |ws, window, cx| {
+                                    if let Some(p) = weak_active.upgrade() {
+                                        ws.set_active_pane(&p, window, cx);
+                                        p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                                    }
+                                }).log_err();
+                            }).detach();
+                        }
+                    } else if needed > 0 {
+                        self.som_restore_splits(needed, window, cx);
                     }
                 }
             }
@@ -7972,6 +8033,53 @@ pub fn open_paths(
 
         result
     })
+}
+
+fn som_collect_flexes(member: &Member) -> Vec<f32> {
+    let mut result = Vec::new();
+    som_collect_flexes_inner(member, &mut result);
+    result
+}
+
+fn som_collect_flexes_inner(member: &Member, out: &mut Vec<f32>) {
+    match member {
+        Member::Pane(_) => {}
+        Member::Axis(axis) => {
+            let flexes = axis.flexes.lock().clone();
+            out.extend_from_slice(&flexes);
+            for child in &axis.members {
+                som_collect_flexes_inner(child, out);
+            }
+        }
+    }
+}
+
+fn som_apply_flexes(member: &Member, flexes: &[f32]) {
+    let mut offset = 0usize;
+    som_apply_flexes_inner(member, flexes, &mut offset);
+}
+
+fn som_apply_flexes_inner(member: &Member, flexes: &[f32], offset: &mut usize) {
+    match member {
+        Member::Pane(_) => {}
+        Member::Axis(axis) => {
+            let len = axis.members.len();
+            let end = (*offset + len).min(flexes.len());
+            if end > *offset {
+                let slice = &flexes[*offset..end];
+                let sum: f32 = slice.iter().sum();
+                let expected = len as f32;
+                // Only apply if the flex count matches and sum is close to expected
+                if slice.len() == len && (sum - expected).abs() < 0.01 {
+                    *axis.flexes.lock() = slice.to_vec();
+                }
+            }
+            *offset += len;
+            for child in &axis.members {
+                som_apply_flexes_inner(child, flexes, offset);
+            }
+        }
+    }
 }
 
 pub fn open_new(

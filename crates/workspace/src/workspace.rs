@@ -5315,43 +5315,6 @@ impl Workspace {
         }).detach();
     }
 
-    fn som_restore_splits(&mut self, remaining: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if remaining == 0 || self.som_split_in_progress {
-            return;
-        }
-        self.som_split_panes.retain(|p| p.upgrade().is_some());
-        let level = self.som_split_panes.len();
-        if level >= 3 {
-            return;
-        }
-        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
-        let direction = directions[level];
-        let pane_to_split = if level == 0 {
-            self.active_pane.clone()
-        } else {
-            match self.som_split_panes[level - 1].upgrade() {
-                Some(p) => p,
-                None => return,
-            }
-        };
-        self.som_split_in_progress = true;
-        let task = self.split_and_clone(pane_to_split, direction, window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if let Some(new_pane) = task.await {
-                this.update_in(cx, |this, window, cx| {
-                    this.som_split_panes.push(new_pane.downgrade());
-                    this.som_split_in_progress = false;
-                    this.som_restore_splits(remaining - 1, window, cx);
-                }).ok();
-            } else {
-                this.update(cx, |this, _| {
-                    this.som_split_in_progress = false;
-                }).ok();
-            }
-        })
-        .detach();
-    }
-
     fn som_restore_splits_with_focus_and_flexes(&mut self, count: usize, pane_index: usize, flexes: Vec<f32>, window: &mut Window, cx: &mut Context<Self>) {
         if count == 0 {
             return;
@@ -5394,8 +5357,6 @@ impl Workspace {
                 None => return,
             }
         };
-        let main_pane = self.panes.first().cloned();
-        let main_tab_index = main_pane.as_ref().map(|p| p.read(cx).active_item_index());
         self.som_split_in_progress = true;
         let task = self.split_and_clone(pane_to_split, direction, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -5410,32 +5371,6 @@ impl Workspace {
                     this.som_split_in_progress = false;
                 }).ok();
             }
-        }).detach();
-    }
-
-    fn som_restore_splits_with_focus(&mut self, count: usize, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if count == 0 {
-            return;
-        }
-        self.som_restore_splits(count, window, cx);
-        if pane_index == 0 {
-            return;
-        }
-        // After splits are created (async), focus the right pane
-        cx.spawn_in(window, async move |this, cx| {
-            // Wait a tick for splits to finish creating
-            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
-            this.update_in(cx, |ws, window, cx| {
-                let target = if pane_index == 0 {
-                    ws.panes.first().cloned()
-                } else {
-                    ws.som_split_panes.get(pane_index - 1).and_then(|w| w.upgrade())
-                };
-                if let Some(p) = target {
-                    ws.set_active_pane(&p, window, cx);
-                    p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
-                }
-            }).log_err();
         }).detach();
     }
 

@@ -1433,13 +1433,7 @@ impl Pane {
         }
     }
 
-    fn update_active_tab(&mut self, index: usize) {
-        if !self.is_tab_pinned(index) {
-            self.suppress_scroll = false;
-            self.tab_bar_scroll_handle
-                .scroll_to_item(index - self.pinned_tab_count);
-        }
-    }
+    fn update_active_tab(&mut self, _index: usize) {}
 
     fn update_history(&mut self, index: usize) {
         if let Some(newly_active_item) = self.items.get(index) {
@@ -2674,6 +2668,7 @@ impl Pane {
         item: &dyn ItemHandle,
         detail: usize,
         focus_handle: &FocusHandle,
+        force_focused: bool,
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> ui::Tab {
@@ -2688,7 +2683,7 @@ impl Pane {
                 detail: Some(detail),
                 selected: is_active,
                 preview: is_preview,
-                deemphasized: !self.has_focus(window, cx),
+                deemphasized: !force_focused && !self.has_focus(window, cx),
             },
             window,
             cx,
@@ -2726,11 +2721,11 @@ impl Pane {
             })
             .toggle_state(is_active)
             .on_click(cx.listener({
-                let item_handle = item.boxed_clone();
                 move |pane: &mut Self, event: &ClickEvent, window, cx| {
                     if event.modifiers().control && ix == pane.active_item_index {
                         let shift = event.modifiers().shift;
-                        if let Some(workspace) = pane.workspace.upgrade() {
+                        let ws = pane.workspace.upgrade();
+                        if let Some(workspace) = ws {
                             window.defer(cx, move |window, cx| {
                                 workspace.update(cx, |ws, cx| {
                                     if shift {
@@ -2950,7 +2945,7 @@ impl Pane {
             .enumerate()
             .zip(tab_details(&self.items, window, cx))
             .map(|((ix, item), detail)| {
-                self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
+                self.render_tab(ix, &**item, detail, &focus_handle, false, window, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -3002,20 +2997,19 @@ impl Pane {
         cx: &mut Context<Pane>,
     ) -> Vec<AnyElement> {
         let focus_handle = self.focus_handle.clone();
-        let tabs: Vec<AnyElement> = self.items
+        self.items
             .iter()
             .enumerate()
             .zip(tab_details(&self.items, window, cx))
             .map(|((ix, item), detail)| {
-                let mut tab = self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
+                let mut tab = self.render_tab(ix, &**item, detail, &focus_handle, true, window, cx)
                     .height(titlebar_height);
                 if ix == 0 {
                     tab = tab.no_left_padding();
                 }
                 tab.into_any_element()
             })
-            .collect();
-        tabs
+            .collect()
     }
 
     fn configure_tab_bar_start(

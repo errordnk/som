@@ -900,6 +900,19 @@ impl Domain for WorkspaceDb {
             ALTER TABLE workspaces ADD COLUMN identity_paths TEXT;
             ALTER TABLE workspaces ADD COLUMN identity_paths_order TEXT;
         ),
+        sql!(
+            CREATE TABLE som_tab_splits (
+                workspace_id INTEGER NOT NULL,
+                tab_index INTEGER NOT NULL,
+                split_count INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, tab_index),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            ) STRICT;
+        ),
+        // som_tab_splits moved to kvp store (no workspace_id dependency)
+        sql!(DROP TABLE IF EXISTS som_tab_splits;),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1818,6 +1831,7 @@ VALUES {placeholders};"#
             DELETE FROM trusted_worktrees
         }
     }
+
 }
 
 #[derive(Clone, Debug, PartialEq)]

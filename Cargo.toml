@@ -101,7 +101,7 @@ menu = { path = "crates/menu" }
 migrator = { path = "crates/migrator" }
 net = { path = "crates/net" }
 paths = { path = "crates/paths" }
-perf = { path = "tooling/perf" }
+perf = { path = "crates/perf" }
 platform_title_bar = { path = "crates/platform_title_bar" }
 project = { path = "crates/project" }
 refineable = { path = "crates/refineable" }

@@ -17,7 +17,7 @@ use crate::application_menu::{
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, Focusable,
     InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Subscription, WeakEntity, Window, actions, div,
+    Styled, Subscription, WeakEntity, Window, actions, canvas, div,
 };
 use ui::PopoverMenuHandle;
 use project::{
@@ -92,13 +92,16 @@ pub use workspace::TabProfiles;
 struct TitlebarTabStrip {
     pane: gpui::Entity<workspace::Pane>,
     titlebar_height: gpui::Pixels,
+    scroll_offset: f32,
+    container_width: f32,
+    content_width: f32,
     _subscription: Subscription,
 }
 
 impl TitlebarTabStrip {
     fn new(pane: gpui::Entity<workspace::Pane>, titlebar_height: gpui::Pixels, cx: &mut Context<Self>) -> Self {
         let sub = cx.observe(&pane, |_, _, cx| cx.notify());
-        Self { pane, titlebar_height, _subscription: sub }
+        Self { pane, titlebar_height, scroll_offset: 0.0, container_width: 0.0, content_width: 0.0, _subscription: sub }
     }
 }
 
@@ -108,14 +111,72 @@ impl Render for TitlebarTabStrip {
         let tabs = self.pane.update(cx, |pane, cx| {
             pane.render_tabs_for_titlebar(height, window, cx)
         });
+        let scroll_offset = self.scroll_offset;
+        let max_scroll = (self.content_width - self.container_width).max(0.0);
+        let clamped = scroll_offset.min(max_scroll);
         div()
             .id("titlebar-tabs")
             .flex()
             .flex_row()
             .h_full()
+            .w_auto()
+            .max_w_full()
             .overflow_x_hidden()
             .occlude()
-            .children(tabs)
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                let delta = event.delta.pixel_delta(gpui::px(24.0));
+                let dx = if delta.x.abs() >= delta.y.abs() {
+                    delta.x.as_f32()
+                } else {
+                    delta.y.as_f32()
+                };
+                let max = (this.content_width - this.container_width).max(0.0);
+                this.scroll_offset = (this.scroll_offset + dx).clamp(0.0, max);
+                cx.notify();
+            }))
+            .child({
+                let entity = cx.entity().downgrade();
+                canvas(
+                    move |bounds, _, cx| {
+                        entity.update(cx, |this, _| {
+                            this.container_width = bounds.size.width.as_f32();
+                        }).ok();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .h_full()
+                    .child({
+                        let entity = cx.entity().downgrade();
+                        canvas(
+                            move |bounds, _, cx| {
+                                entity.update(cx, |this, _| {
+                                    this.content_width = bounds.size.width.as_f32();
+                                }).ok();
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .h_full()
+                        .w_full()
+                    })
+                    .map(move |el| {
+                        let mut el = el;
+                        el.style().margin.left = Some(gpui::Length::Definite(
+                            gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(
+                                gpui::px(0.0 - clamped)
+                            ))
+                        ));
+                        el
+                    })
+                    .children(tabs)
+            )
     }
 }
 
@@ -331,13 +392,15 @@ impl TitleBar {
         h_flex()
             .h_full()
             .w_full()
-            .when_some(tabs_element, |this, tabs| this.child(tabs))
-            // Drag zone: fills remaining space, double-click = maximize
+            .when_some(tabs_element, |this, tabs| {
+                this.child(tabs)
+            })
+            // Drag zone: fills remaining space, min width = 2 buttons (72px)
             .child(
                 div()
                     .id("titlebar-drag-zone")
                     .flex_1()
-                    .min_w(px(40.))
+                    .min_w(px(72.))
                     .h_full()
                     .on_click(|ev: &ClickEvent, window, _cx| {
                         if ev.click_count() == 2 {
@@ -349,6 +412,7 @@ impl TitleBar {
             .child(
                 div()
                     .id("new-terminal")
+                    .flex_none()
                     .w(px(36.))
                     .h_full()
                     .flex()
@@ -368,6 +432,7 @@ impl TitleBar {
                 this.child(
                     div()
                         .id("new-terminal-profile")
+                        .flex_none()
                         .w(px(36.))
                         .h_full()
                         .flex()
@@ -387,7 +452,7 @@ impl TitleBar {
             })
             .when(profiles.len() > 1, |this| {
                 this.child(
-                    div().h_full().child(ui::PopoverMenu::new("terminal-profiles")
+                    div().flex_none().h_full().child(ui::PopoverMenu::new("terminal-profiles")
                         .with_handle(self.profiles_menu_handle.clone())
                         .anchor(gpui::Anchor::TopRight)
                         .attach(gpui::Anchor::BottomRight)

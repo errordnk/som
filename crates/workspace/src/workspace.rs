@@ -1206,6 +1206,7 @@ pub struct Workspace {
     last_active_center_pane: Option<WeakEntity<Pane>>,
     som_split_panes: Vec<WeakEntity<Pane>>,
     som_split_in_progress: bool,
+    som_tab_splits: std::collections::HashMap<usize, usize>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1476,6 +1477,7 @@ impl Workspace {
             last_active_center_pane: Some(center_pane.downgrade()),
             som_split_panes: Vec::new(),
             som_split_in_progress: false,
+            som_tab_splits: std::collections::HashMap::new(),
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -1698,6 +1700,25 @@ impl Workspace {
                 })?
                 .await
                 .unwrap_or_default();
+
+            // Load and restore som split layout for the active tab at startup
+            let som_splits: std::collections::HashMap<usize, usize> =
+                db::kvp::GlobalKeyValueStore::global()
+                    .read_kvp("som_tab_splits")
+                    .ok()
+                    .flatten()
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
+            window.update(cx, |_, window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    ws.som_tab_splits = som_splits;
+                    let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
+                    let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
+                    if count > 0 {
+                        ws.som_restore_splits(count, window, cx);
+                    }
+                })
+            }).log_err();
 
             // Restore default dock state for empty workspaces
             // Only restore if:
@@ -4841,10 +4862,24 @@ impl Workspace {
                 } else if *local {
                     self.set_active_pane(pane, window, cx);
                 }
-                // When switching tabs in the main pane, collapse any split panes
+                // When switching tabs in the main pane: adjust split count only
                 let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
                 if is_main_pane && *local {
-                    self.som_unsplit_all(window, cx);
+                    let tab_index = pane.read(cx).active_item_index();
+                    let needed = self.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
+                    self.som_split_panes.retain(|p| p.upgrade().is_some());
+                    let current = self.som_split_panes.len();
+
+                    if needed < current {
+                        let to_remove: Vec<_> = self.som_split_panes.drain(needed..).collect();
+                        for weak in to_remove {
+                            if let Some(p) = weak.upgrade() {
+                                self.remove_pane(p, None, window, cx);
+                            }
+                        }
+                    } else if needed > current {
+                        self.som_restore_splits(needed - current, window, cx);
+                    }
                 }
             }
             pane::Event::UserSavedItem { item, save_intent } => {
@@ -4999,13 +5034,23 @@ impl Workspace {
             }
         };
 
+        // Capture the main pane's active tab index — we'll save the split count for it
+        let main_pane = self.panes.first().cloned();
+        let main_tab_index = main_pane.as_ref().map(|p| p.read(cx).active_item_index());
+
         self.som_split_in_progress = true;
         let task = self.split_and_clone(pane_to_split, direction, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(new_pane) = task.await {
-                this.update(cx, |this, _| {
+                this.update(cx, |this, inner_cx| {
                     this.som_split_panes.push(new_pane.downgrade());
                     this.som_split_in_progress = false;
+                    // Save split count for the active tab (by index)
+                    if let Some(tab_index) = main_tab_index {
+                        let count = this.som_split_panes.len();
+                        this.som_tab_splits.insert(tab_index, count);
+                        this.som_persist_tab_splits(inner_cx);
+                    }
                 }).ok();
             } else {
                 this.update(cx, |this, _| {
@@ -5024,18 +5069,73 @@ impl Workspace {
                 self.remove_pane(pane, None, window, cx);
             }
         }
+
+        // Update saved split count for the active tab (by index)
+        let tab_index = self.panes.first().map(|p| p.read(cx).active_item_index());
+        if let Some(tab_index) = tab_index {
+            let count = self.som_split_panes.len();
+            if count == 0 {
+                self.som_tab_splits.remove(&tab_index);
+            } else {
+                self.som_tab_splits.insert(tab_index, count);
+            }
+            self.som_persist_tab_splits(cx);
+        }
+    }
+
+    fn som_persist_tab_splits(&self, cx: &mut Context<Self>) {
+        let json = serde_json::to_string(&self.som_tab_splits).unwrap_or_default();
+        cx.background_spawn(async move {
+            let kvp = db::kvp::GlobalKeyValueStore::global();
+            kvp.write_kvp("som_tab_splits".into(), json).await.log_err();
+        }).detach();
+    }
+
+    fn som_restore_splits(&mut self, remaining: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if remaining == 0 || self.som_split_in_progress {
+            return;
+        }
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+        let level = self.som_split_panes.len();
+        if level >= 3 {
+            return;
+        }
+        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
+        let direction = directions[level];
+        let pane_to_split = if level == 0 {
+            self.active_pane.clone()
+        } else {
+            match self.som_split_panes[level - 1].upgrade() {
+                Some(p) => p,
+                None => return,
+            }
+        };
+        self.som_split_in_progress = true;
+        let task = self.split_and_clone(pane_to_split, direction, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(new_pane) = task.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.som_split_panes.push(new_pane.downgrade());
+                    this.som_split_in_progress = false;
+                    this.som_restore_splits(remaining - 1, window, cx);
+                }).ok();
+            } else {
+                this.update(cx, |this, _| {
+                    this.som_split_in_progress = false;
+                }).ok();
+            }
+        })
+        .detach();
     }
 
     pub fn som_unsplit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.som_split_panes.retain(|p| p.upgrade().is_some());
-        log::warn!("som_unsplit_all: {} split panes, total panes: {}", self.som_split_panes.len(), self.panes.len());
         let to_remove: Vec<_> = self.som_split_panes.drain(..).collect();
         for weak in to_remove {
             if let Some(pane) = weak.upgrade() {
                 self.remove_pane(pane, None, window, cx);
             }
         }
-        log::warn!("som_unsplit_all done: total panes: {}", self.panes.len());
     }
 
     pub fn join_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5519,7 +5619,15 @@ impl Workspace {
 
         match self.workspace_location(cx) {
             WorkspaceLocation::Location(location, paths) => {
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
+                // Serialize only the main pane — som split panes are session-only,
+                // their layout is restored from som_tab_splits on tab activation.
+                let center_group = if self.som_split_panes.is_empty() {
+                    build_serialized_pane_group(&self.center.root, window, cx)
+                } else {
+                    self.panes.first()
+                        .map(|p| SerializedPaneGroup::Pane(serialize_pane_handle(p, window, cx)))
+                        .unwrap_or_else(|| build_serialized_pane_group(&self.center.root, window, cx))
+                };
                 let docks = build_serialized_docks(self, window, cx);
                 let window_bounds = Some(SerializedWindowBounds(window.window_bounds()));
                 let identity_paths_hint = self.project_group_key(cx).path_list().clone();
@@ -7672,6 +7780,25 @@ pub fn open_workspace_by_id(
                 })
             })?
             .await?;
+
+        // Load and restore som split layout for the active tab at startup
+        let som_splits: std::collections::HashMap<usize, usize> =
+            db::kvp::GlobalKeyValueStore::global()
+                .read_kvp("som_tab_splits")
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+        window.update(cx, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.som_tab_splits = som_splits;
+                let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
+                let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
+                if count > 0 {
+                    ws.som_restore_splits(count, window, cx);
+                }
+            })
+        }).log_err();
 
         window.update(cx, |_, window, cx| {
             workspace.update(cx, |workspace, cx| {

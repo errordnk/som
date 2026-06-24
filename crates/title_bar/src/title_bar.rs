@@ -429,6 +429,7 @@ impl TitleBar {
             // v button (single profile = opens that profile, multiple = popover menu)
             .when(profiles.len() == 1, |this| {
                 let tab_name = profiles[0].0.clone();
+                let tab_shell = profiles[0].1.clone();
                 this.child(
                     div()
                         .id("new-terminal-profile")
@@ -446,7 +447,7 @@ impl TitleBar {
                             window.dispatch_action(Box::new(workspace::NewTerminal {
                                 local: false,
                                 tab_name: Some(tab_name.clone()),
-                                shell: None,
+                                shell: tab_shell.clone(),
                             }), cx);
                         })),
                 )
@@ -465,8 +466,9 @@ impl TitleBar {
                             let profiles = profiles2.clone();
                             let workspace_focus = workspace_focus.clone();
                             Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
-                                for (name, _shell) in &profiles {
+                                for (name, shell) in &profiles {
                                     let name = name.clone();
+                                    let shell = shell.clone();
                                     let binding = ui::KeyBinding::for_action(
                                         &workspace::NewTerminal::default(),
                                         cx,
@@ -501,7 +503,7 @@ impl TitleBar {
                                                     Box::new(workspace::NewTerminal {
                                                         local: false,
                                                         tab_name: Some(name_for_action.clone()),
-                                                        shell: None,
+                                                        shell: shell.clone(),
                                                     }),
                                                     cx,
                                                 );

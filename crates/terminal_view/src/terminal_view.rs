@@ -49,7 +49,7 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    DraggedSelection, DraggedTab, NewCenterTerminal, Pane,
+    DraggedSelection, NewCenterTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
@@ -125,7 +125,7 @@ pub struct TerminalView {
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
-    self_handle: WeakEntity<Self>,
+    _self_handle: WeakEntity<Self>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -281,7 +281,7 @@ impl TerminalView {
             needs_serialize: tab_name.is_some(),
             custom_title: tab_name,
             ime_state: None,
-            self_handle: cx.entity().downgrade(),
+            _self_handle: cx.entity().downgrade(),
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -1185,7 +1185,7 @@ impl Item for TerminalView {
 
     fn handle_drop(
         &self,
-        active_pane: &Pane,
+        _active_pane: &Pane,
         dropped: &dyn Any,
         window: &mut Window,
         cx: &mut App,

@@ -252,8 +252,8 @@ impl SvgRenderer {
 
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
     let font_paths = [
-        "IBMPlexSans-Regular.ttf",
-        "Lilex-Regular.ttf",
+        "fonts/IBMPlexSans-Regular.ttf",
+        "fonts/Lilex-Regular.ttf",
     ];
     for path in font_paths {
         match asset_source.load(path) {
@@ -303,8 +303,8 @@ mod tests {
     use usvg::fontdb::{Database, Family, Query};
 
     const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/Lilex-Regular.ttf");
+        include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Lilex-Regular.ttf");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();

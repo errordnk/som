@@ -49,8 +49,7 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    DraggedSelection, NewCenterTerminal, Pane,
-    SomActivateNextPane, SomActivatePrevPane, SomActivateNextTab, SomActivatePrevTab,
+    DraggedSelection, NewCenterTerminal, Pane, TabProfiles,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
@@ -1002,21 +1001,6 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
-        let ks = &event.keystroke;
-        if ks.modifiers.control && !ks.modifiers.alt {
-            if ks.key == "left" || ks.key == "right" {
-                let is_right = ks.key == "right";
-                let action: Box<dyn gpui::Action> = if ks.modifiers.shift {
-                    if is_right { Box::new(SomActivateNextTab) } else { Box::new(SomActivatePrevTab) }
-                } else {
-                    if is_right { Box::new(SomActivateNextPane) } else { Box::new(SomActivatePrevPane) }
-                };
-                window.dispatch_action(action, cx);
-                cx.stop_propagation();
-                return;
-            }
-        }
-
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
@@ -1270,9 +1254,10 @@ impl Item for TerminalView {
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
         let Ok(terminal) = self.project.update(cx, |project, cx| {
-            let cwd = project
-                .active_project_directory(cx)
-                .map(|it| it.to_path_buf());
+            // Prefer the terminal's own CWD; fall back to home dir so split panes
+            // don't inherit Som's process directory.
+            let cwd = self.terminal().read(cx).working_directory()
+                .or_else(|| dirs::home_dir());
             project.clone_terminal(self.terminal(), cx, cwd)
         }) else {
             return Task::ready(None);
@@ -1425,7 +1410,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, shell_override) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -1447,13 +1432,23 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let shell_override = custom_title.as_deref().and_then(|title| {
+                        cx.try_global::<TabProfiles>()
+                            .and_then(|p| p.0.iter().find(|(name, _, _)| name == title).and_then(|(_, sh, _)| sh.clone()))
+                    });
+                    (cwd, custom_title, shell_override)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                .update(cx, |project, cx| {
+                    if let Some(shell) = shell_override {
+                        project.create_terminal_with_shell(cwd, shell, cx)
+                    } else {
+                        project.create_terminal_shell(cwd, cx)
+                    }
+                })
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {

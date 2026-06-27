@@ -2831,8 +2831,16 @@ impl Pane {
                     .size(ButtonSize::None)
                     .icon_size(IconSize::Small)
                     .on_click(cx.listener(move |pane, _, window, cx| {
-                        pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                            .detach_and_log_err(cx);
+                        let total = pane.items_len();
+                        let item_id = pane.items().nth(ix).map(|item| item.item_id());
+                        if let Some(item_id) = item_id {
+                            let workspace = pane.workspace.clone();
+                            window.defer(cx, move |window, cx| {
+                                workspace.update(cx, |ws, cx| {
+                                    ws.som_close_tab_at_index(ix, total, item_id, window, cx);
+                                }).log_err();
+                            });
+                        }
                     }))
                 }
                 .map(|this| {

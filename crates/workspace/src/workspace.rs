@@ -436,15 +436,21 @@ pub struct NewTerminal {
 
 /// Global list of tab profiles loaded from som config (name, shell).
 #[derive(Clone, Default)]
-pub struct TabProfiles(pub Vec<(String, Option<String>)>);
+pub struct TabProfiles(pub Vec<(String, Option<String>, Option<String>)>);
 
 impl gpui::Global for TabProfiles {}
 
 impl TabProfiles {
-    pub fn set(profiles: Vec<(String, Option<String>)>, cx: &mut gpui::App) {
+    pub fn set(profiles: Vec<(String, Option<String>, Option<String>)>, cx: &mut gpui::App) {
         cx.set_global(TabProfiles(profiles));
     }
 }
+
+/// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomCloseTab;
 
 /// Splits the active pane by cloning the active terminal (Som).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
@@ -1236,6 +1242,7 @@ pub struct Workspace {
     som_tab_splits: std::collections::HashMap<usize, usize>,
     som_parked_splits: std::collections::HashMap<usize, (Vec<Entity<Pane>>, Vec<f32>, Option<Entity<Pane>>)>,
     som_active_tab_index: usize,
+    som_pending_remove_index: Option<usize>,
     som_tab_active_pane: std::collections::HashMap<usize, WeakEntity<Pane>>,
     som_tab_active_pane_index: std::collections::HashMap<usize, usize>,
     som_tab_flexes: std::collections::HashMap<usize, Vec<f32>>,
@@ -1512,6 +1519,7 @@ impl Workspace {
             som_tab_splits: std::collections::HashMap::new(),
             som_parked_splits: std::collections::HashMap::new(),
             som_active_tab_index: 0,
+            som_pending_remove_index: None,
             som_tab_active_pane: std::collections::HashMap::new(),
             som_tab_active_pane_index: std::collections::HashMap::new(),
             som_tab_flexes: std::collections::HashMap::new(),
@@ -4020,7 +4028,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let main_pane = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
-        self.add_item(main_pane, item, None, true, true, window, cx);
+        let dest = main_pane.read(cx).items_len();
+        // Clear any stale split state at the new tab's index before inserting.
+        self.som_tab_splits.remove(&dest);
+        self.som_parked_splits.remove(&dest);
+        self.som_tab_flexes.remove(&dest);
+        self.som_tab_active_pane.remove(&dest);
+        self.som_tab_active_pane_index.remove(&dest);
+        self.add_item(main_pane, item, Some(dest), true, true, window, cx);
     }
 
     pub fn add_item_to_center(
@@ -4983,8 +4998,15 @@ impl Workspace {
                     }
 
                     // Unpark split panes for new_tab_index
-                    let needed = self.som_tab_splits.get(&new_tab_index).copied().unwrap_or(0);
-                    if let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&new_tab_index) {
+                    // If a tab removal is pending (RemovedItem not yet fired), parked splits
+                    // still use the pre-removal index. Adjust the lookup key accordingly.
+                    let parked_key = if let Some(removed) = self.som_pending_remove_index {
+                        if removed <= new_tab_index { new_tab_index + 1 } else { new_tab_index }
+                    } else {
+                        new_tab_index
+                    };
+                    let needed = self.som_tab_splits.get(&parked_key).copied().unwrap_or(0);
+                    if let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&parked_key) {
                         let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
                         let mut prev: Option<Entity<Pane>> = None;
                         for (i, p) in parked.iter().enumerate() {
@@ -5013,8 +5035,8 @@ impl Workspace {
                             }).detach();
                         }
                     } else if needed > 0 {
-                        let flexes = self.som_tab_flexes.get(&new_tab_index).cloned().unwrap_or_default();
-                        let pane_index = self.som_tab_active_pane_index.get(&new_tab_index).copied().unwrap_or(0);
+                        let flexes = self.som_tab_flexes.get(&parked_key).cloned().unwrap_or_default();
+                        let pane_index = self.som_tab_active_pane_index.get(&parked_key).copied().unwrap_or(0);
                         self.som_restore_splits_then(needed, flexes, pane_index, window, cx);
                     }
                 }
@@ -5044,17 +5066,46 @@ impl Workspace {
                 cx.emit(Event::ItemRemoved {
                     item_id: item.item_id(),
                 });
-                // When a tab is closed in the main pane, clean up split/flex/pane state
-                // for that tab index to prevent the next tab at the same index inheriting splits.
+                // When a tab is closed in the main pane, remap split state indices.
                 let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
                 if is_main_pane {
+                    let removed = self.som_pending_remove_index.take();
                     let new_count = pane.read(cx).items_len();
-                    // Remove state for any index >= new_count (tabs that no longer exist)
-                    self.som_tab_splits.retain(|&k, _| k < new_count);
-                    self.som_parked_splits.retain(|&k, _| k < new_count);
-                    self.som_tab_flexes.retain(|&k, _| k < new_count);
-                    self.som_tab_active_pane.retain(|&k, _| k < new_count);
-                    self.som_tab_active_pane_index.retain(|&k, _| k < new_count);
+                    if let Some(removed_idx) = removed {
+                        // Remap: remove the closed index, shift all higher indices down by 1.
+                        macro_rules! remap_map {
+                            ($map:expr) => {{
+                                $map.remove(&removed_idx);
+                                let shifted = $map.drain()
+                                    .map(|(k, v)| if k > removed_idx { (k - 1, v) } else { (k, v) })
+                                    .collect();
+                                $map = shifted;
+                            }};
+                        }
+                        remap_map!(self.som_tab_splits);
+                        remap_map!(self.som_parked_splits);
+                        remap_map!(self.som_tab_flexes);
+                        remap_map!(self.som_tab_active_pane);
+                        remap_map!(self.som_tab_active_pane_index);
+                        if self.som_active_tab_index > removed_idx {
+                            self.som_active_tab_index -= 1;
+                        }
+                        // If active index is now out of range (e.g. closed the last tab),
+                        // clamp it to the new last tab.
+                        if new_count > 0 && self.som_active_tab_index >= new_count {
+                            self.som_active_tab_index = new_count - 1;
+                        }
+                    } else {
+                        // Fallback: just drop indices out of range.
+                        self.som_tab_splits.retain(|&k, _| k < new_count);
+                        self.som_parked_splits.retain(|&k, _| k < new_count);
+                        self.som_tab_flexes.retain(|&k, _| k < new_count);
+                        self.som_tab_active_pane.retain(|&k, _| k < new_count);
+                        self.som_tab_active_pane_index.retain(|&k, _| k < new_count);
+                        if new_count > 0 && self.som_active_tab_index >= new_count {
+                            self.som_active_tab_index = new_count - 1;
+                        }
+                    }
                     self.som_persist_tab_state(cx);
                 }
             }
@@ -5233,6 +5284,55 @@ impl Workspace {
         }
     }
 
+    pub fn som_close_tab(&mut self, _: &SomCloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(main_pane) = self.panes.first().cloned() else { return };
+        let total = main_pane.read(cx).items_len();
+        let item_id = main_pane.read(cx).items()
+            .nth(self.som_active_tab_index)
+            .map(|item| item.item_id());
+        let Some(item_id) = item_id else { return };
+        self.som_close_tab_at_index(self.som_active_tab_index, total, item_id, window, cx);
+        cx.stop_propagation();
+    }
+
+    pub fn som_close_tab_at_index(&mut self, target_idx: usize, total: usize, item_id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if total <= 1 { return; }
+        let Some(main_pane) = self.panes.first().cloned() else { return };
+
+        if let Some((parked, _, _)) = self.som_parked_splits.remove(&target_idx) {
+            for p in &parked {
+                self.panes.retain(|x| x != p);
+                self.center.remove(p, cx).log_err();
+            }
+        } else if target_idx == self.som_active_tab_index {
+            // Closing the currently active tab: drain its live split panes
+            self.som_split_panes.retain(|p| p.upgrade().is_some());
+            let to_remove: Vec<Entity<Pane>> = self.som_split_panes.drain(..).filter_map(|w| w.upgrade()).collect();
+            for p in &to_remove {
+                self.panes.retain(|x| x != p);
+                self.center.remove(p, cx).log_err();
+            }
+        }
+        // If target_idx != som_active_tab_index, splits were parked when switching away — nothing to do
+        self.som_tab_splits.remove(&target_idx);
+        self.som_tab_flexes.remove(&target_idx);
+        self.som_tab_active_pane.remove(&target_idx);
+        self.som_tab_active_pane_index.remove(&target_idx);
+
+        let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
+        self.active_pane = main.clone();
+        self.last_active_center_pane = Some(main.downgrade());
+        cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            this.active_item_path_changed(true, window, cx);
+        });
+
+        self.som_pending_remove_index = Some(target_idx);
+        main_pane.update(cx, |pane, cx| {
+            pane.close_item_by_id(item_id, SaveIntent::Skip, window, cx).detach();
+        });
+    }
+
     pub fn som_activate_next_pane(&mut self, _: &SomActivateNextPane, window: &mut Window, cx: &mut Context<Self>) {
         self.som_split_panes.retain(|p| p.upgrade().is_some());
         let all_panes: Vec<Entity<Pane>> = std::iter::once(self.panes.first().cloned())
@@ -5247,6 +5347,7 @@ impl Workspace {
         let next = &all_panes[(idx + 1) % all_panes.len()];
         self.set_active_pane(next, window, cx);
         next.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+        cx.stop_propagation();
     }
 
     pub fn som_activate_prev_pane(&mut self, _: &SomActivatePrevPane, window: &mut Window, cx: &mut Context<Self>) {
@@ -5263,6 +5364,7 @@ impl Workspace {
         let prev = &all_panes[(idx + all_panes.len() - 1) % all_panes.len()];
         self.set_active_pane(prev, window, cx);
         prev.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+        cx.stop_propagation();
     }
 
     pub fn som_activate_next_tab(&mut self, _: &SomActivateNextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -5277,6 +5379,7 @@ impl Workspace {
         let current = main_pane.read(cx).active_item_index();
         let next = (current + 1) % count;
         main_pane.update(cx, |pane, cx| pane.activate_item(next, true, true, window, cx));
+        cx.stop_propagation();
     }
 
     pub fn som_activate_prev_tab(&mut self, _: &SomActivatePrevTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -5291,6 +5394,7 @@ impl Workspace {
         let current = main_pane.read(cx).active_item_index();
         let prev = (current + count - 1) % count;
         main_pane.update(cx, |pane, cx| pane.activate_item(prev, true, true, window, cx));
+        cx.stop_propagation();
     }
 
     fn som_persist_tab_splits(&mut self, cx: &mut Context<Self>) {
@@ -6512,6 +6616,7 @@ impl Workspace {
             .on_action(cx.listener(|workspace, _: &FocusCenterPane, window, cx| {
                 workspace.focus_center_pane(window, cx);
             }))
+            .on_action(cx.listener(Workspace::som_close_tab))
             .on_action(cx.listener(Workspace::som_split_pane))
             .on_action(cx.listener(Workspace::som_unsplit_pane))
             .on_action(cx.listener(Workspace::som_activate_next_pane))

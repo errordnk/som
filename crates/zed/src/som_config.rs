@@ -3,6 +3,7 @@ use futures::StreamExt;
 use gpui::{App, AppContext as _, AsyncApp, UpdateGlobal as _};
 use serde::Deserialize;
 use settings::{KeymapFile, KeymapFileLoadResult, SettingsStore};
+use indexmap::IndexMap;
 use std::{collections::HashMap, sync::Arc};
 use paths;
 
@@ -11,7 +12,7 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
     match action {
         "Copy"         => Some(("terminal::Copy",                   Some("Terminal"), false)),
         "Paste"        => Some(("terminal::Paste",                  Some("Terminal"), false)),
-        "CloseTab"     => Some(("pane::CloseActiveItem",            None,            false)),
+        "CloseTab"     => Some(("workspace::SomCloseTab",            None,            false)),
         "SplitTab"     => Some(("workspace::SomSplitPane",          None,            false)),
         "UnSplitTab"   => Some(("workspace::SomUnsplitPane",        None,            false)),
         "NextPane"     => Some(("workspace::SomActivateNextPane",   None,            false)),
@@ -37,7 +38,7 @@ pub struct SomConfig {
     pub scroll: ScrollConfig,
     pub log: LogConfig,
     pub tabs: Vec<TabProfile>,
-    pub keys: HashMap<String, String>,
+    pub keys: IndexMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -139,15 +140,27 @@ impl SomConfig {
             }
         }
 
-        let from_file = std::fs::read(&user_config_path)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok());
+        // Start with embedded defaults, then overlay user file on top.
+        // This ensures new default keys are always present even when the user
+        // created their settings.json before those keys were added.
+        let mut config: SomConfig = assets::Assets::get(asset_name)
+            .and_then(|f| serde_json::from_slice(&f.data).ok())
+            .unwrap_or_default();
 
-        from_file.unwrap_or_else(|| {
-            assets::Assets::get(asset_name)
-                .and_then(|f| serde_json::from_slice(&f.data).ok())
-                .unwrap_or_default()
-        })
+        if let Ok(data) = std::fs::read(&user_config_path) {
+            if let Ok(user) = serde_json::from_slice::<SomConfig>(&data) {
+                // Merge: user fields override defaults; user keys override default keys.
+                // For the keys map specifically: start from defaults, then insert user keys.
+                let mut merged_keys = config.keys.clone();
+                for (k, v) in &user.keys {
+                    merged_keys.insert(k.clone(), v.clone());
+                }
+                config = user;
+                config.keys = merged_keys;
+            }
+        }
+
+        config
     }
 
     pub fn apply_keys(&self, cx: &mut App) {
@@ -332,7 +345,23 @@ impl SomConfig {
     }
 
     fn parse(content: &str) -> Result<Self, String> {
-        serde_json::from_str(content).map_err(|e| {
+        Self::parse_with_defaults(content, Self::embedded_defaults())
+    }
+
+    fn embedded_defaults() -> Self {
+        #[cfg(target_os = "windows")]
+        let asset_name = "windows.json";
+        #[cfg(target_os = "macos")]
+        let asset_name = "darwin.json";
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let asset_name = "linux.json";
+        assets::Assets::get(asset_name)
+            .and_then(|f| serde_json::from_slice(&f.data).ok())
+            .unwrap_or_default()
+    }
+
+    fn parse_with_defaults(content: &str, defaults: Self) -> Result<Self, String> {
+        let user: Self = serde_json::from_str(content).map_err(|e| {
             let line = e.line();
             let col = e.column();
             let source_line = content
@@ -343,7 +372,14 @@ impl SomConfig {
             format!(
                 "settings.json line {line}, column {col}: {e}\n  → {source_line}"
             )
-        })
+        })?;
+        let mut merged_keys = defaults.keys;
+        let mut config = user;
+        for (k, v) in std::mem::take(&mut config.keys) {
+            merged_keys.insert(k, v);
+        }
+        config.keys = merged_keys;
+        Ok(config)
     }
 
     pub fn watch(fs: Arc<dyn Fs>, cx: &mut App) {

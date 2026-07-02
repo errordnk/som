@@ -39,7 +39,7 @@
   "tabs": [
     {
       "name": "shell",
-      "icon": "",
+      "icon": "",
       "shell": "$SHELL",
       "workingDir": "~"
     }
@@ -64,7 +64,7 @@
     "ctrl-0": "FontReset",
     "ctrl-f4": "CloseTab",
     "ctrl-\\": "SplitTab",
-    "ctrl-shift-\\": "UnSplitTab",
+    "ctrl-shift-\\": "ClosePane",
     "ctrl-left": "PrevPane",
     "ctrl-right": "NextPane",
     "ctrl-shift-left": "PrevTab",

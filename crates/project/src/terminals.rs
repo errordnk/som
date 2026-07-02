@@ -19,6 +19,39 @@ use util::{
 
 use crate::Project;
 
+/// Parses a shell command string, handling paths with spaces.
+/// If the string looks like a bare executable path (ends with .exe or has no flag-like args),
+/// treat the whole string as the program. Otherwise split on first whitespace boundary
+/// where the program part is quoted or has no spaces.
+/// E.g. `C:\Program Files\pwsh.exe` → (`C:\Program Files\pwsh.exe`, [])
+///      `wsl --cd ~` → (`wsl`, [`--cd`, `~`])
+fn parse_shell_command(cmd: &str) -> (String, Vec<String>) {
+    let cmd = cmd.trim();
+    // Quoted program: "path with spaces" [args...]
+    if cmd.starts_with('"') {
+        if let Some(end) = cmd[1..].find('"') {
+            let program = cmd[1..end + 1].to_string();
+            let rest = cmd[end + 2..].trim();
+            let args = if rest.is_empty() {
+                vec![]
+            } else {
+                rest.split_whitespace().map(|s| s.to_string()).collect()
+            };
+            return (program, args);
+        }
+    }
+    // Check if the whole string is a path to an executable (no args)
+    // Heuristic: if it ends with .exe (case-insensitive) treat whole string as program
+    if cmd.to_ascii_lowercase().ends_with(".exe") {
+        return (cmd.to_string(), vec![]);
+    }
+    // Otherwise split on whitespace
+    let mut parts = cmd.split_whitespace();
+    let program = parts.next().unwrap_or("").to_string();
+    let args = parts.map(|s| s.to_string()).collect();
+    (program, args)
+}
+
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
@@ -113,9 +146,7 @@ impl Project {
             let activation_script: Vec<String> = Vec::new();
 
             let shell = if let Some(cmd) = shell_override {
-                let mut parts = cmd.split_whitespace();
-                let program = parts.next().unwrap_or("").to_string();
-                let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+                let (program, args) = parse_shell_command(&cmd);
                 if args.is_empty() {
                     Shell::Program(program)
                 } else {

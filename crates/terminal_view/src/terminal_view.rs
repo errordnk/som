@@ -117,6 +117,7 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
+    custom_icon: Option<String>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
     workspace_id: Option<WorkspaceId>,
@@ -221,6 +222,19 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_title_and_icon(terminal, workspace, workspace_id, project, tab_name, None, window, cx)
+    }
+
+    pub fn new_with_title_and_icon(
+        terminal: Entity<Terminal>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: Option<WorkspaceId>,
+        project: WeakEntity<Project>,
+        tab_name: Option<String>,
+        tab_icon: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let workspace_handle = workspace.clone();
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, window, cx);
@@ -280,6 +294,7 @@ impl TerminalView {
             scroll_handle,
             needs_serialize: tab_name.is_some(),
             custom_title: tab_name,
+            custom_icon: tab_icon,
             ime_state: None,
             _self_handle: cx.entity().downgrade(),
             _subscriptions: subscriptions,
@@ -1161,12 +1176,22 @@ impl Item for TerminalView {
             .cloned()
             .unwrap_or_else(|| terminal.title(true));
 
+        let icon_element: AnyElement = if let Some(icon) = &self.custom_icon {
+            div()
+                .font_family("FiraCode Nerd Font")
+                .text_color(params.text_color().color(cx))
+                .child(icon.clone())
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Terminal).color(params.text_color()).into_any_element()
+        };
+
         h_flex()
-            .gap_1()
+            .gap_2()
             .when(!params.selected, |this| {
                 this.track_focus(&self.focus_handle)
             })
-            .child(Icon::new(IconName::Terminal).color(params.text_color()))
+            .child(icon_element)
             .child(Label::new(title).color(params.text_color()))
             .into_any()
     }
@@ -1410,7 +1435,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title, shell_override) = cx
+            let (cwd, custom_title, shell_override, icon_override) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -1432,14 +1457,13 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    let shell_override = custom_title.as_deref().and_then(|title| {
-                        cx.try_global::<TabProfiles>()
-                            .and_then(|p| p.0.iter().find(|(name, _, _)| name == title).and_then(|(_, sh, _)| sh.clone()))
-                    });
-                    (cwd, custom_title, shell_override)
+                    let (shell_override, icon_override) = custom_title.as_deref()
+                        .map(|title| TabProfiles::profile_by_name(title, cx))
+                        .unwrap_or((None, None));
+                    (cwd, custom_title, shell_override, icon_override)
                 })
                 .ok()
-                .unwrap_or((None, None, None));
+                .unwrap_or((None, None, None, None));
 
             let terminal = project
                 .update(cx, |project, cx| {
@@ -1452,12 +1476,13 @@ impl SerializableItem for TerminalView {
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {
-                    TerminalView::new_with_title(
+                    TerminalView::new_with_title_and_icon(
                         terminal,
                         workspace,
                         Some(workspace_id),
                         project.downgrade(),
                         custom_title,
+                        icon_override,
                         window,
                         cx,
                     )

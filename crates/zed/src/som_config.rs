@@ -15,6 +15,7 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
         "CloseTab"     => Some(("workspace::SomCloseTab",            None,            false)),
         "SplitTab"     => Some(("workspace::SomSplitPane",          None,            false)),
         "UnSplitTab"   => Some(("workspace::SomUnsplitPane",        None,            false)),
+        "ClosePane"    => Some(("workspace::SomClosePane",          None,            false)),
         "NextPane"     => Some(("workspace::SomActivateNextPane",   Some("Terminal"), false)),
         "PrevPane"     => Some(("workspace::SomActivatePrevPane",   Some("Terminal"), false)),
         "NextTab"      => Some(("workspace::SomActivateNextTab",    Some("Terminal"), false)),

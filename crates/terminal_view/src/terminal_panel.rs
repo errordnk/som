@@ -26,8 +26,9 @@ use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
     MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
-    PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, TabProfiles, ToggleZoom, Workspace,
+    PaneGroup, SomTabsRestorer, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight,
+    SplitUp, SwapPaneDown, SwapPaneLeft, SwapPaneRight, SwapPaneUp, TabProfiles, ToggleZoom,
+    Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -49,6 +50,9 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    cx.set_global(SomTabsRestorer(std::sync::Arc::new(
+        |workspace, window, cx| TerminalPanel::restore_som_tabs(workspace, window, cx),
+    )));
     cx.observe_new(
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
             workspace.register_action(TerminalPanel::new_terminal);
@@ -526,77 +530,45 @@ impl TerminalPanel {
             .detach_and_log_err(cx);
     }
 
-    /// Create a new Terminal in the current working directory or the user's home directory
+    /// Create a new Terminal tab. This is the single entry point for opening a new
+    /// tab in Som — the title bar `+` button, the tab-profile menu, and every
+    /// keyboard shortcut all dispatch the same `workspace::NewTerminal` action,
+    /// which always lands here. In Som every tab lives in the workspace's main
+    /// (center) pane, so this always goes through `add_item_to_main_pane`, which
+    /// appends the new tab at the end and clears any stale per-tab split state at
+    /// that index. There is intentionally no other path: a second path (through
+    /// `TerminalPanel`'s own side-panel pane) used to exist as a Zed-inherited
+    /// fallback and could insert the tab next to the currently active one while
+    /// skipping the split-state cleanup, causing new tabs to inherit a previous
+    /// tab's split panes.
     fn new_terminal(
         workspace: &mut Workspace,
         action: &workspace::NewTerminal,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let center_pane = workspace.active_pane();
-        let center_pane_has_focus = center_pane.focus_handle(cx).contains_focused(window, cx);
-        let active_center_item_is_terminal = center_pane
-            .read(cx)
-            .active_item()
-            .is_some_and(|item| item.downcast::<TerminalView>().is_some());
-
         let default_tab_name = cx
             .try_global::<TabProfiles>()
-            .and_then(|p| p.0.first().map(|(name, _)| name.clone()));
+            .and_then(|p| p.0.first().map(|(name, _, _, _)| name.clone()));
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
-        // Resolve shell from action or from TabProfiles by name
-        let shell_override = action.shell.clone().or_else(|| {
-            let wanted = tab_name.as_deref()?;
-            cx.try_global::<TabProfiles>()
-                .and_then(|p| p.0.iter().find(|(name, _)| name == wanted).and_then(|(_, sh)| sh.clone()))
-        });
-
-        if center_pane_has_focus && active_center_item_is_terminal {
-            let working_directory = default_working_directory(workspace, cx);
-            let local = action.local;
-            Self::add_center_terminal_named(workspace, tab_name, window, cx, move |project, cx| {
-                if local {
-                    project.create_local_terminal(cx)
-                } else if let Some(cmd) = shell_override {
-                    project.create_terminal_with_shell(working_directory, cmd, cx)
-                } else {
-                    project.create_terminal_shell(working_directory, cx)
-                }
-            })
-            .detach_and_log_err(cx);
-            return;
-        }
-
-        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
-            return;
-        };
-
+        let (profile_shell, tab_icon) = tab_name.as_deref()
+            .map(|name| TabProfiles::profile_by_name(name, cx))
+            .unwrap_or((None, None));
+        let profile_index = tab_name.as_deref().and_then(|name| TabProfiles::index_by_name(name, cx));
+        let shell_override = action.shell.clone().or(profile_shell);
+        let working_directory = default_working_directory(workspace, cx);
         let local = action.local;
-        terminal_panel
-            .update(cx, |this, cx| {
-                if local {
-                    this.add_terminal_shell_internal(
-                        true,
-                        tab_name,
-                        None,
-                        shell_override,
-                        RevealStrategy::Always,
-                        window,
-                        cx,
-                    )
-                } else {
-                    this.add_terminal_shell_named_with_shell(
-                        tab_name,
-                        default_working_directory(workspace, cx),
-                        shell_override,
-                        RevealStrategy::Always,
-                        window,
-                        cx,
-                    )
-                }
-            })
-            .detach_and_log_err(cx);
+        Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
+            if local {
+                project.create_local_terminal(cx)
+            } else if let Some(cmd) = shell_override {
+                project.create_terminal_with_shell(working_directory, cmd, cx)
+            } else {
+                project.create_terminal_shell(working_directory, cx)
+            }
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn add_center_terminal(
@@ -609,12 +581,14 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        Self::add_center_terminal_named(workspace, None, window, cx, create_terminal)
+        Self::add_center_terminal_named(workspace, None, None, None, window, cx, create_terminal)
     }
 
     pub fn add_center_terminal_named(
         workspace: &mut Workspace,
         tab_name: Option<String>,
+        tab_icon: Option<String>,
+        profile_index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
         create_terminal: impl FnOnce(
@@ -634,19 +608,168 @@ impl TerminalPanel {
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new_with_title(
+                    TerminalView::new_with_title_and_icon(
                         terminal.clone(),
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
                         tab_name.clone(),
+                        tab_icon.clone(),
                         window,
                         cx,
                     )
                 });
-                workspace.add_item_to_main_pane(Box::new(terminal_view), window, cx);
+                workspace.add_item_to_main_pane(Box::new(terminal_view), profile_index, window, cx);
             })?;
             Ok(terminal.downgrade())
+        })
+    }
+
+    /// Restores tabs and their split panes from `~/.config/som/db.json` at
+    /// launch. Registered as the `workspace::SomTabsRestorer` global hook (see
+    /// `init` below) since `workspace` can't call into `terminal_view`
+    /// directly (dependency points the other way).
+    ///
+    /// Tabs are created and split *one at a time, fully sequentially*: each
+    /// tab's terminal is awaited before starting its splits, and each split is
+    /// awaited (via `som_split_active_pane_awaited`) before starting the next
+    /// one or moving to the next tab. This is deliberate — creating several
+    /// panes concurrently at launch was the original source of the ssh-MOTD
+    /// duplication bug (a pane resizing/spawning while a sibling's ssh session
+    /// was still logging in could make the remote replay its MOTD banner).
+    pub fn restore_som_tabs(
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<()> {
+        let window_handle = window.window_handle();
+        cx.spawn(async move |cx| {
+            let db_state = workspace::som_db::load_som_db();
+
+            // Phase 1: create every tab's terminal concurrently — each tab is
+            // an independent item in the main pane, so there's no shared
+            // state to race on here.
+            let mut tab_creations = Vec::with_capacity(db_state.tabs.len());
+            for tab in db_state.tabs.iter() {
+                let Some((name, shell, working_dir, icon)) = window_handle
+                    .update(cx, |_, _, cx| {
+                        workspace::TabProfiles::profile_at(tab.profile_index, cx)
+                    })
+                    .ok()
+                    .flatten()
+                else {
+                    // Profile index no longer exists in settings.json — skip
+                    // this tab entirely rather than guessing.
+                    continue;
+                };
+
+                let cwd = working_dir
+                    .as_deref()
+                    .and_then(|dir| shellexpand::full(dir).ok())
+                    .map(|dir| PathBuf::from(dir.to_string()))
+                    .filter(|dir| dir.is_dir());
+
+                let created = window_handle
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
+                            let shell = shell.clone();
+                            Self::add_center_terminal_named(
+                                workspace,
+                                Some(name.clone()),
+                                icon.clone(),
+                                Some(tab.profile_index),
+                                window,
+                                cx,
+                                move |project, cx| {
+                                    if let Some(shell) = shell {
+                                        project.create_terminal_with_shell(cwd, shell, cx)
+                                    } else {
+                                        project.create_terminal_shell(cwd, cx)
+                                    }
+                                },
+                            )
+                        })
+                    })
+                    .ok()
+                    .and_then(|r| r.ok());
+                if let Some(created) = created {
+                    tab_creations.push((tab.extra_splits, created));
+                }
+            }
+
+            // Phase 2: for each tab whose terminal is now created, add its
+            // split panes. Splits within one tab must stay sequential (level 1
+            // splits level 0, which must already exist), and tabs are handled
+            // one at a time here too — `som_split_active_pane_awaited` works
+            // through `Workspace`'s single shared `active_pane`/`som_split_panes`,
+            // so two tabs creating splits at the same time would race on that
+            // shared state and corrupt each other's layout.
+            //
+            // Crucially, each tab must be made the active tab (via
+            // `activate_item` on its main-pane position) before splitting it —
+            // `som_split_active_pane_awaited` always splits whatever tab is
+            // currently active. Tabs were appended in order in Phase 1, so the
+            // Nth successfully-created tab sits at main-pane index N.
+            for (position, (extra_splits, created)) in tab_creations.into_iter().enumerate() {
+                if created.await.log_err().is_none() {
+                    continue;
+                }
+                if extra_splits == 0 {
+                    continue;
+                }
+
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            if let Some(main_pane) = workspace.panes().first().cloned() {
+                                main_pane.update(cx, |pane, cx| {
+                                    pane.activate_item(position, true, true, window, cx);
+                                });
+                            }
+                        })
+                    })
+                    .ok();
+
+                for _ in 0..extra_splits {
+                    let split_task = window_handle
+                        .update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.som_split_active_pane_awaited(window, cx)
+                            })
+                        })
+                        .ok()
+                        .and_then(|r| r.ok());
+                    if let Some(split_task) = split_task {
+                        split_task.await;
+                    }
+                }
+            }
+
+            // All tabs (and their splits) exist now — focus the tab db.json
+            // marked active. Activating it also unparks its split panes via
+            // the existing tab-switch handler if they aren't already live
+            // (they are live only for the last tab created above). Focusing
+            // the exact split pane within that tab (db.json's "active_pane")
+            // is left to that same unpark logic's own focus restoration
+            // rather than reached into here, since `som_split_panes` is
+            // private to `Workspace` and reaching past it would duplicate
+            // logic that already exists for the live-session case.
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        let Some(main_pane) = workspace.panes().first().cloned() else {
+                            return;
+                        };
+                        let current = main_pane.read(cx).active_item_index();
+                        if db_state.active_tab != current {
+                            main_pane.update(cx, |pane, cx| {
+                                pane.activate_item(db_state.active_tab, true, true, window, cx);
+                            });
+                        }
+                    })
+                })
+                .ok();
         })
     }
 
@@ -669,18 +792,6 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         self.add_terminal_shell_internal(false, tab_name, cwd, None, reveal_strategy, window, cx)
-    }
-
-    fn add_terminal_shell_named_with_shell(
-        &mut self,
-        tab_name: Option<String>,
-        cwd: Option<PathBuf>,
-        shell_override: Option<String>,
-        reveal_strategy: RevealStrategy,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(false, tab_name, cwd, shell_override, reveal_strategy, window, cx)
     }
 
     fn add_local_terminal_shell(
@@ -1334,7 +1445,7 @@ impl Panel for TerminalPanel {
             };
             let first_profile_name = cx
                 .try_global::<TabProfiles>()
-                .and_then(|p| p.0.first().map(|(name, _)| name.clone()));
+                .and_then(|p| p.0.first().map(|(name, _, _, _)| name.clone()));
 
             this.add_terminal_shell_named(first_profile_name, kind, RevealStrategy::Always, window, cx)
                 .detach_and_log_err(cx)

@@ -428,8 +428,8 @@ impl TitleBar {
             )
             // v button (single profile = opens that profile, multiple = popover menu)
             .when(profiles.len() == 1, |this| {
-                let tab_name = profiles[0].0.clone();
-                let tab_shell = profiles[0].1.clone();
+                let tab_name = profiles[0].name.clone();
+                let tab_shell = profiles[0].shell.clone();
                 this.child(
                     div()
                         .id("new-terminal-profile")
@@ -466,11 +466,11 @@ impl TitleBar {
                             let profiles = profiles2.clone();
                             let workspace_focus = workspace_focus.clone();
                             Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                                for (name, shell, keystroke, icon) in &profiles {
-                                    let name = name.clone();
-                                    let shell = shell.clone();
-                                    let icon = icon.clone();
-                                    let binding = keystroke.as_deref().and_then(|ks| {
+                                for profile in &profiles {
+                                    let name = profile.name.clone();
+                                    let shell = profile.shell.clone();
+                                    let icon = profile.icon.clone();
+                                    let binding = profile.keystroke.as_deref().and_then(|ks| {
                                         let keystrokes: std::rc::Rc<[gpui::KeybindingKeystroke]> = ks
                                             .split_whitespace()
                                             .filter_map(|chunk| gpui::Keystroke::parse(chunk).ok())

@@ -1359,12 +1359,46 @@ impl Pane {
         self.index_for_item_id(item.item_id())
     }
 
-    fn index_for_item_id(&self, item_id: EntityId) -> Option<usize> {
+    pub fn index_for_item_id(&self, item_id: EntityId) -> Option<usize> {
         self.items.iter().position(|i| i.item_id() == item_id)
     }
 
     pub fn item_for_index(&self, ix: usize) -> Option<&dyn ItemHandle> {
         self.items.get(ix).map(|i| i.as_ref())
+    }
+
+    /// Moves the item identified by `item_id` to `destination_index`,
+    /// shifting the items between its old and new position. Used by
+    /// `restore_som_tabs` to fix up tab order after concurrent tab creation
+    /// (whose completion order depends on connection speed, not `db.json`'s
+    /// order) — unlike `add_item`'s `destination_index`, this doesn't get
+    /// clamped by however many items happen to exist yet, since it runs only
+    /// after every tab has already been inserted somewhere.
+    pub fn reorder_item_to(&mut self, item_id: EntityId, destination_index: usize) {
+        let Some(actual_index) = self.index_for_item_id(item_id) else {
+            return;
+        };
+        let destination_index = destination_index.min(self.items.len().saturating_sub(1));
+        if actual_index == destination_index {
+            return;
+        }
+        let item = self.items.remove(actual_index);
+        self.items.insert(destination_index, item);
+
+        let active = self.active_item_index;
+        self.active_item_index = if active == actual_index {
+            destination_index
+        } else if actual_index < destination_index {
+            if active > actual_index && active <= destination_index {
+                active - 1
+            } else {
+                active
+            }
+        } else if active >= destination_index && active < actual_index {
+            active + 1
+        } else {
+            active
+        };
     }
 
     pub fn toggle_zoom(&mut self, _: &ToggleZoom, window: &mut Window, cx: &mut Context<Self>) {

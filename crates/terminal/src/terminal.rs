@@ -118,6 +118,10 @@ const DEBUG_TERMINAL_HEIGHT: Pixels = px(30.);
 const DEBUG_CELL_WIDTH: Pixels = px(5.);
 const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 
+/// How long after creation a terminal's PTY resize (SIGWINCH) is suppressed
+/// for anything but its first size-set. See `created_at` on `Terminal`.
+const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Inserts Zed-specific environment variables for terminal sessions.
 /// Used by both local terminals and remote terminals (via SSH).
 pub fn insert_zed_terminal_env(
@@ -422,6 +426,7 @@ impl TerminalBuilder {
             child_exited: None,
             keyboard_input_sent: false,
             last_pty_grid_size: None,
+            created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
@@ -682,6 +687,7 @@ impl TerminalBuilder {
                 child_exited: None,
                 keyboard_input_sent: false,
                 last_pty_grid_size: None,
+                created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
@@ -907,6 +913,19 @@ pub struct Terminal {
     /// Last (cols, rows) actually sent to the PTY. Used to suppress redundant
     /// SIGWINCH when only pixel metrics change but the grid size is identical.
     last_pty_grid_size: Option<(usize, usize)>,
+    /// When this terminal was created. A sibling split pane can be resized
+    /// (and thus SIGWINCH'd) purely as a side effect of `PaneGroup::split`
+    /// restructuring the whole flex layout when a *new* split is added next
+    /// to it — including while it's still mid-login. Many shells/servers
+    /// react to SIGWINCH by repainting their prompt or MOTD, which then
+    /// shows up as visibly duplicated banner text. Suppressing the PTY-side
+    /// resize for a short window after creation avoids reaching a
+    /// still-connecting remote at all; `last_pty_grid_size` is deliberately
+    /// left unset while suppressed, so the next real resize event (there's
+    /// always another one soon — `prepaint` calls `set_size` every frame)
+    /// sends the correct size once the window passes. The local grid still
+    /// resizes immediately either way, so rendering is never stale.
+    created_at: Instant,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
@@ -1066,7 +1085,20 @@ impl Terminal {
                 let grid_size = (new_bounds.num_columns(), new_bounds.num_lines());
                 let grid_size_changed = self.last_pty_grid_size != Some(grid_size);
 
+                // Suppress SIGWINCH for a short window after creation — a
+                // sibling split pane being added restructures the whole flex
+                // layout and resizes every other pane in the tab, including
+                // ones still mid-login. Many shells/servers repaint their
+                // prompt or MOTD on SIGWINCH, which then shows up as visibly
+                // duplicated banner text. The very first resize (establishing
+                // the terminal's actual starting size) always goes through
+                // regardless, since without it the shell negotiates with a
+                // bogus default size.
+                let suppress_for_grace_window =
+                    self.last_pty_grid_size.is_some() && self.created_at.elapsed() < RESIZE_GRACE_PERIOD;
+
                 if grid_size_changed
+                    && !suppress_for_grace_window
                     && let TerminalType::Pty { pty_tx, .. } = &self.terminal_type
                 {
                     self.last_pty_grid_size = Some(grid_size);

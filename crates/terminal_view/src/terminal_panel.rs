@@ -549,7 +549,7 @@ impl TerminalPanel {
     ) {
         let default_tab_name = cx
             .try_global::<TabProfiles>()
-            .and_then(|p| p.0.first().map(|(name, _, _, _)| name.clone()));
+            .and_then(|p| p.0.first().map(|profile| profile.name.clone()));
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
         let (profile_shell, tab_icon) = tab_name.as_deref()
@@ -581,9 +581,16 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        Self::add_center_terminal_named(workspace, None, None, None, window, cx, create_terminal)
+        let task = Self::add_center_terminal_named(workspace, None, None, None, window, cx, create_terminal);
+        cx.background_spawn(async move { task.await.map(|(_, terminal)| terminal) })
     }
 
+    /// Returns the newly-created tab item's `EntityId` alongside the
+    /// terminal handle. Callers that need to find this specific tab's real
+    /// position in the main pane later (e.g. `restore_som_tabs`, where
+    /// several tabs are created concurrently and may finish out of order)
+    /// must match on this id via `Pane::index_for_item` rather than assuming
+    /// a fixed index.
     pub fn add_center_terminal_named(
         workspace: &mut Workspace,
         tab_name: Option<String>,
@@ -596,7 +603,37 @@ impl TerminalPanel {
             &mut Context<Project>,
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
-    ) -> Task<Result<WeakEntity<Terminal>>> {
+    ) -> Task<Result<(gpui::EntityId, WeakEntity<Terminal>)>> {
+        Self::add_center_terminal_named_at(
+            workspace,
+            tab_name,
+            tab_icon,
+            profile_index,
+            None,
+            window,
+            cx,
+            create_terminal,
+        )
+    }
+
+    /// Like `add_center_terminal_named`, but pins the tab to `destination_index`
+    /// in the main pane instead of always appending. Used by `restore_som_tabs`
+    /// so tabs created concurrently still land in `db.json`'s order regardless
+    /// of which terminal (local shell vs. ssh) finishes connecting first.
+    pub fn add_center_terminal_named_at(
+        workspace: &mut Workspace,
+        tab_name: Option<String>,
+        tab_icon: Option<String>,
+        profile_index: Option<usize>,
+        destination_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<(gpui::EntityId, WeakEntity<Terminal>)>> {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
@@ -606,7 +643,7 @@ impl TerminalPanel {
         cx.spawn_in(window, async move |workspace, cx| {
             let terminal = project.update(cx, create_terminal)?.await?;
 
-            workspace.update_in(cx, |workspace, window, cx| {
+            let item_id = workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = cx.new(|cx| {
                     TerminalView::new_with_title_and_icon(
                         terminal.clone(),
@@ -619,9 +656,17 @@ impl TerminalPanel {
                         cx,
                     )
                 });
-                workspace.add_item_to_main_pane(Box::new(terminal_view), profile_index, window, cx);
+                let item_id = terminal_view.entity_id();
+                workspace.add_item_to_main_pane_at(
+                    Box::new(terminal_view),
+                    profile_index,
+                    destination_index,
+                    window,
+                    cx,
+                );
+                item_id
             })?;
-            Ok(terminal.downgrade())
+            Ok((item_id, terminal.downgrade()))
         })
     }
 
@@ -630,13 +675,17 @@ impl TerminalPanel {
     /// `init` below) since `workspace` can't call into `terminal_view`
     /// directly (dependency points the other way).
     ///
-    /// Tabs are created and split *one at a time, fully sequentially*: each
-    /// tab's terminal is awaited before starting its splits, and each split is
-    /// awaited (via `som_split_active_pane_awaited`) before starting the next
-    /// one or moving to the next tab. This is deliberate — creating several
-    /// panes concurrently at launch was the original source of the ssh-MOTD
-    /// duplication bug (a pane resizing/spawning while a sibling's ssh session
-    /// was still logging in could make the remote replay its MOTD banner).
+    /// Tabs' terminals are created *concurrently* in Phase 1 (a slow ssh login
+    /// doesn't block a fast local shell from appearing), but each tab is
+    /// pinned to its `db.json` array index up front via
+    /// `add_center_terminal_named_at` — otherwise tabs would land in the main
+    /// pane in whatever order their connections happen to finish, not the
+    /// order the user left them in. Splits are then created in Phase 2, one
+    /// tab at a time and fully sequentially within a tab (level 1 splits
+    /// level 0, which must already exist) — `som_split_active_pane_awaited`
+    /// works through `Workspace`'s single shared `active_pane`/
+    /// `som_split_panes`, so splitting two tabs at once would race on that
+    /// shared state and corrupt each other's layout.
     pub fn restore_som_tabs(
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -648,10 +697,15 @@ impl TerminalPanel {
 
             // Phase 1: create every tab's terminal concurrently — each tab is
             // an independent item in the main pane, so there's no shared
-            // state to race on here.
+            // state to race on here. Where each tab actually lands in the
+            // main pane depends on connection speed (fast local shells vs.
+            // slow ssh logins), not `db.json`'s order, so `db_index` is kept
+            // alongside each creation and used to fix up ordering explicitly
+            // once every tab exists (see the reorder step at the start of
+            // Phase 2) rather than trying to pin positions during insertion.
             let mut tab_creations = Vec::with_capacity(db_state.tabs.len());
-            for tab in db_state.tabs.iter() {
-                let Some((name, shell, working_dir, icon)) = window_handle
+            for (db_index, tab) in db_state.tabs.iter().enumerate() {
+                let Some(profile) = window_handle
                     .update(cx, |_, _, cx| {
                         workspace::TabProfiles::profile_at(tab.profile_index, cx)
                     })
@@ -663,7 +717,8 @@ impl TerminalPanel {
                     continue;
                 };
 
-                let cwd = working_dir
+                let cwd = profile
+                    .working_dir
                     .as_deref()
                     .and_then(|dir| shellexpand::full(dir).ok())
                     .map(|dir| PathBuf::from(dir.to_string()))
@@ -673,11 +728,11 @@ impl TerminalPanel {
                     .update(cx, |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
                             let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
-                            let shell = shell.clone();
+                            let shell = profile.shell.clone();
                             Self::add_center_terminal_named(
                                 workspace,
-                                Some(name.clone()),
-                                icon.clone(),
+                                Some(profile.name.clone()),
+                                profile.icon.clone(),
                                 Some(tab.profile_index),
                                 window,
                                 cx,
@@ -694,42 +749,132 @@ impl TerminalPanel {
                     .ok()
                     .and_then(|r| r.ok());
                 if let Some(created) = created {
-                    tab_creations.push((tab.extra_splits, created));
+                    tab_creations.push((db_index, tab.extra_splits, created));
                 }
             }
 
-            // Phase 2: for each tab whose terminal is now created, add its
-            // split panes. Splits within one tab must stay sequential (level 1
-            // splits level 0, which must already exist), and tabs are handled
-            // one at a time here too — `som_split_active_pane_awaited` works
-            // through `Workspace`'s single shared `active_pane`/`som_split_panes`,
-            // so two tabs creating splits at the same time would race on that
-            // shared state and corrupt each other's layout.
-            //
-            // Crucially, each tab must be made the active tab (via
-            // `activate_item` on its main-pane position) before splitting it —
-            // `som_split_active_pane_awaited` always splits whatever tab is
-            // currently active. Tabs were appended in order in Phase 1, so the
-            // Nth successfully-created tab sits at main-pane index N.
-            for (position, (extra_splits, created)) in tab_creations.into_iter().enumerate() {
-                if created.await.log_err().is_none() {
-                    continue;
+            // Await every tab's creation before doing anything else. Tabs
+            // were created concurrently in Phase 1, so they can land in the
+            // main pane in a different order than `db_state.tabs` (a local
+            // shell resolves faster than an ssh connection) — fix that up
+            // explicitly now, in one pass, rather than trying to pin
+            // positions during insertion (which doesn't work: `add_item`'s
+            // destination index gets clamped to however many items exist
+            // *at that moment*, so an early-finishing tab meant for index 2
+            // would just get inserted at 0).
+            let mut tabs_in_db_order = Vec::with_capacity(tab_creations.len());
+            for (db_index, extra_splits, created) in tab_creations.into_iter() {
+                if let Some((item_id, _terminal)) = created.await.log_err() {
+                    tabs_in_db_order.push((db_index, extra_splits, item_id));
                 }
+            }
+            tabs_in_db_order.sort_by_key(|(db_index, _, _)| *db_index);
+            window_handle
+                .update(cx, |_, _, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        if let Some(main_pane) = workspace.panes().first().cloned() {
+                            main_pane.update(cx, |pane, cx| {
+                                for (position, (_, _, item_id)) in
+                                    tabs_in_db_order.iter().enumerate()
+                                {
+                                    pane.reorder_item_to(*item_id, position);
+                                }
+                                cx.notify();
+                            });
+                        }
+                        // The reorder above can silently move which array
+                        // position the active tab sits at, without emitting
+                        // `ActivateItem` — resync so the next real tab switch
+                        // parks the correct tab instead of a stale one.
+                        workspace.som_resync_active_tab_index(cx);
+                    })
+                })
+                .ok();
+
+            // Phase 2: for each tab, add its split panes. Splits within one
+            // tab must stay sequential (level 1 splits level 0, which must
+            // already exist), and tabs are handled one at a time here too —
+            // `som_split_active_pane_awaited` works through `Workspace`'s
+            // single shared `active_pane`/`som_split_panes`, so two tabs
+            // creating splits at the same time would race on that shared
+            // state and corrupt each other's layout.
+            //
+            // Each tab must be made the active tab before splitting it —
+            // `som_split_active_pane_awaited` always splits whatever tab is
+            // currently active. The reorder above already fixed up the main
+            // pane's ordering, but locate each tab's index by `EntityId`
+            // again anyway rather than assuming `position` still holds,
+            // since reordering shifts indices around as each item moves.
+            for (_db_index, extra_splits, item_id) in tabs_in_db_order.into_iter() {
                 if extra_splits == 0 {
                     continue;
                 }
+
+                let real_index = window_handle
+                    .update(cx, |_, _, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .panes()
+                                .first()
+                                .and_then(|p| p.read(cx).index_for_item_id(item_id))
+                        })
+                    })
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                let Some(real_index) = real_index else {
+                    // Item vanished (closed mid-restore?) — nothing to split.
+                    continue;
+                };
 
                 window_handle
                     .update(cx, |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
                             if let Some(main_pane) = workspace.panes().first().cloned() {
                                 main_pane.update(cx, |pane, cx| {
-                                    pane.activate_item(position, true, true, window, cx);
+                                    pane.activate_item(real_index, true, true, window, cx);
                                 });
                             }
                         })
                     })
                     .ok();
+
+                // `activate_item` above only *emits* `pane::Event::ActivateItem`;
+                // GPUI dispatches that event (and the park/unpark handling that
+                // updates `Workspace::active_pane`) on a later effect flush, not
+                // synchronously within this `update` call. Without waiting for
+                // that to land, the split below would clone whatever pane was
+                // active *before* this activation (e.g. a previous tab), not
+                // the tab we just switched to. Poll until the main pane's
+                // active item actually reflects the tab we just activated.
+                let mut activated = false;
+                for _ in 0..50 {
+                    let is_active = window_handle
+                        .update(cx, |_, _, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .panes()
+                                    .first()
+                                    .map(|p| p.read(cx).active_item_index() == real_index)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or(false);
+                    if is_active {
+                        activated = true;
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(5))
+                        .await;
+                }
+                if !activated {
+                    // Something's very wrong (item removed mid-restore?) — skip
+                    // this tab's splits rather than risk cloning the wrong pane.
+                    continue;
+                }
 
                 for _ in 0..extra_splits {
                     let split_task = window_handle
@@ -749,24 +894,77 @@ impl TerminalPanel {
             // All tabs (and their splits) exist now — focus the tab db.json
             // marked active. Activating it also unparks its split panes via
             // the existing tab-switch handler if they aren't already live
-            // (they are live only for the last tab created above). Focusing
-            // the exact split pane within that tab (db.json's "active_pane")
-            // is left to that same unpark logic's own focus restoration
-            // rather than reached into here, since `som_split_panes` is
-            // private to `Workspace` and reaching past it would duplicate
-            // logic that already exists for the live-session case.
-            window_handle
+            // (they are live only for the last tab created above).
+            //
+            // `som_park_current_split_panes` is called unconditionally first:
+            // `pane::Event::ActivateItem` (and the parking it triggers) only
+            // fires below if `current != db_state.active_tab`. If the last
+            // split-creating tab in the loop above happens to already be the
+            // one db.json marked active, `activate_item` would be a no-op and
+            // that tab's splits would never be parked — leaving them visible
+            // on screen while a *different* tab (per active_item_index) is
+            // considered active.
+            //
+            // Once that tab is confirmed active, focus its `active_pane`
+            // (0 = main pane, 1..=3 = a split level) explicitly — there is no
+            // "saved active split" restoration elsewhere to fall back on
+            // (`som_parked_splits`'s per-tab saved-active slot is always
+            // written as `None` and never read back).
+            let needs_activation = window_handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
+                        workspace.som_park_current_split_panes(db_state.active_tab, window, cx);
                         let Some(main_pane) = workspace.panes().first().cloned() else {
-                            return;
+                            return false;
                         };
                         let current = main_pane.read(cx).active_item_index();
                         if db_state.active_tab != current {
                             main_pane.update(cx, |pane, cx| {
                                 pane.activate_item(db_state.active_tab, true, true, window, cx);
                             });
+                            true
+                        } else {
+                            false
                         }
+                    })
+                })
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(false);
+
+            // `activate_item` above only *emits* `ActivateItem`; GPUI dispatches
+            // it (and the unpark it triggers, which populates `som_split_panes`
+            // for this tab) on a later effect flush. Wait for it to land before
+            // focusing a specific split pane below, or we'd focus a pane that
+            // still belongs to the previous tab.
+            if needs_activation {
+                for _ in 0..50 {
+                    let landed = window_handle
+                        .update(cx, |_, _, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .panes()
+                                    .first()
+                                    .map(|p| p.read(cx).active_item_index() == db_state.active_tab)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or(false);
+                    if landed {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(5))
+                        .await;
+                }
+            }
+
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.som_focus_pane_by_index(db_state.active_pane, window, cx);
                     })
                 })
                 .ok();
@@ -1445,7 +1643,7 @@ impl Panel for TerminalPanel {
             };
             let first_profile_name = cx
                 .try_global::<TabProfiles>()
-                .and_then(|p| p.0.first().map(|(name, _, _, _)| name.clone()));
+                .and_then(|p| p.0.first().map(|profile| profile.name.clone()));
 
             this.add_terminal_shell_named(first_profile_name, kind, RevealStrategy::Always, window, cx)
                 .detach_and_log_err(cx)

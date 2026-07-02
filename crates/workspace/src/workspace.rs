@@ -11,6 +11,7 @@ pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
 mod persistence;
+pub mod som_db;
 pub mod searchable;
 pub mod security_modal;
 pub mod focus_follows_mouse;
@@ -436,15 +437,54 @@ pub struct NewTerminal {
 
 /// Global list of tab profiles loaded from som config (name, shell).
 #[derive(Clone, Default)]
-pub struct TabProfiles(pub Vec<(String, Option<String>, Option<String>)>);
+pub struct TabProfiles(pub Vec<(String, Option<String>, Option<String>, Option<String>)>);
 
 impl gpui::Global for TabProfiles {}
 
 impl TabProfiles {
-    pub fn set(profiles: Vec<(String, Option<String>, Option<String>)>, cx: &mut gpui::App) {
+    pub fn set(profiles: Vec<(String, Option<String>, Option<String>, Option<String>)>, cx: &mut gpui::App) {
         cx.set_global(TabProfiles(profiles));
     }
+
+    /// Returns (shell, icon) for the profile with the given name, or (None, None).
+    pub fn profile_by_name(name: &str, cx: &gpui::App) -> (Option<String>, Option<String>) {
+        cx.try_global::<TabProfiles>()
+            .and_then(|p| p.0.iter().find(|(n, _, _, _)| n == name).map(|(_, sh, _, ic)| (sh.clone(), ic.clone())))
+            .unwrap_or((None, None))
+    }
+
+    /// Returns the index of the profile with the given name in settings.json's
+    /// `tabs[]` list, if any. Used to record which profile a tab was created
+    /// from, for `som_db.json` persistence.
+    pub fn index_by_name(name: &str, cx: &gpui::App) -> Option<usize> {
+        cx.try_global::<TabProfiles>()
+            .and_then(|p| p.0.iter().position(|(n, _, _, _)| n == name))
+    }
+
+    /// Returns (name, shell, working_dir, icon) for the profile at the given
+    /// index, or `None` if out of range (e.g. settings.json shrank since
+    /// `som_db.json` was last written).
+    pub fn profile_at(
+        index: usize,
+        cx: &gpui::App,
+    ) -> Option<(String, Option<String>, Option<String>, Option<String>)> {
+        cx.try_global::<TabProfiles>()
+            .and_then(|p| p.0.get(index).cloned())
+    }
 }
+
+/// Callback hook letting `terminal_view` (which depends on `workspace`, so
+/// can't be called by it directly) register the actual tab/split restore
+/// logic. `workspace`'s launch path reads `som_db.json` state itself but
+/// delegates "create this profile's terminal and add it as a tab" back to
+/// whichever crate knows how to build a `TerminalView` — set once by
+/// `terminal_view::init`.
+#[derive(Clone)]
+pub struct SomTabsRestorer(
+    pub std::sync::Arc<dyn Fn(WeakEntity<Workspace>, &mut Window, &mut App) -> Task<()> + Send + Sync>,
+);
+
+impl gpui::Global for SomTabsRestorer {}
 
 /// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
@@ -463,6 +503,12 @@ pub struct SomSplitPane;
 #[action(namespace = workspace)]
 #[serde(deny_unknown_fields)]
 pub struct SomUnsplitPane;
+
+/// Closes the currently active split pane (Som).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct SomClosePane;
 
 /// Activates the next split pane (Som).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
@@ -1239,6 +1285,11 @@ pub struct Workspace {
     last_active_center_pane: Option<WeakEntity<Pane>>,
     som_split_panes: Vec<WeakEntity<Pane>>,
     som_split_in_progress: bool,
+    // Each index 0/1/2 corresponds to split level. Set to true the moment
+    // som_split_pane fires for that level; cleared only when the panel is
+    // explicitly closed (som_close_pane / som_unsplit_pane) or the tab changes.
+    // This prevents rapid Ctrl+\ from creating duplicate SSH connections.
+    som_level_locked: [bool; 3],
     som_tab_splits: std::collections::HashMap<usize, usize>,
     som_parked_splits: std::collections::HashMap<usize, (Vec<Entity<Pane>>, Vec<f32>, Option<Entity<Pane>>)>,
     som_active_tab_index: usize,
@@ -1246,6 +1297,11 @@ pub struct Workspace {
     som_tab_active_pane: std::collections::HashMap<usize, WeakEntity<Pane>>,
     som_tab_active_pane_index: std::collections::HashMap<usize, usize>,
     som_tab_flexes: std::collections::HashMap<usize, Vec<f32>>,
+    /// Which settings.json `tabs[]` profile index each open tab (main-pane
+    /// item) was created from, keyed by that item's `EntityId`. Used to
+    /// reconstruct `som_db.json`'s "x.y" tab entries without guessing the
+    /// profile back from a possibly-ambiguous or user-renamed tab title.
+    som_tab_profile_index: std::collections::HashMap<gpui::EntityId, usize>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -1516,6 +1572,7 @@ impl Workspace {
             last_active_center_pane: Some(center_pane.downgrade()),
             som_split_panes: Vec::new(),
             som_split_in_progress: false,
+            som_level_locked: [false; 3],
             som_tab_splits: std::collections::HashMap::new(),
             som_parked_splits: std::collections::HashMap::new(),
             som_active_tab_index: 0,
@@ -1523,6 +1580,7 @@ impl Workspace {
             som_tab_active_pane: std::collections::HashMap::new(),
             som_tab_active_pane_index: std::collections::HashMap::new(),
             som_tab_flexes: std::collections::HashMap::new(),
+            som_tab_profile_index: std::collections::HashMap::new(),
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -1737,59 +1795,21 @@ impl Workspace {
                 .map(|ws| !ws.paths.is_empty())
                 .unwrap_or(false);
 
-            let opened_items = window
+            // Tabs/splits are restored from ~/.config/som/db.json (see
+            // `som_db.rs`), not from the SQLite-backed SerializedWorkspace —
+            // `project_paths`/`serialized_workspace` are Zed's file/folder-open
+            // machinery, which Som's tabs never used in the first place.
+            let _ = (serialized_workspace, project_paths);
+            let restore_task = window
                 .update(cx, |_, window, cx| {
-                    workspace.update(cx, |_workspace: &mut Workspace, cx| {
-                        open_items(serialized_workspace, project_paths, window, cx)
-                    })
-                })?
-                .await
-                .unwrap_or_default();
-
-            // Load and restore som split layout for the active tab at startup
-            let gkvp = db::kvp::GlobalKeyValueStore::global();
-            let som_splits: std::collections::HashMap<usize, usize> =
-                gkvp.read_kvp("som_tab_splits").ok().flatten()
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or_default();
-            let som_active_tab: usize =
-                gkvp.read_kvp("som_active_tab").ok().flatten()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-            let som_tab_pane_index: std::collections::HashMap<usize, usize> =
-                gkvp.read_kvp("som_tab_pane_index").ok().flatten()
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or_default();
-            let som_tab_flexes: std::collections::HashMap<usize, Vec<f32>> =
-                gkvp.read_kvp("som_tab_flexes").ok().flatten()
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or_default();
-            window.update(cx, |_, window, cx| {
-                workspace.update(cx, |ws, cx| {
-                    ws.som_tab_splits = som_splits;
-                    ws.som_tab_active_pane_index = som_tab_pane_index;
-                    ws.som_tab_flexes = som_tab_flexes;
-                    ws.som_active_tab_index = som_active_tab;
-
-                    // Activate the saved tab if it differs from current
-                    if let Some(main_pane) = ws.panes.first().cloned() {
-                        let current_tab = main_pane.read(cx).active_item_index();
-                        if som_active_tab != current_tab {
-                            main_pane.update(cx, |pane, cx| {
-                                pane.activate_item(som_active_tab, true, true, window, cx);
-                            });
-                        }
-                    }
-
-                    let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
-                    let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
-                    if count > 0 {
-                        let pane_index = ws.som_tab_active_pane_index.get(&tab_index).copied().unwrap_or(0);
-                        let flexes = ws.som_tab_flexes.get(&tab_index).cloned().unwrap_or_default();
-                        ws.som_restore_splits_with_focus_and_flexes(count, pane_index, flexes, window, cx);
-                    }
+                    let restorer = cx.try_global::<SomTabsRestorer>().cloned();
+                    restorer.map(|restorer| (restorer.0)(workspace.downgrade(), window, cx))
                 })
-            }).log_err();
+                .ok()
+                .flatten();
+            if let Some(restore_task) = restore_task {
+                restore_task.await;
+            }
 
             // Restore default dock state for empty workspaces
             // Only restore if:
@@ -1845,7 +1865,9 @@ impl Workspace {
             Ok(OpenResult {
                 window,
                 workspace,
-                opened_items,
+                // Som's tabs are terminals restored from db.json, not opened
+                // files — there's nothing meaningful to report here.
+                opened_items: Vec::new(),
             })
         })
     }
@@ -4024,17 +4046,15 @@ impl Workspace {
     pub fn add_item_to_main_pane(
         &mut self,
         item: Box<dyn ItemHandle>,
+        profile_index: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(profile_index) = profile_index {
+            self.som_tab_profile_index.insert(item.item_id(), profile_index);
+        }
         let main_pane = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
         let dest = main_pane.read(cx).items_len();
-        // Clear any stale split state at the new tab's index before inserting.
-        self.som_tab_splits.remove(&dest);
-        self.som_parked_splits.remove(&dest);
-        self.som_tab_flexes.remove(&dest);
-        self.som_tab_active_pane.remove(&dest);
-        self.som_tab_active_pane_index.remove(&dest);
         self.add_item(main_pane, item, Some(dest), true, true, window, cx);
     }
 
@@ -4954,7 +4974,7 @@ impl Workspace {
                 } else if *local {
                     self.set_active_pane(pane, window, cx);
                 }
-                // When switching tabs in the main pane: park/unpark split panes per tab
+                // When switching tabs in the main pane: park/unpark split panes per tab.
                 let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
                 if is_main_pane && *local {
                     let new_tab_index = pane.read(cx).active_item_index();
@@ -4991,6 +5011,8 @@ impl Workspace {
                         // Save flexes for the tab we're leaving
                         self.som_tab_flexes.insert(prev_tab_index, saved_flexes.clone());
                         self.som_parked_splits.insert(prev_tab_index, (to_park_strong, saved_flexes, None));
+                        // Reset level locks — panels are parked, new tab starts fresh
+                        self.som_level_locked = [false; 3];
                         self.som_persist_tab_state(cx);
                         let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
                         self.set_active_pane(&main, window, cx);
@@ -5005,7 +5027,6 @@ impl Workspace {
                     } else {
                         new_tab_index
                     };
-                    let needed = self.som_tab_splits.get(&parked_key).copied().unwrap_or(0);
                     if let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&parked_key) {
                         let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
                         let mut prev: Option<Entity<Pane>> = None;
@@ -5020,6 +5041,11 @@ impl Workspace {
                         // Update flexes map for new tab and persist all tabs
                         self.som_tab_flexes.insert(new_tab_index, saved_flexes);
                         self.som_split_panes = parked.iter().map(|p| p.downgrade()).collect();
+                        // Lock levels for all restored panels
+                        self.som_level_locked = [false; 3];
+                        for i in 0..self.som_split_panes.len().min(3) {
+                            self.som_level_locked[i] = true;
+                        }
                         self.som_persist_tab_state(cx);
                         // Restore last-focused pane for this tab (may be a split pane)
                         let weak_active = self.som_tab_active_pane.get(&new_tab_index).cloned();
@@ -5034,10 +5060,6 @@ impl Workspace {
                                 }).log_err();
                             }).detach();
                         }
-                    } else if needed > 0 {
-                        let flexes = self.som_tab_flexes.get(&parked_key).cloned().unwrap_or_default();
-                        let pane_index = self.som_tab_active_pane_index.get(&parked_key).copied().unwrap_or(0);
-                        self.som_restore_splits_then(needed, flexes, pane_index, window, cx);
                     }
                 }
             }
@@ -5063,6 +5085,7 @@ impl Workspace {
                 {
                     entry.remove();
                 }
+                self.som_tab_profile_index.remove(&item.item_id());
                 cx.emit(Event::ItemRemoved {
                     item_id: item.item_id(),
                 });
@@ -5087,7 +5110,12 @@ impl Workspace {
                         remap_map!(self.som_tab_flexes);
                         remap_map!(self.som_tab_active_pane);
                         remap_map!(self.som_tab_active_pane_index);
-                        if self.som_active_tab_index > removed_idx {
+                        // If the closed tab was itself the active one, don't guess its
+                        // replacement by offset — Pane::close_item_by_id already picked
+                        // whichever neighboring item is now active. Read that directly.
+                        if self.som_active_tab_index == removed_idx {
+                            self.som_active_tab_index = pane.read(cx).active_item_index();
+                        } else if self.som_active_tab_index > removed_idx {
                             self.som_active_tab_index -= 1;
                         }
                         // If active index is now out of range (e.g. closed the last tab),
@@ -5207,16 +5235,43 @@ impl Workspace {
     }
 
     pub fn som_split_pane(&mut self, _: &SomSplitPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_active_pane_awaited(window, cx).detach();
+    }
+
+    /// Splits whatever tab is currently active, same as `som_split_pane`, but
+    /// returns a `Task` the caller can await — used by launch-time restore
+    /// (`terminal_view`'s `SomTabsRestorer`) to create a tab's split panes one
+    /// at a time, in order, rather than firing them concurrently. Concurrent
+    /// split creation at launch was the original source of the ssh-MOTD
+    /// duplication bug: several panes resizing/spawning at once could land a
+    /// resize on a sibling pane mid-login.
+    pub fn som_split_active_pane_awaited(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         if self.som_split_in_progress {
-            return;
+            return Task::ready(());
         }
         // Cleanup dead pane references
         self.som_split_panes.retain(|p| p.upgrade().is_some());
 
         let level = self.som_split_panes.len();
         if level >= 3 {
-            return;
+            return Task::ready(());
         }
+
+        // Levels below the current one are occupied by existing panes — mark them.
+        // Level at current count is free (the one we're about to create).
+        // Levels above are always free.
+        // This sync ensures stale locked state from previous sessions / tab switches
+        // never blocks Ctrl+\ when there are actually no panes at that level.
+        for i in 0..3usize {
+            self.som_level_locked[i] = i < level;
+        }
+        // Lock this level immediately so any second Ctrl+\ arriving before the
+        // async spawn completes sees it as taken.
+        self.som_level_locked[level] = true;
 
         let directions = [
             SplitDirection::Right,
@@ -5231,7 +5286,7 @@ impl Workspace {
         } else {
             match self.som_split_panes[level - 1].upgrade() {
                 Some(p) => p,
-                None => return,
+                None => return Task::ready(()),
             }
         };
 
@@ -5245,13 +5300,12 @@ impl Workspace {
             if let Some(new_pane) = task.await {
                 this.update(cx, |this, inner_cx| {
                     this.som_split_panes.push(new_pane.downgrade());
-                    this.som_split_in_progress = false;
-                    // Save split count for the active tab (by index)
                     if let Some(tab_index) = main_tab_index {
                         let count = this.som_split_panes.len();
                         this.som_tab_splits.insert(tab_index, count);
                         this.som_persist_tab_splits(inner_cx);
                     }
+                    this.som_split_in_progress = false;
                 }).ok();
             } else {
                 this.update(cx, |this, _| {
@@ -5259,13 +5313,15 @@ impl Workspace {
                 }).ok();
             }
         })
-        .detach();
     }
 
     pub fn som_unsplit_pane(&mut self, _: &SomUnsplitPane, window: &mut Window, cx: &mut Context<Self>) {
         self.som_split_panes.retain(|p| p.upgrade().is_some());
 
         if let Some(last) = self.som_split_panes.pop() {
+            // Unlock this level so Ctrl+\ can open it again
+            let freed_level = self.som_split_panes.len();
+            if freed_level < 3 { self.som_level_locked[freed_level] = false; }
             if let Some(pane) = last.upgrade() {
                 self.remove_pane(pane, None, window, cx);
             }
@@ -5284,6 +5340,38 @@ impl Workspace {
         }
     }
 
+    pub fn som_close_pane(&mut self, _: &SomClosePane, window: &mut Window, cx: &mut Context<Self>) {
+        self.som_split_panes.retain(|p| p.upgrade().is_some());
+
+        let Some(main_pane) = self.panes.first().cloned() else { return };
+        let Some(last_weak) = self.som_split_panes.pop() else { return };
+        let Some(last) = last_weak.upgrade() else { return };
+
+        // Unlock the freed level so Ctrl+\ can open it again
+        let freed_level = self.som_split_panes.len();
+        if freed_level < 3 { self.som_level_locked[freed_level] = false; }
+
+        let tab_index = main_pane.read(cx).active_item_index();
+
+        // Focus the pane to the left of the removed one, or main if none remain.
+        let focus_target = self.som_split_panes.last()
+            .and_then(|w| w.upgrade())
+            .unwrap_or_else(|| main_pane.clone());
+
+        self.remove_pane(last, Some(focus_target.clone()), window, cx);
+        self.set_active_pane(&focus_target, window, cx);
+        focus_target.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+
+        let count = self.som_split_panes.len();
+        if count == 0 {
+            self.som_tab_splits.remove(&tab_index);
+        } else {
+            self.som_tab_splits.insert(tab_index, count);
+        }
+        self.som_persist_tab_splits(cx);
+        cx.stop_propagation();
+    }
+
     pub fn som_close_tab(&mut self, _: &SomCloseTab, window: &mut Window, cx: &mut Context<Self>) {
         let Some(main_pane) = self.panes.first().cloned() else { return };
         let total = main_pane.read(cx).items_len();
@@ -5295,37 +5383,55 @@ impl Workspace {
         cx.stop_propagation();
     }
 
+    /// The single, exhaustive path for closing a tab in Som — used by the tab's
+    /// close (X) button, middle-click, and Ctrl+F4 (`SomCloseTab`) alike. It must
+    /// stay correct regardless of *which* tab is targeted (active or not) and
+    /// *what* split state that tab holds (none, parked, or live-in-tree):
+    ///   - if the target tab is the one currently active, its split panes are live
+    ///     in `som_split_panes` / `self.center` and must be torn down directly;
+    ///   - otherwise its splits (if any) are parked in `som_parked_splits` under
+    ///     its index and must be torn down from there instead;
+    ///   - either way, per-tab state maps are cleared at `target_idx` and then
+    ///     `pane::Event::RemovedItem` remaps every index above it down by one, so
+    ///     tabs that shift left keep the split/flex/focus state that belongs to
+    ///     them, not to whichever tab used to sit at their new position.
+    /// Closing a tab that is NOT the active one must not touch `active_pane` —
+    /// only reassign it when the closed tab was actually the active one.
     pub fn som_close_tab_at_index(&mut self, target_idx: usize, total: usize, item_id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
         if total <= 1 { return; }
         let Some(main_pane) = self.panes.first().cloned() else { return };
 
-        if let Some((parked, _, _)) = self.som_parked_splits.remove(&target_idx) {
-            for p in &parked {
-                self.panes.retain(|x| x != p);
-                self.center.remove(p, cx).log_err();
-            }
-        } else if target_idx == self.som_active_tab_index {
-            // Closing the currently active tab: drain its live split panes
+        let closing_active_tab = target_idx == self.som_active_tab_index;
+
+        if closing_active_tab {
+            // Live split panes for the active tab: drain and tear down directly.
             self.som_split_panes.retain(|p| p.upgrade().is_some());
             let to_remove: Vec<Entity<Pane>> = self.som_split_panes.drain(..).filter_map(|w| w.upgrade()).collect();
             for p in &to_remove {
                 self.panes.retain(|x| x != p);
                 self.center.remove(p, cx).log_err();
             }
+        } else if let Some((parked, _, _)) = self.som_parked_splits.remove(&target_idx) {
+            // Split panes for a non-active tab live parked (off-tree) — tear those down.
+            for p in &parked {
+                self.panes.retain(|x| x != p);
+                self.center.remove(p, cx).log_err();
+            }
         }
-        // If target_idx != som_active_tab_index, splits were parked when switching away — nothing to do
         self.som_tab_splits.remove(&target_idx);
         self.som_tab_flexes.remove(&target_idx);
         self.som_tab_active_pane.remove(&target_idx);
         self.som_tab_active_pane_index.remove(&target_idx);
 
-        let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
-        self.active_pane = main.clone();
-        self.last_active_center_pane = Some(main.downgrade());
-        cx.notify();
-        cx.defer_in(window, |this, window, cx| {
-            this.active_item_path_changed(true, window, cx);
-        });
+        if closing_active_tab {
+            let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
+            self.active_pane = main.clone();
+            self.last_active_center_pane = Some(main.downgrade());
+            cx.notify();
+            cx.defer_in(window, |this, window, cx| {
+                this.active_item_path_changed(true, window, cx);
+            });
+        }
 
         self.som_pending_remove_index = Some(target_idx);
         main_pane.update(cx, |pane, cx| {
@@ -5344,7 +5450,8 @@ impl Workspace {
         }
         let current = &self.active_pane;
         let idx = all_panes.iter().position(|p| p == current).unwrap_or(0);
-        let next = &all_panes[(idx + 1) % all_panes.len()];
+        let next_idx = (idx + 1) % all_panes.len();
+        let next = &all_panes[next_idx];
         self.set_active_pane(next, window, cx);
         next.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         cx.stop_propagation();
@@ -5361,7 +5468,8 @@ impl Workspace {
         }
         let current = &self.active_pane;
         let idx = all_panes.iter().position(|p| p == current).unwrap_or(0);
-        let prev = &all_panes[(idx + all_panes.len() - 1) % all_panes.len()];
+        let prev_idx = (idx + all_panes.len() - 1) % all_panes.len();
+        let prev = &all_panes[prev_idx];
         self.set_active_pane(prev, window, cx);
         prev.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         cx.stop_propagation();
@@ -5433,70 +5541,56 @@ impl Workspace {
             kvp.write_kvp("som_tab_pane_index".into(), pane_index_json).await.log_err();
             kvp.write_kvp("som_tab_flexes".into(), flexes_json).await.log_err();
         }).detach();
+        self.som_persist_db_json(cx);
     }
 
-    fn som_restore_splits_with_focus_and_flexes(&mut self, count: usize, pane_index: usize, flexes: Vec<f32>, window: &mut Window, cx: &mut Context<Self>) {
-        if count == 0 {
+    /// Writes `~/.config/som/db.json` from the live tab/pane state. Replaces
+    /// the kvp/SQLite-based `som_persist_tab_state` as the source of truth for
+    /// what gets restored on launch — see `som_db.rs` for the file format.
+    /// Called from the same trigger points `som_persist_tab_state` is (tab
+    /// focus, split creation/removal, tab close/switch).
+    fn som_persist_db_json(&mut self, cx: &mut Context<Self>) {
+        let Some(main_pane) = self.panes.first().cloned() else {
             return;
-        }
-        self.som_restore_splits_then(count, flexes, pane_index, window, cx);
-    }
-
-    fn som_restore_splits_then(&mut self, remaining: usize, flexes: Vec<f32>, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if remaining == 0 || self.som_split_in_progress {
-            if remaining == 0 {
-                // All splits created — apply flexes and focus now
-                if !flexes.is_empty() {
-                    som_apply_flexes(&self.center.root, &flexes);
-                }
-                let target = if pane_index == 0 {
-                    self.panes.first().cloned()
-                } else {
-                    self.som_split_panes.get(pane_index - 1).and_then(|w| w.upgrade())
-                };
-                if let Some(p) = target {
-                    self.set_active_pane(&p, window, cx);
-                    p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
-                }
-                cx.notify();
-            }
-            return;
-        }
-        self.som_split_panes.retain(|p| p.upgrade().is_some());
-        let level = self.som_split_panes.len();
-        if level >= 3 {
-            return;
-        }
-        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
-        let direction = directions[level];
-        let pane_to_split = if level == 0 {
-            self.active_pane.clone()
-        } else {
-            match self.som_split_panes[level - 1].upgrade() {
-                Some(p) => p,
-                None => return,
-            }
         };
-        self.som_split_in_progress = true;
-        let task = self.split_and_clone(pane_to_split, direction, window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            if let Some(new_pane) = task.await {
-                this.update_in(cx, |this, window, cx| {
-                    this.som_split_panes.push(new_pane.downgrade());
-                    this.som_split_in_progress = false;
-                    this.som_restore_splits_then(remaining - 1, flexes, pane_index, window, cx);
-                }).ok();
-            } else {
-                this.update(cx, |this, _| {
-                    this.som_split_in_progress = false;
-                }).ok();
-            }
-        }).detach();
+        let main_pane = main_pane.read(cx);
+        let tabs: Vec<som_db::SomDbTab> = main_pane
+            .items()
+            .enumerate()
+            .map(|(tab_index, item)| {
+                let profile_index = self
+                    .som_tab_profile_index
+                    .get(&item.item_id())
+                    .copied()
+                    .unwrap_or(0);
+                let extra_splits = self.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
+                som_db::SomDbTab {
+                    profile_index,
+                    extra_splits,
+                }
+            })
+            .collect();
+        if tabs.is_empty() {
+            return;
+        }
+        let active_tab = self.som_active_tab_index.min(tabs.len() - 1);
+        let active_pane = self
+            .som_tab_active_pane_index
+            .get(&active_tab)
+            .copied()
+            .unwrap_or(0)
+            .min(tabs[active_tab].extra_splits);
+        som_db::save_som_db(&som_db::SomDbState {
+            tabs,
+            active_tab,
+            active_pane,
+        });
     }
 
     pub fn som_unsplit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.som_split_panes.retain(|p| p.upgrade().is_some());
         let to_remove: Vec<_> = self.som_split_panes.drain(..).collect();
+        self.som_level_locked = [false; 3];
         for weak in to_remove {
             if let Some(pane) = weak.upgrade() {
                 self.remove_pane(pane, None, window, cx);
@@ -5989,7 +6083,9 @@ impl Workspace {
             WorkspaceLocation::Location(location, paths) => {
                 // Serialize only the main pane — som split panes are session-only,
                 // their layout is restored from som_tab_splits on tab activation.
-                let center_group = if self.som_split_panes.is_empty() {
+                // Also serialize only main pane when split is in progress: center.root
+                // may already contain the new split pane before som_split_panes is updated.
+                let center_group = if self.som_split_panes.is_empty() && !self.som_split_in_progress {
                     build_serialized_pane_group(&self.center.root, window, cx)
                 } else {
                     self.panes.first()
@@ -6619,6 +6715,7 @@ impl Workspace {
             .on_action(cx.listener(Workspace::som_close_tab))
             .on_action(cx.listener(Workspace::som_split_pane))
             .on_action(cx.listener(Workspace::som_unsplit_pane))
+            .on_action(cx.listener(Workspace::som_close_pane))
             .on_action(cx.listener(Workspace::som_activate_next_pane))
             .on_action(cx.listener(Workspace::som_activate_prev_pane))
             .on_action(cx.listener(Workspace::som_activate_next_tab))
@@ -8145,58 +8242,21 @@ pub fn open_workspace_by_id(
 
         notify_if_database_failed(window, cx);
 
-        // Restore items from the serialized workspace
-        window
+        // Tabs/splits are restored from ~/.config/som/db.json (see
+        // `som_db.rs`) — same as `new_local`'s restore path, see the comment
+        // there. `serialized_workspace` (Zed's file/folder SQLite state) is
+        // not used for Som's tabs.
+        let _ = serialized_workspace;
+        let restore_task = window
             .update(cx, |_, window, cx| {
-                workspace.update(cx, |_workspace, cx| {
-                    open_items(Some(serialized_workspace), vec![], window, cx)
-                })
-            })?
-            .await?;
-
-        // Load and restore som split layout for the active tab at startup
-        let kvp2 = db::kvp::GlobalKeyValueStore::global();
-        let som_splits2: std::collections::HashMap<usize, usize> =
-            kvp2.read_kvp("som_tab_splits").ok().flatten()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-        let som_active_tab2: usize =
-            kvp2.read_kvp("som_active_tab").ok().flatten()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-        let som_tab_pane_index2: std::collections::HashMap<usize, usize> =
-            kvp2.read_kvp("som_tab_pane_index").ok().flatten()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-        let som_tab_flexes2: std::collections::HashMap<usize, Vec<f32>> =
-            kvp2.read_kvp("som_tab_flexes").ok().flatten()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-        window.update(cx, |_, window, cx| {
-            workspace.update(cx, |ws, cx| {
-                ws.som_tab_splits = som_splits2;
-                ws.som_tab_active_pane_index = som_tab_pane_index2;
-                ws.som_tab_flexes = som_tab_flexes2;
-                ws.som_active_tab_index = som_active_tab2;
-
-                if let Some(main_pane) = ws.panes.first().cloned() {
-                    let current_tab = main_pane.read(cx).active_item_index();
-                    if som_active_tab2 != current_tab {
-                        main_pane.update(cx, |pane, cx| {
-                            pane.activate_item(som_active_tab2, true, true, window, cx);
-                        });
-                    }
-                }
-
-                let tab_index = ws.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
-                let count = ws.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
-                if count > 0 {
-                    let pane_index = ws.som_tab_active_pane_index.get(&tab_index).copied().unwrap_or(0);
-                    let flexes = ws.som_tab_flexes.get(&tab_index).cloned().unwrap_or_default();
-                    ws.som_restore_splits_with_focus_and_flexes(count, pane_index, flexes, window, cx);
-                }
+                let restorer = cx.try_global::<SomTabsRestorer>().cloned();
+                restorer.map(|restorer| (restorer.0)(workspace.downgrade(), window, cx))
             })
-        }).log_err();
+            .ok()
+            .flatten();
+        if let Some(restore_task) = restore_task {
+            restore_task.await;
+        }
 
         window.update(cx, |_, window, cx| {
             workspace.update(cx, |workspace, cx| {

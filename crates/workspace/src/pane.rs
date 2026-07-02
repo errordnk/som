@@ -661,13 +661,13 @@ impl Pane {
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Event::Focus);
         if !self.was_focused {
             self.was_focused = true;
             self.update_history(self.active_item_index);
             if !self.suppress_scroll && self.items.get(self.active_item_index).is_some() {
                 self.update_active_tab(self.active_item_index);
             }
-            cx.emit(Event::Focus);
             cx.notify();
         }
 
@@ -2747,8 +2747,17 @@ impl Pane {
                         return;
                     }
 
-                    pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                        .detach_and_log_err(cx);
+                    // Route through Workspace::som_close_tab_at_index (same as the
+                    // close-tab X button) so per-tab split state is remapped
+                    // correctly, instead of closing the item directly.
+                    let total = pane.items_len();
+                    if let Some(workspace) = pane.workspace.upgrade() {
+                        window.defer(cx, move |window, cx| {
+                            workspace.update(cx, |ws, cx| {
+                                ws.som_close_tab_at_index(ix, total, item_id, window, cx);
+                            });
+                        });
+                    }
                     cx.stop_propagation();
                 }),
             )

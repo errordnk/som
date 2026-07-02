@@ -181,7 +181,7 @@ fn open_terminal_in_workspace(
     let tab_name = cx
         .try_global::<workspace::TabProfiles>()
         .and_then(|p| p.0.first())
-        .map(|(name, _)| name.clone())
+        .map(|(name, _, _, _)| name.clone())
         .filter(|n| !n.trim().is_empty());
 
     let project = workspace.project().clone();
@@ -434,10 +434,18 @@ fn main() {
         som_config.apply_settings(cx);
         som_config.load_nord_theme(cx);
 
-        let profiles: Vec<(String, Option<String>)> = som_config
+        let profiles: Vec<(String, Option<String>, Option<String>, Option<String>)> = som_config
             .tabs
             .iter()
-            .map(|t| (t.name.clone(), t.shell.clone()))
+            .enumerate()
+            .map(|(i, t)| {
+                let idx = i + 1;
+                let key_name = format!("New{}", idx);
+                let keystroke = som_config.keys.iter()
+                    .find(|(_, v)| *v == &key_name)
+                    .map(|(k, _)| k.clone());
+                (t.name.clone(), t.shell.clone(), keystroke, t.icon.clone())
+            })
             .collect();
         title_bar::TabProfiles::set(profiles, cx);
 

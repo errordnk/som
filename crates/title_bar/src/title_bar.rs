@@ -465,14 +465,20 @@ impl TitleBar {
                         .menu(move |window, cx| {
                             let profiles = profiles2.clone();
                             let workspace_focus = workspace_focus.clone();
-                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, cx| {
-                                for (name, shell) in &profiles {
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                                for (name, shell, keystroke, icon) in &profiles {
                                     let name = name.clone();
                                     let shell = shell.clone();
-                                    let binding = ui::KeyBinding::for_action(
-                                        &workspace::NewTerminal::default(),
-                                        cx,
-                                    );
+                                    let icon = icon.clone();
+                                    let binding = keystroke.as_deref().and_then(|ks| {
+                                        let keystrokes: std::rc::Rc<[gpui::KeybindingKeystroke]> = ks
+                                            .split_whitespace()
+                                            .filter_map(|chunk| gpui::Keystroke::parse(chunk).ok())
+                                            .map(gpui::KeybindingKeystroke::from_keystroke)
+                                            .collect::<Vec<_>>()
+                                            .into();
+                                        if keystrokes.is_empty() { None } else { Some(ui::KeyBinding::from_keystrokes(keystrokes, false)) }
+                                    });
                                     let name_for_action = name.clone();
                                     let workspace_focus = workspace_focus.clone();
                                     menu = menu.custom_entry(
@@ -480,17 +486,28 @@ impl TitleBar {
                                             let name = name.clone();
                                             let binding = binding.clone();
                                             move |_window, _cx| {
-                                                h_flex()
+                                                let icon_element: AnyElement = if let Some(ref ic) = icon {
+                                                    div()
+                                                        .font_family("FiraCode Nerd Font")
+                                                        .child(ic.clone())
+                                                        .into_any_element()
+                                                } else {
+                                                    Icon::new(IconName::Terminal).size(IconSize::Small).color(Color::Default).into_any_element()
+                                                };
+                                                let row = h_flex()
                                                     .w_full()
                                                     .justify_between()
                                                     .child(
                                                         h_flex()
                                                             .gap_2()
-                                                            .child(Icon::new(IconName::Terminal).size(IconSize::Small).color(Color::Default))
+                                                            .child(icon_element)
                                                             .child(Label::new(name.clone()))
-                                                    )
-                                                    .child(div().ml_4().child(binding.clone()))
-                                                    .into_any_element()
+                                                    );
+                                                if let Some(b) = binding.clone() {
+                                                    row.child(div().ml_4().child(b)).into_any_element()
+                                                } else {
+                                                    row.into_any_element()
+                                                }
                                             }
                                         },
                                         {

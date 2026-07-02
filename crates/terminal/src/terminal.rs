@@ -421,6 +421,7 @@ impl TerminalBuilder {
             },
             child_exited: None,
             keyboard_input_sent: false,
+            last_pty_grid_size: None,
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
@@ -523,10 +524,18 @@ impl TerminalBuilder {
             #[cfg(windows)]
             let shell_program = shell_params.as_ref().map(|params| {
                 use util::ResultExt;
-
-                Self::resolve_path(&params.program)
+                // Try resolving with .exe extension first (avoids picking up wrong binaries
+                // that share a name without extension, e.g. usbipd-win/wsl vs wsl.exe)
+                let program = &params.program;
+                let with_exe = if !program.contains('.') && !program.contains('\\') && !program.contains('/') {
+                    format!("{}.exe", program)
+                } else {
+                    program.clone()
+                };
+                Self::resolve_path(&with_exe)
+                    .or_else(|_| Self::resolve_path(program))
                     .log_err()
-                    .unwrap_or(params.program.clone())
+                    .unwrap_or(program.clone())
             });
 
             // Note: when remoting, this shell_kind will scrutinize `ssh` or
@@ -538,8 +547,12 @@ impl TerminalBuilder {
 
             let pty_options = {
                 let alac_shell = shell_params.as_ref().map(|params| {
+                    #[cfg(windows)]
+                    let program = shell_program.as_deref().unwrap_or(&params.program);
+                    #[cfg(not(windows))]
+                    let program = params.program.as_str();
                     alacritty_terminal::tty::Shell::new(
-                        params.program.clone(),
+                        program.to_string(),
                         params.args.clone().unwrap_or_default(),
                     )
                 });
@@ -668,6 +681,7 @@ impl TerminalBuilder {
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
+                last_pty_grid_size: None,
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
@@ -890,6 +904,9 @@ pub struct Terminal {
     activation_script: Vec<String>,
     child_exited: Option<ExitStatus>,
     keyboard_input_sent: bool,
+    /// Last (cols, rows) actually sent to the PTY. Used to suppress redundant
+    /// SIGWINCH when only pixel metrics change but the grid size is identical.
+    last_pty_grid_size: Option<(usize, usize)>,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
@@ -1043,7 +1060,16 @@ impl Terminal {
 
                 self.last_content.terminal_bounds = new_bounds;
 
-                if let TerminalType::Pty { pty_tx, .. } = &self.terminal_type {
+                // Only send a PTY resize (SIGWINCH) when the character grid actually
+                // changes size. A resize with identical cols/rows but slightly different
+                // pixel metrics would otherwise trigger a spurious SIGWINCH.
+                let grid_size = (new_bounds.num_columns(), new_bounds.num_lines());
+                let grid_size_changed = self.last_pty_grid_size != Some(grid_size);
+
+                if grid_size_changed
+                    && let TerminalType::Pty { pty_tx, .. } = &self.terminal_type
+                {
+                    self.last_pty_grid_size = Some(grid_size);
                     pty_tx.0.send(Msg::Resize(new_bounds.into())).ok();
                 }
 

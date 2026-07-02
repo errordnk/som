@@ -173,45 +173,36 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
+/// Opens the very first tab for a brand-new (never-before-persisted)
+/// workspace — i.e. the fallback used when there's no `db.json` state to
+/// restore yet. Goes through the same canonical
+/// `TerminalPanel::add_center_terminal_named` path as every other tab
+/// creation (`NewTerminal`, `restore_som_tabs`), so this tab is recorded in
+/// `som_tab_profile_index` like any other rather than silently defaulting to
+/// profile 0 when `db.json` is next written.
 fn open_terminal_in_workspace(
     workspace: &mut workspace::Workspace,
     window: &mut gpui::Window,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
-    let tab_name = cx
+    let profile = cx
         .try_global::<workspace::TabProfiles>()
-        .and_then(|p| p.0.first())
-        .map(|(name, _, _, _)| name.clone())
+        .and_then(|p| p.0.first().cloned());
+    let tab_name = profile
+        .as_ref()
+        .map(|profile| profile.name.clone())
         .filter(|n| !n.trim().is_empty());
+    let tab_icon = profile.as_ref().and_then(|profile| profile.icon.clone());
 
-    let project = workspace.project().clone();
-    let terminal_task = project.update(cx, |project, cx| project.create_local_terminal(cx));
-    let workspace_handle = workspace.weak_handle();
-    let workspace_id = workspace.database_id();
-    let project_weak = project.downgrade();
-    cx.spawn_in(window, async move |workspace, cx| {
-        let terminal = terminal_task.await?;
-        workspace.update_in(cx, |workspace, window, cx| {
-            let terminal_view = cx.new(|cx| {
-                terminal_view::TerminalView::new_with_title(
-                    terminal,
-                    workspace_handle,
-                    workspace_id,
-                    project_weak,
-                    tab_name,
-                    window,
-                    cx,
-                )
-            });
-            workspace.add_item_to_active_pane(
-                Box::new(terminal_view),
-                None,
-                true,
-                window,
-                cx,
-            );
-        })
-    })
+    terminal_view::terminal_panel::TerminalPanel::add_center_terminal_named(
+        workspace,
+        tab_name,
+        tab_icon,
+        Some(0),
+        window,
+        cx,
+        |project, cx| project.create_local_terminal(cx),
+    )
     .detach_and_log_err(cx);
 }
 
@@ -434,7 +425,7 @@ fn main() {
         som_config.apply_settings(cx);
         som_config.load_nord_theme(cx);
 
-        let profiles: Vec<(String, Option<String>, Option<String>, Option<String>)> = som_config
+        let profiles: Vec<workspace::TabProfile> = som_config
             .tabs
             .iter()
             .enumerate()
@@ -444,7 +435,13 @@ fn main() {
                 let keystroke = som_config.keys.iter()
                     .find(|(_, v)| *v == &key_name)
                     .map(|(k, _)| k.clone());
-                (t.name.clone(), t.shell.clone(), keystroke, t.icon.clone())
+                workspace::TabProfile {
+                    name: t.name.clone(),
+                    shell: t.shell.clone(),
+                    keystroke,
+                    icon: t.icon.clone(),
+                    working_dir: t.working_dir.clone(),
+                }
             })
             .collect();
         title_bar::TabProfiles::set(profiles, cx);

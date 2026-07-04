@@ -126,7 +126,7 @@ pub use toolbar::{
 pub use ui;
 use ui::{Window, prelude::*};
 use util::{
-    ResultExt, TryFutureExt,
+    ResultExt,
     paths::{PathStyle, SanitizedPath},
     rel_path::RelPath,
     serde::default_true,
@@ -986,63 +986,17 @@ pub fn register_project_item<I: ProjectItem>(cx: &mut App) {
 
 #[derive(Copy, Clone)]
 struct SerializableItemDescriptor {
-    deserialize: fn(
-        Entity<Project>,
-        WeakEntity<Workspace>,
-        WorkspaceId,
-        ItemId,
-        &mut Window,
-        &mut Context<Pane>,
-    ) -> Task<Result<Box<dyn ItemHandle>>>,
-    cleanup: fn(WorkspaceId, Vec<ItemId>, &mut Window, &mut App) -> Task<Result<()>>,
     view_to_serializable_item: fn(AnyView) -> Box<dyn SerializableItemHandle>,
 }
 
 #[derive(Default)]
 struct SerializableItemRegistry {
-    descriptors_by_kind: HashMap<Arc<str>, SerializableItemDescriptor>,
     descriptors_by_type: HashMap<TypeId, SerializableItemDescriptor>,
 }
 
 impl Global for SerializableItemRegistry {}
 
 impl SerializableItemRegistry {
-    fn deserialize(
-        item_kind: &str,
-        project: Entity<Project>,
-        workspace: WeakEntity<Workspace>,
-        workspace_id: WorkspaceId,
-        item_item: ItemId,
-        window: &mut Window,
-        cx: &mut Context<Pane>,
-    ) -> Task<Result<Box<dyn ItemHandle>>> {
-        let Some(descriptor) = Self::descriptor(item_kind, cx) else {
-            return Task::ready(Err(anyhow!(
-                "cannot deserialize {}, descriptor not found",
-                item_kind
-            )));
-        };
-
-        (descriptor.deserialize)(project, workspace, workspace_id, item_item, window, cx)
-    }
-
-    fn cleanup(
-        item_kind: &str,
-        workspace_id: WorkspaceId,
-        loaded_items: Vec<ItemId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<Result<()>> {
-        let Some(descriptor) = Self::descriptor(item_kind, cx) else {
-            return Task::ready(Err(anyhow!(
-                "cannot cleanup {}, descriptor not found",
-                item_kind
-            )));
-        };
-
-        (descriptor.cleanup)(workspace_id, loaded_items, window, cx)
-    }
-
     fn view_to_serializable_item_handle(
         view: AnyView,
         cx: &App,
@@ -1051,31 +1005,13 @@ impl SerializableItemRegistry {
         let descriptor = this.descriptors_by_type.get(&view.entity_type())?;
         Some((descriptor.view_to_serializable_item)(view))
     }
-
-    fn descriptor(item_kind: &str, cx: &App) -> Option<SerializableItemDescriptor> {
-        let this = cx.try_global::<Self>()?;
-        this.descriptors_by_kind.get(item_kind).copied()
-    }
 }
 
 pub fn register_serializable_item<I: SerializableItem>(cx: &mut App) {
-    let serialized_item_kind = I::serialized_item_kind();
-
     let registry = cx.default_global::<SerializableItemRegistry>();
     let descriptor = SerializableItemDescriptor {
-        deserialize: |project, workspace, workspace_id, item_id, window, cx| {
-            let task = I::deserialize(project, workspace, workspace_id, item_id, window, cx);
-            cx.foreground_executor()
-                .spawn(async { Ok(Box::new(task.await?) as Box<_>) })
-        },
-        cleanup: |workspace_id, loaded_items, window, cx| {
-            I::cleanup(workspace_id, loaded_items, window, cx)
-        },
         view_to_serializable_item: |view| Box::new(view.downcast::<I>().unwrap()),
     };
-    registry
-        .descriptors_by_kind
-        .insert(Arc::from(serialized_item_kind), descriptor);
     registry
         .descriptors_by_type
         .insert(TypeId::of::<I>(), descriptor);
@@ -6010,19 +5946,6 @@ impl Workspace {
             .collect::<Vec<_>>()
     }
 
-    fn remove_panes(&mut self, member: Member, window: &mut Window, cx: &mut Context<Workspace>) {
-        match member {
-            Member::Axis(PaneAxis { members, .. }) => {
-                for child in members.iter() {
-                    self.remove_panes(child.clone(), window, cx)
-                }
-            }
-            Member::Pane(pane) => {
-                self.force_remove_pane(&pane, &None, window, cx);
-            }
-        }
-    }
-
     fn remove_from_session(&mut self, window: &mut Window, cx: &mut App) -> Task<()> {
         self.session_id.take();
         self.serialize_workspace_internal(window, cx)
@@ -6273,128 +6196,6 @@ impl Workspace {
         self.serializable_items_tx
             .unbounded_send(item)
             .map_err(|err| anyhow!("failed to send serializable item over channel: {err}"))
-    }
-
-    pub(crate) fn load_workspace(
-        serialized_workspace: SerializedWorkspace,
-        paths_to_open: Vec<Option<ProjectPath>>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
-        cx.spawn_in(window, async move |workspace, cx| {
-            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
-
-            let mut center_group = None;
-            let mut center_items = None;
-
-            // Traverse the splits tree and add to things
-            if let Some((group, active_pane, items)) = serialized_workspace
-                .center_group
-                .deserialize(&project, serialized_workspace.id, workspace.clone(), cx)
-                .await
-            {
-                center_items = Some(items);
-                center_group = Some((group, active_pane))
-            }
-
-            let mut items_by_project_path = HashMap::default();
-            let mut item_ids_by_kind = HashMap::default();
-            let mut all_deserialized_items = Vec::default();
-            cx.update(|_, cx| {
-                for item in center_items.unwrap_or_default().into_iter().flatten() {
-                    if let Some(serializable_item_handle) = item.to_serializable_item_handle(cx) {
-                        item_ids_by_kind
-                            .entry(serializable_item_handle.serialized_item_kind())
-                            .or_insert(Vec::new())
-                            .push(item.item_id().as_u64() as ItemId);
-                    }
-
-                    if let Some(project_path) = item.project_path(cx) {
-                        items_by_project_path.insert(project_path, item.clone());
-                    }
-                    all_deserialized_items.push(item);
-                }
-            })?;
-
-            let opened_items = paths_to_open
-                .into_iter()
-                .map(|path_to_open| {
-                    path_to_open
-                        .and_then(|path_to_open| items_by_project_path.remove(&path_to_open))
-                })
-                .collect::<Vec<_>>();
-
-            // Remove old panes from workspace panes list
-            workspace.update_in(cx, |workspace, window, cx| {
-                if let Some((center_group, active_pane)) = center_group {
-                    workspace.remove_panes(workspace.center.root.clone(), window, cx);
-
-                    // Swap workspace center group
-                    workspace.center = PaneGroup::with_root(center_group);
-                    workspace.center.set_is_center(true);
-                    workspace.center.mark_positions(cx);
-
-                    if let Some(active_pane) = active_pane {
-                        workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
-                    } else {
-                        workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
-                    }
-                }
-
-                let docks = serialized_workspace.docks;
-
-                for (dock, serialized_dock) in [
-                    (&mut workspace.right_dock, docks.right),
-                    (&mut workspace.left_dock, docks.left),
-                    (&mut workspace.bottom_dock, docks.bottom),
-                ]
-                .iter_mut()
-                {
-                    dock.update(cx, |dock, cx| {
-                        dock.serialized_dock = Some(serialized_dock.clone());
-                        dock.restore_state(window, cx);
-                    });
-                }
-
-                cx.notify();
-            })?;
-
-            // Clean up all the items that have _not_ been loaded. Our ItemIds aren't stable. That means
-            // after loading the items, we might have different items and in order to avoid
-            // the database filling up, we delete items that haven't been loaded now.
-            //
-            // The items that have been loaded, have been saved after they've been added to the workspace.
-            let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
-                item_ids_by_kind
-                    .into_iter()
-                    .map(|(item_kind, loaded_items)| {
-                        SerializableItemRegistry::cleanup(
-                            item_kind,
-                            serialized_workspace.id,
-                            loaded_items,
-                            window,
-                            cx,
-                        )
-                        .log_err()
-                    })
-                    .collect::<Vec<_>>()
-            })?;
-
-            futures::future::join_all(clean_up_tasks).await;
-
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    // Serialize ourself to make sure our timestamps and any pane / item changes are replicated
-                    workspace.serialize_workspace_internal(window, cx).detach();
-
-                    // Ensure that we mark the window as edited if we did load dirty items
-                    workspace.update_window_edited(window, cx);
-                })
-                .ok();
-
-            Ok(opened_items)
-        })
     }
 
     pub fn key_context(&self, cx: &App) -> KeyContext {
@@ -7122,111 +6923,6 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
             origin: position,
             size,
         })
-}
-
-fn open_items(
-    serialized_workspace: Option<SerializedWorkspace>,
-    mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> impl 'static + Future<Output = Result<Vec<Option<Result<Box<dyn ItemHandle>>>>>> + use<> {
-    let restored_items = serialized_workspace.map(|serialized_workspace| {
-        Workspace::load_workspace(
-            serialized_workspace,
-            project_paths_to_open
-                .iter()
-                .map(|(_, project_path)| project_path)
-                .cloned()
-                .collect(),
-            window,
-            cx,
-        )
-    });
-
-    cx.spawn_in(window, async move |workspace, cx| {
-        let mut opened_items = Vec::with_capacity(project_paths_to_open.len());
-
-        if let Some(restored_items) = restored_items {
-            let restored_items = restored_items.await?;
-
-            let restored_project_paths = restored_items
-                .iter()
-                .filter_map(|item| {
-                    cx.update(|_, cx| item.as_ref()?.project_path(cx))
-                        .ok()
-                        .flatten()
-                })
-                .collect::<HashSet<_>>();
-
-            for restored_item in restored_items {
-                opened_items.push(restored_item.map(Ok));
-            }
-
-            project_paths_to_open
-                .iter_mut()
-                .for_each(|(_, project_path)| {
-                    if let Some(project_path_to_open) = project_path
-                        && restored_project_paths.contains(project_path_to_open)
-                    {
-                        *project_path = None;
-                    }
-                });
-        } else {
-            for _ in 0..project_paths_to_open.len() {
-                opened_items.push(None);
-            }
-        }
-        assert!(opened_items.len() == project_paths_to_open.len());
-
-        let tasks =
-            project_paths_to_open
-                .into_iter()
-                .enumerate()
-                .map(|(ix, (abs_path, project_path))| {
-                    let workspace = workspace.clone();
-                    cx.spawn(async move |cx| {
-                        let file_project_path = project_path?;
-                        let abs_path_task = workspace.update(cx, |workspace, cx| {
-                            workspace.project().update(cx, |project, cx| {
-                                project.resolve_abs_path(abs_path.to_string_lossy().as_ref(), cx)
-                            })
-                        });
-
-                        // We only want to open file paths here. If one of the items
-                        // here is a directory, it was already opened further above
-                        // with a `find_or_create_worktree`.
-                        if let Ok(task) = abs_path_task
-                            && task.await.is_none_or(|p| p.is_file())
-                        {
-                            return Some((
-                                ix,
-                                workspace
-                                    .update_in(cx, |workspace, window, cx| {
-                                        workspace.open_path(
-                                            file_project_path,
-                                            None,
-                                            true,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .log_err()?
-                                    .await,
-                            ));
-                        }
-                        None
-                    })
-                });
-
-        let tasks = tasks.collect::<Vec<_>>();
-
-        let tasks = futures::future::join_all(tasks);
-        for (ix, path_open_result) in tasks.await.into_iter().flatten() {
-            opened_items[ix] = Some(path_open_result);
-        }
-
-        Ok(opened_items)
-    })
 }
 
 #[derive(Clone)]

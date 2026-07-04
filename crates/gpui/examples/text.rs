@@ -355,7 +355,7 @@ fn run_example() {
         }]);
 
         let fonts = [include_bytes!(
-            "../../../assets/Lilex-Regular.ttf"
+            "../../../assets/fonts/Lilex-Regular.ttf"
         )]
         .iter()
         .map(|b| Cow::Borrowed(&b[..]))

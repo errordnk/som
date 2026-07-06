@@ -1,5 +1,54 @@
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::vte::ansi::Color;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// One rendered grid cell's content and appearance — deliberately a
+/// protocol-specific type rather than sending `alacritty_terminal::term::
+/// cell::Cell` directly, even though that type already derives `Serialize`/
+/// `Deserialize` (its `serde` feature is enabled by default in this
+/// workspace's `Cargo.toml`). Keeping the wire format decoupled from
+/// alacritty's internal `Cell` (which also carries an `Option<Arc<
+/// CellExtra>>` for hyperlinks/zero-width chars/underline color — not
+/// needed yet) means a future alacritty version bump can't silently change
+/// what's on the wire, which matters more here than usual: `som-tmux`'s
+/// eventual WSL/SSH transports (see `project_som_tmux` memory) may end up
+/// with a server binary built from a different commit than the client Som
+/// is running, and the two only need to agree on THIS type, not on
+/// alacritty's internals. `Color`/`Flags` themselves ARE reused as-is
+/// (rather than redefining yet another color enum) — they're small, stable
+/// enough, and already exactly what `terminal_view::terminal_element::
+/// convert_color` expects, so the client can hand a cell's `fg`/`bg`
+/// straight to that existing function instead of converting through an
+/// intermediate representation first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolCell {
+    pub c: char,
+    pub fg: Color,
+    pub bg: Color,
+    pub flags: Flags,
+}
+
+/// Cursor position within the grid, using the same `line`/`column`
+/// convention as `alacritty_terminal::index::Point` (line can be negative
+/// when scrolled into history — not currently possible here since the
+/// server never scrolls back, but kept as `i32` to match `Point` exactly
+/// rather than assuming `usize` and having to special-case it later).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CursorPosition {
+    pub line: i32,
+    pub column: usize,
+}
+
+/// A full grid snapshot: every visible cell, row-major, plus where the
+/// cursor currently is (`None` if the terminal has hidden it, e.g. many
+/// full-screen TUI apps hide the cursor between redraws — see
+/// `alacritty_terminal::term::RenderableCursor`'s `CursorShape::Hidden`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridSnapshot {
+    pub rows: Vec<Vec<ProtocolCell>>,
+    pub cursor: Option<CursorPosition>,
+}
 
 /// One profile (e.g. "dnk") gets exactly one server process, listening on
 /// this pipe name. The server multiplexes many sessions (panes) over the
@@ -48,10 +97,7 @@ pub enum ServerMessage {
     /// already-parsed screen state instead of a raw-byte replay (which would
     /// risk splitting an escape sequence mid-stream, or misrendering
     /// alternate-screen state across the gap).
-    ///
-    /// Known limitation (first iteration): plain text only, no
-    /// colors/attributes/cursor position yet.
-    GridUpdate { session_id: Uuid, grid_text: String },
+    GridUpdate { session_id: Uuid, snapshot: GridSnapshot },
     AttachFailed { session_id: Uuid, reason: String },
     SessionClosed { session_id: Uuid },
     Error { message: String },

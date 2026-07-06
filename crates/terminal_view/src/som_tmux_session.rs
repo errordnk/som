@@ -16,7 +16,7 @@ use crate::som_tmux_view::SomTmuxView;
 use anyhow::{Context as _, Result, bail};
 use gpui::{AppContext as _, AsyncApp, Task, WeakEntity};
 use som_tmux_server::pipe::PipeConnection;
-use som_tmux_server::protocol::{ClientMessage, ServerMessage};
+use som_tmux_server::protocol::{ClientMessage, GridSnapshot, ServerMessage};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
@@ -118,7 +118,7 @@ pub fn create_session(
     cols: u16,
     rows: u16,
     cx: &AsyncApp,
-) -> Task<Result<(SomTmuxSession, String)>> {
+) -> Task<Result<(SomTmuxSession, GridSnapshot)>> {
     cx.background_spawn(async move {
         let spawn_spec = SpawnSpec { profile_name: profile_name.clone(), program: program.clone(), args: args.clone(), cwd: cwd.clone() };
         let connection = som_tmux_client::connect_or_spawn(&profile_name)
@@ -133,8 +133,8 @@ pub fn create_session(
 
         send(&connection, &ClientMessage::Attach { session_id, cols, rows })?;
         let reply = recv(&connection)?;
-        let grid_text = match reply {
-            ServerMessage::GridUpdate { grid_text, .. } => grid_text,
+        let snapshot = match reply {
+            ServerMessage::GridUpdate { snapshot, .. } => snapshot,
             ServerMessage::AttachFailed { reason, .. } => bail!("attach failed right after creating the session: {reason}"),
             other => bail!("unexpected reply to Attach: {other:?}"),
         };
@@ -145,7 +145,7 @@ pub fn create_session(
             spawn_spec,
             cols: Arc::new(Mutex::new((cols, rows))),
         };
-        Ok((session, grid_text))
+        Ok((session, snapshot))
     })
 }
 
@@ -165,15 +165,15 @@ pub fn attach_session(
     cols: u16,
     rows: u16,
     cx: &AsyncApp,
-) -> Task<Result<(SomTmuxSession, String)>> {
+) -> Task<Result<(SomTmuxSession, GridSnapshot)>> {
     cx.background_spawn(async move {
         let spawn_spec = SpawnSpec { profile_name: profile_name.clone(), program, args, cwd };
         let connection = som_tmux_client::connect_or_spawn(&profile_name)
             .context("failed to connect to som-tmux-server")?;
         send(&connection, &ClientMessage::Attach { session_id, cols, rows })?;
         let reply = recv(&connection)?;
-        let grid_text = match reply {
-            ServerMessage::GridUpdate { grid_text, .. } => grid_text,
+        let snapshot = match reply {
+            ServerMessage::GridUpdate { snapshot, .. } => snapshot,
             ServerMessage::AttachFailed { reason, .. } => bail!("attach failed: {reason}"),
             other => bail!("unexpected reply to Attach: {other:?}"),
         };
@@ -183,7 +183,7 @@ pub fn attach_session(
             spawn_spec,
             cols: Arc::new(Mutex::new((cols, rows))),
         };
-        Ok((session, grid_text))
+        Ok((session, snapshot))
     })
 }
 
@@ -215,7 +215,7 @@ pub fn attach_session(
 /// made a server with zero real sessions exit immediately — see
 /// `som_tmux_server::server`'s "0 sessions → exit" — turning every retry
 /// into a respawn race instead of actually waiting for anything.)
-fn reconnect_blocking(spawn_spec: &SpawnSpec, session_id: Uuid, cols: u16, rows: u16) -> Result<(PipeConnection, Uuid, String)> {
+fn reconnect_blocking(spawn_spec: &SpawnSpec, session_id: Uuid, cols: u16, rows: u16) -> Result<(PipeConnection, Uuid, GridSnapshot)> {
     const CONNECT_RETRY_ATTEMPTS: u32 = 5;
     const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -224,7 +224,7 @@ fn reconnect_blocking(spawn_spec: &SpawnSpec, session_id: Uuid, cols: u16, rows:
         match som_tmux_client::connect_or_spawn(&spawn_spec.profile_name) {
             Ok(connection) => {
                 match try_attach(&connection, session_id, cols, rows) {
-                    Ok(grid_text) => return Ok((connection, session_id, grid_text)),
+                    Ok(snapshot) => return Ok((connection, session_id, snapshot)),
                     // Definitive "no such session" on a connection that DID
                     // work — don't retry, go straight to the fallback below.
                     Err(AttachOutcome::AttachFailed) => break,
@@ -260,7 +260,7 @@ fn reconnect_blocking(spawn_spec: &SpawnSpec, session_id: Uuid, cols: u16, rows:
 
     let mut last_err = None;
     for attempt in 0..FALLBACK_RETRY_ATTEMPTS {
-        let attempt_result = (|| -> Result<(PipeConnection, Uuid, String)> {
+        let attempt_result = (|| -> Result<(PipeConnection, Uuid, GridSnapshot)> {
             let connection = som_tmux_client::connect_or_spawn(&spawn_spec.profile_name)?;
             send(
                 &connection,
@@ -278,12 +278,12 @@ fn reconnect_blocking(spawn_spec: &SpawnSpec, session_id: Uuid, cols: u16, rows:
                 other => bail!("unexpected reply to NewSession: {other:?}"),
             };
             send(&connection, &ClientMessage::Attach { session_id: new_session_id, cols, rows })?;
-            let grid_text = match recv(&connection)? {
-                ServerMessage::GridUpdate { grid_text, .. } => grid_text,
+            let snapshot = match recv(&connection)? {
+                ServerMessage::GridUpdate { snapshot, .. } => snapshot,
                 ServerMessage::AttachFailed { reason, .. } => bail!("attach failed right after creating fallback session: {reason}"),
                 other => bail!("unexpected reply to Attach: {other:?}"),
             };
-            Ok((connection, new_session_id, grid_text))
+            Ok((connection, new_session_id, snapshot))
         })();
         match attempt_result {
             Ok(result) => return Ok(result),
@@ -307,10 +307,10 @@ enum AttachOutcome {
     TransportError(anyhow::Error),
 }
 
-fn try_attach(connection: &PipeConnection, session_id: Uuid, cols: u16, rows: u16) -> std::result::Result<String, AttachOutcome> {
+fn try_attach(connection: &PipeConnection, session_id: Uuid, cols: u16, rows: u16) -> std::result::Result<GridSnapshot, AttachOutcome> {
     send(connection, &ClientMessage::Attach { session_id, cols, rows }).map_err(AttachOutcome::TransportError)?;
     match recv(connection).map_err(AttachOutcome::TransportError)? {
-        ServerMessage::GridUpdate { grid_text, .. } => Ok(grid_text),
+        ServerMessage::GridUpdate { snapshot, .. } => Ok(snapshot),
         ServerMessage::AttachFailed { .. } => Err(AttachOutcome::AttachFailed),
         other => Err(AttachOutcome::TransportError(anyhow::anyhow!("unexpected reply to Attach: {other:?}"))),
     }
@@ -320,15 +320,15 @@ fn try_attach(connection: &PipeConnection, session_id: Uuid, cols: u16, rows: u1
 /// GPUI-side task, which applies it to the view — see that function's doc
 /// comment for the full flow.
 enum ReadLoopEvent {
-    GridUpdate(String),
+    GridUpdate(GridSnapshot),
     /// The connection died and a health-check reconnect attempt is
     /// underway — lets the view show a "Reconnecting…" indicator instead of
     /// silently freezing on stale content.
     Reconnecting,
-    /// Reconnect finished. `session_id`/`grid_text` reflect whichever
+    /// Reconnect finished. `session_id`/`snapshot` reflect whichever
     /// happened: reattached to the same session (id unchanged) or fell back
     /// to a brand new one (id changed) — see `reconnect_blocking`.
-    Reconnected { session_id: Uuid, grid_text: String },
+    Reconnected { session_id: Uuid, snapshot: GridSnapshot },
 }
 
 /// Starts forwarding `GridUpdate`s for `session`'s live session id into
@@ -372,8 +372,8 @@ fn spawn_read_loop(session: SomTmuxSession, view: WeakEntity<SomTmuxView>, cx: A
             let session_id = session.session_id();
             let message = recv(&connection);
             match message {
-                Ok(ServerMessage::GridUpdate { session_id: id, grid_text }) if id == session_id => {
-                    if tx.send_blocking(ReadLoopEvent::GridUpdate(grid_text)).is_err() {
+                Ok(ServerMessage::GridUpdate { session_id: id, snapshot }) if id == session_id => {
+                    if tx.send_blocking(ReadLoopEvent::GridUpdate(snapshot)).is_err() {
                         return; // GPUI-side task has stopped listening
                     }
                 }
@@ -385,11 +385,11 @@ fn spawn_read_loop(session: SomTmuxSession, view: WeakEntity<SomTmuxView>, cx: A
                     }
                     let (cols, rows) = *session.cols.lock().unwrap();
                     match reconnect_blocking(&session.spawn_spec, session_id, cols, rows) {
-                        Ok((new_connection, new_session_id, grid_text)) => {
+                        Ok((new_connection, new_session_id, snapshot)) => {
                             *session.connection.lock().unwrap() = Arc::new(new_connection);
                             *session.session_id.lock().unwrap() = new_session_id;
                             if tx
-                                .send_blocking(ReadLoopEvent::Reconnected { session_id: new_session_id, grid_text })
+                                .send_blocking(ReadLoopEvent::Reconnected { session_id: new_session_id, snapshot })
                                 .is_err()
                             {
                                 return;
@@ -408,10 +408,10 @@ fn spawn_read_loop(session: SomTmuxSession, view: WeakEntity<SomTmuxView>, cx: A
     cx.spawn(async move |cx| {
         while let Ok(event) = rx.recv().await {
             let updated = view.update(cx, |view, cx| match event {
-                ReadLoopEvent::GridUpdate(grid_text) => view.apply_grid_update(grid_text, cx),
+                ReadLoopEvent::GridUpdate(snapshot) => view.apply_grid_update(snapshot, cx),
                 ReadLoopEvent::Reconnecting => view.set_reconnecting(true, cx),
-                ReadLoopEvent::Reconnected { session_id, grid_text } => {
-                    view.apply_reconnect(session_id, grid_text, cx)
+                ReadLoopEvent::Reconnected { session_id, snapshot } => {
+                    view.apply_reconnect(session_id, snapshot, cx)
                 }
             });
             if updated.is_err() {
@@ -485,7 +485,7 @@ mod reconnect_tests {
             args: vec![],
             cwd: None,
         };
-        let (_connection, reconnected_id, _grid_text) =
+        let (_connection, reconnected_id, _snapshot) =
             reconnect_blocking(&spawn_spec, session_id, 80, 24).unwrap();
         assert_eq!(reconnected_id, session_id, "should reattach to the original session, not fall back to a new one");
     }
@@ -504,7 +504,7 @@ mod reconnect_tests {
             args: vec![],
             cwd: None,
         };
-        let (_connection, new_session_id, _grid_text) =
+        let (_connection, new_session_id, _snapshot) =
             reconnect_blocking(&spawn_spec, bogus_session_id, 80, 24).unwrap();
         assert_ne!(new_session_id, bogus_session_id, "should have fallen back to a brand new session");
     }

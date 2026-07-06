@@ -1,6 +1,9 @@
 mod blink_manager;
 pub mod cursor;
 mod persistence;
+pub mod som_tmux_client;
+pub mod som_tmux_session;
+pub mod som_tmux_view;
 pub mod terminal_element;
 pub mod terminal_panel;
 pub mod terminal_scrollbar;

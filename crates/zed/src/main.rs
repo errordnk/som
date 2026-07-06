@@ -441,6 +441,7 @@ fn main() {
                     keystroke,
                     icon: t.icon.clone(),
                     working_dir: t.working_dir.clone(),
+                    tmux: t.tmux,
                 }
             })
             .collect();

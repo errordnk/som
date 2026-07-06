@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 async-recursion.workspace = true
 collections.workspace = true
 db.workspace = true
@@ -35,11 +36,13 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
+som_tmux_server.workspace = true
 terminal.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
+uuid.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 

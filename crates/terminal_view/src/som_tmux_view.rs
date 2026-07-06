@@ -20,6 +20,7 @@ use settings::Settings;
 use terminal::mappings::keys::to_esc_str;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::terminal_settings::TerminalSettings;
+use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
 use util::ResultExt;
 use uuid::Uuid;
@@ -36,6 +37,11 @@ pub struct SomTmuxView {
     tab_name: Option<String>,
     workspace: WeakEntity<Workspace>,
     workspace_id: Option<WorkspaceId>,
+    /// Set while the health-check reconnect (see `som_tmux_session`'s
+    /// `spawn_read_loop`/`reconnect_blocking`) is in flight after this
+    /// pane's connection died — surfaced in `render` as a small banner so
+    /// the pane doesn't just look frozen with no explanation.
+    reconnecting: bool,
 }
 
 impl SomTmuxView {
@@ -54,6 +60,7 @@ impl SomTmuxView {
             tab_name,
             workspace,
             workspace_id,
+            reconnecting: false,
         }
     }
 
@@ -64,8 +71,35 @@ impl SomTmuxView {
         cx.notify();
     }
 
+    /// Called by the read loop right when it detects the connection died and
+    /// is about to attempt a health-check reconnect (see
+    /// `som_tmux_session::reconnect_blocking`).
+    pub fn set_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
+        self.reconnecting = reconnecting;
+        cx.notify();
+    }
+
+    /// Called by the read loop once a health-check reconnect resolves —
+    /// `session_id` may differ from before (fell back to a brand new
+    /// session because the old one couldn't be reattached; see
+    /// `reconnect_blocking`'s doc comment). When it does, the workspace's
+    /// `som_tab_tmux_sessions` registry (used to write db.json's
+    /// `tmux_sessions` field) needs to be refreshed too, or a later restore
+    /// would try to attach to a session id that's no longer live.
+    pub fn apply_reconnect(&mut self, session_id: Uuid, grid_text: String, cx: &mut Context<Self>) {
+        self.reconnecting = false;
+        self.grid_text = grid_text;
+        let item_id = cx.entity_id();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, _cx| {
+                workspace.set_tmux_sessions_for_item(item_id, vec![session_id]);
+            });
+        }
+        cx.notify();
+    }
+
     pub fn session_id(&self) -> Uuid {
-        self.session.session_id
+        self.session.session_id()
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -141,6 +175,20 @@ impl Render for SomTmuxView {
             .overflow_hidden()
             .flex()
             .flex_col()
+            .when(self.reconnecting, |el| {
+                // Health-check reconnect in progress (see
+                // `som_tmux_session::spawn_read_loop`'s doc comment) — the
+                // pane's content below is stale until this clears, so make
+                // that visible rather than leaving it looking silently
+                // frozen.
+                el.child(
+                    div()
+                        .bg(cx.theme().status().warning_background)
+                        .text_color(cx.theme().status().warning)
+                        .px_2()
+                        .child("Reconnecting…"),
+                )
+            })
             .children(
                 self.grid_text
                     .lines()

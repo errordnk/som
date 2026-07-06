@@ -749,7 +749,6 @@ impl TerminalPanel {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!("terminal not yet supported for remote projects")));
         }
-        let _ = tab_icon; // TODO(som-tmux): SomTmuxView doesn't render a tab icon yet.
         let tab_name = profile_name.clone();
         cx.spawn_in(window, async move |workspace, cx| {
             let (session, grid_text) = {
@@ -792,6 +791,7 @@ impl TerminalPanel {
                         session.clone(),
                         grid_text,
                         Some(tab_name),
+                        tab_icon,
                         workspace.weak_handle(),
                         workspace.database_id(),
                         cx,

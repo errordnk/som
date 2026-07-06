@@ -46,6 +46,9 @@ uuid.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
 pretty_assertions.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

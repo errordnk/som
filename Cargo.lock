@@ -7627,6 +7627,7 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "windows 0.61.3",
  "workspace",
  "zed_actions",
 ]

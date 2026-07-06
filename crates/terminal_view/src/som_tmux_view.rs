@@ -13,8 +13,8 @@
 
 use crate::som_tmux_session::SomTmuxSession;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Keystroke, Render,
-    WeakEntity, Window, div, prelude::*,
+    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Keystroke,
+    Render, SharedString, WeakEntity, Window, div, prelude::*,
 };
 use settings::Settings;
 use terminal::mappings::keys::to_esc_str;
@@ -22,9 +22,13 @@ use terminal::alacritty_terminal::term::TermMode;
 use terminal::terminal_settings::TerminalSettings;
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
+use ui::{Icon, IconName, Label, h_flex, prelude::*};
 use util::ResultExt;
 use uuid::Uuid;
-use workspace::{Workspace, WorkspaceId, item::{Item, ItemEvent}};
+use workspace::{
+    Workspace, WorkspaceId,
+    item::{Item, ItemEvent, TabContentParams},
+};
 
 pub enum Event {
     Closed,
@@ -35,6 +39,12 @@ pub struct SomTmuxView {
     grid_text: String,
     focus_handle: FocusHandle,
     tab_name: Option<String>,
+    /// Profile's configured tab icon (a Nerd Font glyph, same convention as
+    /// `TerminalView`'s `custom_icon` — see that type's `tab_content` for
+    /// the pattern this mirrors). Was accepted but silently discarded by
+    /// `add_center_tmux_terminal_named` until now — a known gap (tmux tabs
+    /// never showed their profile's icon), not a design choice.
+    tab_icon: Option<String>,
     workspace: WeakEntity<Workspace>,
     workspace_id: Option<WorkspaceId>,
     /// Set while the health-check reconnect (see `som_tmux_session`'s
@@ -49,6 +59,7 @@ impl SomTmuxView {
         session: SomTmuxSession,
         initial_grid_text: String,
         tab_name: Option<String>,
+        tab_icon: Option<String>,
         workspace: WeakEntity<Workspace>,
         workspace_id: Option<WorkspaceId>,
         cx: &mut Context<Self>,
@@ -58,6 +69,7 @@ impl SomTmuxView {
             grid_text: initial_grid_text,
             focus_handle: cx.focus_handle(),
             tab_name,
+            tab_icon,
             workspace,
             workspace_id,
             reconnecting: false,
@@ -203,6 +215,31 @@ impl Item for SomTmuxView {
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> gpui::SharedString {
         self.tab_name.clone().unwrap_or_else(|| "tmux".to_string()).into()
+    }
+
+    /// Same icon convention as `TerminalView::tab_content` (a Nerd Font
+    /// glyph string from the profile's `icon` setting) — overriding this
+    /// rather than the simpler `tab_icon` hook because that one only
+    /// supports a `ui::Icon` from `IconName`'s fixed enum, not an arbitrary
+    /// glyph character.
+    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
+        let title = self.tab_content_text(0, cx);
+
+        let icon_element: AnyElement = if let Some(icon) = &self.tab_icon {
+            div()
+                .font_family("FiraCode Nerd Font")
+                .text_color(params.text_color().color(cx))
+                .child(icon.clone())
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Terminal).color(params.text_color()).into_any_element()
+        };
+
+        h_flex()
+            .gap_2()
+            .child(icon_element)
+            .child(Label::new(SharedString::from(title)).color(params.text_color()))
+            .into_any()
     }
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {

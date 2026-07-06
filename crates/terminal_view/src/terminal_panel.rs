@@ -751,7 +751,7 @@ impl TerminalPanel {
         }
         let tab_name = profile_name.clone();
         cx.spawn_in(window, async move |workspace, cx| {
-            let (session, grid_text) = {
+            let (session, snapshot) = {
                 let cx = cx.clone();
                 let profile_name = profile_name.clone();
                 let attach_result = if let Some(session_id) = existing_session_id {
@@ -789,7 +789,7 @@ impl TerminalPanel {
                 let view = cx.new(|cx| {
                     SomTmuxView::new(
                         session.clone(),
-                        grid_text,
+                        snapshot,
                         Some(tab_name),
                         tab_icon,
                         workspace.weak_handle(),

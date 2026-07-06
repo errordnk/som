@@ -91,12 +91,12 @@ fn handle_connection(connection: PipeConnection, sessions: &Sessions) -> anyhow:
                     let mut guard = sessions.lock().unwrap();
                     guard.get_mut(&session_id).map(|session| {
                         session.resize(SessionBounds::new(cols, rows));
-                        session.snapshot_text()
+                        session.snapshot()
                     })
                 };
                 match snapshot {
-                    Some(grid_text) => {
-                        send(&connection, &writer, &ServerMessage::GridUpdate { session_id, grid_text })?;
+                    Some(snapshot) => {
+                        send(&connection, &writer, &ServerMessage::GridUpdate { session_id, snapshot })?;
                         spawn_forwarder(session_id, connection.clone(), writer.clone(), sessions.clone(), &mut forwarders);
                     }
                     None => {
@@ -180,14 +180,14 @@ fn spawn_forwarder(
             if !changed {
                 continue;
             }
-            let grid_text = {
+            let snapshot = {
                 let guard = sessions.lock().unwrap();
                 match guard.get(&session_id) {
-                    Some(session) => session.snapshot_text(),
+                    Some(session) => session.snapshot(),
                     None => return,
                 }
             };
-            if send(&connection, &writer, &ServerMessage::GridUpdate { session_id, grid_text }).is_err() {
+            if send(&connection, &writer, &ServerMessage::GridUpdate { session_id, snapshot }).is_err() {
                 return; // client disconnected
             }
         }

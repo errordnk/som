@@ -1,9 +1,9 @@
 //! View component for `tmux:true` panes — deliberately separate from
 //! `TerminalView` rather than patching it, since `TerminalView` is tightly
 //! coupled to a live local `alacritty_terminal::Term` in nearly every
-//! method, while this renders a plain-text grid snapshot arriving over IPC
-//! from `som-tmux-server` (no colors/attributes yet — a known limitation of
-//! the protocol's first iteration, see `som_tmux_server::protocol`).
+//! method, while this renders a grid snapshot (cells, with color/attributes/
+//! cursor position) arriving over IPC from `som-tmux-server` — see
+//! `som_tmux_server::protocol::GridSnapshot`.
 //!
 //! This is designed as a real, permanent component (not a throwaway shim):
 //! the long-term direction for som-tmux is for it to become the default
@@ -12,11 +12,14 @@
 //! concept.
 
 use crate::som_tmux_session::SomTmuxSession;
+use crate::terminal_element::convert_color;
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Keystroke,
     Render, SharedString, WeakEntity, Window, div, prelude::*,
 };
 use settings::Settings;
+use som_tmux_server::protocol::GridSnapshot;
+use terminal::alacritty_terminal::term::cell::Flags;
 use terminal::mappings::keys::to_esc_str;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::terminal_settings::TerminalSettings;
@@ -36,7 +39,7 @@ pub enum Event {
 
 pub struct SomTmuxView {
     session: SomTmuxSession,
-    grid_text: String,
+    snapshot: GridSnapshot,
     focus_handle: FocusHandle,
     tab_name: Option<String>,
     /// Profile's configured tab icon (a Nerd Font glyph, same convention as
@@ -57,7 +60,7 @@ pub struct SomTmuxView {
 impl SomTmuxView {
     pub fn new(
         session: SomTmuxSession,
-        initial_grid_text: String,
+        initial_snapshot: GridSnapshot,
         tab_name: Option<String>,
         tab_icon: Option<String>,
         workspace: WeakEntity<Workspace>,
@@ -66,7 +69,7 @@ impl SomTmuxView {
     ) -> Self {
         Self {
             session,
-            grid_text: initial_grid_text,
+            snapshot: initial_snapshot,
             focus_handle: cx.focus_handle(),
             tab_name,
             tab_icon,
@@ -78,8 +81,8 @@ impl SomTmuxView {
 
     /// Called by the read loop (`som_tmux_session::spawn_read_loop`) when a
     /// new `GridUpdate` arrives for this pane's session.
-    pub fn apply_grid_update(&mut self, grid_text: String, cx: &mut Context<Self>) {
-        self.grid_text = grid_text;
+    pub fn apply_grid_update(&mut self, snapshot: GridSnapshot, cx: &mut Context<Self>) {
+        self.snapshot = snapshot;
         cx.notify();
     }
 
@@ -98,9 +101,9 @@ impl SomTmuxView {
     /// `som_tab_tmux_sessions` registry (used to write db.json's
     /// `tmux_sessions` field) needs to be refreshed too, or a later restore
     /// would try to attach to a session id that's no longer live.
-    pub fn apply_reconnect(&mut self, session_id: Uuid, grid_text: String, cx: &mut Context<Self>) {
+    pub fn apply_reconnect(&mut self, session_id: Uuid, snapshot: GridSnapshot, cx: &mut Context<Self>) {
         self.reconnecting = false;
-        self.grid_text = grid_text;
+        self.snapshot = snapshot;
         let item_id = cx.entity_id();
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, _cx| {
@@ -160,10 +163,9 @@ impl EventEmitter<ItemEvent> for SomTmuxView {}
 impl Render for SomTmuxView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // GPUI's text layout doesn't have a CSS-`pre`-like whitespace mode
-        // that preserves spaces/newlines verbatim, so each grid row is its
-        // own element rather than relying on that — this is a plain-text
-        // monospace render, not yet accounting for cell colors/attributes
-        // (the protocol doesn't carry those yet, see module doc comment).
+        // that preserves spaces/newlines verbatim, so each grid row (and
+        // each cell within it, to carry per-cell color/attributes) is its
+        // own element rather than relying on that.
         //
         // Same font-resolution order `TerminalElement` uses (see
         // `terminal_element.rs`): the user's configured terminal font
@@ -176,6 +178,10 @@ impl Render for SomTmuxView {
             .font_family
             .as_ref()
             .map_or_else(|| theme_settings.buffer_font.family.clone(), |f| f.0.clone().into());
+        let theme = cx.theme().clone();
+
+        let cursor_row = self.snapshot.cursor.map(|c| c.line.max(0) as usize);
+        let cursor_col = self.snapshot.cursor.map(|c| c.column);
 
         div()
             .id("som-tmux-view")
@@ -201,13 +207,49 @@ impl Render for SomTmuxView {
                         .child("Reconnecting…"),
                 )
             })
-            .children(
-                self.grid_text
-                    .lines()
-                    .map(|line| div().child(line.to_string()))
-                    .collect::<Vec<_>>(),
-            )
+            .children(self.snapshot.rows.iter().enumerate().map(|(row_ix, row)| {
+                let is_cursor_row = cursor_row == Some(row_ix);
+                render_grid_row(row, is_cursor_row.then_some(cursor_col).flatten(), &theme)
+            }))
     }
+}
+
+/// Renders one grid row as a sequence of per-cell `div`s carrying that
+/// cell's own foreground/background/bold/italic/underline — plain-text-only
+/// rendering (like the module used to have) loses exactly this information,
+/// which is the whole point of `GridSnapshot` carrying full `Cell` data
+/// instead of a bare `String`. `cursor_col`, when `Some`, is the column
+/// within THIS row where the cursor sits (already resolved to `None` by the
+/// caller for every other row) — rendered by swapping that one cell's
+/// fg/bg, the simplest correct way to show a block cursor without a
+/// separate absolutely-positioned overlay element.
+fn render_grid_row(
+    row: &[som_tmux_server::protocol::ProtocolCell],
+    cursor_col: Option<usize>,
+    theme: &theme::Theme,
+) -> impl IntoElement {
+    h_flex().children(row.iter().enumerate().map(|(col_ix, cell)| {
+        let mut fg = convert_color(&cell.fg, theme);
+        let mut bg = convert_color(&cell.bg, theme);
+        if cell.flags.contains(Flags::INVERSE) || cursor_col == Some(col_ix) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+
+        let mut el = div().text_color(fg).bg(bg).child(cell.c.to_string());
+        if cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
+            el = el.font_weight(gpui::FontWeight::BOLD);
+        }
+        if cell.flags.contains(Flags::ITALIC) {
+            el = el.italic();
+        }
+        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+            el = el.underline();
+        }
+        if cell.flags.contains(Flags::STRIKEOUT) {
+            el = el.line_through();
+        }
+        el
+    }))
 }
 
 impl Item for SomTmuxView {

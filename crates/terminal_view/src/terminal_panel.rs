@@ -757,8 +757,17 @@ impl TerminalPanel {
                 let profile_name = profile_name.clone();
                 let attach_result = if let Some(session_id) = existing_session_id {
                     Some(
-                        som_tmux_session::attach_session(profile_name.clone(), session_id, 80, 24, &cx)
-                            .await,
+                        som_tmux_session::attach_session(
+                            profile_name.clone(),
+                            session_id,
+                            program.clone(),
+                            args.clone(),
+                            cwd.clone(),
+                            80,
+                            24,
+                            &cx,
+                        )
+                        .await,
                     )
                 } else {
                     None
@@ -793,7 +802,7 @@ impl TerminalPanel {
                 // Splits aren't implemented for tmux tabs yet (SomTmuxView::can_split()
                 // is false), so this is always a single-session vec for now — see
                 // `set_tmux_sessions_for_item`'s doc comment.
-                workspace.set_tmux_sessions_for_item(item_id, vec![session.session_id]);
+                workspace.set_tmux_sessions_for_item(item_id, vec![session.session_id()]);
                 (item_id, view)
             })?;
 

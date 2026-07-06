@@ -1,6 +1,6 @@
 # Som Multiplexer — Plan
 
-## Status (2026-07-04)
+## Status (2026-07-06)
 
 The original version of this plan proposed a separate `crates/som_mux/`
 crate with its own `SomLayout` enum (`Single/SplitH/SplitV/SplitH3/Quad`).
@@ -22,8 +22,11 @@ That was never built. What actually shipped instead — directly inside
 - `TabProfile` (`crates/workspace/src/workspace.rs:443`) has 5 fields:
   `name`, `shell: Option<String>`, `keystroke`, `icon`, `working_dir`.
 
-This doc is kept as a reference for what's implemented and what's still
-open — not as a build plan for a crate that doesn't exist.
+The old "SSH Reconnect After Disconnect" design sketch that used to live in
+this doc has been **superseded entirely** by `som-tmux` (below) — a real
+detached PTY server that survives Som closing, rather than a reconnect-retry
+layer bolted onto a plain PTY. That old section is gone; this doc now covers
+what's actually being built.
 
 ---
 
@@ -79,6 +82,8 @@ open — not as a build plan for a crate that doesn't exist.
     ssh-MOTD duplication bug (see below).
   - The saved active split pane is restored via
     `Workspace::som_focus_pane_by_index`.
+- **Will be extended** for `som-tmux` tabs with a per-panel session-id field
+  (see below) — not yet implemented.
 
 ### Bugs fixed during db.json rollout (2026-07-02), kept here for context
 - **Tab order / wrong split content after restore**: fixed by matching
@@ -116,95 +121,215 @@ no default keybinding.
 
 ---
 
-## SSH Reconnect After Disconnect (new — not yet started)
+## som-tmux — detached PTY server (in progress)
 
-### Current state: greenfield, nothing to build on
+### Why
 
-Investigated 2026-07-04. Som has **no SSH-awareness at all** today:
+Even with tabs/splits/db.json restore working, a process in a pane still
+dies when Som closes: restore re-spawns the *same command* on next launch
+(new PID, no continuity), it doesn't reattach to a still-running one. E.g. a
+`ping google.com` running in a pane does not survive closing Som via the X
+button or Alt+F4 — restore just runs `ping google.com` again from scratch.
 
-- A tab's `shell` field (`TabProfile::shell`) is an opaque string, e.g.
-  `"ssh user@host"`. It gets naively split into program+args
-  (`crates/project/src/terminals.rs`) and handed to the PTY as a plain
-  child process — same as running any other command. There is no
-  `RemoteClient`/`SshSession`/connection object, and no `crates/remote` or
-  `crates/remote_server` in this fork.
-- The only SSH-adjacent flag is `Terminal::is_remote_terminal`
-  (`crates/terminal/src/terminal.rs`) — purely cosmetic, it just disables
-  cwd tracking/persistence ("can't introspect a remote shell's cwd"). No
-  connection state.
-- Process exit IS already detected (`completion_tx`/`completion_rx`,
-  `child_exited`, `register_task_finished` in `terminal.rs`) — but for any
-  interactive shell (SSH included), exit unconditionally emits
-  `Event::CloseTerminal` and the pane just closes. Nothing distinguishes
-  "user typed `exit`" from "network dropped the connection."
-- No restart/respawn/reconnect action exists anywhere in the codebase.
-- The closest reusable building block: `Terminal::clone_builder`
-  (`terminal.rs`) already knows how to rebuild a `TerminalBuilder` from a
-  terminal's own shell/env/cwd template — this is what split-pane cloning
-  uses today, and reconnect would reuse the same idea (rebuild with the
-  same shell command against the same pane, instead of a new pane).
+`som-tmux` fixes this properly: for tabs whose profile opts in, the actual
+PTY/shell process lives in a **separate, detached server process** that
+outlives Som's own window. Closing/reopening a tab reattaches to it instead
+of respawning. This is deliberately *not* full tmux (no tmux panes, splits,
+or keybindings are reused — Som has its own for all of that) — only the
+server/session-survival part is our own, built from scratch (evaluated
+reusing an existing Windows tmux port, `psmux` — not viable: no separable
+server crate, no documented/stable wire protocol, would mean vendoring an
+actively-changing external codebase).
 
-### Design sketch
+### Activation
 
-1. **Mark a pane as "reconnectable."** Need a way to know a given
-   `Terminal`/`TerminalView` is an SSH session worth reconnecting, as
-   opposed to a normal shell that exited on purpose. Simplest approach:
-   treat any tab/pane whose `shell` command matches `ssh ...` (or a new
-   explicit `is_ssh: bool` on `TabProfile`, safer than string-sniffing) as
-   reconnectable, rather than trying to detect this after the fact.
+A tab's profile in `settings.json` opts in with `"tmux": true` (default
+`false` — must be explicit). Applies to **all** panes in that tab (main +
+up to 3 splits).
 
-2. **Distinguish disconnect from intentional exit.** `register_task_finished`
-   currently only looks at exit code / whether the user typed input. For
-   SSH specifically, a non-zero exit shortly after having been connected
-   (or an `ExitStatus` matching typical ssh connection-drop codes) should
-   be treated as "disconnected," not "closed." This needs its own branch
-   in the exit-handling path, gated on the pane being marked SSH per (1).
+**Guiding goal for the whole feature**: maximum context restoration across
+all panes on Som restart, at maximum zero-config. Both matter equally —
+where they conflict (e.g. fully recovering a session after the remote
+server machine itself rebooted would require root access there to
+auto-restart the server), zero-config wins; that specific case falls back
+to plain new-session creation instead (see health-check, below).
 
-3. **Don't close the pane on disconnect — show a reconnect state.** Instead
-   of emitting `Event::CloseTerminal`, keep the pane alive and render an
-   inline "Connection lost — reconnecting…" / "Connection lost — press R
-   to retry" state in place of the dead terminal content. This is new UI,
-   not present anywhere in `TerminalView` today.
+The `tmux` field stays in the config schema permanently — what changes over
+time is its **default**, not its existence. Right now it's an explicit
+opt-in (`false` by default, must write `"tmux": true`). The long-term goal
+is for the default to flip to `true` — tmux behavior on for every profile
+with zero config needed — while the field remains available as an explicit
+**opt-out** (`"tmux": false`) for anyone who wants the plain direct-PTY path
+for a specific profile. The only *automatic* (non-user-driven) fallback to
+the plain path is on setups where `som-tmux-server` genuinely can't be run
+at all (silent, no user action needed). So: the requirement to *write* the
+setting to get tmux behavior disappears; the setting itself does not.
 
-4. **Reconnect action.** Rebuild the terminal in place using the same
-   approach as `clone_builder`/`clone_terminal` (same shell command, same
-   working directory if known), replacing the dead terminal's content
-   without tearing down the pane itself (so split layout, focus, and tab
-   position are undisturbed). Exposed as:
-   - Automatic retry with backoff (e.g. 1s, 2s, 5s, then give up and show
-     a manual-retry prompt), AND
-   - A manual action/keybinding (e.g. `ctrl-shift-r` while a dead pane is
-     focused) to force an immediate retry.
+### Where the server actually runs — real tmux semantics, not "Windows-only helper"
 
-5. **Don't reconnect-loop forever.** Cap automatic retries (e.g. 5
-   attempts) before falling back to a manual-only "press R to retry"
-   state, so a genuinely-down host doesn't spin forever or spam
-   connection attempts.
+This is the single most important design point, revisited and corrected
+mid-implementation: **`som-tmux-server` runs on whichever machine actually
+executes the shell**, not always next to Som:
 
-6. **Session survival across app restart.** Since `db.json` already saves
-   which tabs/splits had an SSH profile, a pane that was mid-disconnect at
-   quit time should just attempt a fresh connection on next launch (same
-   as any other restored tab) rather than trying to persist "was
-   disconnected" state — simpler, and consistent with how restore already
-   works for everything else.
+- Local Windows profile (e.g. `dnk`, running `pwsh.exe`) → server runs on
+  this same Windows machine. Transport: a Windows named pipe.
+- WSL profile (`wsl --cd ~`) → server is a **separate Linux binary**,
+  running *inside* WSL. Transport to it from Windows-side Som: **not yet
+  decided** (candidates: `wsl.exe` as a transport wrapper, a TCP port
+  forwarded from WSL2 to Windows localhost).
+- SSH profiles (`ssh host`) → server is a binary built for the **remote**
+  machine's platform, running *there*, launched over the same SSH
+  connection the shell itself would have used (same idea as real tmux's
+  `ssh host tmux attach`) — not a separate direct network channel by IP.
+  - Being tested via a `loc` profile (`"shell": "ssh localhost"`) added
+    specifically to exercise the SSH transport without needing to
+    cross-compile for another OS or touch a real remote box — `ssh
+    localhost` on this same Windows machine, once its OpenSSH server
+    (`sshd` Windows service) is running.
+  - Leading transport design (not fully locked in yet): Som spawns
+    `ssh <host> som-tmux-server <profile>` as a child process and talks to
+    the server directly over that child's stdin/stdout — no named pipe on
+    the far side in this mode. Requires abstracting the pipe-connection
+    type behind a small trait/enum (`WindowsNamedPipe` vs
+    `ChildProcessStdio`, same read/write interface) and a `--stdio` launch
+    mode for the server binary.
+- Protocol itself (`ClientMessage`/`ServerMessage`, length-prefixed JSON)
+  is transport-agnostic — none of this changes `protocol.rs`, only how its
+  bytes physically move.
 
-### Open questions
-1. Should SSH-awareness be an explicit `TabProfile` field (`is_ssh: bool`)
-   set from settings.json, or inferred from the `shell` string starting
-   with `ssh`/`ssh.exe`? Explicit is more robust (works with `autossh`,
-   wrapper scripts, `Plink`, etc. too) but requires a settings schema
-   change; inferred is zero-config but fragile.
-2. What counts as "disconnected" vs "exited on purpose"? Exit code alone
-   is unreliable (a remote `exit` command and a dropped connection can
-   both produce non-zero codes depending on the shell/ssh client). May
-   need to watch for specific stderr patterns (`ssh` prints
-   "Connection to X closed" / "Connection reset by peer" / "Broken pipe"
-   on unexpected drops) rather than relying on exit code alone.
-3. Does reconnecting need to restore scrollback/session state, or is a
-   fresh login (new MOTD, new shell) acceptable? (Given the MOTD-duplicate
-   bug just fixed, a fresh reconnect banner is expected — just needs to
-   render once, not duplicated.)
-4. Backoff/retry-limit values — needs real-world tuning, not a guess.
+**Deliberate divergence from real tmux**, called out explicitly because
+it's easy to "fix" this the wrong way later: real tmux runs *one server per
+user per host*. Som instead runs **one server per profile**, always — even
+if several profiles point at the exact same host (three profiles all SSHing
+to the same Mac = three independent `som-tmux-server` processes there, not
+one shared one). This avoids needing to resolve "are `mac` and
+`192.168.50.6` the same host" (hostname/IP/alias equivalence is exactly the
+kind of fragile check this design sidesteps) at the cost of some duplicate
+server processes on hosts with multiple profiles. Chosen intentionally for
+simplicity, not an oversight.
+
+**Practical rollout order**: get the Windows-local case (profile `dnk`,
+named-pipe transport) fully working end-to-end first — it already is, see
+below — before tackling WSL/SSH transports, which are meaningfully
+different problems (cross-compilation, remote spawn-and-connect).
+
+### Server core — implemented and tested (`crates/som_tmux_server/`)
+
+- Separate crate, split into a `[lib]` (transport: `pipe.rs`, `protocol.rs`
+  — the only parts Som's client side needs) and a `[[bin]]` `som-tmux-server`
+  (PTY/session internals: `bounds.rs`, `session.rs`, `server.rs` — private
+  to the server process).
+- **Grouping**: one server process per profile name. It multiplexes many
+  sessions (= panes, across any number of tabs of that profile) over a
+  single pipe, keyed by `session_id: Uuid` in the protocol — not one pipe
+  per session.
+- **Protocol** (`protocol.rs`): `ClientMessage::{NewSession, Attach, Write,
+  Resize, CloseSession}`, `ServerMessage::{SessionCreated, GridUpdate,
+  AttachFailed, SessionClosed, Error}`. `GridUpdate` carries a full
+  plain-text grid snapshot (`grid_text: String`) sent on `Attach` and again
+  on every change — not raw PTY bytes (alacritty's IO thread parses bytes
+  into its own `Term` and never exposes them raw, only a "something
+  changed" signal) and not a diff (first-iteration simplicity; no
+  colors/attributes/cursor position carried yet — known, deliberate
+  limitation).
+- **Session lifecycle** (`session.rs`): each session owns a real PTY
+  (`alacritty_terminal::tty`) and its own `Term`, plus a permanent internal
+  "pump" thread that answers terminal escape-sequence queries
+  (`PtyWrite` events, e.g. a Device Attributes request PowerShell sends on
+  startup) immediately — without this, the shell sits waiting for a reply
+  that never comes and produces no further output (found the hard way: an
+  empty 1920-blank-cell grid).
+- **Detach vs. kill semantics**:
+  - Detach = the connection drops but the session keeps running. Happens
+    passively whenever Som just exits/crashes (no command sent, nothing to
+    do differently).
+  - Closing a tab/pane through the UI sends an explicit
+    `CloseSession(session_id)` — this really kills the PTY process, it's
+    not a "leave it running" detach.
+  - When a server's last session is closed this way, the server exits
+    itself (`std::process::exit(0)`).
+  - On next launch, Som attempts `Attach` for any `tmux:true` tab's saved
+    session id; if the server isn't there/doesn't know it (didn't survive,
+    e.g. a reboot), falls back to creating a fresh session.
+- **IPC transport (Windows-local case)**: `\\.\pipe\som-tmux-<profile>`,
+  using **overlapped I/O** (`FILE_FLAG_OVERLAPPED`), not synchronous pipe
+  calls. This was a real, subtle bug: a synchronous (non-overlapped) named
+  pipe handle serializes *all* I/O through the OS — a blocking `ReadFile`
+  pending on one thread will block a concurrent `WriteFile` from another
+  thread on the *same handle* until the read completes. Since the server
+  needs one thread reading incoming client messages while another streams
+  `GridUpdate`s out on the same connection, this deadlocked reliably after
+  the first update. Confirmed as documented Windows behavior (Microsoft
+  Learn: "Synchronous and Overlapped Pipe I/O"), fixed by giving every
+  read/write its own `OVERLAPPED` + manual-reset event.
+- **Verified end-to-end** via a manual PowerShell test client
+  (`test_client.ps1`, kept in the repo root for further manual testing):
+  spawn a session, attach, type an interactive command, see live streamed
+  grid updates land, see the echoed output actually appear, explicitly
+  close the session, confirm the server process exits on its own.
+
+### Not yet done
+
+1. **UI rendering component.** Decided: a **new, separate view component**
+   for `tmux:true` panes rather than patching the existing `TerminalView` —
+   `TerminalView` is tightly coupled to a live local `alacritty_terminal::Term`
+   in nearly every method (render, scrolling, hover, resize all read/write
+   `self.terminal`), and tmux panes have fundamentally different data (a
+   plain-text grid snapshot arriving over IPC, no colors/attributes yet).
+   Patching would mean threading an `if tmux {...} else {...}` branch
+   through ~90 methods; a new component keeps the existing, already-solid
+   `tmux:false` path completely untouched while this is being built out.
+   Since the long-term direction may make `tmux:true` the *only* mode
+   someday (except where the server can't run), the new component should be
+   designed as a real, full replacement candidate (not a throwaway shim) —
+   just only wired up for `tmux:true` panes for now.
+2. `som_config::TabProfile` / `workspace::TabProfile` — add `tmux: bool`
+   (default false).
+3. `db.json` schema — add a per-tab session-id list for `tmux:true` tabs.
+4. Client-side connect-or-spawn logic (detached process creation on
+   Windows, `PipeConnection::connect` retry loop) — not yet written.
+5. Wire the new view component into tab creation / close / restore paths.
+6. WSL and SSH transports (see above) — separate follow-up work, not
+   started; `sshd` (Windows OpenSSH Server) needs to be running locally to
+   test the `loc` (`ssh localhost`) profile once SSH transport exists.
+7. **Per-pane health-check.** Each `tmux:true` pane needs to detect a
+   dropped connection — deliberately kept simple, on the user's own
+   correction mid-design: don't try to distinguish *why* the channel died
+   (client-side network blip vs. the server's own machine rebooting) and
+   don't try to build a special "resurrect the exact same session after the
+   server host reboots" mechanism. Instead: on a detected drop, retry
+   `Attach` to the same `session_id` (cheap, handles the common
+   "network blipped, server's still there" case transparently); if that
+   doesn't succeed after some retries, just fall back to creating a **brand
+   new session**, via the exact same attach-or-create path restore already
+   uses when a server doesn't respond on launch. No new third state, no
+   separate server-side recovery mechanism — health-check is this same
+   fallback path, just triggered live during a session instead of only at
+   Som startup.
+   **Why no server-side auto-recovery**: making `som-tmux-server`
+   auto-start itself after the remote machine reboots (e.g. a systemd unit
+   on Linux/a router, launchd on Mac) and re-register old sessions would
+   need root/admin access on that remote machine to set up the OS-level
+   autostart. That's an unacceptable requirement on the user's environment
+   (ARM routers often don't grant root at all; personal servers — the user
+   may not want to hand an app that kind of access). This isn't a "simplify
+   now, revisit later" shortcut — it's a firm constraint: som-tmux must
+   never require root on the remote side, so it will never try to
+   self-restart/recover itself at the OS level. Falling back to a plain new
+   session is the only approach compatible with that.
+   Not designed yet — open questions: detection mechanism
+   (heartbeat/ping-pong in the protocol vs. a timeout on missing
+   `GridUpdate`s), retry count/backoff before falling back to a new session,
+   what the new view component (item 1) shows while a reconnect attempt is
+   in flight. This subsumes what used to be a separate "SSH Reconnect After
+   Disconnect" idea in an earlier version of this doc — folded into
+   som-tmux's health-check rather than a standalone reconnect layer bolted
+   onto a plain PTY.
+
+Full blow-by-blow implementation log, exact file states, and the discovery
+process for each bug above lives in this session's `project_som_tmux`
+memory note (not duplicated here) — this doc is the durable summary, that
+memory is the working log.
 
 ---
 

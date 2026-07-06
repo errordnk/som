@@ -7047,6 +7047,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "som_tmux_server"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "async-channel 2.5.0",
+ "futures",
+ "log",
+ "paths",
+ "serde",
+ "serde_json",
+ "smol",
+ "sysinfo 0.37.2",
+ "uuid",
+ "windows 0.61.3",
+ "zlog",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

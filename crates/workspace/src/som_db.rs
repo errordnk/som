@@ -12,14 +12,30 @@
 //! is active), `j` is which pane within that tab is active (0 = main,
 //! 1-3 = split panes). A missing/unreadable file falls back to a single tab
 //! using profile 0, no splits, active — `{"tabs": ["0.0"], "active": "0.0"}`.
+//!
+//! Tabs whose profile has `tmux: true` additionally carry their live
+//! `som-tmux` session ids as a third, colon-separated segment:
+//! `"x.y:uuid1,uuid2,uuid3"` — one uuid per pane (main first, then splits in
+//! creation order), only ever written for tabs that are actually tmux. A
+//! plain (non-tmux) tab never has this segment at all — it's not "no
+//! sessions", it's "not applicable".
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SomDbTab {
     pub profile_index: usize,
     pub extra_splits: usize,
+    /// One `som-tmux` session id per live pane (main first, then splits in
+    /// order), only ever present for tabs whose profile has `tmux: true`.
+    /// `None` for a plain (non-tmux) tab — this is NOT "no sessions to
+    /// restore", it's "this tab was never tmux in the first place". Length
+    /// must match `1 + extra_splits` when present; restore treats a
+    /// mismatched length as corrupt and falls back to creating fresh
+    /// sessions for the whole tab rather than trying to partially trust it.
+    pub tmux_sessions: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +51,7 @@ impl Default for SomDbState {
             tabs: vec![SomDbTab {
                 profile_index: 0,
                 extra_splits: 0,
+                tmux_sessions: None,
             }],
             active_tab: 0,
             active_pane: 0,
@@ -56,6 +73,32 @@ fn parse_pair(s: &str) -> Option<(usize, usize)> {
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
+/// Parses one `tabs[]` entry: `"x.y"` or `"x.y:uuid1,uuid2,..."`. The tmux
+/// session-id segment is validated against `extra_splits` (must have exactly
+/// `1 + extra_splits` ids) — a mismatch is treated as corrupt data for that
+/// segment only, so the tab still restores as a plain (non-tmux) tab rather
+/// than failing entirely.
+fn parse_tab_entry(s: &str) -> Option<SomDbTab> {
+    let (pair, sessions_part) = match s.split_once(':') {
+        Some((pair, rest)) => (pair, Some(rest)),
+        None => (s, None),
+    };
+    let (profile_index, extra_splits) = parse_pair(pair)?;
+    let extra_splits = extra_splits.min(3);
+
+    let tmux_sessions = sessions_part.and_then(|rest| {
+        let ids: Option<Vec<Uuid>> = rest.split(',').map(|part| Uuid::parse_str(part).ok()).collect();
+        let ids = ids?;
+        (ids.len() == 1 + extra_splits).then_some(ids)
+    });
+
+    Some(SomDbTab {
+        profile_index,
+        extra_splits,
+        tmux_sessions,
+    })
+}
+
 pub fn som_db_path() -> PathBuf {
     paths::config_dir().join("db.json")
 }
@@ -72,17 +115,7 @@ pub fn load_som_db() -> SomDbState {
         return SomDbState::default();
     };
 
-    let tabs: Vec<SomDbTab> = file
-        .tabs
-        .iter()
-        .filter_map(|s| {
-            let (profile_index, extra_splits) = parse_pair(s)?;
-            Some(SomDbTab {
-                profile_index,
-                extra_splits: extra_splits.min(3),
-            })
-        })
-        .collect();
+    let tabs: Vec<SomDbTab> = file.tabs.iter().filter_map(|s| parse_tab_entry(s)).collect();
 
     if tabs.is_empty() {
         return SomDbState::default();
@@ -109,7 +142,16 @@ pub fn save_som_db(state: &SomDbState) {
         tabs: state
             .tabs
             .iter()
-            .map(|t| format!("{}.{}", t.profile_index, t.extra_splits))
+            .map(|t| {
+                let pair = format!("{}.{}", t.profile_index, t.extra_splits);
+                match &t.tmux_sessions {
+                    Some(ids) => {
+                        let ids = ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+                        format!("{pair}:{ids}")
+                    }
+                    None => pair,
+                }
+            })
             .collect(),
         active: format!("{}.{}", state.active_tab, state.active_pane),
     };
@@ -138,7 +180,10 @@ mod tests {
     #[test]
     fn default_state_is_single_tab() {
         let s = SomDbState::default();
-        assert_eq!(s.tabs, vec![SomDbTab { profile_index: 0, extra_splits: 0 }]);
+        assert_eq!(
+            s.tabs,
+            vec![SomDbTab { profile_index: 0, extra_splits: 0, tmux_sessions: None }]
+        );
         assert_eq!(s.active_tab, 0);
         assert_eq!(s.active_pane, 0);
     }
@@ -147,5 +192,43 @@ mod tests {
     fn clamps_extra_splits_to_three() {
         let (_, y) = parse_pair("0.9").unwrap();
         assert_eq!(y.min(3), 3);
+    }
+
+    #[test]
+    fn parses_plain_tab_entry_without_tmux_sessions() {
+        let tab = parse_tab_entry("3.2").unwrap();
+        assert_eq!(tab.profile_index, 3);
+        assert_eq!(tab.extra_splits, 2);
+        assert_eq!(tab.tmux_sessions, None);
+    }
+
+    #[test]
+    fn parses_tab_entry_with_tmux_sessions() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let entry = format!("0.1:{id1},{id2}");
+        let tab = parse_tab_entry(&entry).unwrap();
+        assert_eq!(tab.profile_index, 0);
+        assert_eq!(tab.extra_splits, 1);
+        assert_eq!(tab.tmux_sessions, Some(vec![id1, id2]));
+    }
+
+    #[test]
+    fn tmux_sessions_length_mismatch_falls_back_to_none() {
+        // extra_splits=0 means 1 pane expected, but two ids given.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let entry = format!("0.0:{id1},{id2}");
+        let tab = parse_tab_entry(&entry).unwrap();
+        assert_eq!(tab.tmux_sessions, None);
+    }
+
+    #[test]
+    fn tab_entry_formats_and_parses_symmetrically() {
+        let id = Uuid::new_v4();
+        let tab = SomDbTab { profile_index: 1, extra_splits: 0, tmux_sessions: Some(vec![id]) };
+        let formatted = format!("{}.{}:{}", tab.profile_index, tab.extra_splits, id);
+        let parsed = parse_tab_entry(&formatted).unwrap();
+        assert_eq!(parsed, tab);
     }
 }

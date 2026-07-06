@@ -25,7 +25,13 @@ use crate::Project;
 /// where the program part is quoted or has no spaces.
 /// E.g. `C:\Program Files\pwsh.exe` → (`C:\Program Files\pwsh.exe`, [])
 ///      `wsl --cd ~` → (`wsl`, [`--cd`, `~`])
-fn parse_shell_command(cmd: &str) -> (String, Vec<String>) {
+///
+/// Public so `som-tmux` client code (`terminal_view::som_tmux_client`) can
+/// turn a `TabProfile::shell` string into the `program`/`args` its
+/// `NewSession` protocol message needs, using the exact same parsing as the
+/// regular (non-tmux) terminal-creation path — rather than duplicating this
+/// logic and risking the two diverging.
+pub fn parse_shell_command(cmd: &str) -> (String, Vec<String>) {
     let cmd = cmd.trim();
     // Quoted program: "path with spaces" [args...]
     if cmd.starts_with('"') {

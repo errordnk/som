@@ -5,6 +5,8 @@ use crate::{
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
+    som_tmux_session,
+    som_tmux_view::SomTmuxView,
 };
 use db::kvp::KeyValueStore;
 use gpui::{
@@ -552,6 +554,47 @@ impl TerminalPanel {
             .and_then(|p| p.0.first().map(|profile| profile.name.clone()));
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
+        let profile = tab_name.as_deref().and_then(|name| workspace::TabProfiles::find_by_name(name, cx));
+        // `action.shell` is populated even for the profile's OWN keybinding
+        // (`Ctrl+Shift+N` — see `som_config.rs`'s keymap generation, which
+        // bakes the profile's shell into the binding so it round-trips
+        // through gpui's action-persistence), not just for a genuine
+        // user override — so only treat this as an override (and skip the
+        // tmux path) if it actually differs from the profile's own shell.
+        let is_shell_override = action
+            .shell
+            .as_deref()
+            .is_some_and(|shell| profile.as_ref().and_then(|p| p.shell.as_deref()) != Some(shell));
+        if !is_shell_override && profile.as_ref().is_some_and(|p| p.tmux) {
+            let profile = profile.unwrap();
+            let profile_index = tab_name.as_deref().and_then(|name| TabProfiles::index_by_name(name, cx)).unwrap_or(0);
+            let (program, args) = project::terminals::parse_shell_command(
+                profile.shell.as_deref().unwrap_or(""),
+            );
+            let cwd = profile
+                .working_dir
+                .as_deref()
+                .and_then(|dir| shellexpand::full(dir).ok())
+                .map(|dir| dir.to_string())
+                .or_else(|| {
+                    default_working_directory(workspace, cx)
+                        .map(|p| p.to_string_lossy().to_string())
+                });
+            Self::add_center_tmux_terminal_named(
+                workspace,
+                profile.name.clone(),
+                profile.icon.clone(),
+                profile_index,
+                program,
+                args,
+                cwd,
+                window,
+                cx,
+            )
+            .detach_and_log_err(cx);
+            return;
+        }
+
         let (profile_shell, tab_icon) = tab_name.as_deref()
             .map(|name| TabProfiles::profile_by_name(name, cx))
             .unwrap_or((None, None));
@@ -667,6 +710,62 @@ impl TerminalPanel {
                 item_id
             })?;
             Ok((item_id, terminal.downgrade()))
+        })
+    }
+
+    /// Creates a new tab backed by `som-tmux` instead of a plain local PTY —
+    /// used when the tab's profile has `tmux: true`. Unlike
+    /// `add_center_terminal_named_at`, this doesn't go through `Project` at
+    /// all (there's no local `Terminal`/`alacritty_terminal::Term` — the PTY
+    /// lives inside `som-tmux-server`, possibly on a different machine
+    /// entirely, see `SOM_MUX_PLAN.md`). The connect-or-spawn/`NewSession`
+    /// handshake is genuinely blocking network+process work, so it runs in
+    /// `cx.background_spawn` first; only once that resolves do we touch
+    /// `Workspace`/create the `SomTmuxView` (which needs `AsyncApp` — see
+    /// `som_tmux_session`'s doc comments for why the two can't be mixed into
+    /// one future).
+    pub fn add_center_tmux_terminal_named(
+        workspace: &mut Workspace,
+        profile_name: String,
+        tab_icon: Option<String>,
+        profile_index: usize,
+        program: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<Result<gpui::EntityId>> {
+        if !is_enabled_in_workspace(workspace, cx) {
+            return Task::ready(Err(anyhow!("terminal not yet supported for remote projects")));
+        }
+        let _ = tab_icon; // TODO(som-tmux): SomTmuxView doesn't render a tab icon yet.
+        let tab_name = profile_name.clone();
+        cx.spawn_in(window, async move |workspace, cx| {
+            let (session, grid_text) = {
+                let cx = cx.clone();
+                som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx)
+            }
+            .await?;
+
+            let (item_id, view) = workspace.update_in(cx, |workspace, window, cx| {
+                let view = cx.new(|cx| {
+                    SomTmuxView::new(
+                        session.clone(),
+                        grid_text,
+                        Some(tab_name),
+                        workspace.weak_handle(),
+                        workspace.database_id(),
+                        cx,
+                    )
+                });
+                let item_id = view.entity_id();
+                workspace.add_item_to_main_pane(Box::new(view.clone()), Some(profile_index), window, cx);
+                (item_id, view)
+            })?;
+
+            som_tmux_session::start_read_loop(&session, view.downgrade(), cx);
+
+            Ok(item_id)
         })
     }
 

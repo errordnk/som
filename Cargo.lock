@@ -7599,6 +7599,7 @@ name = "terminal_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "async-recursion",
  "collections",
  "db",
@@ -7618,12 +7619,14 @@ dependencies = [
  "serde_json",
  "settings",
  "shellexpand",
+ "som_tmux_server",
  "task",
  "terminal",
  "theme",
  "theme_settings",
  "ui",
  "util",
+ "uuid",
  "workspace",
  "zed_actions",
 ]

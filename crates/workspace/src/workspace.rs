@@ -446,6 +446,9 @@ pub struct TabProfile {
     pub keystroke: Option<String>,
     pub icon: Option<String>,
     pub working_dir: Option<String>,
+    /// See `som_config::TabProfile::tmux` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub tmux: bool,
 }
 
 /// Global list of tab profiles loaded from som config (name, shell, etc).
@@ -457,6 +460,14 @@ impl gpui::Global for TabProfiles {}
 impl TabProfiles {
     pub fn set(profiles: Vec<TabProfile>, cx: &mut gpui::App) {
         cx.set_global(TabProfiles(profiles));
+    }
+
+    /// Returns the full profile for the given name, if any — unlike
+    /// `profile_by_name` (which only surfaces shell/icon, kept for its
+    /// existing callers), this exposes every field, notably `tmux`.
+    pub fn find_by_name(name: &str, cx: &gpui::App) -> Option<TabProfile> {
+        cx.try_global::<TabProfiles>()
+            .and_then(|p| p.0.iter().find(|profile| profile.name == name).cloned())
     }
 
     /// Returns (shell, icon) for the profile with the given name, or (None, None).
@@ -5573,9 +5584,14 @@ impl Workspace {
                     .copied()
                     .unwrap_or(0);
                 let extra_splits = self.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
+                // TODO(som-tmux): populate `tmux_sessions` once the client
+                // side actually tracks per-pane session ids for tmux:true
+                // tabs — see `project_som_tmux` memory. Every tab is treated
+                // as non-tmux (`None`) until then.
                 som_db::SomDbTab {
                     profile_index,
                     extra_splits,
+                    tmux_sessions: None,
                 }
             })
             .collect();

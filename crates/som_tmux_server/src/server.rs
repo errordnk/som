@@ -121,10 +121,23 @@ fn handle_connection(connection: PipeConnection, sessions: &Sessions) -> anyhow:
                 if let Some(stop) = forwarders.remove(&session_id) {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                let removed = sessions.lock().unwrap().remove(&session_id);
+                let (removed, now_empty) = {
+                    let mut guard = sessions.lock().unwrap();
+                    let removed = guard.remove(&session_id);
+                    (removed, guard.is_empty())
+                };
                 if let Some(session) = removed {
                     session.kill();
                     send(&connection, &writer, &ServerMessage::SessionClosed { session_id })?;
+                }
+                // Check right away rather than waiting for this connection to
+                // disconnect — Som keeps the pipe connection open after
+                // closing one tab (other tabs on the same profile may still
+                // be using it), so waiting for disconnect could leave this
+                // process running forever with zero sessions.
+                if now_empty {
+                    log::info!("no sessions left, exiting");
+                    std::process::exit(0);
                 }
             }
         }

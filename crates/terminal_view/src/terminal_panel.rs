@@ -24,6 +24,7 @@ use ui::{
     Tooltip, prelude::*,
 };
 use util::{ResultExt, TryFutureExt};
+use uuid::Uuid;
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
@@ -588,6 +589,7 @@ impl TerminalPanel {
                 program,
                 args,
                 cwd,
+                None,
                 window,
                 cx,
             )
@@ -724,6 +726,14 @@ impl TerminalPanel {
     /// `Workspace`/create the `SomTmuxView` (which needs `AsyncApp` — see
     /// `som_tmux_session`'s doc comments for why the two can't be mixed into
     /// one future).
+    /// `existing_session_id` is `Some` on the restore path (`restore_som_tabs`,
+    /// coming from db.json's `tmux_sessions`) — if given, tries `Attach` to
+    /// that id first (the server may still be alive from before Som
+    /// restarted, see the detach-vs-kill semantics in `project_som_tmux`
+    /// memory), falling back to spawning a brand new session with
+    /// `program`/`args`/`cwd` if the attach fails (server gone, or the
+    /// session id no longer exists on it) — same fallback the rest of Som's
+    /// restore path already uses when a saved terminal can't be resurrected.
     pub fn add_center_tmux_terminal_named(
         workspace: &mut Workspace,
         profile_name: String,
@@ -732,6 +742,7 @@ impl TerminalPanel {
         program: String,
         args: Vec<String>,
         cwd: Option<String>,
+        existing_session_id: Option<Uuid>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<gpui::EntityId>> {
@@ -743,9 +754,28 @@ impl TerminalPanel {
         cx.spawn_in(window, async move |workspace, cx| {
             let (session, grid_text) = {
                 let cx = cx.clone();
-                som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx)
-            }
-            .await?;
+                let profile_name = profile_name.clone();
+                let attach_result = if let Some(session_id) = existing_session_id {
+                    Some(
+                        som_tmux_session::attach_session(profile_name.clone(), session_id, 80, 24, &cx)
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                match attach_result {
+                    Some(Ok(session_and_grid)) => Ok(session_and_grid),
+                    Some(Err(err)) => {
+                        log::info!(
+                            "tmux restore: attach to saved session failed ({err:#}), starting a new session instead"
+                        );
+                        som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx).await
+                    }
+                    None => {
+                        som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx).await
+                    }
+                }
+            }?;
 
             let (item_id, view) = workspace.update_in(cx, |workspace, window, cx| {
                 let view = cx.new(|cx| {
@@ -760,6 +790,10 @@ impl TerminalPanel {
                 });
                 let item_id = view.entity_id();
                 workspace.add_item_to_main_pane(Box::new(view.clone()), Some(profile_index), window, cx);
+                // Splits aren't implemented for tmux tabs yet (SomTmuxView::can_split()
+                // is false), so this is always a single-session vec for now — see
+                // `set_tmux_sessions_for_item`'s doc comment.
+                workspace.set_tmux_sessions_for_item(item_id, vec![session.session_id]);
                 (item_id, view)
             })?;
 
@@ -823,6 +857,44 @@ impl TerminalPanel {
                     .map(|dir| PathBuf::from(dir.to_string()))
                     .filter(|dir| dir.is_dir());
 
+                if profile.tmux {
+                    // Splits aren't supported for tmux tabs yet (see
+                    // `SomTmuxView::can_split`), so there's only ever the
+                    // main session id to restore, never any extras.
+                    let existing_session_id =
+                        tab.tmux_sessions.as_ref().and_then(|ids| ids.first().copied());
+                    let (program, args) =
+                        project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+                    let cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+                    let created = window_handle
+                        .update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                let cwd_string = cwd_string.clone().or_else(|| {
+                                    default_working_directory(workspace, cx)
+                                        .map(|p| p.to_string_lossy().to_string())
+                                });
+                                Self::add_center_tmux_terminal_named(
+                                    workspace,
+                                    profile.name.clone(),
+                                    profile.icon.clone(),
+                                    tab.profile_index,
+                                    program,
+                                    args,
+                                    cwd_string,
+                                    existing_session_id,
+                                    window,
+                                    cx,
+                                )
+                            })
+                        })
+                        .ok()
+                        .and_then(|r| r.ok());
+                    if let Some(created) = created {
+                        tab_creations.push((db_index, tab.extra_splits, created));
+                    }
+                    continue;
+                }
+
                 let created = window_handle
                     .update(cx, |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
@@ -848,6 +920,9 @@ impl TerminalPanel {
                     .ok()
                     .and_then(|r| r.ok());
                 if let Some(created) = created {
+                    let created = cx.background_spawn(async move {
+                        created.await.map(|(item_id, _terminal)| item_id)
+                    });
                     tab_creations.push((db_index, tab.extra_splits, created));
                 }
             }
@@ -863,7 +938,7 @@ impl TerminalPanel {
             // would just get inserted at 0).
             let mut tabs_in_db_order = Vec::with_capacity(tab_creations.len());
             for (db_index, extra_splits, created) in tab_creations.into_iter() {
-                if let Some((item_id, _terminal)) = created.await.log_err() {
+                if let Some(item_id) = created.await.log_err() {
                     tabs_in_db_order.push((db_index, extra_splits, item_id));
                 }
             }

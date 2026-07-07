@@ -210,6 +210,20 @@ impl Session {
         GridSnapshot { rows, cursor }
     }
 
+    /// Serializes the current grid into ANSI bytes via `redrawer`, writing
+    /// them to `out` — see `crate::redraw` module doc comment for why this
+    /// exists (transparent-PTY-proxy architecture: `som-tmux-server` must
+    /// emit plain ANSI on its own stdout, not a structured protocol, so
+    /// Som's own unmodified `TerminalElement` can parse it like any other
+    /// shell). `redrawer` carries the diff state; pass the SAME `Redrawer`
+    /// across repeated calls for incremental updates (only what changed
+    /// gets emitted), or a freshly-`Redrawer::new()` one for a full
+    /// redraw (a newly-(re)attached client needs to see the whole screen).
+    pub fn redraw(&self, redrawer: &mut crate::redraw::Redrawer, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        let term = self.term.lock();
+        redrawer.redraw(&term, out)
+    }
+
     /// Waits for the next `Wakeup` from the session's internal pump thread
     /// (i.e. the grid actually changed) — `events_rx` only ever carries
     /// `Wakeup`/`Exit` (everything else, notably `PtyWrite`, is handled

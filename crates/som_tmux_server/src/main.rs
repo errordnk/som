@@ -28,6 +28,18 @@ fn parse_args() -> Args {
     let mut iter = std::env::args().skip(1).peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            // Deliberately checked before any other parsing/validation —
+            // this is the ONLY thing a deploy check (see `project_som_tmux`
+            // memory, "Обновление 19"/23 — remote binary version/platform
+            // comparison before deciding whether to scp a newer build over)
+            // needs from a remote binary it hasn't run as a real HOLDER/
+            // RELAY yet. Prints ONLY the raw handshake JSON (no log
+            // preamble) so the caller (a plain `ssh host ... --version`)
+            // can parse stdout directly without scraping a log file.
+            "--version" => {
+                println!("{}", serde_json::to_string(&som_tmux_server::protocol::HandshakeInfo::current()).unwrap());
+                std::process::exit(0);
+            }
             "--holder" => holder = true,
             "--profile" => profile = iter.next(),
             "--pane-id" => pane_id = iter.next(),

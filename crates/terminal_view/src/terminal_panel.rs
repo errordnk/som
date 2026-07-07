@@ -1559,23 +1559,30 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Finds `som-tmux-server.exe` next to Som's own executable — the same
-/// "binaries live side by side" assumption `target/debug/` (and any
-/// packaged distribution) already guarantees for Som's other bundled
-/// tools. Mirrors the old (now-removed) `som_tmux_client::server_binary_
-/// path`, which lived on the GPUI-client side of the old JSON-protocol
-/// architecture; this is its natural home now that the substitution
-/// happens directly in the shell command instead.
-#[cfg(target_os = "windows")]
+/// Finds `som-tmux-server`/`som-tmux-server.exe` next to Som's own
+/// executable — the same "binaries live side by side" assumption
+/// `target/debug/` (and any packaged distribution) already guarantees for
+/// Som's other bundled tools. Mirrors the old (now-removed)
+/// `som_tmux_client::server_binary_path`, which lived on the GPUI-client
+/// side of the old JSON-protocol architecture; this is its natural home now
+/// that the substitution happens directly in the shell command instead.
+///
+/// Cross-platform, not Windows-only — this is the `RemoteKind::Local` path
+/// in `tmux_wrapped_shell`, which applies just as much to a Mac/Linux build
+/// of Som with a plain local `zsh`/`bash` `tmux: true` profile as it does to
+/// Windows' `pwsh.exe` one; only the `ssh`/`wsl` remote paths are Windows-only
+/// today (those profiles' `shell` settings only make sense from a Windows
+/// Som talking OUT to other machines).
 fn som_tmux_server_binary_path() -> anyhow::Result<PathBuf> {
     let exe_dir = std::env::current_exe()
         .context("failed to determine Som's own executable path")?
         .parent()
         .context("Som's executable path has no parent directory")?
         .to_path_buf();
-    let candidate = exe_dir.join("som-tmux-server.exe");
+    let binary_name = if cfg!(target_os = "windows") { "som-tmux-server.exe" } else { "som-tmux-server" };
+    let candidate = exe_dir.join(binary_name);
     if !candidate.is_file() {
-        anyhow::bail!("som-tmux-server.exe not found next to Som's own executable at {candidate:?}");
+        anyhow::bail!("{binary_name} not found next to Som's own executable at {candidate:?}");
     }
     Ok(candidate)
 }

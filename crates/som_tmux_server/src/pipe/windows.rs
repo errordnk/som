@@ -77,6 +77,26 @@ pub struct PipeConnection {
 unsafe impl Send for PipeConnection {}
 unsafe impl Sync for PipeConnection {}
 
+/// Windows named pipes don't need an actual "listener" object the way a
+/// Unix domain socket does (`PipeConnection::accept` below just creates a
+/// fresh pipe instance under the given name every time) — this just carries
+/// the name along so `bind`/`accept_on` can present the SAME two-step API
+/// `crate::server::run`'s accept loop uses on both platforms, without any
+/// `#[cfg(...)]` in that loop itself beyond picking which `pipe` submodule
+/// to import.
+pub struct Listener(String);
+
+/// No-op beyond remembering the name — see `Listener`'s doc comment for why
+/// Windows doesn't need to actually create anything up front the way
+/// `unix::PipeConnection::bind` does.
+pub fn bind(pipe_name: &str) -> Result<Listener> {
+    Ok(Listener(pipe_name.to_string()))
+}
+
+pub fn accept_on(listener: &Listener) -> Result<PipeConnection> {
+    PipeConnection::accept(&listener.0)
+}
+
 impl PipeConnection {
     /// Blocks until a client connects to a fresh instance of `pipe_name`,
     /// then returns the connected pipe. Callers loop this to keep accepting
@@ -92,7 +112,7 @@ impl PipeConnection {
     /// thousands of times/sec since nothing throttled retries). Plain
     /// `PIPE_UNLIMITED_INSTANCES` on every `CreateNamedPipeW` call already
     /// allows any number of instances to coexist under the same name.
-    pub fn accept(pipe_name: &str) -> Result<Self> {
+    fn accept(pipe_name: &str) -> Result<Self> {
         let wide_name = to_wide(pipe_name);
         let handle = unsafe {
             CreateNamedPipeW(

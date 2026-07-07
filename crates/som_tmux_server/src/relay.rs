@@ -16,7 +16,7 @@
 use som_tmux_server::pipe::PipeConnection;
 use som_tmux_server::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const CONNECT_RETRY_ATTEMPTS: u32 = 20;
@@ -38,6 +38,22 @@ pub fn run(
     scrollback: Option<usize>,
 ) -> anyhow::Result<()> {
     let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd, cursor_shape, scrollback)?);
+    // Guards every `write_message` call on `connection` — the stdin-forwarding
+    // loop (main thread) and the resize-polling thread both write
+    // `RelayInput`s onto the SAME underlying pipe/socket handle, and
+    // `write_message` is two separate writes (length prefix, then payload).
+    // Without this, an unlucky interleaving between those two threads could
+    // corrupt the framing (one thread's length prefix landing between the
+    // other's prefix and payload) — confirmed as the root cause of a
+    // reported ">>"-after-Enter artifact: a corrupted RelayInput::Bytes
+    // frame can silently drop/mangle a keystroke (e.g. the Enter that ends
+    // a command), leaving PowerShell's own PSReadLine thinking the command
+    // is still incomplete and showing its real continuation prompt. Mirrors
+    // `server.rs`'s own `writer: Arc<Mutex<()>>`, which already protects the
+    // HOLDER's equivalent multi-writer situation (its main loop plus the
+    // redraw-forwarder thread) — this was simply the one side that hadn't
+    // needed it until the resize-polling thread (a second writer) was added.
+    let writer = Arc::new(Mutex::new(()));
 
     // Handshake first, before anything else on this connection — see
     // `protocol::HandshakeInfo`'s doc comment. The relay speaks first here;
@@ -53,7 +69,7 @@ pub fn run(
     // child processes under the shell) — deliberately NOT bolted on here
     // half-finished; the handshake EXCHANGE is the prerequisite this adds,
     // the DECISION is future work.
-    send(&connection, &RelayInput::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &writer, &RelayInput::Handshake(HandshakeInfo::current()))?;
     match read_holder_message(&connection)? {
         HolderOutput::Handshake(info) => {
             log::info!(
@@ -74,7 +90,7 @@ pub fn run(
     // 80x24) — the HOLDER unconditionally waits for exactly one message
     // here, so this side must unconditionally send exactly one.
     let initial_size = crate::term_size::current_size().unwrap_or((80, 24));
-    send(&connection, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
+    send(&connection, &writer, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
 
     let reader_connection = connection.clone();
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
@@ -109,6 +125,7 @@ pub fn run(
     // the REAL pane size while every escape code the HOLDER generated was
     // computed against a completely different, wrong screen width.
     let resize_connection = connection.clone();
+    let resize_writer = writer.clone();
     let resize_thread = std::thread::spawn(move || {
         // Seeded with the size already sent above, so this loop's first
         // tick doesn't immediately re-send an identical Resize.
@@ -120,7 +137,7 @@ pub fn run(
                 continue;
             }
             last_size = (cols, rows);
-            if send(&resize_connection, &RelayInput::Resize { cols, rows }).is_err() {
+            if send(&resize_connection, &resize_writer, &RelayInput::Resize { cols, rows }).is_err() {
                 return; // holder gone — writer_thread/stdin loop will notice too
             }
         }
@@ -138,7 +155,7 @@ pub fn run(
             Ok(n) => n,
             Err(_) => break,
         };
-        if send(&connection, &RelayInput::Bytes(buf[..read].to_vec())).is_err() {
+        if send(&connection, &writer, &RelayInput::Bytes(buf[..read].to_vec())).is_err() {
             break; // holder gone
         }
     }
@@ -155,8 +172,9 @@ pub fn run(
     Ok(())
 }
 
-fn send(connection: &PipeConnection, message: &RelayInput) -> anyhow::Result<()> {
+fn send(connection: &PipeConnection, writer: &Mutex<()>, message: &RelayInput) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(message)?;
+    let _guard = writer.lock().unwrap();
     connection.write_message(&payload)?;
     Ok(())
 }

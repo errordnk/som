@@ -13,12 +13,19 @@
 //! 1-3 = split panes). A missing/unreadable file falls back to a single tab
 //! using profile 0, no splits, active — `{"tabs": ["0.0"], "active": "0.0"}`.
 //!
-//! Tabs whose profile has `tmux: true` additionally carry their live
-//! `som-tmux` session ids as a third, colon-separated segment:
-//! `"x.y:uuid1,uuid2,uuid3"` — one uuid per pane (main first, then splits in
-//! creation order), only ever written for tabs that are actually tmux. A
+//! Tabs whose profile has `tmux: true` additionally carry their
+//! `som-tmux-server` pane ids as a third, colon-separated segment:
+//! `"x.y:uuid1,uuid2,uuid3"` — one pane id per pane (main first, then splits
+//! in creation order), only ever written for tabs that are actually tmux. A
 //! plain (non-tmux) tab never has this segment at all — it's not "no
-//! sessions", it's "not applicable".
+//! sessions", it's "not applicable". Each pane id is a UUID string used as
+//! that pane's `som-tmux-server` pipe name (see `project_som_tmux` memory,
+//! "Обновление 17"/19) — restoring a tab reuses the same id so it
+//! reconnects to the same still-running HOLDER process if one survived,
+//! rather than starting a fresh shell. (Formerly a protocol session id to
+//! `Attach` with — that concept is gone along with the old JSON IPC
+//! protocol; the on-disk format/validation is unchanged, just the meaning
+//! of what's stored.)
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -28,14 +35,14 @@ use uuid::Uuid;
 pub struct SomDbTab {
     pub profile_index: usize,
     pub extra_splits: usize,
-    /// One `som-tmux` session id per live pane (main first, then splits in
-    /// order), only ever present for tabs whose profile has `tmux: true`.
-    /// `None` for a plain (non-tmux) tab — this is NOT "no sessions to
-    /// restore", it's "this tab was never tmux in the first place". Length
-    /// must match `1 + extra_splits` when present; restore treats a
+    /// One `som-tmux-server` pane id per live pane (main first, then splits
+    /// in order), only ever present for tabs whose profile has `tmux:
+    /// true`. `None` for a plain (non-tmux) tab — this is NOT "no sessions
+    /// to restore", it's "this tab was never tmux in the first place".
+    /// Length must match `1 + extra_splits` when present; restore treats a
     /// mismatched length as corrupt and falls back to creating fresh
     /// sessions for the whole tab rather than trying to partially trust it.
-    pub tmux_sessions: Option<Vec<Uuid>>,
+    pub tmux_sessions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +94,11 @@ fn parse_tab_entry(s: &str) -> Option<SomDbTab> {
     let extra_splits = extra_splits.min(3);
 
     let tmux_sessions = sessions_part.and_then(|rest| {
-        let ids: Option<Vec<Uuid>> = rest.split(',').map(|part| Uuid::parse_str(part).ok()).collect();
+        // Validated as UUIDs (rejects corrupt/garbage data), but stored as
+        // plain strings — a pane id is just a pipe-name component now, not
+        // a typed protocol identifier (see module doc comment).
+        let ids: Option<Vec<String>> =
+            rest.split(',').map(|part| Uuid::parse_str(part).ok().map(|id| id.to_string())).collect();
         let ids = ids?;
         (ids.len() == 1 + extra_splits).then_some(ids)
     });
@@ -146,7 +157,7 @@ pub fn save_som_db(state: &SomDbState) {
                 let pair = format!("{}.{}", t.profile_index, t.extra_splits);
                 match &t.tmux_sessions {
                     Some(ids) => {
-                        let ids = ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+                        let ids = ids.join(",");
                         format!("{pair}:{ids}")
                     }
                     None => pair,
@@ -210,7 +221,7 @@ mod tests {
         let tab = parse_tab_entry(&entry).unwrap();
         assert_eq!(tab.profile_index, 0);
         assert_eq!(tab.extra_splits, 1);
-        assert_eq!(tab.tmux_sessions, Some(vec![id1, id2]));
+        assert_eq!(tab.tmux_sessions, Some(vec![id1.to_string(), id2.to_string()]));
     }
 
     #[test]
@@ -226,7 +237,7 @@ mod tests {
     #[test]
     fn tab_entry_formats_and_parses_symmetrically() {
         let id = Uuid::new_v4();
-        let tab = SomDbTab { profile_index: 1, extra_splits: 0, tmux_sessions: Some(vec![id]) };
+        let tab = SomDbTab { profile_index: 1, extra_splits: 0, tmux_sessions: Some(vec![id.to_string()]) };
         let formatted = format!("{}.{}:{}", tab.profile_index, tab.extra_splits, id);
         let parsed = parse_tab_entry(&formatted).unwrap();
         assert_eq!(parsed, tab);

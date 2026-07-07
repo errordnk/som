@@ -1259,16 +1259,21 @@ pub struct Workspace {
     /// reconstruct `som_db.json`'s "x.y" tab entries without guessing the
     /// profile back from a possibly-ambiguous or user-renamed tab title.
     som_tab_profile_index: std::collections::HashMap<gpui::EntityId, usize>,
-    /// Live `som-tmux-server` session ids for tmux tabs (main pane + splits,
-    /// main first), keyed by the *main* item's `EntityId` — mirrors
-    /// `som_tab_profile_index`. Populated by `terminal_view`'s
-    /// `add_center_tmux_terminal_named` (the only place that knows a
-    /// session id right after creating one), since `workspace` can't name
-    /// `SomTmuxView` itself (dependency points the other way). Read back in
+    /// `som-tmux-server` pane ids for tmux tabs (main pane + splits, main
+    /// first), keyed by the *main* item's `EntityId` — mirrors
+    /// `som_tab_profile_index`. A pane id is just a UUID string used as
+    /// that pane's `som-tmux-server` pipe name (see `project_som_tmux`
+    /// memory, "Обновление 17"/19) — NOT a protocol session id to `Attach`
+    /// with anymore (that concept is gone along with the old JSON IPC
+    /// protocol). Populated by `terminal_view` right after creating a tmux
+    /// tab (it generates the pane id itself before ever invoking
+    /// `som-tmux-server`), since `workspace` can't name anything
+    /// tmux-specific itself (dependency points the other way). Read back in
     /// `som_persist_db_json` to fill db.json's `tmux_sessions` field, so a
-    /// later launch can `Attach` instead of starting fresh. Non-tmux tabs
-    /// never get an entry here.
-    som_tab_tmux_sessions: std::collections::HashMap<gpui::EntityId, Vec<Uuid>>,
+    /// later launch reuses the same pane id (and thus reconnects to the
+    /// same still-running HOLDER, if one survived) instead of generating a
+    /// fresh one. Non-tmux tabs never get an entry here.
+    som_tab_tmux_sessions: std::collections::HashMap<gpui::EntityId, Vec<String>>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -4021,12 +4026,12 @@ impl Workspace {
         self.add_item_to_main_pane_at(item, profile_index, None, window, cx);
     }
 
-    /// Records `session_ids` (main pane + splits, main first) as the live
-    /// `som-tmux-server` sessions backing `item`'s tab, so a later
+    /// Records `pane_ids` (main pane + splits, main first) as the
+    /// `som-tmux-server` pane ids backing `item`'s tab, so a later
     /// `som_persist_db_json` call can write them into db.json's
     /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
-    pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, session_ids: Vec<Uuid>) {
-        self.som_tab_tmux_sessions.insert(item_id, session_ids);
+    pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, pane_ids: Vec<String>) {
+        self.som_tab_tmux_sessions.insert(item_id, pane_ids);
     }
 
     /// Like `add_item_to_main_pane`, but lets the caller pin the tab to a

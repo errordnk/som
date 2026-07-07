@@ -16,7 +16,7 @@ use project::{Fs, Project};
 
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, Shell, ShellBuilder, SpawnInTerminal};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
+use terminal::{Terminal, terminal_settings::{CursorShape, TerminalSettings}};
 use ui::{
     ButtonLike, Clickable, ContextMenu, FluentBuilder, PopoverMenu, SplitButton, Toggleable,
     Tooltip, prelude::*,
@@ -589,6 +589,9 @@ impl TerminalPanel {
             // below is just `None`, skipping straight to terminal creation.
             let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
             let remote_kind = classify_remote(&remote_program);
+            let terminal_settings = TerminalSettings::get_global(cx);
+            let cursor_shape = terminal_settings.cursor_shape;
+            let scrollback = terminal_settings.max_scroll_history_lines;
             cx.spawn_in(window, async move |workspace, cx| {
                 if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
                     let host_args = host_args.clone();
@@ -600,7 +603,7 @@ impl TerminalPanel {
                     .await;
                 }
 
-                let (program, args) = match tmux_wrapped_shell(&profile, &pane_id) {
+                let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback) {
                     Ok(pair) => pair,
                     Err(err) => {
                         log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
@@ -821,7 +824,13 @@ impl TerminalPanel {
                         .await;
                     }
 
-                    let wrapped = tmux_wrapped_shell(&profile, &pane_id);
+                    let (cursor_shape, scrollback) = window_handle
+                        .update(cx, |_, _, cx| {
+                            let settings = TerminalSettings::get_global(cx);
+                            (settings.cursor_shape, settings.max_scroll_history_lines)
+                        })
+                        .unwrap_or((CursorShape::default(), None));
+                    let wrapped = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback);
                     let created = match wrapped {
                         Ok((program, args)) => window_handle
                             .update(cx, |_, window, cx| {
@@ -1409,6 +1418,23 @@ fn classify_remote(program: &str) -> RemoteKind {
     }
 }
 
+/// Serializes Som's own `CursorShape` setting into the plain string
+/// `som-tmux-server` parses back out (`crate::session::parse_cursor_shape`
+/// in that crate, deliberately NOT sharing this enum type — see that
+/// function's doc comment for why) — passed via `--cursor-shape` so the
+/// HOLDER's own `alacritty_terminal::Term` (which now OWNS the cursor shape
+/// that gets baked into the ANSI this crate reads back, see
+/// `project_som_tmux` memory's cursor-shape bug writeup) matches whatever
+/// the user actually configured, instead of silently defaulting to Block.
+fn cursor_shape_arg(shape: CursorShape) -> &'static str {
+    match shape {
+        CursorShape::Block => "block",
+        CursorShape::Underline => "underline",
+        CursorShape::Bar => "bar",
+        CursorShape::Hollow => "hollow",
+    }
+}
+
 /// Substitutes a `som-tmux-server`-wrapped command in for a `tmux: true`
 /// profile's own shell — see `project_som_tmux` memory ("Обновление 16"-19)
 /// for the full design. Som's own terminal creation path never learns
@@ -1420,16 +1446,26 @@ fn classify_remote(program: &str) -> RemoteKind {
 /// tab, or a saved one from db.json for restore) — the server never
 /// invents one; see `som_tmux_server::protocol::pipe_name`'s doc comment
 /// for why this changed from the old per-profile-multiplexed design.
-fn tmux_wrapped_shell(profile: &workspace::TabProfile, pane_id: &str) -> anyhow::Result<(String, Vec<String>)> {
+///
+/// `cursor_shape`/`scrollback` mirror Som's own `TerminalSettings` — passed
+/// through explicitly to the server (which owns the actual `Term` these
+/// configure now) rather than left for it to guess/default; see
+/// `cursor_shape_arg`'s doc comment.
+fn tmux_wrapped_shell(
+    profile: &workspace::TabProfile,
+    pane_id: &str,
+    cursor_shape: CursorShape,
+    scrollback: Option<usize>,
+) -> anyhow::Result<(String, Vec<String>)> {
     let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
     match classify_remote(&program) {
         RemoteKind::Local => {
             let server_path = som_tmux_server_binary_path()?;
-            let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args);
+            let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback);
             Ok((server_path.to_string_lossy().to_string(), wrapped_args))
         }
         RemoteKind::Ssh | RemoteKind::Wsl => {
-            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args);
+            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback);
             Ok((program, wrapped_args))
         }
     }
@@ -1440,9 +1476,28 @@ fn tmux_wrapped_shell(profile: &workspace::TabProfile, pane_id: &str) -> anyhow:
 /// binary_path` looks up a real file next to `current_exe()`, which under
 /// `cargo test` resolves to `target/debug/deps/`, not `target/debug/` —
 /// same constraint other tests in this codebase have hit).
-fn wrap_command_args(profile_name: &str, pane_id: &str, program: String, args: Vec<String>) -> Vec<String> {
+///
+/// `--cursor-shape`/`--scrollback` are appended AFTER the program's own args
+/// rather than before the positional `profile`/`pane-id`/`program` — order
+/// doesn't matter to `som-tmux-server`'s own arg parser (each flag consumes
+/// its value via `iter.next()` regardless of what's already been seen), so
+/// putting them last avoids having to touch the positional-fill logic at all.
+fn wrap_command_args(
+    profile_name: &str,
+    pane_id: &str,
+    program: String,
+    args: Vec<String>,
+    cursor_shape: CursorShape,
+    scrollback: Option<usize>,
+) -> Vec<String> {
     let mut wrapped_args = vec![profile_name.to_string(), pane_id.to_string(), program];
     wrapped_args.extend(args);
+    wrapped_args.push("--cursor-shape".to_string());
+    wrapped_args.push(cursor_shape_arg(cursor_shape).to_string());
+    if let Some(scrollback) = scrollback {
+        wrapped_args.push("--scrollback".to_string());
+        wrapped_args.push(scrollback.to_string());
+    }
     wrapped_args
 }
 
@@ -1460,12 +1515,24 @@ fn wrap_command_args(profile_name: &str, pane_id: &str, program: String, args: V
 /// default shell" — the remote HOLDER spawns whatever that resolves to,
 /// same zero-conf assumption a bare `ssh host` (no explicit command) already
 /// makes today.
-fn wrap_remote_command_args(profile_name: &str, pane_id: &str, args: Vec<String>) -> Vec<String> {
+fn wrap_remote_command_args(
+    profile_name: &str,
+    pane_id: &str,
+    args: Vec<String>,
+    cursor_shape: CursorShape,
+    scrollback: Option<usize>,
+) -> Vec<String> {
     let mut wrapped_args = args;
     wrapped_args.push("~/.local/bin/som-tmux-server".to_string());
     wrapped_args.push(profile_name.to_string());
     wrapped_args.push(pane_id.to_string());
     wrapped_args.push("$SHELL".to_string());
+    wrapped_args.push("--cursor-shape".to_string());
+    wrapped_args.push(cursor_shape_arg(cursor_shape).to_string());
+    if let Some(scrollback) = scrollback {
+        wrapped_args.push("--scrollback".to_string());
+        wrapped_args.push(scrollback.to_string());
+    }
     wrapped_args
 }
 
@@ -2064,8 +2131,8 @@ mod tmux_shell_wrapping_tests {
 
     #[test]
     fn wraps_a_simple_program_with_no_args() {
-        let args = wrap_command_args("dnk", "pane-uuid-1", "pwsh.exe".to_string(), vec![]);
-        assert_eq!(args, vec!["dnk", "pane-uuid-1", "pwsh.exe"]);
+        let args = wrap_command_args("dnk", "pane-uuid-1", "pwsh.exe".to_string(), vec![], CursorShape::Block, None);
+        assert_eq!(args, vec!["dnk", "pane-uuid-1", "pwsh.exe", "--cursor-shape", "block"]);
     }
 
     #[test]
@@ -2080,8 +2147,10 @@ mod tmux_shell_wrapping_tests {
             "pane-uuid-2",
             "wsl".to_string(),
             vec!["--cd".to_string(), "~".to_string()],
+            CursorShape::Block,
+            None,
         );
-        assert_eq!(args, vec!["wsl", "pane-uuid-2", "wsl", "--cd", "~"]);
+        assert_eq!(args, vec!["wsl", "pane-uuid-2", "wsl", "--cd", "~", "--cursor-shape", "block"]);
     }
 
     #[test]
@@ -2095,8 +2164,29 @@ mod tmux_shell_wrapping_tests {
             "pane-uuid-3",
             "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
             vec![],
+            CursorShape::Block,
+            None,
         );
-        assert_eq!(args, vec!["dnk", "pane-uuid-3", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"]);
+        assert_eq!(
+            args,
+            vec!["dnk", "pane-uuid-3", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "--cursor-shape", "block"]
+        );
+    }
+
+    #[test]
+    fn appends_cursor_shape_and_scrollback_flags_when_set() {
+        let args = wrap_command_args(
+            "dnk",
+            "pane-uuid-6",
+            "pwsh.exe".to_string(),
+            vec![],
+            CursorShape::Underline,
+            Some(10000),
+        );
+        assert_eq!(
+            args,
+            vec!["dnk", "pane-uuid-6", "pwsh.exe", "--cursor-shape", "underline", "--scrollback", "10000"]
+        );
     }
 
     #[test]
@@ -2116,20 +2206,29 @@ mod tmux_shell_wrapping_tests {
         // som-tmux-server invocation goes on the REMOTE side, appended
         // after ssh's own arguments, since ssh hands everything past its
         // own flags/host to a shell on the far end.
-        let args = wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()]);
+        let args = wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()], CursorShape::Block, None);
         assert_eq!(
             args,
-            vec!["192.168.50.5", "~/.local/bin/som-tmux-server", "pi5", "pane-uuid-4", "$SHELL"]
+            vec!["192.168.50.5", "~/.local/bin/som-tmux-server", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block"]
         );
     }
 
     #[test]
     fn wraps_a_wsl_profile_by_appending_the_remote_holder_invocation() {
         // profile.shell == "wsl --cd ~" -> program="wsl", args=["--cd", "~"].
-        let args = wrap_remote_command_args("wsl", "pane-uuid-5", vec!["--cd".to_string(), "~".to_string()]);
+        let args = wrap_remote_command_args(
+            "wsl",
+            "pane-uuid-5",
+            vec!["--cd".to_string(), "~".to_string()],
+            CursorShape::Bar,
+            Some(5000),
+        );
         assert_eq!(
             args,
-            vec!["--cd", "~", "~/.local/bin/som-tmux-server", "wsl", "pane-uuid-5", "$SHELL"]
+            vec![
+                "--cd", "~", "~/.local/bin/som-tmux-server", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
+                "--scrollback", "5000"
+            ]
         );
     }
 

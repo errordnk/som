@@ -356,6 +356,8 @@ mod tests {
             vec!["/C".into(), command.into()],
             None,
             bounds,
+            None,
+            None,
         )
         .expect("failed to spawn cmd.exe for test");
 
@@ -424,6 +426,8 @@ mod tests {
             vec!["/C".into(), "echo off & echo idle & timeout /T 3600".into()],
             None,
             bounds,
+            None,
+            None,
         )
         .expect("failed to spawn cmd.exe for test");
 
@@ -455,6 +459,93 @@ mod tests {
             "redrawing unchanged content should emit far less than the first full redraw; first={} second={}",
             first.len(),
             second.len()
+        );
+
+        session.kill();
+    }
+
+    /// Reproduces the user-reported "artifacts after pressing Enter at the
+    /// prompt" symptom: printing enough lines to overflow the screen forces
+    /// `Term`'s internal scroll-up (the same thing that happens continuously
+    /// while a shell prints prompt after prompt) — this asserts that a
+    /// sequence of INCREMENTAL redraws through that scrolling, replayed into
+    /// a second real `Term`, ends up pixel-for-pixel identical to what a
+    /// single FULL redraw taken at the same moment would produce. If the
+    /// incremental diff logic gets confused by scrolling (stale cells left
+    /// over from before a line scrolled into a different screen position),
+    /// this is where it would show up as a mismatch.
+    #[test]
+    fn redraw_survives_screen_scroll_without_leaving_stale_cells() {
+        let bounds = SessionBounds::new(80, 24);
+        // Print more lines than fit on screen (24 rows) so the shell's
+        // output forces at least one real scroll-up before this test reads
+        // anything back — "line0" through "line39" is 40 lines, well past
+        // the visible height. `for /L` does NOT zero-pad, so the sentinel
+        // checked for below is the bare "line39", not "line0039".
+        //
+        // Deliberately `/K` (keep the shell open after running the command),
+        // NOT `/C <command> & pause` — `&` after a `for /L ... do <cmd>`
+        // binds to the DO clause itself, not to a separate command after the
+        // whole loop, so an earlier version of this test (`for /L ... do
+        // @echo line%i & pause > nul`) called `pause` after EVERY iteration
+        // and hung forever waiting for Enter after just "line0". `/K`
+        // sidesteps the whole grouping question — cmd.exe stays alive on
+        // its own once the command finishes, no trailing command needed.
+        let command = "echo off & for /L %i in (0,1,39) do @echo line%i";
+        let session = Session::spawn(
+            "C:\\Windows\\System32\\cmd.exe".into(),
+            vec!["/K".into(), command.into()],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn cmd.exe for test");
+
+        // Drive one shared Redrawer incrementally, exactly the way
+        // `crate::server`'s forwarder does in production (repeated
+        // incremental redraws over the SAME Redrawer as the shell keeps
+        // producing output) — this is what would expose stale-cell bugs
+        // that only a fresh-Redrawer full redraw wouldn't.
+        let mut incremental = Redrawer::new();
+        let mut replay_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+
+        let mut last_line_seen = 0usize;
+        for _ in 0..200 {
+            let mut bytes = Vec::new();
+            session.redraw(&mut incremental, &mut bytes).expect("incremental redraw should succeed");
+            parser.advance(&mut replay_term, &bytes);
+
+            let text: String = replay_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+            if text.contains("line39") {
+                last_line_seen = 39;
+                break;
+            }
+            if !session.next_change_blocking() {
+                break;
+            }
+        }
+        assert_eq!(last_line_seen, 39, "the shell's output never fully arrived — test setup problem, not the bug under test");
+
+        // Now compare the REPLAYED grid (built up entirely from incremental
+        // diffs) against a FRESH full redraw taken right now from the
+        // SAME underlying session/Term — these two must describe the exact
+        // same screen. A fresh Redrawer forces a full repaint (see
+        // `Redrawer::new`'s doc comment), which is the ground truth here.
+        let mut full = Redrawer::new();
+        let mut full_bytes = Vec::new();
+        session.redraw(&mut full, &mut full_bytes).expect("full redraw should succeed");
+        let mut ground_truth_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut ground_truth_parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        ground_truth_parser.advance(&mut ground_truth_term, &full_bytes);
+
+        let replayed_text: String = replay_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+        let ground_truth_text: String =
+            ground_truth_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+        assert_eq!(
+            replayed_text, ground_truth_text,
+            "incrementally-replayed screen (built from diffs while scrolling) must match a fresh full redraw taken at the same moment — a mismatch here is exactly the 'stale artifacts after scrolling' bug"
         );
 
         session.kill();

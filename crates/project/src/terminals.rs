@@ -236,12 +236,30 @@ impl Project {
         cx: &mut Context<'_, Project>,
         cwd: Option<PathBuf>,
     ) -> Task<Result<Entity<Terminal>>> {
+        self.clone_terminal_with_shell(terminal, None, cx, cwd)
+    }
+
+    /// Like `clone_terminal`, but with an optional `shell` substituted for
+    /// whatever the source terminal was actually spawned with — see
+    /// `terminal::Terminal::clone_builder_with_shell`'s doc comment for why
+    /// (tmux-wrapped shells need a rebuilt command with a fresh pane id on
+    /// split, not a byte-for-byte copy of the original).
+    pub fn clone_terminal_with_shell(
+        &mut self,
+        terminal: &Entity<Terminal>,
+        shell_override: Option<Shell>,
+        cx: &mut Context<'_, Project>,
+        cwd: Option<PathBuf>,
+    ) -> Task<Result<Entity<Terminal>>> {
         // We cannot clone the task's terminal, as it will effectively re-spawn the task, which might not be desirable.
         // For now, create a new shell instead.
         if terminal.read(cx).task().is_some() {
             return self.create_terminal_shell(cwd, cx);
         }
-        let builder = terminal.read(cx).clone_builder(cx, cwd);
+        let builder = match shell_override {
+            Some(shell) => terminal.read(cx).clone_builder_with_shell(shell, cx, cwd),
+            None => terminal.read(cx).clone_builder(cx, cwd),
+        };
         cx.spawn(async |project, cx| {
             let terminal = builder.await?;
             project.update(cx, |project, cx| {

@@ -38,23 +38,11 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect()
     };
-    let dir = std::env::temp_dir().join(format!("som-tmux-{}", unsafe { libc_getuid() }));
+    let dir = std::env::temp_dir().join(format!("som-tmux-{}", unsafe { libc::getuid() }));
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{}-{}.sock", sanitize(profile_name), sanitize(pane_id)))
         .to_string_lossy()
         .into_owned()
-}
-
-/// Minimal `getuid()` binding — avoids pulling in the whole `libc` crate
-/// (or the heavier `nix`) just for one syscall used purely to namespace the
-/// socket directory per-user, the same reason real tmux does
-/// `$TMPDIR/tmux-<uid>/`.
-#[cfg(unix)]
-unsafe fn libc_getuid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
 }
 
 /// RELAY -> HOLDER: input coming from Som's own PTY (whatever the user

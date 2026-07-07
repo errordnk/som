@@ -154,3 +154,62 @@ fn spawn_detached_holder(
         .spawn()?;
     Ok(())
 }
+
+/// Unix equivalent of the Windows `DETACHED_PROCESS` spawn above — same
+/// goal (a HOLDER that outlives this RELAY, and thus outlives Som itself),
+/// different mechanism: `setsid()` in the child (via `pre_exec`, run after
+/// `fork()` but before `exec()`) detaches it from this process's controlling
+/// terminal/session, so it isn't sent SIGHUP when Som's own session ends.
+/// Just one `fork()`, not the classic double-fork daemon pattern — that
+/// second fork exists specifically to guarantee the daemon can never
+/// re-acquire a controlling terminal, which doesn't matter here (the
+/// HOLDER never opens a tty of its own; its only I/O is the domain socket
+/// and the shell's own PTY, both unrelated to any controlling terminal).
+/// Not waiting on the child leaves it parentless once THIS process exits,
+/// which is fine on Unix (it gets reparented to init/launchd, same as any
+/// orphaned process) — no zombie risk since nothing here ever calls
+/// `waitpid` on it and nothing needs to.
+#[cfg(unix)]
+fn spawn_detached_holder(
+    profile_name: &str,
+    pane_id: &str,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("--holder")
+        .arg("--profile")
+        .arg(profile_name)
+        .arg("--pane-id")
+        .arg(pane_id)
+        .arg("--program")
+        .arg(program);
+    if let Some(cwd) = cwd {
+        command.arg("--cwd").arg(cwd);
+    }
+    if !args.is_empty() {
+        command.arg("--");
+        command.args(args);
+    }
+    unsafe {
+        command.pre_exec(|| {
+            // SAFETY: `setsid()` is async-signal-safe and the only thing
+            // done here between fork and exec — no allocation, no locking,
+            // exactly what `pre_exec`'s safety contract requires.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}

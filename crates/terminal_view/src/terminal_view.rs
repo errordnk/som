@@ -1283,7 +1283,19 @@ impl Item for TerminalView {
             // don't inherit Som's process directory.
             let cwd = self.terminal().read(cx).working_directory()
                 .or_else(|| dirs::home_dir());
-            project.clone_terminal(self.terminal(), cx, cwd)
+            // A tmux-wrapped shell (see `project_som_tmux` memory) must NOT
+            // be cloned byte-for-byte — that would reuse the exact same
+            // pane_id, connecting the new split to the SAME HOLDER/session
+            // as the pane it was split from (confirmed bug: starting a
+            // program in one split showed it in every pane of the tab).
+            // `rebuild_tmux_shell_with_fresh_pane_id` detects that shape and
+            // substitutes a fresh pane_id; anything else falls through to
+            // the normal exact-copy clone.
+            let source_shell = self.terminal().read(cx).shell();
+            match crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(source_shell) {
+                Some(fresh_shell) => project.clone_terminal_with_shell(self.terminal(), Some(fresh_shell), cx, cwd),
+                None => project.clone_terminal(self.terminal(), cx, cwd),
+            }
         }) else {
             return Task::ready(None);
         };

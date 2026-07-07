@@ -5,9 +5,27 @@ use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty;
+use alacritty_terminal::vte::ansi::{CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle};
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Mirrors Som's own `terminal::terminal_settings::CursorShape -> AlacCursorStyle`
+/// conversion (`crates/terminal/src/terminal_settings.rs`) — duplicated
+/// here rather than depending on that crate (which pulls in GPUI and the
+/// rest of Som's editor-side settings machinery, entirely unwanted in a
+/// small standalone server binary) for the 4 variants that actually exist.
+/// Parses the plain string Som passes via `--cursor-shape` (see
+/// `main.rs`'s `Args` doc comment) rather than a shared enum type.
+fn parse_cursor_shape(shape: Option<&str>) -> AlacCursorStyle {
+    let shape = match shape {
+        Some("underline") => AlacCursorShape::Underline,
+        Some("bar") => AlacCursorShape::Beam,
+        Some("hollow") => AlacCursorShape::HollowBlock,
+        _ => AlacCursorShape::Block, // "block", unrecognized, or None
+    };
+    AlacCursorStyle { shape, blinking: false }
+}
 
 /// Mirrors `terminal::ZedListener` (`crates/terminal/src/terminal.rs`) —
 /// alacritty's `EventLoop` needs somewhere to forward parse events. The only
@@ -66,11 +84,20 @@ pub struct Session {
 }
 
 impl Session {
+    /// `cursor_shape`/`scrollback` mirror Som's own `TerminalSettings` (see
+    /// `main.rs`'s `Args` doc comment for why they arrive as a plain string/
+    /// `usize` rather than shared setting types) — without these, the
+    /// `Term` this HOLDER owns silently used alacritty's own defaults
+    /// (block cursor, hardcoded default scrollback) regardless of whatever
+    /// the user actually configured in Som's `settings.json`, which is
+    /// exactly the "cursor isn't the shape I configured" bug this fixes.
     pub fn spawn(
         program: String,
         args: Vec<String>,
         cwd: Option<String>,
         bounds: SessionBounds,
+        cursor_shape: Option<String>,
+        scrollback: Option<usize>,
     ) -> Result<Self> {
         let shell = tty::Shell::new(program, args);
         let pty_options = tty::Options {
@@ -87,8 +114,14 @@ impl Session {
         let pty = tty::new(&pty_options, bounds.into(), 0).context("failed to spawn pty")?;
         let pid = process_pid(&pty);
 
+        let term_config = Config {
+            default_cursor_style: parse_cursor_shape(cursor_shape.as_deref()),
+            scrolling_history: scrollback.unwrap_or(Config::default().scrolling_history),
+            ..Config::default()
+        };
+
         let (raw_events_tx, raw_events_rx) = async_channel::unbounded();
-        let term = Term::new(Config::default(), &bounds, ServerListener(raw_events_tx.clone()));
+        let term = Term::new(term_config, &bounds, ServerListener(raw_events_tx.clone()));
         let term = Arc::new(FairMutex::new(term));
 
         let event_loop = EventLoop::new(

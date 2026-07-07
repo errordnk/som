@@ -2404,12 +2404,31 @@ impl Terminal {
         self.vi_mode_enabled
     }
 
-    pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
+    /// This terminal's own shell command, as it was originally spawned —
+    /// exposed so callers that need to inspect (not just blindly reuse) it
+    /// before cloning can do so. Notably, `terminal_view`'s `clone_on_split`
+    /// needs this to detect a `som-tmux-server`-wrapped shell (see
+    /// `project_som_tmux` memory) and rebuild it with a fresh pane id rather
+    /// than reusing this exact command — `clone_builder` alone always
+    /// copies it byte-for-byte, which for a tmux-wrapped shell would
+    /// connect the new split to the SAME HOLDER/session as the pane it was
+    /// split from.
+    pub fn shell(&self) -> &Shell {
+        &self.template.shell
+    }
+
+    /// Like `clone_builder`, but lets the caller substitute a different
+    /// `Shell` than the one this terminal was actually spawned with — used
+    /// by `terminal_view`'s `clone_on_split` for tmux-wrapped shells (see
+    /// `shell()`'s doc comment), where the SPLIT pane must run a rebuilt
+    /// command (new pane id) rather than a byte-for-byte copy of the
+    /// original.
+    pub fn clone_builder_with_shell(&self, shell: Shell, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
         let working_directory = self.working_directory().or_else(|| cwd);
         TerminalBuilder::new(
             working_directory,
             None,
-            self.template.shell.clone(),
+            shell,
             self.template.env.clone(),
             self.template.cursor_shape,
             self.template.alternate_scroll,
@@ -2423,6 +2442,10 @@ impl Terminal {
             self.activation_script.clone(),
             self.path_style,
         )
+    }
+
+    pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
+        self.clone_builder_with_shell(self.template.shell.clone(), cx, cwd)
     }
 }
 

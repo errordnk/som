@@ -15,7 +15,7 @@
 use crate::bounds::SessionBounds;
 use crate::redraw::Redrawer;
 use crate::session::Session;
-use som_tmux_server::pipe::PipeConnection;
+use som_tmux_server::pipe::{self, PipeConnection};
 use som_tmux_server::protocol::{HolderOutput, RelayInput, pipe_name};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +38,7 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
     log::info!("holder started for profile {profile_name:?} pane {pane_id:?}, session id {}", session.id);
 
     let pipe_name = pipe_name(profile_name, pane_id);
+    let listener = pipe::bind(&pipe_name)?;
 
     // Exits the whole process once the shell itself exits — spawned once,
     // up front, rather than checked after each connection ends: the shell
@@ -56,7 +57,7 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
     }
 
     loop {
-        let connection = match PipeConnection::accept(&pipe_name) {
+        let connection = match pipe::accept_on(&listener) {
             Ok(connection) => connection,
             Err(err) => {
                 log::error!("failed to accept relay connection: {err:#}");

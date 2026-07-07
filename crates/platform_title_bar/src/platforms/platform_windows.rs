@@ -2,6 +2,15 @@ use gpui::{Hsla, Rgba, WindowControlArea, prelude::*};
 use std::sync::OnceLock;
 use ui::prelude::*;
 
+// This whole module is compiled on every platform (see
+// `platform_title_bar.rs`'s `render_right_window_controls` — the Windows
+// branch is picked at RUNTIME via `PlatformStyle::platform()`, not gated by
+// `#[cfg(windows)]`, so `platform_windows` has to exist and compile
+// everywhere even though it only ever RUNS on Windows). Only this one
+// function actually touches the `windows` crate, so only it needs the
+// `cfg` split — everything else here is plain GPUI rendering code that's
+// already platform-agnostic.
+#[cfg(windows)]
 fn is_windows_11() -> bool {
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
@@ -15,6 +24,15 @@ fn is_windows_11() -> bool {
         // Windows 11 is build 22000+
         info.dwBuildNumber >= 22000
     })
+}
+
+// Never actually called on a non-Windows build (this whole module only
+// RENDERS when `PlatformStyle::platform() == Windows`, which is a runtime
+// fact, not something `cfg(not(windows))` can know) — this is purely to
+// satisfy the compiler on the other 3 platforms.
+#[cfg(not(windows))]
+fn is_windows_11() -> bool {
+    false
 }
 
 #[derive(IntoElement)]

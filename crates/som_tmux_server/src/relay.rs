@@ -14,7 +14,7 @@
 //! which is what Som's terminal parser actually reads.
 
 use som_tmux_server::pipe::PipeConnection;
-use som_tmux_server::protocol::{HolderOutput, RelayInput, pipe_name};
+use som_tmux_server::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,17 +31,48 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>, cwd: Option<String>) -> anyhow::Result<()> {
     let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd)?);
 
+    // Handshake first, before anything else on this connection — see
+    // `protocol::HandshakeInfo`'s doc comment. The relay speaks first here;
+    // `crate::server::handle_relay` is the side that waits for it.
+    //
+    // What happens with a MISMATCHED version/platform: right now, just
+    // logged, not acted on — this relay proxies to whatever holder answers
+    // regardless. The actual "copy a newer binary over / restart a live
+    // holder if none of its panes are busy" policy from `project_som_tmux`
+    // memory ("Обновление 19"/"21") needs machinery this crate doesn't have
+    // yet (comparing against Som's OWN bundled version, deciding whether to
+    // overwrite a file out from under a running process, checking for live
+    // child processes under the shell) — deliberately NOT bolted on here
+    // half-finished; the handshake EXCHANGE is the prerequisite this adds,
+    // the DECISION is future work.
+    send(&connection, &RelayInput::Handshake(HandshakeInfo::current()))?;
+    match read_holder_message(&connection)? {
+        HolderOutput::Handshake(info) => {
+            log::info!(
+                "holder handshake: version={:?} os={:?} arch={:?}",
+                info.version, info.os, info.arch
+            );
+        }
+        other => anyhow::bail!("expected Handshake as the first message from a holder, got {other:?}"),
+    }
+
     let reader_connection = connection.clone();
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         loop {
-            let message = reader_connection.read_message()?;
-            let message: HolderOutput = serde_json::from_slice(&message)?;
+            let message = read_holder_message(&reader_connection)?;
             match message {
                 HolderOutput::Bytes(bytes) => {
                     std::io::stdout().write_all(&bytes)?;
                     std::io::stdout().flush()?;
                 }
                 HolderOutput::ShellExited => return Ok(()),
+                // Only expected once, handled above before this loop
+                // starts — a second one mid-connection is a protocol
+                // violation from the holder, not something to crash the
+                // whole relay over.
+                HolderOutput::Handshake(_) => {
+                    log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
+                }
             }
         }
     });
@@ -58,10 +89,7 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
             Ok(n) => n,
             Err(_) => break,
         };
-        if connection
-            .write_message(&serde_json::to_vec(&RelayInput::Bytes(buf[..read].to_vec()))?)
-            .is_err()
-        {
+        if send(&connection, &RelayInput::Bytes(buf[..read].to_vec())).is_err() {
             break; // holder gone
         }
     }
@@ -73,6 +101,17 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
     // this function's return on `join()`.
     drop(writer_thread);
     Ok(())
+}
+
+fn send(connection: &PipeConnection, message: &RelayInput) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(message)?;
+    connection.write_message(&payload)?;
+    Ok(())
+}
+
+fn read_holder_message(connection: &PipeConnection) -> anyhow::Result<HolderOutput> {
+    let message = connection.read_message()?;
+    Ok(serde_json::from_slice(&message)?)
 }
 
 /// Tries to connect to an already-running HOLDER first; if nothing's

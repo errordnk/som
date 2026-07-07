@@ -1,4 +1,5 @@
 use gpui::{Hsla, Rgba, WindowControlArea, prelude::*};
+#[cfg(windows)]
 use std::sync::OnceLock;
 use ui::prelude::*;
 

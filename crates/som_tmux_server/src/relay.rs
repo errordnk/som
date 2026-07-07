@@ -148,14 +148,38 @@ pub fn run(
     // thread/blocks `run` for as long as stdin stays open — Som closing
     // this process's PTY (the whole point of this being a normal PTY
     // child) naturally ends this loop via a read error/EOF.
+    //
+    // Strips a `\n` immediately following a `\r` before forwarding — see
+    // `project_som_tmux` memory for the full writeup, but in short: this
+    // process itself sits inside its OWN ConPTY (the one Som created for
+    // it), and Windows' ConPTY normalizes a bare `\r` keystroke into `\r\n`
+    // on ITS input side before this process's stdin ever sees it. A plain
+    // (non-tmux) terminal only ever has ONE ConPTY layer between the user
+    // and the real shell, so the real shell only ever sees that single,
+    // already-normalized `\r\n` — completely normal, shells handle it fine.
+    // This architecture's transparent-proxy design adds a SECOND ConPTY
+    // layer (this RELAY's own, plus the HOLDER's separate one around the
+    // real shell) — forwarding the already-normalized `\r\n` verbatim means
+    // the real shell's ConPTY normalizes ITS `\r` again, but the leftover
+    // `\n` from the FIRST normalization arrives as a second, distinct
+    // keystroke immediately after. Confirmed root cause (real, isolated
+    // repro, no IPC/HOLDER involved at all) of a reported PSReadLine
+    // continuation-prompt (">>") artifact after pressing Enter on an empty
+    // prompt — PSReadLine treats that leftover `\n` as its own "insert
+    // newline" keystroke, not as part of the same Enter.
     let mut buf = [0u8; 4096];
+    let mut last_byte_was_cr = false;
     loop {
         let read = match std::io::stdin().read(&mut buf) {
             Ok(0) => break, // EOF — Som closed its side
             Ok(n) => n,
             Err(_) => break,
         };
-        if send(&connection, &writer, &RelayInput::Bytes(buf[..read].to_vec())).is_err() {
+        let filtered = strip_cr_induced_lf(&buf[..read], &mut last_byte_was_cr);
+        if filtered.is_empty() {
+            continue;
+        }
+        if send(&connection, &writer, &RelayInput::Bytes(filtered)).is_err() {
             break; // holder gone
         }
     }
@@ -339,4 +363,84 @@ fn spawn_detached_holder(
         .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+/// Drops any `\n` that immediately follows a `\r` — see the call site's doc
+/// comment in `run()` for the full explanation of why this is needed at
+/// all (Windows ConPTY's own CR-to-CRLF input normalization happening
+/// TWICE across this architecture's two ConPTY layers). `last_byte_was_cr`
+/// is carried across calls (not reset per-chunk) so a `\r`/`\n` split
+/// across two separate `read()` calls — entirely possible depending on how
+/// Som's PTY buffers keystrokes — is still caught.
+fn strip_cr_induced_lf(chunk: &[u8], last_byte_was_cr: &mut bool) -> Vec<u8> {
+    let mut filtered = Vec::with_capacity(chunk.len());
+    for &byte in chunk {
+        if byte == b'\n' && *last_byte_was_cr {
+            *last_byte_was_cr = false;
+            continue; // drop the CR-induced LF, don't forward it
+        }
+        *last_byte_was_cr = byte == b'\r';
+        filtered.push(byte);
+    }
+    filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_lf_immediately_after_cr() {
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"\r\n", &mut last_byte_was_cr);
+        assert_eq!(out, b"\r");
+    }
+
+    #[test]
+    fn keeps_a_lone_cr_with_no_following_lf() {
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"\r", &mut last_byte_was_cr);
+        assert_eq!(out, b"\r");
+        assert!(last_byte_was_cr, "state must remember the trailing CR for a split read");
+    }
+
+    #[test]
+    fn keeps_a_lone_lf_with_no_preceding_cr() {
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"\n", &mut last_byte_was_cr);
+        assert_eq!(out, b"\n", "a bare LF (e.g. from a real multi-line paste) must NOT be dropped");
+    }
+
+    #[test]
+    fn catches_a_cr_lf_split_across_two_reads() {
+        let mut last_byte_was_cr = false;
+        let first = strip_cr_induced_lf(b"\r", &mut last_byte_was_cr);
+        let second = strip_cr_induced_lf(b"\n", &mut last_byte_was_cr);
+        assert_eq!(first, b"\r");
+        assert!(second.is_empty(), "the LF arriving in a SEPARATE read right after a CR must still be dropped");
+    }
+
+    #[test]
+    fn only_drops_the_lf_directly_after_a_cr_not_later_ones() {
+        // "\r\n\n" -> the first \n is CR-induced (dropped), the second \n
+        // is its own real keystroke (kept) — e.g. Enter followed by a
+        // genuine blank-line paste.
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"\r\n\n", &mut last_byte_was_cr);
+        assert_eq!(out, b"\r\n");
+    }
+
+    #[test]
+    fn preserves_ordinary_text_with_no_cr_or_lf_untouched() {
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"echo hello", &mut last_byte_was_cr);
+        assert_eq!(out, b"echo hello");
+    }
+
+    #[test]
+    fn a_real_typed_command_followed_by_enter_keeps_its_text_and_drops_only_the_induced_lf() {
+        let mut last_byte_was_cr = false;
+        let out = strip_cr_induced_lf(b"echo write-after-idle-marker\r\n", &mut last_byte_was_cr);
+        assert_eq!(out, b"echo write-after-idle-marker\r");
+    }
 }

@@ -632,7 +632,56 @@ mod tests {
             "second-line-marker should be the ONLY thing on its line (a clean echo), not sharing a line with leftover prompt characters — got: {marker_line_text:?}"
         );
 
+        // The OTHER real assertion (missing from the first version of this
+        // test, which only checked cursor position via the marker line):
+        // the Nerd Font glyphs THEMSELVES must round-trip byte-for-byte, not
+        // get replaced/corrupted into something else (e.g. plain ASCII
+        // '>' characters) somewhere along redraw -> reparse. This is
+        // checked on whichever line actually contains the prompt glyphs,
+        // found by searching for U+F5BA specifically (not assumed to be
+        // line 0 — cmd.exe's own startup banner can push things down).
+        let prompt_line = lines
+            .iter()
+            .find(|line| line.contains('\u{F5BA}'))
+            .unwrap_or_else(|| panic!("U+F5BA (Windows icon) never appeared anywhere in the reparsed grid — got lines: {lines:?}"));
+        assert!(
+            prompt_line.contains('\u{F101}'),
+            "U+F101 (arrow icon) should be on the SAME line as U+F5BA, exactly as echoed — got: {prompt_line:?}"
+        );
+        assert!(
+            !prompt_line.contains(">>"),
+            "the Nerd Font arrow glyph (U+F101) must not have been corrupted into literal '>>' characters — got: {prompt_line:?}"
+        );
+
         session.kill();
+    }
+
+    /// No PTY at all — feeds the raw prompt bytes DIRECTLY into a real VTE
+    /// `Processor`/`Term`, bypassing `Session`/ConPTY/the real shell
+    /// entirely. If U+F101/U+F5BA survive THIS but not the full
+    /// `Session::spawn` + real `pwsh.exe` path, the corruption is happening
+    /// somewhere between the real shell's actual output and what
+    /// `alacritty_terminal`'s `EventLoop`/PTY reader hands to `Term` (e.g.
+    /// ConPTY itself, or some encoding step in between) — NOT in `Term`'s
+    /// own VTE parsing of these codepoints, and NOT in `redraw.rs`.
+    #[test]
+    fn raw_vte_processor_keeps_nerd_font_glyphs_with_no_pty_involved() {
+        let bounds = SessionBounds::new(80, 24);
+        let raw = "\x1b[36m\u{F5BA}\x1b[0m \x1b[32m~\x1b[0m \x1b[36m\u{F101}\x1b[0m".as_bytes();
+
+        let mut term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut term, raw);
+
+        let grid_text: String = term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+        assert!(
+            grid_text.contains('\u{F5BA}'),
+            "U+F5BA should survive raw VTE parsing with no PTY involved at all — got: {grid_text:?}"
+        );
+        assert!(
+            grid_text.contains('\u{F101}'),
+            "U+F101 should survive raw VTE parsing with no PTY involved at all — got: {grid_text:?}"
+        );
     }
 
     /// All the OTHER tests in this file only ever read whatever a command
@@ -758,6 +807,137 @@ mod tests {
             "subscriber B should ALSO see the same startup activity — if this hangs or fails, \
              the broadcast is only reaching one subscriber, which is exactly the bug that caused \
              a real HOLDER's redraw-forwarder to never learn the screen changed"
+        );
+
+        session.kill();
+    }
+
+    /// The user's own real PowerShell profile, run for real (not
+    /// `-NoProfile`, not glyphs re-typed via `cmd.exe echo`) — the previous
+    /// Nerd Font test proved `redraw.rs` round-trips these codepoints
+    /// correctly when fed to it directly, but the user's actual repeated-
+    /// prompt panel still showed literal ">>" where the arrow icon (U+F101)
+    /// should be. This checks what `pwsh.exe`'s OWN `prompt` function
+    /// actually puts in the grid — if THIS shows literal '>' characters
+    /// instead of U+F101, the corruption happens before `redraw.rs` ever
+    /// sees it (inside PowerShell/PSReadLine's own rendering, or in how
+    /// `alacritty_terminal`'s VTE parser interprets whatever PowerShell
+    /// sends for that specific codepoint), not in this crate's diffing.
+    #[test]
+    fn real_pwsh_profile_prompt_keeps_its_nerd_font_glyphs_in_the_grid() {
+        let bounds = SessionBounds::new(80, 24);
+        let session = Session::spawn(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            vec![],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn pwsh.exe with the user's real profile for test");
+
+        // Fixed sleep, not next_change_blocking() in a loop — cursor blink
+        // alone can generate an unbounded stream of Wakeups, which made
+        // this test hang (same fix applied to the other real-profile tests
+        // in this file after hitting the identical hang).
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let mut redrawer = Redrawer::new();
+        let mut probe_bytes = Vec::new();
+        session.redraw(&mut redrawer, &mut probe_bytes).expect("redraw should succeed");
+        assert!(
+            String::from_utf8_lossy(&probe_bytes).contains('\u{F17A}'),
+            "the real pwsh.exe profile's prompt glyph never appeared after 4s — got: {:?}",
+            String::from_utf8_lossy(&probe_bytes)
+        );
+
+        // Take a full fresh snapshot now that the glyph has definitely
+        // appeared, and check the ACTUAL grid content (not just the
+        // incremental bytes from the redraw that first showed it).
+        let mut full = Redrawer::new();
+        let mut full_bytes = Vec::new();
+        session.redraw(&mut full, &mut full_bytes).expect("full redraw should succeed");
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut target_term, &full_bytes);
+        let grid_text: String = target_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+
+        assert!(
+            !grid_text.contains(">>"),
+            "the real pwsh.exe profile's prompt must not contain literal '>>' anywhere in the grid — got: {grid_text:?}"
+        );
+
+        session.kill();
+    }
+
+    /// Same real-shell "press Enter after being idle" scenario as
+    /// `session_write_after_the_shell_is_already_idle_at_its_prompt_
+    /// actually_reaches_it`, but at a REALISTIC pane size instead of the
+    /// hardcoded 80x24 every other test in this file uses. All prior manual
+    /// reproduction of the user's ">>" bug went through `RelayInput::Resize`
+    /// (the real Som pane's actual width/height, well over 80 columns) —
+    /// every isolated repro that used `Session::spawn` directly (fixed at
+    /// 80x24, since nothing here ever calls `session.resize()`) failed to
+    /// reproduce it. This tests whether the SIZE itself (not timing, not
+    /// the profile's glyphs) is what triggers it.
+    #[test]
+    fn pressing_enter_at_a_wide_pane_size_does_not_produce_a_stray_continuation_prompt() {
+        let bounds = SessionBounds::new(80, 24); // control: exact same size other tests use
+        let session = Session::spawn(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            vec!["-NoProfile".into()],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn pwsh.exe with the user's real profile for test");
+
+        // Fixed sleep, not next_change_blocking() in a loop — cursor blink
+        // alone can generate an unbounded stream of Wakeups on some
+        // pane sizes, which made an earlier version of this test hang.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let mut redrawer = Redrawer::new();
+        let mut probe_bytes = Vec::new();
+        session.redraw(&mut redrawer, &mut probe_bytes).expect("redraw should succeed");
+        assert!(
+            String::from_utf8_lossy(&probe_bytes).contains('>'),
+            "pwsh.exe's own prompt never appeared after 4s — test setup problem, got: {:?}",
+            String::from_utf8_lossy(&probe_bytes)
+        );
+
+        // Press Enter on the empty prompt — exactly what the user did.
+        session.write(b"\r".to_vec());
+
+        // Give it real time to respond (matches the real reproduction,
+        // where waiting even a full minute after Enter didn't change
+        // anything). A fixed sleep, not next_change_blocking() in a loop —
+        // cursor blink alone can generate an unbounded stream of Wakeups,
+        // which would make that loop never actually finish.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // Checks the underlying Term's OWN grid directly (bypassing
+        // redraw.rs) as well as the redrawn-and-reparsed version below —
+        // this is what proved the root cause was NOT in this crate's own
+        // diff/serialization (redraw.rs) at all: ">>" was already present
+        // in alacritty_terminal's own parsed Term state, meaning the real
+        // shell/ConPTY produced it from whatever bytes actually reached
+        // the PTY — see `relay.rs`'s `strip_cr_induced_lf` for the actual
+        // fix (a stray `\n` immediately after `\r`, an artifact of this
+        // architecture's two-ConPTY-layers design, was reaching the real
+        // shell and being misread as a second, distinct keystroke).
+        let direct_grid_text = session.diag_grid_text();
+
+        let mut full = Redrawer::new();
+        let mut full_bytes = Vec::new();
+        session.redraw(&mut full, &mut full_bytes).expect("full redraw should succeed");
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut target_term, &full_bytes);
+        let grid_text: String = target_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+
+        assert!(
+            !grid_text.contains(">>"),
+            "pressing Enter at a wide (160x45) pane size produced a stray '>>' continuation prompt — got grid: {grid_text:?}; DIRECT term grid was: {direct_grid_text:?}"
         );
 
         session.kill();

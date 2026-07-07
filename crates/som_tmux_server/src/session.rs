@@ -99,6 +99,26 @@ impl Session {
         cursor_shape: Option<String>,
         scrollback: Option<usize>,
     ) -> Result<Self> {
+        // Mirrors `util::shell::ShellKind::tty_escape_args` (not depended on
+        // directly — it pulls in gpui_util/git2/etc., far too heavy for
+        // this small standalone binary — just the one bit of logic this
+        // needs, reimplemented locally): `cmd.exe` is the ONE shell that
+        // must NOT have its arguments escaped (escaping produces too many
+        // quotes for CMD to parse), every other shell (crucially including
+        // PowerShell) needs proper escaping. This was hardcoded `false`
+        // (the cmd.exe-only behavior) UNCONDITIONALLY before — for
+        // PowerShell specifically, that meant `tty::windows::cmdline` built
+        // its command line with UNESCAPED arguments. Found and fixed while
+        // investigating a reported PSReadLine continuation-prompt (">>")
+        // artifact, but ruled out as ITS cause by direct experiment (the
+        // artifact still reproduced with this fix alone) — see `relay.rs`'s
+        // `strip_cr_induced_lf` for the actual fix. Kept anyway: it's a
+        // real correctness gap on its own (matches what Som's own regular
+        // terminal already does for every shell it spawns).
+        let escape_args = !program.eq_ignore_ascii_case("cmd.exe")
+            && !std::path::Path::new(&program)
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"));
         let shell = tty::Shell::new(program, args);
         // Mirrors `terminal::insert_zed_terminal_env` — without an explicit
         // `TERM`, the shell/its line editor (confirmed cause: PowerShell's
@@ -118,7 +138,7 @@ impl Session {
             #[cfg(not(windows))]
             child_signal_mask: None,
             #[cfg(windows)]
-            escape_args: false,
+            escape_args,
         };
 
         let pty = tty::new(&pty_options, bounds.into(), 0).context("failed to spawn pty")?;
@@ -252,6 +272,19 @@ impl Session {
 
     pub fn write(&self, bytes: Vec<u8>) {
         self.pty_tx.notify(bytes);
+    }
+
+    /// Direct text dump of the underlying `Term`'s grid, bypassing
+    /// `crate::redraw` entirely — used by tests to distinguish "the real
+    /// shell/ConPTY produced this content" from "this crate's own diff/
+    /// redraw serialization corrupted it". Not used by production code
+    /// (the HOLDER always goes through `redraw()`), kept as a test-only
+    /// diagnostic tool since it was exactly what isolated a real bug (see
+    /// `redraw.rs`'s `pressing_enter_at_a_wide_pane_size_...` test) to
+    /// `relay.rs` instead of here.
+    pub fn diag_grid_text(&self) -> String {
+        let term = self.term.lock();
+        term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect()
     }
 
     pub fn resize(&self, bounds: SessionBounds) {

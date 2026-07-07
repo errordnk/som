@@ -1536,6 +1536,60 @@ fn wrap_remote_command_args(
     wrapped_args
 }
 
+/// Detects whether `shell` is a `som-tmux-server`-wrapped command (built by
+/// `wrap_command_args`/`wrap_remote_command_args`) and, if so, returns an
+/// equivalent `Shell` with a FRESH `pane_id` substituted in place of the
+/// original — everything else (profile, program/args, cursor-shape/
+/// scrollback flags) copied through unchanged. Returns `None` for any other
+/// shell, which callers treat as "not tmux-wrapped, clone normally".
+///
+/// Why this exists at all: `TerminalView::clone_on_split` (used for
+/// Ctrl+\-style pane splitting) would otherwise copy this terminal's exact
+/// shell command byte-for-byte into the new split pane — for a tmux-wrapped
+/// shell that means the SAME `pane_id`, which connects the new split to the
+/// SAME HOLDER/session as the pane it was split from (confirmed bug report:
+/// starting `htop` in one split pane made it appear in every pane of the
+/// tab, because they were all just RELAYs onto one shared session). Splits
+/// for tmux tabs aren't a fully designed feature yet (see the comment on
+/// `restore_som_tabs`'s tmux branch — restore only ever recreates the main
+/// pane, never extra splits), but a split CAN still be created interactively
+/// via Ctrl+\ today, so this at minimum stops it from silently aliasing
+/// sessions — the split gets its OWN independent HOLDER/session instead.
+///
+/// Deliberately re-parses the argv shape rather than threading a `pane_id`
+/// through some parallel piece of state — `wrap_command_args`/
+/// `wrap_remote_command_args` are the only places that know this exact
+/// shape, so detecting/rewriting it here means any future change to that
+/// shape only needs updating in one place to keep this in sync (the reverse
+/// of maintaining a second, parallel encoding of the same information).
+pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<Shell> {
+    let Shell::WithArguments { program, args, title_override } = shell else { return None };
+    let fresh_pane_id = uuid::Uuid::new_v4().to_string();
+
+    match classify_remote(program) {
+        RemoteKind::Local => {
+            // wrap_command_args: [profile, pane_id, original_program, ...]
+            if !program.contains("som-tmux-server") || args.len() < 2 {
+                return None;
+            }
+            let mut new_args = args.clone();
+            new_args[1] = fresh_pane_id;
+            Some(Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() })
+        }
+        RemoteKind::Ssh | RemoteKind::Wsl => {
+            // wrap_remote_command_args: [...host_args, "~/.local/bin/som-tmux-server", profile, pane_id, "$SHELL", ...]
+            let server_pos = args.iter().position(|a| a.contains("som-tmux-server"))?;
+            let pane_id_pos = server_pos + 2;
+            if pane_id_pos >= args.len() {
+                return None;
+            }
+            let mut new_args = args.clone();
+            new_args[pane_id_pos] = fresh_pane_id;
+            Some(Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() })
+        }
+    }
+}
+
 /// Builds the argv for running `remote_program` on the far side of an
 /// `ssh`/`wsl` profile's OWN connection args — e.g. for `ssh 192.168.50.5`
 /// this gives `["192.168.50.5", "~/.local/bin/som-tmux-server", "--version"]`,
@@ -2240,5 +2294,60 @@ mod tmux_shell_wrapping_tests {
             &["--version"],
         );
         assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/som-tmux-server", "--version"]);
+    }
+
+    #[test]
+    fn rebuild_gives_a_local_tmux_shell_a_fresh_pane_id_and_nothing_else_changes() {
+        let args = wrap_command_args(
+            "dnk",
+            "original-pane-id",
+            "pwsh.exe".to_string(),
+            vec![],
+            CursorShape::Underline,
+            Some(10000),
+        );
+        let shell = Shell::WithArguments {
+            program: "C:\\som\\som-tmux-server.exe".to_string(),
+            args,
+            title_override: None,
+        };
+        let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a local tmux-wrapped shell");
+        let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
+        assert_eq!(program, "C:\\som\\som-tmux-server.exe");
+        assert_eq!(args[0], "dnk"); // profile unchanged
+        assert_ne!(args[1], "original-pane-id"); // pane_id replaced
+        assert_eq!(&args[2..], &["pwsh.exe", "--cursor-shape", "underline", "--scrollback", "10000"]);
+    }
+
+    #[test]
+    fn rebuild_gives_a_remote_tmux_shell_a_fresh_pane_id_and_nothing_else_changes() {
+        let args = wrap_remote_command_args(
+            "pi5",
+            "original-pane-id",
+            vec!["192.168.50.5".to_string()],
+            CursorShape::Block,
+            None,
+        );
+        let shell = Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
+        let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a remote tmux-wrapped shell");
+        let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
+        assert_eq!(program, "ssh");
+        assert_eq!(args[0], "192.168.50.5");
+        assert_eq!(args[1], "~/.local/bin/som-tmux-server");
+        assert_eq!(args[2], "pi5"); // profile unchanged
+        assert_ne!(args[3], "original-pane-id"); // pane_id replaced
+        assert_eq!(&args[4..], &["$SHELL", "--cursor-shape", "block"]);
+    }
+
+    #[test]
+    fn rebuild_leaves_a_non_tmux_shell_untouched() {
+        let shell = Shell::WithArguments {
+            program: "pwsh.exe".to_string(),
+            args: vec![],
+            title_override: None,
+        };
+        assert!(rebuild_tmux_shell_with_fresh_pane_id(&shell).is_none());
+        assert!(rebuild_tmux_shell_with_fresh_pane_id(&Shell::System).is_none());
+        assert!(rebuild_tmux_shell_with_fresh_pane_id(&Shell::Program("bash".to_string())).is_none());
     }
 }

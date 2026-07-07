@@ -61,9 +61,13 @@ pub fn run(
     // nothing left for this process to hold open.
     {
         let session = session.clone();
+        // Its OWN subscription — see `Session::subscribe`'s doc comment for
+        // why sharing a receiver with `spawn_forwarder`'s threads (as this
+        // used to) silently dropped events between them.
+        let events_rx = session.subscribe();
         std::thread::spawn(move || {
             loop {
-                if !session.next_change_blocking() {
+                if !session.next_change_blocking(&events_rx) {
                     log::info!("shell process exited, holder shutting down");
                     std::process::exit(0);
                 }
@@ -182,12 +186,18 @@ fn spawn_forwarder(
     redrawer: Arc<Mutex<Redrawer>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // Its OWN subscription — see `Session::subscribe`'s doc comment. Every
+    // connected RELAY gets one of these (a fresh `spawn_forwarder` call per
+    // `handle_relay`), and each one now genuinely sees every `Wakeup`
+    // rather than competing with the others (and with the shell-exit
+    // watcher in `run`) over a single shared receiver.
+    let events_rx = session.subscribe();
     std::thread::spawn(move || {
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            if !session.next_change_blocking() {
+            if !session.next_change_blocking(&events_rx) {
                 send(&connection, &writer, &HolderOutput::ShellExited).ok();
                 return;
             }

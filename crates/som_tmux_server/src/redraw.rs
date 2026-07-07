@@ -360,6 +360,7 @@ mod tests {
             None,
         )
         .expect("failed to spawn cmd.exe for test");
+        let events_rx = session.subscribe();
 
         // Wait for the real output to land — poll via a throwaway
         // `Redrawer`/buffer (separate from the one used for the actual
@@ -376,7 +377,7 @@ mod tests {
                 ready = true;
                 break;
             }
-            if !session.next_change_blocking() {
+            if !session.next_change_blocking(&events_rx) {
                 break;
             }
         }
@@ -430,6 +431,7 @@ mod tests {
             None,
         )
         .expect("failed to spawn cmd.exe for test");
+        let events_rx = session.subscribe();
 
         for _ in 0..50 {
             let mut probe = Redrawer::new();
@@ -438,7 +440,7 @@ mod tests {
             if probe_bytes.windows(1).any(|w| w == b"i") {
                 break;
             }
-            if !session.next_change_blocking() {
+            if !session.next_change_blocking(&events_rx) {
                 break;
             }
         }
@@ -501,6 +503,7 @@ mod tests {
             None,
         )
         .expect("failed to spawn cmd.exe for test");
+        let events_rx = session.subscribe();
 
         // Drive one shared Redrawer incrementally, exactly the way
         // `crate::server`'s forwarder does in production (repeated
@@ -522,7 +525,7 @@ mod tests {
                 last_line_seen = 39;
                 break;
             }
-            if !session.next_change_blocking() {
+            if !session.next_change_blocking(&events_rx) {
                 break;
             }
         }
@@ -577,6 +580,7 @@ mod tests {
             None,
         )
         .expect("failed to spawn cmd.exe for test");
+        let events_rx = session.subscribe();
 
         let mut ready = false;
         for _ in 0..50 {
@@ -587,7 +591,7 @@ mod tests {
                 ready = true;
                 break;
             }
-            if !session.next_change_blocking() {
+            if !session.next_change_blocking(&events_rx) {
                 break;
             }
         }
@@ -626,6 +630,134 @@ mod tests {
         assert!(
             marker_line_text.trim_end().ends_with("second-line-marker"),
             "second-line-marker should be the ONLY thing on its line (a clean echo), not sharing a line with leftover prompt characters — got: {marker_line_text:?}"
+        );
+
+        session.kill();
+    }
+
+    /// All the OTHER tests in this file only ever read whatever a command
+    /// PASSED AT SPAWN TIME already printed — they never call
+    /// `Session::write` after the fact. This test does: spawns an
+    /// INTERACTIVE `cmd.exe` (no `/C <command>`, just a normal shell
+    /// sitting at its own prompt), waits for that prompt to actually
+    /// appear, THEN calls `session.write(...)` with a real command typed as
+    /// keystrokes — exactly what `server.rs::read_loop` does for every
+    /// `RelayInput::Bytes` a RELAY forwards. Manual reproduction (see
+    /// `project_som_tmux` memory) found real interactive PowerShell
+    /// sessions going completely unresponsive to ANY input (not just
+    /// Enter — a single letter never echoed either) after their first
+    /// redraw; this is the automated version of that same reproduction,
+    /// against `cmd.exe` (fewer moving parts than `pwsh.exe`, same
+    /// EventLoop/PTY machinery underneath).
+    #[test]
+    fn session_write_after_the_shell_is_already_idle_at_its_prompt_actually_reaches_it() {
+        let bounds = SessionBounds::new(80, 24);
+        let session = Session::spawn(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            vec!["-NoProfile".into()],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn an interactive pwsh.exe for test");
+        let events_rx = session.subscribe();
+
+        // Wait for cmd.exe's own initial prompt (it prints its cwd followed
+        // by ">") to show up — this is the "already idle" state a real
+        // panel is normally sitting in when a user types something.
+        let mut redrawer = Redrawer::new();
+        let mut saw_prompt = false;
+        for _ in 0..50 {
+            let mut bytes = Vec::new();
+            session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
+            if String::from_utf8_lossy(&bytes).contains('>') {
+                saw_prompt = true;
+                break;
+            }
+            if !session.next_change_blocking(&events_rx) {
+                break;
+            }
+        }
+        assert!(saw_prompt, "pwsh.exe's own prompt never appeared — test setup problem, not the bug under test");
+
+        // NOW type a real command, as keystrokes — this is the exact same
+        // `Session::write` call `server.rs::read_loop` makes for every
+        // `RelayInput::Bytes` a RELAY forwards from a user's real typing.
+        session.write(b"echo write-after-idle-marker\r\n".to_vec());
+
+        let mut saw_marker = false;
+        for _ in 0..50 {
+            let mut bytes = Vec::new();
+            session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
+            if String::from_utf8_lossy(&bytes).contains("write-after-idle-marker") {
+                saw_marker = true;
+                break;
+            }
+            if !session.next_change_blocking(&events_rx) {
+                break;
+            }
+        }
+        assert!(
+            saw_marker,
+            "typed command's output never appeared after the shell was already idle at its prompt — \
+             this is the actual bug: Session::write after the initial redraw doesn't reach a shell \
+             that's already sitting idle"
+        );
+
+        session.kill();
+    }
+
+    /// This is the REAL root cause the previous test's manual reproduction
+    /// eventually traced back to (see `project_som_tmux` memory) — proven
+    /// directly here rather than just indirectly through symptoms. A real
+    /// HOLDER process always has AT LEAST two threads competing to read
+    /// `Session`'s change-notification channel: the shell-exit watcher in
+    /// `server.rs::run` (spawned once, for the session's whole life) and
+    /// one redraw-forwarder per connected RELAY (`spawn_forwarder`, called
+    /// fresh from every `handle_relay`). Before `Session::subscribe`
+    /// existed, they all called `next_change_blocking()` against the SAME
+    /// single `events_rx` field — `async_channel` is a competing-consumers
+    /// queue (each message goes to exactly one waiting receiver), not a
+    /// broadcast, so a `Wakeup` meant for the redraw-forwarder could be
+    /// silently stolen by the unrelated exit-watcher thread instead, which
+    /// does nothing with a successful result besides looping straight back
+    /// around to wait for the next one. This asserts that TWO independent
+    /// subscribers (mimicking that real thread topology) EACH see a
+    /// `Wakeup` for the same real PTY output — with the old shared-receiver
+    /// design, at most one of them ever would.
+    #[test]
+    fn two_independent_subscribers_each_see_every_wakeup_not_just_one_of_them() {
+        let bounds = SessionBounds::new(80, 24);
+        let session = Session::spawn(
+            "C:\\Windows\\System32\\cmd.exe".into(),
+            vec![],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn an interactive cmd.exe for test");
+
+        // Two subscribers, mimicking the shell-exit watcher and a redraw
+        // forwarder both wanting every change — spawned BEFORE the shell
+        // prints anything, so both are genuinely competing for the same
+        // real events, not just independently polling stale state.
+        let subscriber_a = session.subscribe();
+        let subscriber_b = session.subscribe();
+
+        // cmd.exe prints its own startup prompt unprompted — that alone is
+        // enough real PTY activity to generate at least one real Wakeup for
+        // both subscribers to (correctly) both see.
+        assert!(
+            session.next_change_blocking(&subscriber_a),
+            "subscriber A should see the shell's own startup activity as a Wakeup"
+        );
+        assert!(
+            session.next_change_blocking(&subscriber_b),
+            "subscriber B should ALSO see the same startup activity — if this hangs or fails, \
+             the broadcast is only reaching one subscriber, which is exactly the bug that caused \
+             a real HOLDER's redraw-forwarder to never learn the screen changed"
         );
 
         session.kill();

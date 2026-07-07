@@ -1,4 +1,5 @@
 mod bounds;
+mod redraw;
 mod server;
 mod session;
 

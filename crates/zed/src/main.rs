@@ -46,6 +46,8 @@ use std::{
     sync::{Arc, OnceLock},
     time::Instant,
 };
+#[cfg(not(target_os = "windows"))]
+use std::io::IsTerminal;
 use theme::{ActiveTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
 use util::ResultExt;
@@ -403,8 +405,6 @@ fn main() {
         let workspace_store = cx.new(|cx| WorkspaceStore::new(cx));
 
         zed::init(cx);
-        #[cfg(target_os = "macos")]
-        zed::move_to_applications::init(cx);
         project::Project::init(cx);
 
         let session = cx.foreground_executor().block_on(session);

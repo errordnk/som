@@ -550,4 +550,84 @@ mod tests {
 
         session.kill();
     }
+
+    /// Reproduces a Nerd Font prompt containing Private Use Area glyphs
+    /// (like the user's real PowerShell profile's `prompt` function, which
+    /// prints `` and ``) round-tripping through redraw — these
+    /// codepoints are exactly the kind that could disagree on display width
+    /// between whatever produced the `alacritty_terminal` grid and the
+    /// `unicode-width` table this crate/Som both link against, which would
+    /// desync the virtual cursor `move_to` tracks against wherever a real
+    /// terminal (Som's own, rendering the redrawn bytes) actually ends up —
+    /// this is the leading theory for the user-reported ">>"-after-Enter
+    /// artifact, since ordinary ASCII prompts never showed it.
+    #[test]
+    fn redraw_round_trips_nerd_font_prompt_glyphs_without_desyncing_cursor_position() {
+        let bounds = SessionBounds::new(80, 24);
+        // Mirrors the user's actual PowerShell profile.ps1 `prompt` function
+        // byte-for-byte (verified via `xxd` against the real file): ESC[36m,
+        // U+F5BA, ESC[0m, ESC[32m, "~", ESC[0m, ESC[36m, U+F101, ESC[0m.
+        let command = "echo off & echo \x1b[36m\u{F5BA}\x1b[0m \x1b[32m~\x1b[0m \x1b[36m\u{F101}\x1b[0m & echo second-line-marker & timeout /T 3600";
+        let session = Session::spawn(
+            "C:\\Windows\\System32\\cmd.exe".into(),
+            vec!["/C".into(), command.into()],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn cmd.exe for test");
+
+        let mut ready = false;
+        for _ in 0..50 {
+            let mut probe = Redrawer::new();
+            let mut probe_bytes = Vec::new();
+            session.redraw(&mut probe, &mut probe_bytes).expect("redraw should succeed writing to a Vec<u8>");
+            if String::from_utf8_lossy(&probe_bytes).contains("second-line-marker") {
+                ready = true;
+                break;
+            }
+            if !session.next_change_blocking() {
+                break;
+            }
+        }
+        assert!(ready, "'second-line-marker' never appeared in the source session's redraw output");
+
+        let mut redrawer = Redrawer::new();
+        let mut bytes = Vec::new();
+        session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed writing to a Vec<u8>");
+
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut target_term, &bytes);
+
+        // The real assertion: "second-line-marker" (echoed on the line
+        // RIGHT AFTER the Nerd Font prompt line) must land on the line
+        // immediately following the prompt glyphs, not shifted by however
+        // many columns a width miscount for U+F5BA/U+F101 would introduce.
+        // If cursor tracking desynced painting the prompt line, this text
+        // would show up in the wrong column/row (or split across two,
+        // exactly like stray ">>" characters bleeding onto their own line).
+        let lines: Vec<String> = (0..bounds.rows)
+            .map(|row| {
+                target_term
+                    .grid()
+                    .display_iter()
+                    .filter(|indexed| indexed.point.line.0 == row as i32)
+                    .map(|indexed| indexed.cell.c)
+                    .collect::<String>()
+            })
+            .collect();
+        let marker_line = lines
+            .iter()
+            .position(|line| line.contains("second-line-marker"))
+            .expect("second-line-marker should be on some line of the reparsed grid");
+        let marker_line_text = &lines[marker_line];
+        assert!(
+            marker_line_text.trim_end().ends_with("second-line-marker"),
+            "second-line-marker should be the ONLY thing on its line (a clean echo), not sharing a line with leftover prompt characters — got: {marker_line_text:?}"
+        );
+
+        session.kill();
+    }
 }

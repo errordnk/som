@@ -576,24 +576,50 @@ impl TerminalPanel {
             let profile = profile.unwrap();
             let cwd = working_directory.clone().map(|p| p.to_string_lossy().to_string());
             let pane_id = uuid::Uuid::new_v4().to_string();
-            match tmux_wrapped_shell(&profile, &pane_id) {
-                Ok((program, args)) => {
-                    let task = Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
-                        project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx)
-                    });
-                    cx.spawn(async move |workspace, cx| {
-                        let (item_id, _terminal) = task.await?;
-                        workspace.update(cx, |workspace, _cx| {
-                            workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
-                        })?;
-                        anyhow::Ok(())
+            // Remote (ssh/wsl) profiles need a blocking deploy check (git
+            // pull + rebuild on the far side if the version there doesn't
+            // match this Som build — see `ensure_remote_binary_deployed`'s
+            // doc comment) BEFORE the terminal is created at all, since
+            // `tmux_wrapped_shell`'s remote path assumes the binary at
+            // `~/.local/bin/som-tmux-server` is already current. That check
+            // runs real blocking child processes, so it can't happen inline
+            // here on GPUI's main thread — spawn it, then create the
+            // terminal (same as the local path) once it's done. A local
+            // profile has no remote binary to check at all, so `deploy_check`
+            // below is just `None`, skipping straight to terminal creation.
+            let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+            let remote_kind = classify_remote(&remote_program);
+            cx.spawn_in(window, async move |workspace, cx| {
+                if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+                    let host_args = host_args.clone();
+                    cx.background_spawn(async move {
+                        if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
+                            log::warn!("remote som-tmux-server deploy check failed, proceeding with whatever is already there: {err:#}");
+                        }
                     })
-                    .detach_and_log_err(cx);
+                    .await;
                 }
-                Err(err) => {
-                    log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
-                }
-            }
+
+                let (program, args) = match tmux_wrapped_shell(&profile, &pane_id) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
+                        return anyhow::Ok(());
+                    }
+                };
+
+                let task = workspace.update_in(cx, |workspace, window, cx| {
+                    Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
+                        project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx)
+                    })
+                })?;
+                let (item_id, _terminal) = task.await?;
+                workspace.update(cx, |workspace, _cx| {
+                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
             return;
         }
 
@@ -776,6 +802,25 @@ impl TerminalPanel {
                         .and_then(|ids| ids.first())
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                    // Same remote deploy check as `new_terminal` — see
+                    // `ensure_remote_binary_deployed`'s doc comment. Already
+                    // inside this function's own `cx.spawn`, so this just
+                    // awaits inline rather than needing a nested `spawn_in`.
+                    let (remote_program, host_args) =
+                        project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+                    if let RemoteKind::Ssh | RemoteKind::Wsl = classify_remote(&remote_program) {
+                        let remote_kind = classify_remote(&remote_program);
+                        cx.background_spawn(async move {
+                            if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
+                                log::warn!(
+                                    "remote som-tmux-server deploy check failed on restore, proceeding with whatever is already there: {err:#}"
+                                );
+                            }
+                        })
+                        .await;
+                    }
+
                     let wrapped = tmux_wrapped_shell(&profile, &pane_id);
                     let created = match wrapped {
                         Ok((program, args)) => window_handle
@@ -1349,6 +1394,7 @@ fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
 /// stdin/stdout tunnel bytes to/from wherever the shell actually runs), so
 /// wrapping the local `ssh`/`wsl` invocation would be wrapping the wrong
 /// end entirely.
+#[derive(Clone, Copy)]
 enum RemoteKind {
     Local,
     Ssh,
@@ -1405,11 +1451,9 @@ fn wrap_command_args(profile_name: &str, pane_id: &str, program: String, args: V
 /// and `wsl [flags] -- <cmd>` hand everything after their own arguments to
 /// a shell on the far side, so this is what that far shell actually runs.
 ///
-/// Deployment (copying the binary to `~/.local/bin`, checking/upgrading its
-/// version) is NOT done here — see `project_som_tmux` memory ("Обновление
-/// 19"): that policy isn't implemented yet, this just assumes the binary is
-/// already at `~/.local/bin/som-tmux-server` on the far side (true today only
-/// because it was deployed there manually while testing cross-compilation).
+/// Deployment (copying/rebuilding the binary at `~/.local/bin`, checking its
+/// version) is NOT this function's job — see `ensure_remote_binary_deployed`,
+/// which callers run first, before ever building this command line.
 ///
 /// `$SHELL` (expanded by the remote login shell that `ssh`/`wsl` hands this
 /// command line to, NOT by Som itself) stands in for "the user's own
@@ -1423,6 +1467,96 @@ fn wrap_remote_command_args(profile_name: &str, pane_id: &str, args: Vec<String>
     wrapped_args.push(pane_id.to_string());
     wrapped_args.push("$SHELL".to_string());
     wrapped_args
+}
+
+/// Builds the argv for running `remote_program` on the far side of an
+/// `ssh`/`wsl` profile's OWN connection args — e.g. for `ssh 192.168.50.5`
+/// this gives `["192.168.50.5", "~/.local/bin/som-tmux-server", "--version"]`,
+/// which `ssh` hands to a shell on the far end exactly like the real relay
+/// invocation does (`wrap_remote_command_args`). Shared by the deploy-check
+/// path so it builds the SAME kind of command line, not a parallel one that
+/// could drift out of sync with what actually gets run for real.
+fn wrap_remote_probe_args(host_args: &[String], remote_program: &str, extra: &[&str]) -> Vec<String> {
+    let mut wrapped_args = host_args.to_vec();
+    wrapped_args.push(remote_program.to_string());
+    wrapped_args.extend(extra.iter().map(|s| s.to_string()));
+    wrapped_args
+}
+
+/// Ensures `~/.local/bin/som-tmux-server` on the far side of an `ssh`/`wsl`
+/// tmux profile is present and matches THIS Som build's version — see
+/// `project_som_tmux` memory ("Обновление 19"/23) for the full policy this
+/// implements. Runs entirely on a background thread (blocking `ssh`/`wsl`
+/// child processes) — callers must not call this from GPUI's main thread.
+///
+/// Deliberately does NOT decide whether to restart an already-running
+/// HOLDER process for this pane — that would need per-pane "is it busy"
+/// state (live child processes under the shell, see `project_som_tmux`
+/// memory) this function has no access to, and isn't needed for the
+/// deploy-vs-not-deploy decision anyway: overwriting the on-disk binary
+/// file is safe even while an old HOLDER process still has it open/running
+/// with the old version loaded in memory (ordinary Unix file semantics) —
+/// a NEW `--holder`/relay invocation picks up the new file next time one is
+/// spawned; an already-running HOLDER just keeps serving with the version
+/// it started with until something else causes it to restart.
+///
+/// Deploy mechanism is `git pull && cargo build` ON the remote machine, NOT
+/// scp of a locally cross-compiled binary — Som's own Windows build has no
+/// cross-compiled artifact for the remote's actual platform (see
+/// `project_som_tmux` memory, "Обновление 21": cross-compilation was
+/// deliberately rejected in favor of building natively on each real target
+/// machine), and every profile's remote host already has its own clone of
+/// this same repository (that's how the binaries got there in the first
+/// place) — `git pull` is a no-op if the remote is already current, so this
+/// is safe to run unconditionally once a version mismatch (or missing
+/// binary) is detected, not just on first deploy.
+fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<()> {
+    let local_version = som_tmux_server::protocol::HandshakeInfo::current().version;
+
+    let version_probe = wrap_remote_probe_args(host_args, "~/.local/bin/som-tmux-server", &["--version"]);
+    let remote_version = run_remote_command(remote_kind, &version_probe)
+        .ok()
+        .and_then(|output| serde_json::from_str::<som_tmux_server::protocol::HandshakeInfo>(output.trim()).ok())
+        .map(|info| info.version);
+
+    if remote_version.as_deref() == Some(local_version.as_str()) {
+        return Ok(()); // already up to date, nothing to do
+    }
+
+    log::info!(
+        "som-tmux-server on remote host is {:?} (local build is {local_version:?}) — rebuilding remotely",
+        remote_version
+    );
+
+    let deploy_script = "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux_server) && mkdir -p ~/.local/bin && cp target/release/som-tmux-server ~/.local/bin/som-tmux-server";
+    let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", deploy_script]);
+    run_remote_command(remote_kind, &deploy_probe)?;
+    Ok(())
+}
+
+/// Runs one blocking `ssh`/`wsl` invocation to completion and returns its
+/// stdout — shared plumbing for both the `--version` probe and the deploy
+/// script in `ensure_remote_binary_deployed`. A non-zero exit or spawn
+/// failure is surfaced as `Err` (e.g. "binary not found yet" for a
+/// brand-new host); callers treat that as "assume out of date, deploy".
+fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Result<String> {
+    let program = match remote_kind {
+        RemoteKind::Ssh => "ssh",
+        RemoteKind::Wsl => "wsl",
+        RemoteKind::Local => anyhow::bail!("run_remote_command called with RemoteKind::Local"),
+    };
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to spawn {program:?} for remote deploy check"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{program} exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Finds `som-tmux-server.exe` next to Som's own executable — the same
@@ -1990,5 +2124,15 @@ mod tmux_shell_wrapping_tests {
             args,
             vec!["--cd", "~", "~/.local/bin/som-tmux-server", "wsl", "pane-uuid-5", "$SHELL"]
         );
+    }
+
+    #[test]
+    fn builds_a_version_probe_using_the_same_host_args_as_the_real_invocation() {
+        let args = wrap_remote_probe_args(
+            &["192.168.50.5".to_string()],
+            "~/.local/bin/som-tmux-server",
+            &["--version"],
+        );
+        assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/som-tmux-server", "--version"]);
     }
 }

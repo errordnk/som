@@ -72,15 +72,15 @@ pub struct Session {
     /// `CloseSession`, since alacritty's `EventLoop`/`Notifier` only exposes
     /// writing bytes and resizing, not process control.
     pid: Option<sysinfo::Pid>,
-    /// `Wakeup` notifications only (see `spawn`'s internal pump thread doc
-    /// comment for why `PtyWrite`/other events never reach here). Consumed
-    /// by `server.rs`'s per-connection grid-update forwarder, which turns
-    /// each `Wakeup` into a `GridUpdate` sent to the attached client. Cloned
-    /// (not moved) when a new client attaches, since more than one client
-    /// could plausibly attach to the same session (e.g. briefly during a
-    /// tab-restore race) — `async_channel` supports multiple consumers on
-    /// the same channel natively.
-    pub events_rx: async_channel::Receiver<AlacTermEvent>,
+    /// Every live subscriber's own private channel — see `subscribe()`'s
+    /// doc comment for why this exists instead of one shared
+    /// `events_rx` field every consumer read from directly (the bug that
+    /// used to be here: `async_channel` is a competing-consumers queue, NOT
+    /// a broadcast — each `Wakeup` went to exactly ONE of potentially
+    /// several readers, not all of them). Also held by the broadcaster
+    /// thread spawned in `spawn()` (a second `Arc` clone, not through
+    /// `Session` itself, since that thread starts before `Session` exists).
+    subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<AlacTermEvent>>>>,
 }
 
 impl Session {
@@ -100,11 +100,21 @@ impl Session {
         scrollback: Option<usize>,
     ) -> Result<Self> {
         let shell = tty::Shell::new(program, args);
+        // Mirrors `terminal::insert_zed_terminal_env` — without an explicit
+        // `TERM`, the shell/its line editor (confirmed cause: PowerShell's
+        // PSReadLine) has to guess the terminal's capabilities from
+        // whatever platform default it falls back to, which does not
+        // necessarily match how this crate's own `redraw.rs`/`Term` actually
+        // behaves. `TERM=xterm-256color` is exactly what Som's own regular
+        // (non-tmux) terminal already sets for every shell it spawns.
+        let mut env = std::collections::HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
         let pty_options = tty::Options {
             shell: Some(shell),
             working_directory: cwd.map(std::path::PathBuf::from),
             drain_on_exit: true,
-            env: Default::default(),
+            env,
             #[cfg(not(windows))]
             child_signal_mask: None,
             #[cfg(windows)]
@@ -156,17 +166,34 @@ impl Session {
         // driven by GPUI's render loop) because a GPUI window is always
         // "polling" while visible; the server has no such render loop, so it
         // needs its own always-on consumer.
+        //
+        // Also the ONLY place that reads `raw_events_rx` — a `Wakeup`/`Exit`
+        // is broadcast to every current subscriber (see `subscribe()`'s doc
+        // comment for the bug this replaced: several threads used to all
+        // `recv_blocking()` the SAME single channel directly, which is a
+        // competing-consumers queue, not a broadcast — a `Wakeup` meant for
+        // the redraw-forwarder could just as easily be silently consumed by
+        // the unrelated shell-exit-watcher thread instead, and the RELAY
+        // would never learn the screen changed at all).
         let pump_pty_tx = Notifier(pty_tx.0.clone());
-        let (wakeup_tx, wakeup_rx) = async_channel::unbounded();
+        let subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<AlacTermEvent>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pump_subscribers = subscribers.clone();
         std::thread::spawn(move || {
             while let Ok(event) = raw_events_rx.recv_blocking() {
                 match event {
                     AlacTermEvent::PtyWrite(bytes) => pump_pty_tx.notify(bytes.into_bytes()),
                     AlacTermEvent::Wakeup => {
-                        wakeup_tx.try_send(AlacTermEvent::Wakeup).ok();
+                        let subs = pump_subscribers.lock().unwrap();
+                        for sub in subs.iter() {
+                            sub.try_send(AlacTermEvent::Wakeup).ok();
+                        }
                     }
                     AlacTermEvent::Exit => {
-                        wakeup_tx.try_send(AlacTermEvent::Exit).ok();
+                        let subs = pump_subscribers.lock().unwrap();
+                        for sub in subs.iter() {
+                            sub.try_send(AlacTermEvent::Exit).ok();
+                        }
                         break;
                     }
                     _ => {}
@@ -180,8 +207,29 @@ impl Session {
             pty_tx,
             last_bounds: std::sync::Mutex::new(bounds),
             pid,
-            events_rx: wakeup_rx,
+            subscribers,
         })
+    }
+
+    /// Registers a new, independent receiver for this session's `Wakeup`/
+    /// `Exit` events — every call gets its OWN channel, and the pump thread
+    /// started in `spawn()` broadcasts each event to ALL of them, not just
+    /// whichever one happens to `recv` first. Each of the HOLDER's several
+    /// consumers (the shell-exit watcher in `server.rs::run`, and one
+    /// redraw-forwarder per connected RELAY in `spawn_forwarder`) must call
+    /// this to get its own feed — sharing one `Receiver` between them was
+    /// the actual root cause of a reported PowerShell PSReadLine
+    /// continuation-prompt (">>") artifact: with a shared MPMC channel, a
+    /// `Wakeup` meant for the redraw-forwarder could be silently consumed by
+    /// the exit-watcher thread instead (which does nothing with a `true`
+    /// result besides looping back around), so the RELAY never learned the
+    /// screen had changed and the client-side terminal never advanced past
+    /// its last-known state — indistinguishable from dropped input from the
+    /// user's point of view.
+    pub fn subscribe(&self) -> async_channel::Receiver<AlacTermEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        self.subscribers.lock().unwrap().push(tx);
+        rx
     }
 
     /// Kills the underlying process for real (used for an explicit
@@ -231,16 +279,21 @@ impl Session {
         redrawer.redraw(&term, out)
     }
 
-    /// Waits for the next `Wakeup` from the session's internal pump thread
-    /// (i.e. the grid actually changed) — `events_rx` only ever carries
-    /// `Wakeup`/`Exit` (everything else, notably `PtyWrite`, is handled
-    /// internally by the pump thread started in `spawn`, never forwarded
-    /// here). Returns `false` on `Exit`/channel closed. Blocking (not
-    /// async) — every consumer in this crate (the shell-exit watcher, the
-    /// redraw forwarder) runs on a plain OS thread, not an async executor.
-    pub fn next_change_blocking(&self) -> bool {
+    /// Waits for the next `Wakeup` on `events_rx` (i.e. the grid actually
+    /// changed) — `events_rx` must be a receiver obtained from THIS
+    /// session's own `subscribe()`, not shared with any other caller (see
+    /// `subscribe()`'s doc comment for why: this used to take no receiver
+    /// argument at all and read a single field shared across every
+    /// consumer, which silently dropped events between competing threads).
+    /// Only ever carries `Wakeup`/`Exit` (everything else, notably
+    /// `PtyWrite`, is handled internally by the pump thread started in
+    /// `spawn`, never forwarded here). Returns `false` on `Exit`/channel
+    /// closed. Blocking (not async) — every consumer in this crate (the
+    /// shell-exit watcher, the redraw forwarder) runs on a plain OS thread,
+    /// not an async executor.
+    pub fn next_change_blocking(&self, events_rx: &async_channel::Receiver<AlacTermEvent>) -> bool {
         loop {
-            match self.events_rx.recv_blocking() {
+            match events_rx.recv_blocking() {
                 Ok(AlacTermEvent::Wakeup) => return true,
                 Ok(AlacTermEvent::Exit) => return false,
                 Ok(_) => continue,

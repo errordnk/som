@@ -16,7 +16,7 @@ use crate::bounds::SessionBounds;
 use crate::redraw::Redrawer;
 use crate::session::Session;
 use som_tmux_server::pipe::{self, PipeConnection};
-use som_tmux_server::protocol::{HolderOutput, RelayInput, pipe_name};
+use som_tmux_server::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::sync::{Arc, Mutex};
 
 /// Runs as the HOLDER for `profile_name`/`pane_id`: spawns `program`/`args`
@@ -80,11 +80,31 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     let connection = Arc::new(connection);
     let writer = Arc::new(Mutex::new(()));
 
-    // Full redraw immediately on connect — a fresh Redrawer has no prior
-    // state, so the very first `Session::redraw` call against it emits
-    // the entire current screen (see `Redrawer::new`'s doc comment). This
-    // is what gives a (re)attaching RELAY the "restore the screen as it
-    // was" behavior without ever replaying raw historical bytes.
+    // Handshake FIRST, before anything else on this connection — see
+    // `protocol::HandshakeInfo`'s doc comment. The relay always speaks
+    // first (see `crate::relay::run`); the holder just waits for it here
+    // and replies in kind. This connection has nothing better to do with a
+    // relay's version/platform info than log it — `crate::relay` is where
+    // the actual "should I copy a newer binary / restart a live holder"
+    // policy decisions get made, using the HOLDER's reply to ITS OWN
+    // handshake, sent when it first connects (a fresh pipe connection, not
+    // this one) before ever getting to the point of becoming this holder's
+    // relay in the first place.
+    let relay_info = match read_relay_message(&connection)? {
+        RelayInput::Handshake(info) => info,
+        other => anyhow::bail!("expected Handshake as the first message from a relay, got {other:?}"),
+    };
+    log::info!(
+        "relay handshake: version={:?} os={:?} arch={:?}",
+        relay_info.version, relay_info.os, relay_info.arch
+    );
+    send(&connection, &writer, &HolderOutput::Handshake(HandshakeInfo::current()))?;
+
+    // Full redraw immediately after the handshake — a fresh Redrawer has no
+    // prior state, so the very first `Session::redraw` call against it
+    // emits the entire current screen (see `Redrawer::new`'s doc comment).
+    // This is what gives a (re)attaching RELAY the "restore the screen as
+    // it was" behavior without ever replaying raw historical bytes.
     let redrawer = Arc::new(Mutex::new(Redrawer::new()));
     send_redraw(&connection, &writer, session, &redrawer)?;
 
@@ -96,10 +116,14 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     result
 }
 
+fn read_relay_message(connection: &PipeConnection) -> anyhow::Result<RelayInput> {
+    let message = connection.read_message()?;
+    Ok(serde_json::from_slice(&message)?)
+}
+
 fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<()> {
     loop {
-        let message = connection.read_message()?;
-        let message: RelayInput = serde_json::from_slice(&message)?;
+        let message = read_relay_message(connection)?;
         match message {
             RelayInput::Bytes(bytes) => session.write(bytes),
             RelayInput::Resize { cols, rows } => {
@@ -108,6 +132,13 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
             RelayInput::Close => {
                 session.kill();
                 return Ok(());
+            }
+            // Only ever expected once, as the very first message (handled
+            // in `handle_relay` before this loop starts) — a second one on
+            // the same connection would be a protocol violation from the
+            // relay, not something to crash over.
+            RelayInput::Handshake(_) => {
+                log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
             }
         }
     }
@@ -126,9 +157,7 @@ fn spawn_forwarder(
                 return;
             }
             if !session.next_change_blocking() {
-                let payload = serde_json::to_vec(&HolderOutput::ShellExited).unwrap_or_default();
-                let _guard = writer.lock().unwrap();
-                connection.write_message(&payload).ok();
+                send(&connection, &writer, &HolderOutput::ShellExited).ok();
                 return;
             }
             if send_redraw(&connection, &writer, &session, &redrawer).is_err() {
@@ -149,7 +178,11 @@ fn send_redraw(
     if bytes.is_empty() {
         return Ok(());
     }
-    let payload = serde_json::to_vec(&HolderOutput::Bytes(bytes))?;
+    send(connection, writer, &HolderOutput::Bytes(bytes))
+}
+
+fn send(connection: &PipeConnection, writer: &Mutex<()>, message: &HolderOutput) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(message)?;
     let _guard = writer.lock().unwrap();
     connection.write_message(&payload)?;
     Ok(())

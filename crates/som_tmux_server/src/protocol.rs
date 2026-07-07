@@ -45,11 +45,84 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
         .into_owned()
 }
 
+/// Which OS a HOLDER is running on — part of the handshake (see
+/// `HandshakeInfo`) so a RELAY (potentially a newer build than the HOLDER
+/// it's reattaching to, e.g. after Som updated but a remote HOLDER survived
+/// from before) can tell whether they're even compatible before trusting
+/// anything else about the connection. Deliberately only the four
+/// combinations `project_som_tmux` memory ("Обновление 21") says are
+/// actually supported — Intel Mac and Windows-on-ARM are excluded on
+/// purpose ("пока не поддерживается" — not supported YET, not a permanent
+/// decision, just nothing to detect or build for right now).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Os {
+    Windows,
+    Darwin,
+    Linux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Arch {
+    Amd64,
+    Arm64,
+}
+
+/// Detects the CURRENT process's own OS/architecture — used by both sides
+/// to fill in their half of the handshake. `cfg!` rather than
+/// `std::env::consts::{OS,ARCH}` string-matching, since those give runtime
+/// strings ("windows", "aarch64") that would need re-parsing into this enum
+/// anyway, and the actual platform is a compile-time fact for a given
+/// binary.
+pub fn current_platform() -> (Os, Arch) {
+    let os = if cfg!(target_os = "windows") {
+        Os::Windows
+    } else if cfg!(target_os = "macos") {
+        Os::Darwin
+    } else {
+        Os::Linux
+    };
+    let arch = if cfg!(target_arch = "x86_64") { Arch::Amd64 } else { Arch::Arm64 };
+    (os, arch)
+}
+
+/// Exchanged first thing on every new connection, before any actual
+/// terminal data — see `project_som_tmux` memory ("Обновление 19"/"21") for
+/// the full policy this feeds into (always copy a newer binary over an
+/// older one on disk; only ever restart a LIVE, already-running HOLDER
+/// process if none of its panes have live child processes). This type only
+/// carries the raw facts (version string, OS, arch) — the actual
+/// version-compare/restart-or-not DECISION lives in `crate::relay`, not
+/// here, since it needs additional context (e.g. "is the shell busy") this
+/// protocol module has no business knowing about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeInfo {
+    /// `env!("CARGO_PKG_VERSION")` at build time — compared as a plain
+    /// string, not semver-parsed: any difference at all (not just a
+    /// semver-incompatible one) is treated as "different build, evaluate
+    /// whether to update" by the policy in `crate::relay`, since this
+    /// binary doesn't follow a public semver contract with itself.
+    pub version: String,
+    pub os: Os,
+    pub arch: Arch,
+}
+
+impl HandshakeInfo {
+    pub fn current() -> Self {
+        let (os, arch) = current_platform();
+        Self { version: env!("CARGO_PKG_VERSION").to_string(), os, arch }
+    }
+}
+
 /// RELAY -> HOLDER: input coming from Som's own PTY (whatever the user
 /// typed) gets forwarded verbatim, plus the couple of control events a
 /// terminal needs to convey out-of-band from plain bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RelayInput {
+    /// Always the FIRST message a RELAY sends on a fresh connection, before
+    /// anything else — see `HandshakeInfo`'s doc comment. The HOLDER
+    /// replies in kind with `HolderOutput::Handshake` before its first
+    /// redraw.
+    Handshake(HandshakeInfo),
     /// Raw bytes read from Som's side of the RELAY's own PTY — keystrokes,
     /// paste, anything the user's terminal client sends. Forwarded
     /// byte-for-byte into the real shell's PTY on the HOLDER side.
@@ -68,6 +141,10 @@ pub enum RelayInput {
 /// unmodified terminal parser.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HolderOutput {
+    /// Always the FIRST message a HOLDER sends back on a fresh connection,
+    /// replying to the RELAY's own `RelayInput::Handshake` — see
+    /// `HandshakeInfo`'s doc comment.
+    Handshake(HandshakeInfo),
     /// ANSI bytes to write to the RELAY's stdout verbatim. The very first
     /// one after a connection is accepted is always a full redraw (see
     /// `Redrawer::new`'s doc comment); every one after that is an

@@ -3,6 +3,7 @@ mod redraw;
 mod relay;
 mod server;
 mod session;
+mod term_size;
 
 /// Parsed command line — two shapes depending on whether this process is
 /// starting as a RELAY (Som's direct PTY child, the normal case) or a
@@ -15,6 +16,18 @@ struct Args {
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    /// Mirrors Som's own `TerminalSettings::cursor_shape` — passed through
+    /// explicitly rather than the HOLDER guessing/defaulting, since it's
+    /// the HOLDER's `Session`, not Som's `TerminalElement`, that actually
+    /// owns the `alacritty_terminal::Term` whose `Config` this configures
+    /// now (see `crate::session::Session::spawn`). Parsed here as a plain
+    /// string (not `terminal_settings::CursorShape` — this crate
+    /// deliberately doesn't depend on that crate) and turned into the real
+    /// `CursorShape` enum in `session.rs`.
+    cursor_shape: Option<String>,
+    /// Mirrors Som's own `TerminalSettings::max_scroll_history_lines` — same
+    /// reasoning as `cursor_shape` above.
+    scrollback: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -23,6 +36,8 @@ fn parse_args() -> Args {
     let mut pane_id = None;
     let mut program = None;
     let mut cwd = None;
+    let mut cursor_shape = None;
+    let mut scrollback = None;
     let mut extra_args = Vec::new();
 
     let mut iter = std::env::args().skip(1).peekable();
@@ -45,18 +60,22 @@ fn parse_args() -> Args {
             "--pane-id" => pane_id = iter.next(),
             "--program" => program = iter.next(),
             "--cwd" => cwd = iter.next(),
+            "--cursor-shape" => cursor_shape = iter.next(),
+            "--scrollback" => scrollback = iter.next().and_then(|s| s.parse().ok()),
             "--" => {
                 extra_args.extend(iter.by_ref());
             }
             other => {
                 // The RELAY's own invocation (what Som actually runs as
-                // the "shell") is `som-tmux-server <profile> <pane-id>
-                // <program> [args...]` — positional, not flagged, since
+                // the "shell") is `som-tmux-server [--cursor-shape ...]
+                // [--scrollback ...] <profile> <pane-id> <program>
+                // [args...]` — positional past the flags above, since
                 // Som substitutes this in as a plain shell command (see
                 // `project_som_tmux` memory, "Обновление 17") rather than
-                // constructing named flags itself. Only `--holder` mode
-                // (spawned by `relay::spawn_detached_holder`, never by
-                // Som directly) uses the named-flag form above.
+                // constructing named flags itself for the parts that
+                // aren't settings. Only `--holder` mode (spawned by
+                // `relay::spawn_detached_holder`, never by Som directly)
+                // uses the fully named-flag form above for everything.
                 if profile.is_none() {
                     profile = Some(other.to_string());
                 } else if pane_id.is_none() {
@@ -72,7 +91,7 @@ fn parse_args() -> Args {
 
     let usage = || -> ! {
         eprintln!(
-            "usage:\n  som-tmux-server <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux-server --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [-- args...]"
+            "usage:\n  som-tmux-server [--cursor-shape <shape>] [--scrollback <n>] <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux-server --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [--cursor-shape <shape>] [--scrollback <n>] [-- args...]"
         );
         std::process::exit(2);
     };
@@ -81,7 +100,7 @@ fn parse_args() -> Args {
     let Some(pane_id) = pane_id.filter(|s| !s.trim().is_empty()) else { usage() };
     let Some(program) = program.filter(|s| !s.trim().is_empty()) else { usage() };
 
-    Args { holder, profile, pane_id, program, args: extra_args, cwd }
+    Args { holder, profile, pane_id, program, args: extra_args, cwd, cursor_shape, scrollback }
 }
 
 fn main() {
@@ -89,9 +108,9 @@ fn main() {
     init_logging(&args.profile, &args.pane_id, args.holder);
 
     let result = if args.holder {
-        server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd)
+        server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     } else {
-        relay::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd)
+        relay::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     };
 
     if let Err(err) = result {

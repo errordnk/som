@@ -28,8 +28,16 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// that point there's nothing left for this process to proxy, so `main`
 /// just lets it exit (Som sees its PTY's child process end, same as any
 /// other shell exiting).
-pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>, cwd: Option<String>) -> anyhow::Result<()> {
-    let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd)?);
+pub fn run(
+    profile_name: &str,
+    pane_id: &str,
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    cursor_shape: Option<String>,
+    scrollback: Option<usize>,
+) -> anyhow::Result<()> {
+    let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd, cursor_shape, scrollback)?);
 
     // Handshake first, before anything else on this connection — see
     // `protocol::HandshakeInfo`'s doc comment. The relay speaks first here;
@@ -56,6 +64,18 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
         other => anyhow::bail!("expected Handshake as the first message from a holder, got {other:?}"),
     }
 
+    // Sends the current pane size right after the handshake, before
+    // anything else — `crate::server::handle_relay` deliberately waits for
+    // exactly this one message before its first full redraw (see that
+    // function's doc comment), so a (re)attaching pane never has to visibly
+    // jump from whatever size the session happened to be at to its actual
+    // current size. Always sent (never skipped), even when `current_size()`
+    // can't read a real size (falls back to `SessionBounds::default()`'s
+    // 80x24) — the HOLDER unconditionally waits for exactly one message
+    // here, so this side must unconditionally send exactly one.
+    let initial_size = crate::term_size::current_size().unwrap_or((80, 24));
+    send(&connection, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
+
     let reader_connection = connection.clone();
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         loop {
@@ -73,6 +93,35 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
                 HolderOutput::Handshake(_) => {
                     log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
                 }
+            }
+        }
+    });
+
+    // Polls this process's own stdout (Som's PTY, resized whenever Som
+    // resizes the pane/window) for size changes and forwards them to the
+    // HOLDER — see `crate::term_size`'s module doc comment for why this is
+    // a poll rather than an event subscription, and `project_som_tmux`
+    // memory ("Обновление 20") for why this was missing entirely before:
+    // the HOLDER's session used to be permanently stuck at its initial
+    // hardcoded 80x24, which is the root cause of both "the terminal
+    // doesn't fill the pane" and (less obviously) stray-looking artifacts
+    // after the shell scrolls, since Som's own `TerminalElement` renders at
+    // the REAL pane size while every escape code the HOLDER generated was
+    // computed against a completely different, wrong screen width.
+    let resize_connection = connection.clone();
+    let resize_thread = std::thread::spawn(move || {
+        // Seeded with the size already sent above, so this loop's first
+        // tick doesn't immediately re-send an identical Resize.
+        let mut last_size = initial_size;
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let Some((cols, rows)) = crate::term_size::current_size() else { continue };
+            if last_size == (cols, rows) {
+                continue;
+            }
+            last_size = (cols, rows);
+            if send(&resize_connection, &RelayInput::Resize { cols, rows }).is_err() {
+                return; // holder gone — writer_thread/stdin loop will notice too
             }
         }
     });
@@ -98,8 +147,11 @@ pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>
     // out once this relay's connection handle is dropped at the end of
     // `run` (stdin loop above already broke), so there's nothing more to
     // signal it — just let it wind down on its own rather than blocking
-    // this function's return on `join()`.
+    // this function's return on `join()`. Same reasoning applies to the
+    // resize-polling thread — its next `send()` fails once `connection` is
+    // gone, ending its loop on its own.
     drop(writer_thread);
+    drop(resize_thread);
     Ok(())
 }
 
@@ -130,13 +182,15 @@ fn connect_or_become_holder(
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    cursor_shape: Option<String>,
+    scrollback: Option<usize>,
 ) -> anyhow::Result<PipeConnection> {
     let name = pipe_name(profile_name, pane_id);
     if let Ok(connection) = PipeConnection::connect(&name) {
         return Ok(connection);
     }
 
-    spawn_detached_holder(profile_name, pane_id, &program, &args, cwd.as_deref())?;
+    spawn_detached_holder(profile_name, pane_id, &program, &args, cwd.as_deref(), cursor_shape.as_deref(), scrollback)?;
 
     for attempt in 0..CONNECT_RETRY_ATTEMPTS {
         match PipeConnection::connect(&name) {
@@ -164,6 +218,8 @@ fn spawn_detached_holder(
     program: &str,
     args: &[String],
     cwd: Option<&str>,
+    cursor_shape: Option<&str>,
+    scrollback: Option<usize>,
 ) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
 
@@ -180,6 +236,12 @@ fn spawn_detached_holder(
         .arg(program);
     if let Some(cwd) = cwd {
         command.arg("--cwd").arg(cwd);
+    }
+    if let Some(cursor_shape) = cursor_shape {
+        command.arg("--cursor-shape").arg(cursor_shape);
+    }
+    if let Some(scrollback) = scrollback {
+        command.arg("--scrollback").arg(scrollback.to_string());
     }
     if !args.is_empty() {
         command.arg("--");
@@ -215,6 +277,8 @@ fn spawn_detached_holder(
     program: &str,
     args: &[String],
     cwd: Option<&str>,
+    cursor_shape: Option<&str>,
+    scrollback: Option<usize>,
 ) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
@@ -229,6 +293,12 @@ fn spawn_detached_holder(
         .arg(program);
     if let Some(cwd) = cwd {
         command.arg("--cwd").arg(cwd);
+    }
+    if let Some(cursor_shape) = cursor_shape {
+        command.arg("--cursor-shape").arg(cursor_shape);
+    }
+    if let Some(scrollback) = scrollback {
+        command.arg("--scrollback").arg(scrollback.to_string());
     }
     if !args.is_empty() {
         command.arg("--");

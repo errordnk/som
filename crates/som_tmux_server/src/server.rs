@@ -29,9 +29,24 @@ use std::sync::{Arc, Mutex};
 /// old design's "0 sessions -> exit", just simplified to "1 session, its
 /// exit IS the exit" now that there's no multi-session registry to check
 /// emptiness of.
-pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>, cwd: Option<String>) -> anyhow::Result<()> {
+pub fn run(
+    profile_name: &str,
+    pane_id: &str,
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    cursor_shape: Option<String>,
+    scrollback: Option<usize>,
+) -> anyhow::Result<()> {
+    // 80x24 here is just a starting point, not a lasting default — the
+    // first RELAY to connect always sends its actual pane size as the
+    // second message on the connection (right after the handshake), applied
+    // in `handle_relay` before that RELAY ever sees a single redrawn byte.
+    // See `crate::relay::run`'s doc comment and `project_som_tmux` memory
+    // ("Обновление 20"'s confirmed `RelayInput::Resize` gap) for why this
+    // used to just stay 80x24 forever.
     let bounds = SessionBounds::new(80, 24);
-    let session = Arc::new(Session::spawn(program, args, cwd, bounds).map_err(|err| {
+    let session = Arc::new(Session::spawn(program, args, cwd, bounds, cursor_shape, scrollback).map_err(|err| {
         log::error!("failed to spawn shell: {err:#}");
         err
     })?);
@@ -100,11 +115,27 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     );
     send(&connection, &writer, &HolderOutput::Handshake(HandshakeInfo::current()))?;
 
-    // Full redraw immediately after the handshake — a fresh Redrawer has no
-    // prior state, so the very first `Session::redraw` call against it
-    // emits the entire current screen (see `Redrawer::new`'s doc comment).
-    // This is what gives a (re)attaching RELAY the "restore the screen as
-    // it was" behavior without ever replaying raw historical bytes.
+    // Every RELAY sends its actual pane size as the very next message,
+    // right after the handshake (see `crate::relay::run`'s doc comment) —
+    // applied here BEFORE the first redraw so a (re)attaching pane never
+    // has to visibly jump from whatever size the session happened to be at
+    // (the hardcoded 80x24 fallback on first spawn, or just however big the
+    // window was the last time anything was connected) to its actual
+    // current size. Every new connection resizes, not just the session's
+    // first ever one — the window may well have been resized while nothing
+    // was attached at all (Som closed, or between tabs), so there's no
+    // "already correct, skip it" case to special-case here.
+    match read_relay_message(&connection)? {
+        RelayInput::Resize { cols, rows } => session.resize(SessionBounds::new(cols, rows)),
+        other => anyhow::bail!("expected an initial Resize as the second message from a relay, got {other:?}"),
+    }
+
+    // Full redraw immediately after the handshake+initial resize — a fresh
+    // Redrawer has no prior state, so the very first `Session::redraw` call
+    // against it emits the entire current screen (see `Redrawer::new`'s doc
+    // comment). This is what gives a (re)attaching RELAY the "restore the
+    // screen as it was" behavior without ever replaying raw historical
+    // bytes.
     let redrawer = Arc::new(Mutex::new(Redrawer::new()));
     send_redraw(&connection, &writer, session, &redrawer)?;
 

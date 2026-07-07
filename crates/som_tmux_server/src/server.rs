@@ -1,201 +1,155 @@
+//! HOLDER side of the transparent-PTY-proxy architecture (see
+//! `project_som_tmux` memory, "Обновление 16"-19 for the full design
+//! history): this is the long-lived process that actually owns the real
+//! shell's PTY and keeps parsing its output into a grid, independent of
+//! whether any RELAY is currently connected. A RELAY (the process Som
+//! itself spawned into its own PTY — see `crate::relay`) connects here,
+//! gets a full ANSI redraw of the current screen, then a live stream of
+//! incremental updates for as long as it stays connected.
+//!
+//! One HOLDER = exactly one pane (see `protocol::pipe_name`'s doc comment
+//! for why this changed from the old per-profile multiplexed design) — so
+//! there's no session registry here at all, just one `Session` for this
+//! process's entire lifetime.
+
 use crate::bounds::SessionBounds;
+use crate::redraw::Redrawer;
 use crate::session::Session;
 use som_tmux_server::pipe::PipeConnection;
-use som_tmux_server::protocol::{ClientMessage, ServerMessage, pipe_name};
-use std::collections::HashMap;
+use som_tmux_server::protocol::{HolderOutput, RelayInput, pipe_name};
 use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 
-/// Sessions live only as long as at least one is registered — this map IS
-/// the process's reason to exist. When it becomes empty (an explicit
-/// `CloseSession` removed the last one), the process exits. It survives
-/// clients disconnecting without `CloseSession` (Som crashing, Alt+F4,
-/// simply closing the whole app) — that's the entire point: those are
-/// exactly the cases where a session should keep running for a later
-/// `Attach`.
-type Sessions = Arc<Mutex<HashMap<Uuid, Session>>>;
+/// Runs as the HOLDER for `profile_name`/`pane_id`: spawns `program`/`args`
+/// as the real shell (only meaningful the FIRST time this pipe name is
+/// used — see `crate::relay` for how a caller decides whether to become a
+/// HOLDER or connect as a RELAY to one that already exists), then accepts
+/// RELAY connections for as long as the shell process is alive.
+///
+/// Exits when the shell process exits (nothing left to hold) — mirrors the
+/// old design's "0 sessions -> exit", just simplified to "1 session, its
+/// exit IS the exit" now that there's no multi-session registry to check
+/// emptiness of.
+pub fn run(profile_name: &str, pane_id: &str, program: String, args: Vec<String>, cwd: Option<String>) -> anyhow::Result<()> {
+    let bounds = SessionBounds::new(80, 24);
+    let session = Arc::new(Session::spawn(program, args, cwd, bounds).map_err(|err| {
+        log::error!("failed to spawn shell: {err:#}");
+        err
+    })?);
+    log::info!("holder started for profile {profile_name:?} pane {pane_id:?}, session id {}", session.id);
 
-pub fn run(profile_name: &str) -> anyhow::Result<()> {
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let pipe_name = pipe_name(profile_name);
+    let pipe_name = pipe_name(profile_name, pane_id);
 
-    log::info!("som-tmux-server listening on {pipe_name} for profile {profile_name:?}");
+    // Exits the whole process once the shell itself exits — spawned once,
+    // up front, rather than checked after each connection ends: the shell
+    // can exit while zero OR one RELAY is connected, and either way there's
+    // nothing left for this process to hold open.
+    {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            loop {
+                if !session.next_change_blocking() {
+                    log::info!("shell process exited, holder shutting down");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     loop {
         let connection = match PipeConnection::accept(&pipe_name) {
             Ok(connection) => connection,
             Err(err) => {
-                log::error!("failed to accept connection: {err:#}");
-                // Defensive: avoid busy-looping if CreateNamedPipeW/
-                // ConnectNamedPipe keeps failing for some persistent reason
-                // (permissions, resource exhaustion, etc). Hit this exact
-                // failure mode once already from a flag misuse — see the
-                // doc comment on `PipeConnection::accept`.
+                log::error!("failed to accept relay connection: {err:#}");
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
         };
+        log::info!("relay connected");
 
-        let sessions = sessions.clone();
-        let profile_name = profile_name.to_owned();
+        let session = session.clone();
         std::thread::spawn(move || {
-            if let Err(err) = handle_connection(connection, &sessions) {
-                log::warn!("connection ended: {err:#}");
-            }
-            // A client disconnecting (this thread ending) is NOT a reason to
-            // kill any session on its own — see the `Sessions` doc comment
-            // above. Only check here whether an explicit CloseSession
-            // (handled inside `handle_connection`) already emptied the map;
-            // if so, there's nothing left for this process to do.
-            if sessions.lock().unwrap().is_empty() {
-                log::info!("no sessions left for profile {profile_name:?}, exiting");
-                std::process::exit(0);
+            if let Err(err) = handle_relay(connection, &session) {
+                log::warn!("relay connection ended: {err:#}");
             }
         });
     }
 }
 
-fn handle_connection(connection: PipeConnection, sessions: &Sessions) -> anyhow::Result<()> {
+fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::Result<()> {
     let connection = Arc::new(connection);
-    // The connection's single pipe handle is shared between this reader
-    // loop and any grid-update-forwarder threads spawned below for attached
-    // sessions — writes are serialized by a mutex around the handle's
-    // `write_message` call, since two threads writing to the same pipe
-    // instance concurrently would interleave bytes.
     let writer = Arc::new(Mutex::new(()));
-    // session_id -> stop flag for that session's grid-update forwarder
-    // thread, so a CloseSession/disconnect can tell it to stop rather than
-    // leaking a thread that blocks forever on `next_change_blocking`.
-    let mut forwarders: HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
 
+    // Full redraw immediately on connect — a fresh Redrawer has no prior
+    // state, so the very first `Session::redraw` call against it emits
+    // the entire current screen (see `Redrawer::new`'s doc comment). This
+    // is what gives a (re)attaching RELAY the "restore the screen as it
+    // was" behavior without ever replaying raw historical bytes.
+    let redrawer = Arc::new(Mutex::new(Redrawer::new()));
+    send_redraw(&connection, &writer, session, &redrawer)?;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_forwarder(connection.clone(), writer.clone(), session.clone(), redrawer, stop.clone());
+
+    let result = read_loop(&connection, session);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<()> {
     loop {
         let message = connection.read_message()?;
-        let message: ClientMessage = serde_json::from_slice(&message)?;
-
+        let message: RelayInput = serde_json::from_slice(&message)?;
         match message {
-            ClientMessage::NewSession { program, args, cwd, cols, rows } => {
-                let bounds = SessionBounds::new(cols, rows);
-                match Session::spawn(program, args, cwd, bounds) {
-                    Ok(session) => {
-                        let session_id = session.id;
-                        sessions.lock().unwrap().insert(session_id, session);
-                        send(&connection, &writer, &ServerMessage::SessionCreated { session_id })?;
-                    }
-                    Err(err) => {
-                        send(&connection, &writer, &ServerMessage::Error { message: err.to_string() })?;
-                    }
-                }
+            RelayInput::Bytes(bytes) => session.write(bytes),
+            RelayInput::Resize { cols, rows } => {
+                session.resize(SessionBounds::new(cols, rows));
             }
-            ClientMessage::Attach { session_id, cols, rows } => {
-                let snapshot = {
-                    let mut guard = sessions.lock().unwrap();
-                    guard.get_mut(&session_id).map(|session| {
-                        session.resize(SessionBounds::new(cols, rows));
-                        session.snapshot()
-                    })
-                };
-                match snapshot {
-                    Some(snapshot) => {
-                        send(&connection, &writer, &ServerMessage::GridUpdate { session_id, snapshot })?;
-                        spawn_forwarder(session_id, connection.clone(), writer.clone(), sessions.clone(), &mut forwarders);
-                    }
-                    None => {
-                        send(&connection, &writer, &ServerMessage::AttachFailed {
-                            session_id,
-                            reason: "no such session".into(),
-                        })?;
-                    }
-                }
-            }
-            ClientMessage::Write { session_id, bytes } => {
-                if let Some(session) = sessions.lock().unwrap().get(&session_id) {
-                    session.write(bytes);
-                }
-            }
-            ClientMessage::Resize { session_id, cols, rows } => {
-                if let Some(session) = sessions.lock().unwrap().get_mut(&session_id) {
-                    session.resize(SessionBounds::new(cols, rows));
-                }
-            }
-            ClientMessage::CloseSession { session_id } => {
-                if let Some(stop) = forwarders.remove(&session_id) {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                let (removed, now_empty) = {
-                    let mut guard = sessions.lock().unwrap();
-                    let removed = guard.remove(&session_id);
-                    (removed, guard.is_empty())
-                };
-                if let Some(session) = removed {
-                    session.kill();
-                    send(&connection, &writer, &ServerMessage::SessionClosed { session_id })?;
-                }
-                // Check right away rather than waiting for this connection to
-                // disconnect — Som keeps the pipe connection open after
-                // closing one tab (other tabs on the same profile may still
-                // be using it), so waiting for disconnect could leave this
-                // process running forever with zero sessions.
-                if now_empty {
-                    log::info!("no sessions left, exiting");
-                    std::process::exit(0);
-                }
+            RelayInput::Close => {
+                session.kill();
+                return Ok(());
             }
         }
     }
 }
 
 fn spawn_forwarder(
-    session_id: Uuid,
     connection: Arc<PipeConnection>,
     writer: Arc<Mutex<()>>,
-    sessions: Sessions,
-    forwarders: &mut HashMap<Uuid, Arc<std::sync::atomic::AtomicBool>>,
+    session: Arc<Session>,
+    redrawer: Arc<Mutex<Redrawer>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    forwarders.insert(session_id, stop.clone());
-
     std::thread::spawn(move || {
-        // Clone the receiver handle ONCE, outside the loop. Re-cloning it
-        // every iteration (an earlier version of this code did that) opens
-        // a window between dropping the old clone and creating a new one —
-        // any `Wakeup` sent by the pump thread in that gap is delivered to
-        // neither, since `async_channel` is a competing-consumers channel
-        // (each message goes to exactly one receiver clone, not broadcast to
-        // all of them) and a dropped-then-recreated receiver isn't the same
-        // logical subscriber. Found via manual testing: only the first of
-        // ~25 `Wakeup`s sent during a burst of PTY output ever reached the
-        // client.
-        let events_rx = {
-            let guard = sessions.lock().unwrap();
-            match guard.get(&session_id) {
-                Some(session) => session.events_rx.clone(),
-                None => return, // session was closed elsewhere
-            }
-        };
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            let changed = matches!(events_rx.recv_blocking(), Ok(alacritty_terminal::event::Event::Wakeup));
-            if !changed {
-                continue;
+            if !session.next_change_blocking() {
+                let payload = serde_json::to_vec(&HolderOutput::ShellExited).unwrap_or_default();
+                let _guard = writer.lock().unwrap();
+                connection.write_message(&payload).ok();
+                return;
             }
-            let snapshot = {
-                let guard = sessions.lock().unwrap();
-                match guard.get(&session_id) {
-                    Some(session) => session.snapshot(),
-                    None => return,
-                }
-            };
-            if send(&connection, &writer, &ServerMessage::GridUpdate { session_id, snapshot }).is_err() {
-                return; // client disconnected
+            if send_redraw(&connection, &writer, &session, &redrawer).is_err() {
+                return; // relay disconnected
             }
         }
     });
 }
 
-fn send(connection: &PipeConnection, writer: &Mutex<()>, message: &ServerMessage) -> anyhow::Result<()> {
+fn send_redraw(
+    connection: &PipeConnection,
+    writer: &Mutex<()>,
+    session: &Session,
+    redrawer: &Mutex<Redrawer>,
+) -> anyhow::Result<()> {
+    let mut bytes = Vec::new();
+    session.redraw(&mut redrawer.lock().unwrap(), &mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::to_vec(&HolderOutput::Bytes(bytes))?;
     let _guard = writer.lock().unwrap();
-    let payload = serde_json::to_vec(message)?;
-    connection.write_message(&payload)
+    connection.write_message(&payload)?;
+    Ok(())
 }

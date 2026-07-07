@@ -1,0 +1,36 @@
+[package]
+name = "som_tmux_server"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "som_tmux_server"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "som-tmux-server"
+path = "src/main.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+log.workspace = true
+paths.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+sysinfo.workspace = true
+uuid.workspace = true
+zlog.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

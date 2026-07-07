@@ -1,0 +1,3 @@
+mod settings;
+
+pub(crate) use settings::{SETTINGS_NESTED_KEY_VALUE_PATTERN, SETTINGS_ROOT_KEY_VALUE_PATTERN};

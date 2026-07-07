@@ -1,12 +1,10 @@
 use crate::bounds::SessionBounds;
-use som_tmux_server::protocol::{CursorPosition, GridSnapshot, ProtocolCell};
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::CursorShape;
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -42,7 +40,14 @@ pub struct Session {
     pub id: Uuid,
     term: Arc<FairMutex<Term<ServerListener>>>,
     pty_tx: Notifier,
-    last_bounds: SessionBounds,
+    /// A `Mutex` (not a plain field) purely so `resize` can take `&self`
+    /// instead of `&mut self` — `Session` is shared via `Arc` across
+    /// several threads (the shell-exit watcher, the redraw forwarder, the
+    /// RELAY connection's read loop), none of which hold exclusive access,
+    /// and resize is rare/cheap enough that a `Mutex` here isn't worth
+    /// restructuring the rest of `Session` around a `Mutex<Session>`
+    /// wrapper just to support this one method.
+    last_bounds: std::sync::Mutex<SessionBounds>,
     /// PID of the spawned shell/program, captured before the `Pty` handle is
     /// moved into `EventLoop` (which owns it from then on and doesn't expose
     /// it back out) — this is the only way to actually kill the process on
@@ -140,7 +145,7 @@ impl Session {
             id: Uuid::new_v4(),
             term,
             pty_tx,
-            last_bounds: bounds,
+            last_bounds: std::sync::Mutex::new(bounds),
             pid,
             events_rx: wakeup_rx,
         })
@@ -168,46 +173,15 @@ impl Session {
         self.pty_tx.notify(bytes);
     }
 
-    pub fn resize(&mut self, bounds: SessionBounds) {
-        if bounds == self.last_bounds {
+    pub fn resize(&self, bounds: SessionBounds) {
+        let mut last_bounds = self.last_bounds.lock().unwrap();
+        if bounds == *last_bounds {
             return;
         }
-        self.last_bounds = bounds;
+        *last_bounds = bounds;
         self.term.lock().resize(bounds);
         let window_size: WindowSize = bounds.into();
         self.pty_tx.0.send(Msg::Resize(window_size)).ok();
-    }
-
-    /// Plain-text snapshot of the current grid — see
-    /// See `protocol::ServerMessage::GridUpdate` doc comment for why this is
-    /// a full re-snapshot on every change rather than a byte stream.
-    /// `alacritty_terminal::term::Cell`'s `fg`/`bg`/`flags` are carried
-    /// straight into `protocol::ProtocolCell` (see that type's doc comment
-    /// for why it's a protocol-specific type rather than sending `Cell`
-    /// itself), and the cursor position/visibility comes from
-    /// `RenderableContent::cursor` (hidden cursor - e.g. many full-screen
-    /// TUI apps hide it between redraws - becomes `None`, not some sentinel
-    /// position).
-    pub fn snapshot(&self) -> GridSnapshot {
-        let term = self.term.lock();
-        let content = term.renderable_content();
-        let cursor = (content.cursor.shape != CursorShape::Hidden).then(|| CursorPosition {
-            line: content.cursor.point.line.0,
-            column: content.cursor.point.column.0,
-        });
-        let mut rows: Vec<Vec<ProtocolCell>> = Vec::new();
-        let mut cell_count = 0;
-        for indexed in content.display_iter {
-            cell_count += 1;
-            let line_ix = indexed.point.line.0.max(0) as usize;
-            while rows.len() <= line_ix {
-                rows.push(Vec::new());
-            }
-            let cell = &indexed.cell;
-            rows[line_ix].push(ProtocolCell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags });
-        }
-        log::debug!("snapshot: {cell_count} cells visited, {} rows", rows.len());
-        GridSnapshot { rows, cursor }
     }
 
     /// Serializes the current grid into ANSI bytes via `redrawer`, writing
@@ -228,21 +202,9 @@ impl Session {
     /// (i.e. the grid actually changed) — `events_rx` only ever carries
     /// `Wakeup`/`Exit` (everything else, notably `PtyWrite`, is handled
     /// internally by the pump thread started in `spawn`, never forwarded
-    /// here). Returns `false` on `Exit`/channel closed.
-    pub async fn next_change(&self) -> bool {
-        loop {
-            match self.events_rx.recv().await {
-                Ok(AlacTermEvent::Wakeup) => return true,
-                Ok(AlacTermEvent::Exit) => return false,
-                Ok(_) => continue,
-                Err(_) => return false,
-            }
-        }
-    }
-
-    /// Blocking equivalent of `next_change`, for `server.rs`'s
-    /// thread-per-connection grid-update forwarder threads (which are plain
-    /// OS threads, not running on an async executor).
+    /// here). Returns `false` on `Exit`/channel closed. Blocking (not
+    /// async) — every consumer in this crate (the shell-exit watcher, the
+    /// redraw forwarder) runs on a plain OS thread, not an async executor.
     pub fn next_change_blocking(&self) -> bool {
         loop {
             match self.events_rx.recv_blocking() {
@@ -273,66 +235,8 @@ fn process_pid(pty: &tty::Pty) -> Option<sysinfo::Pid> {
         .map(|pid| sysinfo::Pid::from_u32(u32::from(pid)))
 }
 
-#[cfg(test)]
-mod tests {
-    //! Verifies `Session::snapshot()` actually carries real color/attribute
-    //! data end-to-end (spawn a real PTY, print real ANSI-colored text,
-    //! check the resulting `ProtocolCell`s) — not just that the protocol
-    //! types compile, which a type-level check alone wouldn't have caught if
-    //! e.g. `Cell::fg`/`bg` weren't being read correctly out of alacritty's
-    //! `RenderableContent`. Spawns a real `cmd.exe`, no mocking — matches the
-    //! rest of this crate's testing style (see `terminal_view`'s
-    //! `reconnect_tests`/`spawn_race_tests` for the same philosophy on the
-    //! client side).
-
-    use super::*;
-    use alacritty_terminal::vte::ansi::{Color, NamedColor};
-
-    #[test]
-    fn snapshot_carries_real_color_and_text() {
-        let bounds = SessionBounds::new(80, 24);
-        // `\x1b` is the real ESC byte (0x1b) — a literal `[92m` without it
-        // is just plain text to the terminal, not a color escape sequence.
-        let command = "echo off & echo \x1b[92mgreentext\x1b[0m & timeout /T 3600";
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/C".into(), command.into()],
-            None,
-            bounds,
-        )
-        .expect("failed to spawn cmd.exe for test");
-
-        // Wait for the colored text to actually show up in the grid rather
-        // than relying on a fixed sleep — poll snapshot() a bounded number
-        // of times, waiting for the next Wakeup between attempts.
-        let mut found_row = None;
-        for _ in 0..50 {
-            let snapshot = session.snapshot();
-            if snapshot.rows.iter().any(|row| row.iter().any(|c| c.c == 'g' && c.fg != Color::Named(NamedColor::Foreground))) {
-                found_row = Some(snapshot);
-                break;
-            }
-            if !session.next_change_blocking() {
-                break;
-            }
-        }
-
-        let snapshot = found_row.expect("'greentext' with a non-default fg color never appeared in the grid");
-        let text: String = snapshot.rows.iter().flat_map(|row| row.iter().map(|c| c.c)).collect();
-        assert!(text.contains("greentext"), "grid text should contain the echoed string, got: {text:?}");
-
-        let colored_cell = snapshot
-            .rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .find(|c| c.c == 'g' && c.fg != Color::Named(NamedColor::Foreground))
-            .expect("at least one 'g' cell should have a non-default foreground color");
-        assert_eq!(
-            colored_cell.fg,
-            Color::Named(NamedColor::BrightGreen),
-            "cmd.exe's `[92m` (bright green) should map to NamedColor::BrightGreen"
-        );
-
-        session.kill();
-    }
-}
+// Color/attribute round-trip through a real PTY is covered by
+// `crate::redraw`'s tests (`redraw_round_trips_colored_text_through_a_real_
+// parser`), which exercises `Session::redraw` — the actual method used in
+// production now that `Session::snapshot`/the old `GridSnapshot` protocol
+// are gone. No separate test needed here for the same behavior.

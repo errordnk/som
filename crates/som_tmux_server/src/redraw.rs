@@ -94,16 +94,6 @@ impl Redrawer {
         }
     }
 
-    /// Forces the next `redraw` call to behave like a fresh `Redrawer` —
-    /// used when a new client attaches to an already-running session and
-    /// needs the full current screen, not just whatever's changed since the
-    /// last client's last redraw (each client connection gets its own
-    /// `Redrawer`, so this is mostly for clarity/explicit intent rather than
-    /// a shared-state concern).
-    pub fn reset(&mut self) {
-        *self = Self::new();
-    }
-
     /// Walks `term`'s current visible grid and writes the minimal ANSI
     /// bytes needed to bring the client's screen up to date, given this
     /// `Redrawer`'s record of what was last written. Always ends by
@@ -369,16 +359,18 @@ mod tests {
         )
         .expect("failed to spawn cmd.exe for test");
 
-        // Wait for the real output to land, same polling approach as
-        // Session's own test.
+        // Wait for the real output to land — poll via a throwaway
+        // `Redrawer`/buffer (separate from the one used for the actual
+        // assertions below) rather than a dedicated snapshot API, since
+        // `Session` no longer exposes one (redraw() is the only way to
+        // observe grid contents now that the old GridSnapshot protocol is
+        // gone).
         let mut ready = false;
         for _ in 0..50 {
-            if session
-                .snapshot()
-                .rows
-                .iter()
-                .any(|row| row.iter().any(|c| c.c == 'g'))
-            {
+            let mut probe = Redrawer::new();
+            let mut probe_bytes = Vec::new();
+            session.redraw(&mut probe, &mut probe_bytes).expect("redraw should succeed writing to a Vec<u8>");
+            if probe_bytes.windows(1).any(|w| w == b"g") {
                 ready = true;
                 break;
             }
@@ -386,7 +378,7 @@ mod tests {
                 break;
             }
         }
-        assert!(ready, "'greentext' never appeared in the source session's grid");
+        assert!(ready, "'greentext' never appeared in the source session's redraw output");
 
         let mut redrawer = Redrawer::new();
         let mut bytes = Vec::new();
@@ -436,7 +428,10 @@ mod tests {
         .expect("failed to spawn cmd.exe for test");
 
         for _ in 0..50 {
-            if session.snapshot().rows.iter().any(|row| row.iter().any(|c| c.c == 'i')) {
+            let mut probe = Redrawer::new();
+            let mut probe_bytes = Vec::new();
+            session.redraw(&mut probe, &mut probe_bytes).expect("redraw should succeed writing to a Vec<u8>");
+            if probe_bytes.windows(1).any(|w| w == b"i") {
                 break;
             }
             if !session.next_change_blocking() {

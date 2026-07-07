@@ -110,7 +110,37 @@ impl Project {
         shell_cmd: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, Some(shell_cmd), cx)
+        let (program, args) = parse_shell_command(&shell_cmd);
+        let shell = if args.is_empty() {
+            Shell::Program(program)
+        } else {
+            Shell::WithArguments { program, args, title_override: None }
+        };
+        self.create_terminal_shell_internal(cwd, Some(shell), cx)
+    }
+
+    /// Like `create_terminal_with_shell`, but takes `program`/`args`
+    /// directly instead of a single command string to parse — needed by
+    /// `tmux:true` profiles (see `project_som_tmux` memory), which
+    /// substitute `som-tmux-server <profile> <program> [args...]` in for
+    /// the profile's own shell. Round-tripping that substitution through a
+    /// single string (build one, hand it to `create_terminal_with_shell`,
+    /// have it get re-split by `parse_shell_command`) risks mangling
+    /// arguments/paths containing spaces or quotes — this skips that
+    /// entirely.
+    pub fn create_terminal_with_program_and_args(
+        &mut self,
+        cwd: Option<PathBuf>,
+        program: String,
+        args: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        let shell = if args.is_empty() {
+            Shell::Program(program)
+        } else {
+            Shell::WithArguments { program, args, title_override: None }
+        };
+        self.create_terminal_shell_internal(cwd, Some(shell), cx)
     }
 
     pub fn create_local_terminal(
@@ -124,7 +154,7 @@ impl Project {
     fn create_terminal_shell_internal(
         &mut self,
         cwd: Option<PathBuf>,
-        shell_override: Option<String>,
+        shell_override: Option<Shell>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -151,16 +181,7 @@ impl Project {
 
             let activation_script: Vec<String> = Vec::new();
 
-            let shell = if let Some(cmd) = shell_override {
-                let (program, args) = parse_shell_command(&cmd);
-                if args.is_empty() {
-                    Shell::Program(program)
-                } else {
-                    Shell::WithArguments { program, args, title_override: None }
-                }
-            } else {
-                settings.shell
-            };
+            let shell = shell_override.unwrap_or(settings.shell);
 
             let builder = project
                 .update(cx, move |_, cx| {

@@ -5,8 +5,6 @@ use crate::{
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
-    som_tmux_session,
-    som_tmux_view::SomTmuxView,
 };
 use db::kvp::KeyValueStore;
 use gpui::{
@@ -24,7 +22,6 @@ use ui::{
     Tooltip, prelude::*,
 };
 use util::{ResultExt, TryFutureExt};
-use uuid::Uuid;
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
     ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
@@ -37,7 +34,7 @@ use workspace::{
     move_active_item, pane,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
@@ -556,54 +553,50 @@ impl TerminalPanel {
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
         let profile = tab_name.as_deref().and_then(|name| workspace::TabProfiles::find_by_name(name, cx));
+        let (profile_shell, tab_icon) = tab_name.as_deref()
+            .map(|name| TabProfiles::profile_by_name(name, cx))
+            .unwrap_or((None, None));
+        let profile_index = tab_name.as_deref().and_then(|name| TabProfiles::index_by_name(name, cx));
         // `action.shell` is populated even for the profile's OWN keybinding
         // (`Ctrl+Shift+N` — see `som_config.rs`'s keymap generation, which
         // bakes the profile's shell into the binding so it round-trips
         // through gpui's action-persistence), not just for a genuine
         // user override — so only treat this as an override (and skip the
-        // tmux path) if it actually differs from the profile's own shell.
+        // tmux substitution) if it actually differs from the profile's own
+        // shell.
         let is_shell_override = action
             .shell
             .as_deref()
             .is_some_and(|shell| profile.as_ref().and_then(|p| p.shell.as_deref()) != Some(shell));
-        if !is_shell_override && profile.as_ref().is_some_and(|p| p.tmux) {
-            let profile = profile.unwrap();
-            let profile_index = tab_name.as_deref().and_then(|name| TabProfiles::index_by_name(name, cx)).unwrap_or(0);
-            let (program, args) = project::terminals::parse_shell_command(
-                profile.shell.as_deref().unwrap_or(""),
-            );
-            let cwd = profile
-                .working_dir
-                .as_deref()
-                .and_then(|dir| shellexpand::full(dir).ok())
-                .map(|dir| dir.to_string())
-                .or_else(|| {
-                    default_working_directory(workspace, cx)
-                        .map(|p| p.to_string_lossy().to_string())
-                });
-            Self::add_center_tmux_terminal_named(
-                workspace,
-                profile.name.clone(),
-                profile.icon.clone(),
-                profile_index,
-                program,
-                args,
-                cwd,
-                None,
-                window,
-                cx,
-            )
-            .detach_and_log_err(cx);
-            return;
-        }
-
-        let (profile_shell, tab_icon) = tab_name.as_deref()
-            .map(|name| TabProfiles::profile_by_name(name, cx))
-            .unwrap_or((None, None));
-        let profile_index = tab_name.as_deref().and_then(|name| TabProfiles::index_by_name(name, cx));
         let shell_override = action.shell.clone().or(profile_shell);
         let working_directory = default_working_directory(workspace, cx);
         let local = action.local;
+
+        if !is_shell_override && profile.as_ref().is_some_and(|p| p.tmux) {
+            let profile = profile.unwrap();
+            let cwd = working_directory.clone().map(|p| p.to_string_lossy().to_string());
+            let pane_id = uuid::Uuid::new_v4().to_string();
+            match tmux_wrapped_shell(&profile, &pane_id) {
+                Ok((program, args)) => {
+                    let task = Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
+                        project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx)
+                    });
+                    cx.spawn(async move |workspace, cx| {
+                        let (item_id, _terminal) = task.await?;
+                        workspace.update(cx, |workspace, _cx| {
+                            workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                        })?;
+                        anyhow::Ok(())
+                    })
+                    .detach_and_log_err(cx);
+                }
+                Err(err) => {
+                    log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
+                }
+            }
+            return;
+        }
+
         Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
             if local {
                 project.create_local_terminal(cx)
@@ -715,103 +708,6 @@ impl TerminalPanel {
         })
     }
 
-    /// Creates a new tab backed by `som-tmux` instead of a plain local PTY —
-    /// used when the tab's profile has `tmux: true`. Unlike
-    /// `add_center_terminal_named_at`, this doesn't go through `Project` at
-    /// all (there's no local `Terminal`/`alacritty_terminal::Term` — the PTY
-    /// lives inside `som-tmux-server`, possibly on a different machine
-    /// entirely, see `SOM_MUX_PLAN.md`). The connect-or-spawn/`NewSession`
-    /// handshake is genuinely blocking network+process work, so it runs in
-    /// `cx.background_spawn` first; only once that resolves do we touch
-    /// `Workspace`/create the `SomTmuxView` (which needs `AsyncApp` — see
-    /// `som_tmux_session`'s doc comments for why the two can't be mixed into
-    /// one future).
-    /// `existing_session_id` is `Some` on the restore path (`restore_som_tabs`,
-    /// coming from db.json's `tmux_sessions`) — if given, tries `Attach` to
-    /// that id first (the server may still be alive from before Som
-    /// restarted, see the detach-vs-kill semantics in `project_som_tmux`
-    /// memory), falling back to spawning a brand new session with
-    /// `program`/`args`/`cwd` if the attach fails (server gone, or the
-    /// session id no longer exists on it) — same fallback the rest of Som's
-    /// restore path already uses when a saved terminal can't be resurrected.
-    pub fn add_center_tmux_terminal_named(
-        workspace: &mut Workspace,
-        profile_name: String,
-        tab_icon: Option<String>,
-        profile_index: usize,
-        program: String,
-        args: Vec<String>,
-        cwd: Option<String>,
-        existing_session_id: Option<Uuid>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> Task<Result<gpui::EntityId>> {
-        if !is_enabled_in_workspace(workspace, cx) {
-            return Task::ready(Err(anyhow!("terminal not yet supported for remote projects")));
-        }
-        let tab_name = profile_name.clone();
-        cx.spawn_in(window, async move |workspace, cx| {
-            let (session, snapshot) = {
-                let cx = cx.clone();
-                let profile_name = profile_name.clone();
-                let attach_result = if let Some(session_id) = existing_session_id {
-                    Some(
-                        som_tmux_session::attach_session(
-                            profile_name.clone(),
-                            session_id,
-                            program.clone(),
-                            args.clone(),
-                            cwd.clone(),
-                            80,
-                            24,
-                            &cx,
-                        )
-                        .await,
-                    )
-                } else {
-                    None
-                };
-                match attach_result {
-                    Some(Ok(session_and_grid)) => Ok(session_and_grid),
-                    Some(Err(err)) => {
-                        log::info!(
-                            "tmux restore: attach to saved session failed ({err:#}), starting a new session instead"
-                        );
-                        som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx).await
-                    }
-                    None => {
-                        som_tmux_session::create_session(profile_name, program, args, cwd, 80, 24, &cx).await
-                    }
-                }
-            }?;
-
-            let (item_id, view) = workspace.update_in(cx, |workspace, window, cx| {
-                let view = cx.new(|cx| {
-                    SomTmuxView::new(
-                        session.clone(),
-                        snapshot,
-                        Some(tab_name),
-                        tab_icon,
-                        workspace.weak_handle(),
-                        workspace.database_id(),
-                        cx,
-                    )
-                });
-                let item_id = view.entity_id();
-                workspace.add_item_to_main_pane(Box::new(view.clone()), Some(profile_index), window, cx);
-                // Splits aren't implemented for tmux tabs yet (SomTmuxView::can_split()
-                // is false), so this is always a single-session vec for now — see
-                // `set_tmux_sessions_for_item`'s doc comment.
-                workspace.set_tmux_sessions_for_item(item_id, vec![session.session_id()]);
-                (item_id, view)
-            })?;
-
-            som_tmux_session::start_read_loop(&session, view.downgrade(), cx);
-
-            Ok(item_id)
-        })
-    }
-
     /// Restores tabs and their split panes from `~/.config/som/db.json` at
     /// launch. Registered as the `workspace::SomTabsRestorer` global hook (see
     /// `init` below) since `workspace` can't call into `terminal_view`
@@ -867,38 +763,49 @@ impl TerminalPanel {
                     .filter(|dir| dir.is_dir());
 
                 if profile.tmux {
-                    // Splits aren't supported for tmux tabs yet (see
-                    // `SomTmuxView::can_split`), so there's only ever the
-                    // main session id to restore, never any extras.
-                    let existing_session_id =
-                        tab.tmux_sessions.as_ref().and_then(|ids| ids.first().copied());
-                    let (program, args) =
-                        project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
-                    let cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
-                    let created = window_handle
-                        .update(cx, |_, window, cx| {
-                            workspace.update(cx, |workspace, cx| {
-                                let cwd_string = cwd_string.clone().or_else(|| {
-                                    default_working_directory(workspace, cx)
-                                        .map(|p| p.to_string_lossy().to_string())
-                                });
-                                Self::add_center_tmux_terminal_named(
-                                    workspace,
-                                    profile.name.clone(),
-                                    profile.icon.clone(),
-                                    tab.profile_index,
-                                    program,
-                                    args,
-                                    cwd_string,
-                                    existing_session_id,
-                                    window,
-                                    cx,
-                                )
+                    // Splits aren't supported for tmux tabs yet, so there's
+                    // only ever the one pane_id to restore, never extras —
+                    // see `set_tmux_sessions_for_item`'s doc comment (still
+                    // named for the OLD session_id-based design, now
+                    // repurposed to store the pane_id used as this pane's
+                    // `som-tmux-server` pipe name — see `project_som_tmux`
+                    // memory, "Обновление 17"/19).
+                    let pane_id = tab
+                        .tmux_sessions
+                        .as_ref()
+                        .and_then(|ids| ids.first())
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let wrapped = tmux_wrapped_shell(&profile, &pane_id);
+                    let created = match wrapped {
+                        Ok((program, args)) => window_handle
+                            .update(cx, |_, window, cx| {
+                                workspace.update(cx, |workspace, cx| {
+                                    let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
+                                    Self::add_center_terminal_named(
+                                        workspace,
+                                        Some(profile.name.clone()),
+                                        profile.icon.clone(),
+                                        Some(tab.profile_index),
+                                        window,
+                                        cx,
+                                        move |project, cx| {
+                                            project.create_terminal_with_program_and_args(cwd, program, args, cx)
+                                        },
+                                    )
+                                })
                             })
-                        })
-                        .ok()
-                        .and_then(|r| r.ok());
+                            .ok()
+                            .and_then(|r| r.ok()),
+                        Err(err) => {
+                            log::error!("failed to set up tmux profile {:?} on restore: {err:#}", profile.name);
+                            None
+                        }
+                    };
                     if let Some(created) = created {
+                        let created = cx.background_spawn(async move {
+                            created.await.map(|(item_id, _terminal)| item_id)
+                        });
                         tab_creations.push((db_index, tab.extra_splits, created));
                     }
                     continue;
@@ -1433,6 +1340,57 @@ fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
 }
 
+/// Substitutes `som-tmux-server <profile> <pane-id> <program> [args...]` in
+/// for a `tmux: true` profile's own shell — see `project_som_tmux` memory
+/// ("Обновление 16"-19) for the full design. Som's own terminal creation
+/// path never learns anything happened; it just gets a different
+/// program/args than the profile's `shell` setting says, exactly the way
+/// `action.shell`/a user-typed shell override already works for any other
+/// profile.
+///
+/// `pane_id` is generated by the CALLER (fresh `Uuid::new_v4()` for a new
+/// tab, or a saved one from db.json for restore) — the server never
+/// invents one; see `som_tmux_server::protocol::pipe_name`'s doc comment
+/// for why this changed from the old per-profile-multiplexed design.
+fn tmux_wrapped_shell(profile: &workspace::TabProfile, pane_id: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+    let server_path = som_tmux_server_binary_path()?;
+    let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args);
+    Ok((server_path.to_string_lossy().to_string(), wrapped_args))
+}
+
+/// The actual argv construction, split out from `tmux_wrapped_shell` so it
+/// can be unit-tested without touching the filesystem (`som_tmux_server_
+/// binary_path` looks up a real file next to `current_exe()`, which under
+/// `cargo test` resolves to `target/debug/deps/`, not `target/debug/` —
+/// same constraint other tests in this codebase have hit).
+fn wrap_command_args(profile_name: &str, pane_id: &str, program: String, args: Vec<String>) -> Vec<String> {
+    let mut wrapped_args = vec![profile_name.to_string(), pane_id.to_string(), program];
+    wrapped_args.extend(args);
+    wrapped_args
+}
+
+/// Finds `som-tmux-server.exe` next to Som's own executable — the same
+/// "binaries live side by side" assumption `target/debug/` (and any
+/// packaged distribution) already guarantees for Som's other bundled
+/// tools. Mirrors the old (now-removed) `som_tmux_client::server_binary_
+/// path`, which lived on the GPUI-client side of the old JSON-protocol
+/// architecture; this is its natural home now that the substitution
+/// happens directly in the shell command instead.
+#[cfg(target_os = "windows")]
+fn som_tmux_server_binary_path() -> anyhow::Result<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .context("failed to determine Som's own executable path")?
+        .parent()
+        .context("Som's executable path has no parent directory")?
+        .to_path_buf();
+    let candidate = exe_dir.join("som-tmux-server.exe");
+    if !candidate.is_file() {
+        anyhow::bail!("som-tmux-server.exe not found next to Som's own executable at {candidate:?}");
+    }
+    Ok(candidate)
+}
+
 pub fn new_terminal_pane(
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -1901,5 +1859,47 @@ impl Render for InlineAssistTabBarButton {
             .tooltip(move |_window, cx| {
                 Tooltip::for_action_in("Inline Assist", &InlineAssist::default(), &focus_handle, cx)
             })
+    }
+}
+
+#[cfg(test)]
+mod tmux_shell_wrapping_tests {
+    use super::*;
+
+    #[test]
+    fn wraps_a_simple_program_with_no_args() {
+        let args = wrap_command_args("dnk", "pane-uuid-1", "pwsh.exe".to_string(), vec![]);
+        assert_eq!(args, vec!["dnk", "pane-uuid-1", "pwsh.exe"]);
+    }
+
+    #[test]
+    fn wraps_a_program_with_its_own_args_preserving_order() {
+        // e.g. a "wsl --cd ~" profile: parse_shell_command already split
+        // this into program="wsl", args=["--cd", "~"] upstream — this just
+        // checks that gets appended after profile/pane-id/program, in
+        // order, not re-parsed or re-joined into a single string (which
+        // would risk mangling arguments containing spaces/quotes).
+        let args = wrap_command_args(
+            "wsl",
+            "pane-uuid-2",
+            "wsl".to_string(),
+            vec!["--cd".to_string(), "~".to_string()],
+        );
+        assert_eq!(args, vec!["wsl", "pane-uuid-2", "wsl", "--cd", "~"]);
+    }
+
+    #[test]
+    fn preserves_a_program_path_containing_spaces_as_a_single_argument() {
+        // The whole point of NOT round-tripping through a single joined
+        // command string (see `create_terminal_with_program_and_args`'s
+        // doc comment) — a path like this must stay one argv element, not
+        // get split on its internal spaces.
+        let args = wrap_command_args(
+            "dnk",
+            "pane-uuid-3",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
+            vec![],
+        );
+        assert_eq!(args, vec!["dnk", "pane-uuid-3", "C:\\Program Files\\PowerShell\\7\\pwsh.exe"]);
     }
 }

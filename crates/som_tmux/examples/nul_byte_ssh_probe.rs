@@ -59,9 +59,31 @@ fn main() {
     let term = Term::new(Config::default(), &bounds, Listener);
     let term = std::sync::Arc::new(alacritty_terminal::sync::FairMutex::new(term));
 
-    let event_loop = EventLoop::new(term.clone(), Listener, pty, pty_options.drain_on_exit, false).expect("failed to create event loop");
+    struct RawSink(std::sync::mpsc::Sender<Vec<u8>>);
+    impl std::io::Write for RawSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.send(buf.to_vec()).ok();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    let event_loop = EventLoop::new(term.clone(), Listener, pty, pty_options.drain_on_exit, false)
+        .expect("failed to create event loop")
+        .with_raw_byte_sink(Box::new(RawSink(raw_tx)));
     let notifier = Notifier(event_loop.channel());
     let _io_thread = event_loop.spawn();
+
+    let raw_collector = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        while let Ok(chunk) = raw_rx.recv_timeout(std::time::Duration::from_secs(6)) {
+            all.extend(chunk);
+        }
+        all
+    });
 
     std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -69,16 +91,13 @@ fn main() {
     notifier.notify(b"before\n".to_vec());
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    println!("writing NUL+NUL in ONE SINGLE write() call ...");
-    notifier.notify(vec![0u8, 0u8]);
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    println!("writing plain 'x' now to see if the double-NUL landed invisibly ...");
-    notifier.notify(b"x\n".to_vec());
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    println!("writing NUL in its own call, then \\r in a SEPARATE call 50ms later (matching server.rs's real fix) ...");
+    notifier.notify(vec![0u8]);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    notifier.notify(vec![b'\r']);
+    std::thread::sleep(std::time::Duration::from_millis(2000));
 
-    let grid_text: String = {
-        let term = term.lock();
-        term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect()
-    };
-    println!("grid text:\n{grid_text}");
+    let raw_bytes = raw_collector.join().unwrap();
+    println!("RAW bytes received from the remote side ({} bytes): {:?}", raw_bytes.len(), raw_bytes);
+    println!("contains a literal NUL byte: {}", raw_bytes.contains(&0u8));
 }

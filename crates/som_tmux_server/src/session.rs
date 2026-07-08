@@ -311,11 +311,45 @@ impl Session {
         term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect()
     }
 
+    /// Skips re-applying an identical size — mainly for the resize-poll
+    /// thread's 250ms tick (`crate::relay`), which calls this constantly
+    /// and would otherwise spam a `TIOCSWINSZ`/`SIGWINCH`-equivalent on
+    /// every single tick even when nothing changed. NOT used for a RELAY's
+    /// very first `RelayInput::Resize` on a fresh connection — see
+    /// `force_resize`'s doc comment for why that path needs the opposite
+    /// behavior.
     pub fn resize(&self, bounds: SessionBounds) {
         let mut last_bounds = self.last_bounds.lock().unwrap();
         if bounds == *last_bounds {
             return;
         }
+        *last_bounds = bounds;
+        self.term.lock().resize(bounds);
+        let window_size: WindowSize = bounds.into();
+        self.pty_tx.0.send(Msg::Resize(window_size)).ok();
+    }
+
+    /// Like `resize`, but ALWAYS notifies the shell (`TIOCSWINSZ`, which the
+    /// kernel turns into `SIGWINCH` for the PTY's foreground process group)
+    /// even when `bounds` is identical to what this session already thinks
+    /// its size is. Used specifically for a RELAY's very first
+    /// `RelayInput::Resize` on a freshly-established connection
+    /// (`server.rs::handle_relay`) — a (re)attaching RELAY's size can
+    /// genuinely equal the HOLDER's last-known size (the pane never
+    /// actually moved) while a program running INSIDE the shell (`htop`)
+    /// still needs a fresh `SIGWINCH` to correctly lay itself out, because
+    /// it only reads the terminal size once at its own startup. Confirmed
+    /// root cause of a reported bug: `htop` started in a session that was
+    /// later detached/reattached (Som restart, tab switch away and back)
+    /// stayed laid out for whatever size it happened to start at, since
+    /// `resize`'s "skip if unchanged" fast path meant this session's
+    /// `SIGWINCH`-equivalent silently never fired again despite
+    /// `server.rs`'s own doc comment explicitly saying "every new
+    /// connection resizes, not just the session's first ever one" — the
+    /// PROTOCOL already did that; `Session::resize` itself was the one
+    /// place still skipping it.
+    pub fn force_resize(&self, bounds: SessionBounds) {
+        let mut last_bounds = self.last_bounds.lock().unwrap();
         *last_bounds = bounds;
         self.term.lock().resize(bounds);
         let window_size: WindowSize = bounds.into();

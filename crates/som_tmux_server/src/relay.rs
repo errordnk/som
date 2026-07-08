@@ -37,6 +37,17 @@ pub fn run(
     cursor_shape: Option<String>,
     scrollback: Option<usize>,
 ) -> anyhow::Result<()> {
+    // See `term_size::enable_raw_input_mode`'s doc comment — without this,
+    // Windows's OWN console input layer (`ReadConsoleW`, underneath this
+    // process's `std::io::stdin()`) line-buffers and locally echoes every
+    // keystroke completely independent of anything this crate does with the
+    // bytes, which is the confirmed root cause of three separate reported
+    // symptoms (line-buffered input needing an extra Enter, typed text
+    // showing up in the console's leftover color instead of the shell's own
+    // syntax-highlight color, and PSReadLine's live suggestions never
+    // triggering). Called before anything else touches stdin.
+    crate::term_size::enable_raw_input_mode();
+
     let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd, cursor_shape, scrollback)?);
     // Guards every `write_message` call on `connection` — the stdin-forwarding
     // loop (main thread) and the resize-polling thread both write

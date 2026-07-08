@@ -3903,15 +3903,53 @@ mod tests {
         // the local test, just a longer budget for the extra network hop.
         std::thread::sleep(std::time::Duration::from_secs(4));
 
+        // Mirrors `TerminalView::on_removed` exactly (see that function's
+        // doc comment): a lone NUL byte, THEN a separate `input()` call
+        // with an ordinary `\r`. That second call isn't cosmetic — while
+        // diagnosing this test against the real Mac, a bare NUL byte (even
+        // sent twice in a row) reliably never arrived at the RELAY at all
+        // over this ssh-tunneled path, while following it with a second,
+        // separate call containing ordinary bytes reliably made the first
+        // one arrive too. Exact root cause not pinned down further than
+        // "somewhere between this ConPTY and the far side's RELAY", but the
+        // workaround is what `on_removed` now does in production.
         terminal.update(cx, |terminal, _cx| {
             terminal.input(vec![0u8]);
         });
-
+        cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        drop(terminal); // triggers Terminal::drop, killing the local ssh process
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![b'\r']);
+        });
+        cx.run_until_parked();
 
+        // Deliberately NOT `drop(terminal)` here (unlike the local test) —
+        // over a real SSH tunnel, killing the LOCAL `ssh.exe` the instant
+        // after queuing the NUL byte races the byte's actual delivery
+        // across the network (SSH channel flow control/buffering can hold
+        // a few bytes for longer than any fixed local sleep reliably
+        // covers) against `ssh.exe`'s own death tearing down the TCP
+        // connection first — confirmed by reproducing exactly that "pipe
+        // closed" (no `RelayInput::Close` ever logged) failure mode
+        // against the real Mac while diagnosing this test. Instead: let
+        // `ssh.exe` keep running and wait for the REAL RELAY (on the far
+        // side) to receive the byte, forward `RelayInput::Close`, and the
+        // HOLDER to log its own death — same as it does the moment a
+        // real user closes a real tab (`TerminalView::on_removed` doesn't
+        // kill anything either; it only ever queues the NUL byte and lets
+        // `Pane::_remove_item`'s later `Terminal::drop` happen on its own
+        // natural schedule).
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // NOT `~/.config/som/logs/` — `paths::logs_dir()` has a macOS-only
+        // branch (`crates/paths/src/paths.rs`) that resolves to
+        // `~/Library/Logs/Som/` instead, unlike every other Unix platform
+        // (Linux/WSL use `~/.config/som/logs/` same as Windows). Confirmed
+        // the hard way: earlier manual `ssh`-based diagnosis of this test
+        // kept finding an empty log because it looked in the Linux-style
+        // path on a real Mac.
         let holder_log_path =
-            format!("~/.config/som/logs/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+            format!("~/Library/Logs/Som/som-tmux-server-{profile_name}-{pane_id}-holder.log");
         let mut holder_log = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3931,7 +3969,7 @@ mod tests {
 
         std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &holder_log_path]).output().ok();
         let relay_log_path =
-            format!("~/.config/som/logs/som-tmux-server-{profile_name}-{pane_id}-relay.log");
+            format!("~/Library/Logs/Som/som-tmux-server-{profile_name}-{pane_id}-relay.log");
         std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &relay_log_path]).output().ok();
     }
 

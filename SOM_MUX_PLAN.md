@@ -242,15 +242,17 @@ specific modes someone remembered to add tracking for."
   host requirement and its settings-validation/fallback design (all of
   v2's open questions 1-7 in the prior version of this doc are now moot —
   not carried forward).
-- **Windows-local case**: unlike v2 (which needed a permanent separate
-  path for Windows since real tmux has no Windows PTY port), v3's
-  `alacritty_terminal::Term`-based approach is PLATFORM-AGNOSTIC — the
-  same HOLDER/RELAY snapshot/restore design can apply to the Windows-local
-  profile too, once implemented. Whether to actually unify the local-
-  Windows path onto v3 (retiring the CURRENT Windows-only HOLDER/RELAY
-  code, which already works and was never buggy) or leave it alone since
-  it isn't broken is an open question, not decided yet — no urgency
-  either way since it isn't blocking anything.
+- **Windows-local case — RESOLVED, unified**: unlike v2 (which needed a
+  permanent separate path for Windows since real tmux has no Windows PTY
+  port), v3's `alacritty_terminal::Term`-based approach turned out to be
+  PLATFORM-AGNOSTIC in practice, not just in theory — `main.rs`'s dispatch
+  has no `#[cfg(windows)]`/`#[cfg(unix)]` split at all anymore (removed as
+  part of the v3 rewrite itself, see the Implementation checklist below),
+  so the Windows-local `tmux: true` profile already runs through the
+  IDENTICAL HOLDER/RELAY/`Session` code as every SSH/WSL profile — this
+  was never a separate decision to make; it fell out naturally once v3
+  replaced the old platform-specific code paths. No remaining local-only
+  Windows code exists to retire.
 
 ### Implementation checklist
 
@@ -587,9 +589,22 @@ specific modes someone remembered to add tracking for."
       double-hop). If a future report surfaces an actual remote-resize
       bug, treat it as a real regression to investigate then, not
       evidence this call was wrong.
-- [ ] `SOM_MUX_PLAN.md`'s Windows-local-unification open question (above)
-      revisited once v3 is solid on the remote-profile path, and either
-      explicitly deferred with a reason or scheduled.
+- [x] Windows-local-unification open question (above) revisited and
+      resolved: already unified, not a remaining decision — see the
+      "Architecture" section above's updated note. Confirmed by grepping
+      `main.rs` for `cfg(windows)`/`cfg(unix)`: zero matches.
+
+**Status: v3 is done.** Every checklist item above is checked off. The
+original session goal (F2 doesn't open htop's Setup screen over WSL/SSH,
+plain text gets corrupted through the tmux wrapper) is confirmed fixed —
+by direct reproduction against real remote hosts, not just code review —
+and the architecture is simpler than v2 was (one platform-agnostic
+HOLDER/RELAY implementation instead of a Windows-only path plus a
+Unix-only real-tmux wrapper). Remaining possible follow-ups, none
+blocking anything: extending `Redrawer`'s full-redraw path to emit every
+`TermMode` bit generically (currently only `ALT_SCREEN`/`APP_CURSOR` are
+special-cased — see the note earlier in this file); further real-world
+use to surface anything this session's testing didn't happen to exercise.
 
 Full blow-by-blow implementation log for v1 and v2 (exact file states,
 the discovery process for each abandoned design's bugs) lives in this

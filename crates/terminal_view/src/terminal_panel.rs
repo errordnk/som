@@ -1698,7 +1698,17 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
         RemoteKind::Wsl => "wsl",
         RemoteKind::Local => anyhow::bail!("run_remote_command called with RemoteKind::Local"),
     };
-    let output = std::process::Command::new(program)
+    // `util::command::new_std_command`, NOT a bare `std::process::Command::
+    // new` — the plain version has no console window of its own on
+    // Windows, but `ssh.exe`/`wsl.exe` are themselves console
+    // subsystem binaries, so spawning them without `CREATE_NO_WINDOW`
+    // (which this helper sets) makes Windows briefly flash a new console
+    // window into existence for each one — confirmed as a real, visible
+    // regression report (a `cmd`-looking window flashing on every new tab
+    // for every `tmux: true` profile, local and remote alike, since this
+    // deploy check's every-tab-open version probe is what's actually
+    // spawning it).
+    let output = util::command::new_std_command(program)
         .args(args)
         .output()
         .with_context(|| format!("failed to spawn {program:?} for remote deploy check"))?;

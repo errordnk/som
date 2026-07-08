@@ -383,6 +383,16 @@ fn spawn_detached_holder(
     use std::os::windows::process::CommandExt;
 
     const DETACHED_PROCESS: u32 = 0x0000_0008;
+    // `DETACHED_PROCESS` alone means "don't inherit the parent's console",
+    // NOT "don't create one" — without also passing `CREATE_NO_WINDOW`,
+    // Windows still allocates a brand-new (visible, briefly flashing)
+    // console window for this process, since a normal console-subsystem
+    // binary (which `som-tmux-server.exe` is) otherwise always gets one.
+    // Confirmed as a real, visible regression report: a `cmd`-looking
+    // window flashing every time a `tmux: true` tab is opened, including
+    // purely local ones — this HOLDER spawn happens on every such tab, not
+    // just remote/ssh ones.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
@@ -410,7 +420,7 @@ fn spawn_detached_holder(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS)
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }

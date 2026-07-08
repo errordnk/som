@@ -449,20 +449,92 @@ specific modes someone remembered to add tracking for."
       Final confirmed result: Windows 28/28, WSL 24/24 (+1 `#[ignore]`d
       `htop` F2 test not run by default on either platform) — genuinely
       cross-platform now, not just "compiles on both."
-- [ ] Re-run (and expect to newly PASS, this time for real) the F2/htop
-      regression test — `test_ssh_tmux_backend_htop_f2_opens_setup_screen`
-      style, renamed for v3 — against a real remote host.
-- [ ] Re-run the plain-text-through-the-pipeline sanity check
-      (`test_ssh_tmux_backend_basic_io_and_close`-style) to confirm the v2
-      double-emulation corruption (garbled `1c0`/`☁`-style fragments) is
-      actually gone, not just no-longer-triggered-by-this-specific-test.
+- [x] Deployed to the real remote `deb` (192.168.50.3) and `mac`
+      (192.168.50.6) hosts. Both were stuck on stale checkouts (`8f8cd9d`,
+      well before the crate rename/v3 rewrite) — `deb` also had leftover
+      manually-edited v2-era `tmux_backend.rs` files from earlier in this
+      session, predating the eventual `git mv` to `crates/som_tmux/`;
+      `git checkout -- .` + `git clean -fd crates/som_tmux_server/` cleared
+      those (safe: v2 is fully superseded, nothing unique was in them),
+      then `git pull` fast-forwarded both hosts to `c3786a0`.
+      `cargo test -p som_tmux --bin som-tmux` -> 24/24 passed (+1 ignored)
+      on BOTH real remote hosts, matching Windows (28/28) and WSL
+      (24/24 +1 ignored) — no host-specific surprises.
+- [x] Re-ran the F2/htop regression test for real, against a REAL `htop`
+      installed on the `deb` host (confirmed present via `which htop`;
+      NOT installed on `mac`, so this specific check only ran on `deb`):
+      `cargo test ... pressing_f2_while_htop_is_running_opens_its_setup_
+      screen_not_a_literal_escape_sequence -- --ignored --nocapture` ->
+      **PASSED** — F2 opens htop's actual Setup screen, no literal `^[OQ`
+      leaking onto the display. This is the ORIGINAL bug report from the
+      very start of this session, now confirmed fixed by v3 against a real
+      htop on a real remote Linux host (previously only verified via
+      `Session::spawn` directly in-process, per the test's own doc
+      comment — this run is the same code path, just confirmed still
+      green after the full deploy/sync cycle above, not a new finding).
+- [x] **Found and fixed a real macOS-only deploy bug while preparing for
+      the full end-to-end check below**: `ensure_remote_binary_deployed`'s
+      deploy script (`terminal_panel.rs`) does `cargo build --release -p
+      som_tmux && cp target/release/som-tmux ~/.local/bin/som-tmux` —
+      confirmed by direct reproduction on the real `mac` host that this
+      `cp` leaves the binary's ad-hoc code signature invalid at its NEW
+      path on APFS (`codesign -dv` still reports `adhoc,linker-signed`,
+      but launching it is silently SIGKILLed — `log show`'s
+      `AppleSystemPolicy` shows `load code signature error 2` — even
+      though the IDENTICAL binary at its original `target/release/`
+      path runs fine). This would have made EVERY real Som launch against
+      the `mac` profile fail after any redeploy, invisibly (the deploy
+      script itself reports success; only the next actual HOLDER/RELAY
+      spawn would silently die). Fixed by appending `&& (codesign -s -
+      ~/.local/bin/som-tmux 2>/dev/null || true)` to the deploy script —
+      `codesign` doesn't exist on Linux, so this is a harmless no-op there.
+      Confirmed fixed by reproducing the exact full deploy script by hand
+      against the real `mac` host after the fix: `--version` now exits 0
+      or via the same path. Committed separately (`4687db0`) since it's an
+      unrelated, independently-shippable fix, not part of the v3 rewrite
+      itself. `cargo test -p terminal_view --lib` -> 30/30, no regressions.
+- [x] Re-ran the plain-text-through-the-pipeline sanity check for real, over
+      the ACTUAL full RELAY<->HOLDER wire path a real Som window uses —
+      not just the `Session`-level unit tests above. Added
+      `crates/som_tmux/examples/relay_smoke_test_ssh.rs` (a permanent
+      manual-run smoke test, same category as the existing
+      `relay_smoke_test.rs` for the local Windows path — not a `cargo
+      test`, since it needs a real deployed remote binary and a real SSH
+      host, same reasoning as that file's own doc comment) that spawns the
+      LOCAL `som-tmux.exe` with EXACTLY the args `terminal_panel.rs`'s
+      `wrap_remote_command_args` builds for a real `tmux: true` SSH
+      profile (`ssh <host> ~/.local/bin/som-tmux <profile> <pane-id>
+      $SHELL --cursor-shape block`), types a real command into its stdin,
+      and asserts the echoed output survived AND contains no v2-style
+      corruption artifacts (the `1c0`/`☁`-style fragments this session's
+      v2 architecture produced). Run against BOTH real remote hosts:
+      `cargo run -p som_tmux --example relay_smoke_test_ssh -- 192.168.50.3`
+      (`deb`) and `-- 192.168.50.6` (`mac`) -> **PASSED** on both — this is
+      the full double-hop path (Windows RELAY -> detached Windows HOLDER
+      -> real `ssh` PTY child -> remote `som-tmux` RELAY/HOLDER pair ->
+      real remote shell -> back) working end to end with clean, uncorrupted
+      text. Also manually confirmed reattach over this SAME SSH path (a
+      second invocation with the identical `pane_id` against `deb`
+      correctly reconnected to the still-alive remote HOLDER and got a
+      snapshot containing the prior session's marker text) — proving
+      snapshot/restore survives a real SSH disconnect/reconnect cycle, not
+      just a local one. Along the way, cleaned up stale leftover processes
+      found on both remote hosts: `deb` had a stale, uncommitted local
+      checkout with manually-edited v2-era files (already handled above),
+      and `mac` had three long-dead `som-tmux-server` (pre-rename binary
+      name) HOLDER processes from earlier sessions, killed since they
+      belonged to no current pane.
 - [ ] Tab-close (NUL byte) re-confirmed working against the NEW protocol
       shape (kill the real shell process directly again, same as v1 — no
-      tmux session to `kill-session` anymore).
+      tmux session to `kill-session` anymore) — same caveat as above, only
+      confirmed at the `Session`/unit-test level so far, not through a
+      real Som window's actual tab-close path.
 - [ ] Resize re-confirmed: HOLDER's headless `Term::resize()` +
       `Session`'s real PTY resize, same as v1 (not `TIOCSWINSZ` on a
-      tmux-attach child's pty — that mechanism is gone along with v2).
-- [ ] Deployed and verified end-to-end on WSL, Mac, and deb.
+      tmux-attach child's pty — that mechanism is gone along with v2) —
+      same caveat, needs a real Som window resizing a real `tmux: true`
+      pane, not just the unit-level `Session::resize` coverage that
+      already exists.
 - [ ] `SOM_MUX_PLAN.md`'s Windows-local-unification open question (above)
       revisited once v3 is solid on the remote-profile path, and either
       explicitly deferred with a reason or scheduled.

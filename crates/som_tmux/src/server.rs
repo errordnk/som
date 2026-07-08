@@ -179,25 +179,36 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
                 // Forwards the NUL byte into the PTY itself FIRST, before
                 // ever force-killing anything — for a plain local shell
                 // (`cmd.exe`/`pwsh.exe`/`sh`) this is harmless (nothing
-                // treats a stray NUL as meaningful input, and the
-                // `session.kill()` below still runs), but for a `tmux:
-                // true` SSH profile the PTY child THIS HOLDER owns isn't
-                // the user's real remote shell at all — it's `ssh <host>
-                // ~/.local/bin/som-tmux ...`, i.e. a SECOND, nested RELAY
-                // running on the far side of that SSH connection. Without
-                // this, `session.kill()` alone just SIGKILLs the local
-                // `ssh` process, which the remote RELAY sees as a plain
-                // disconnect (EOF), not as ITS OWN `relay.rs::run`'s NUL-
-                // byte close signal — so it never sends ITS OWN `Close` to
-                // the remote HOLDER, which means the REAL remote shell is
-                // never killed and just sits there orphaned forever
-                // (confirmed by direct reproduction against a real `deb`
-                // host: the remote shell process was still alive well
-                // after the local tab's `session.kill()` ran). Writing the
-                // NUL byte first gives that nested RELAY (if there is one)
-                // a chance to propagate the real close all the way through
-                // before this HOLDER kills its own immediate PTY child.
-                session.write(vec![0u8]);
+                // treats a stray NUL/space as meaningful input, and the
+                // `session.kill()` below still runs regardless), but for a
+                // `tmux: true` SSH profile the PTY child THIS HOLDER owns
+                // isn't the user's real remote shell at all — it's `ssh
+                // <host> ~/.local/bin/som-tmux ...`, i.e. a SECOND, nested
+                // RELAY running on the far side of that SSH connection.
+                // Without this, `session.kill()` alone just SIGKILLs the
+                // local `ssh` process, which the remote RELAY sees as a
+                // plain disconnect (EOF), not as ITS OWN `relay.rs::run`'s
+                // NUL-byte close signal — so it never sends ITS OWN
+                // `Close` to the remote HOLDER, which means the REAL
+                // remote shell is never killed and just sits there
+                // orphaned forever (confirmed by direct reproduction
+                // against a real `deb` host).
+                //
+                // A trailing space AFTER the NUL is deliberate, not
+                // decorative — confirmed by isolated reproduction
+                // (`examples/nul_byte_ssh_probe.rs`) that a write
+                // consisting of ONLY NUL byte(s), with nothing else after
+                // it, never actually reaches the far side of a real
+                // `ssh.exe` PTY child at all (some buffering layer below
+                // `alacritty_terminal`'s own `EventLoop` — not this
+                // crate's code — appears to hold data back until a
+                // non-NUL byte arrives to flush it, since sending literally
+                // ANY other byte right after immediately released BOTH).
+                // `relay.rs`'s NUL-detection checks `buf[..read].contains
+                // (&0u8)`, not "buffer is exactly one NUL byte", so an
+                // extra harmless byte alongside it doesn't change that
+                // detection at all.
+                session.write(vec![0u8, b' ']);
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 session.kill();
                 return Ok(());

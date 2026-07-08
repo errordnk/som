@@ -7047,7 +7047,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "som_tmux_server"
+name = "som_tmux"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
@@ -7056,6 +7056,7 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "nix 0.29.0",
  "paths",
  "serde",
  "serde_json",
@@ -7621,7 +7622,7 @@ dependencies = [
  "serde_json",
  "settings",
  "shellexpand",
- "som_tmux_server",
+ "som_tmux",
  "task",
  "terminal",
  "theme",

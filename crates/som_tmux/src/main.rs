@@ -1,9 +1,22 @@
+// `redraw`/`relay`/`server`/`session`/`bounds` are the old from-scratch
+// transparent-proxy architecture — kept ONLY for the Windows-local profile
+// (real `tmux` has no Windows PTY port). `tmux_backend` is the new,
+// `tmux`-wrapping architecture used for every Unix case (WSL/SSH remote
+// profiles) — see `SOM_MUX_PLAN.md`'s "som-tmux v2" section and `main`'s
+// dispatch below.
+#[cfg(windows)]
 mod bounds;
+#[cfg(windows)]
 mod redraw;
+#[cfg(windows)]
 mod relay;
+#[cfg(windows)]
 mod server;
+#[cfg(windows)]
 mod session;
 mod term_size;
+#[cfg(unix)]
+mod tmux_backend;
 
 /// Parsed command line — two shapes depending on whether this process is
 /// starting as a RELAY (Som's direct PTY child, the normal case) or a
@@ -52,7 +65,7 @@ fn parse_args() -> Args {
             // preamble) so the caller (a plain `ssh host ... --version`)
             // can parse stdout directly without scraping a log file.
             "--version" => {
-                println!("{}", serde_json::to_string(&som_tmux_server::protocol::HandshakeInfo::current()).unwrap());
+                println!("{}", serde_json::to_string(&som_tmux::protocol::HandshakeInfo::current()).unwrap());
                 std::process::exit(0);
             }
             "--holder" => holder = true,
@@ -67,7 +80,7 @@ fn parse_args() -> Args {
             }
             other => {
                 // The RELAY's own invocation (what Som actually runs as
-                // the "shell") is `som-tmux-server [--cursor-shape ...]
+                // the "shell") is `som-tmux [--cursor-shape ...]
                 // [--scrollback ...] <profile> <pane-id> <program>
                 // [args...]` — positional past the flags above, since
                 // Som substitutes this in as a plain shell command (see
@@ -91,7 +104,7 @@ fn parse_args() -> Args {
 
     let usage = || -> ! {
         eprintln!(
-            "usage:\n  som-tmux-server [--cursor-shape <shape>] [--scrollback <n>] <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux-server --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [--cursor-shape <shape>] [--scrollback <n>] [-- args...]"
+            "usage:\n  som-tmux [--cursor-shape <shape>] [--scrollback <n>] <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [--cursor-shape <shape>] [--scrollback <n>] [-- args...]"
         );
         std::process::exit(2);
     };
@@ -107,14 +120,30 @@ fn main() {
     let args = parse_args();
     init_logging(&args.profile, &args.pane_id, args.holder);
 
+    #[cfg(windows)]
     let result = if args.holder {
         server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     } else {
         relay::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     };
 
+    // No `--holder` mode on Unix at all — `tmux_backend::run` both ensures
+    // the session exists AND proxies to it in one call (see that module's
+    // doc comment for why a separate detached-HOLDER process, needed on
+    // Windows because there's no real tmux to hand session-survival off
+    // to, is unnecessary here: real tmux's own detached server process
+    // already IS the thing that outlives Som).
+    #[cfg(unix)]
+    let result = {
+        if args.holder {
+            log::error!("--holder is a Windows-only concept; this Unix build never spawns one");
+            std::process::exit(2);
+        }
+        tmux_backend::run(&args.pane_id, &args.program, &args.args, args.cwd.as_deref(), args.scrollback)
+    };
+
     if let Err(err) = result {
-        log::error!("som-tmux-server exiting: {err:#}");
+        log::error!("som-tmux exiting: {err:#}");
         std::process::exit(1);
     }
 }
@@ -131,7 +160,7 @@ fn init_logging(profile_name: &str, pane_id: &str, is_holder: bool) {
     zlog::init();
     let role = if is_holder { "holder" } else { "relay" };
     let log_path: &'static std::path::PathBuf = Box::leak(Box::new(
-        paths::logs_dir().join(format!("som-tmux-server-{profile_name}-{pane_id}-{role}.log")),
+        paths::logs_dir().join(format!("som-tmux-{profile_name}-{pane_id}-{role}.log")),
     ));
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).ok();

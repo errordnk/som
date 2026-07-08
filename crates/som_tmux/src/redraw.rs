@@ -3,9 +3,9 @@
 //! `grid.c` state rather than replaying raw bytes from the child process.
 //!
 //! Why this exists at all (see `project_som_tmux` memory, "Обновление 16"
-//! for the full history): `som-tmux-server` needs to be a transparent PTY
+//! for the full history): `som-tmux` needs to be a transparent PTY
 //! proxy — Som's own `TerminalElement`/`TerminalView` must never change, so
-//! whatever `som-tmux-server` writes to its own stdout has to be plain ANSI
+//! whatever `som-tmux` writes to its own stdout has to be plain ANSI
 //! bytes that any terminal emulator (including alacritty, which is what Som
 //! itself uses) can parse normally. Raw byte replay from the child process
 //! doesn't work here — a client reattaching after a resize, or after missing
@@ -1121,7 +1121,7 @@ mod tests {
     /// Reproduces a user-reported bug: leftover fragments of a full-screen
     /// TUI app (e.g. `htop`) staying visible after quitting back to a plain
     /// shell prompt, screenshotted live — text like "erver.exe" (a chopped-
-    /// up remnant of "...som-tmux-server.exe" from the process list) and
+    /// up remnant of "...som-tmux.exe" from the process list) and
     /// stale cyan coloring stuck on screen well after `htop` exited and the
     /// shell's own plain-colored prompt was showing underneath.
     ///
@@ -1524,6 +1524,77 @@ mod tests {
             !bytes.is_empty(),
             "the session should still be alive and producing normal screen output after handling \
              a text-area-size query — an empty redraw here suggests the query handling hung or crashed"
+        );
+
+        session.kill();
+    }
+
+    /// Regression test for a real user report ("F-клавиши не работают в
+    /// терминалах wsl" — F2 specifically confirmed against a real `htop`):
+    /// pressing F2 while `htop` is running should open its Setup screen,
+    /// same as it does under a REAL `tmux` (confirmed manually via `tmux
+    /// send-keys -t <session> F2` against a real htop before writing this
+    /// test, as the baseline this compares against) — not print the
+    /// literal escape sequence `^[OQ` onto the screen, which is what a
+    /// live screenshot showed happening through `som-tmux` instead.
+    ///
+    /// `#[cfg(unix)]` and `#[ignore]`d by default — needs a real `htop`
+    /// binary installed, and is inherently slower/flakier than the other
+    /// tests in this file (waits on a real full-screen ncurses app's
+    /// actual startup + redraw timing, not just a shell prompt). Run
+    /// explicitly with:
+    /// `cargo test -p som_tmux --lib htop_f2 -- --ignored --nocapture`
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn pressing_f2_while_htop_is_running_opens_its_setup_screen_not_a_literal_escape_sequence() {
+        let bounds = SessionBounds::new(100, 30);
+        let session = Session::spawn("htop".into(), vec![], None, bounds, None, None).expect("failed to spawn htop for test");
+
+        // Wait for htop's own first real screen (its header shows "Tasks:"
+        // unconditionally) — same fixed-sleep reasoning as this file's
+        // other real-PTY tests: cursor blink/htop's own periodic refresh
+        // can otherwise make a `next_change_blocking` polling loop never
+        // settle.
+        let mut ready = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let mut probe = Redrawer::new();
+            let mut probe_bytes = Vec::new();
+            session.redraw(&mut probe, &mut probe_bytes).expect("redraw should succeed");
+            if String::from_utf8_lossy(&probe_bytes).contains("Tasks:") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "htop's own header never appeared after 5s — test setup problem");
+
+        // F2, exactly as `mappings::keys::to_esc_str` generates it for a
+        // real Som user pressing the F2 key (see that file's `to_esc_str`,
+        // the `("f2", ...)` case isn't in the "manual" match arms so it
+        // falls through to a shared xterm-style mapping — confirmed by
+        // reading `to_esc_str`'s full match and cross-checking against
+        // `infocmp -1 xterm-256color`'s own `kf2=\EOQ`, which agree).
+        session.write(b"\x1bOQ".to_vec());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let mut redrawer = Redrawer::new();
+        let mut bytes = Vec::new();
+        session.redraw(&mut redrawer, &mut bytes).expect("redraw after F2 should succeed");
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut target_term, &bytes);
+        let grid_text: String = target_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+
+        assert!(
+            !grid_text.contains("OQ"),
+            "F2's escape sequence leaked onto the screen as literal text instead of being consumed \
+             by htop as the F2 keypress — this is the exact reported bug. Got grid: {grid_text:?}"
+        );
+        assert!(
+            grid_text.contains("Setup") || grid_text.contains("Display options") || grid_text.contains("Meters"),
+            "F2 should have opened htop's Setup screen (same as under a real tmux, confirmed via \
+             `tmux send-keys F2` against a real htop as this test's baseline) — got grid: {grid_text:?}"
         );
 
         session.kill();

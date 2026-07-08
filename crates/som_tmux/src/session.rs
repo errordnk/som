@@ -358,7 +358,7 @@ impl Session {
 
     /// Serializes the current grid into ANSI bytes via `redrawer`, writing
     /// them to `out` — see `crate::redraw` module doc comment for why this
-    /// exists (transparent-PTY-proxy architecture: `som-tmux-server` must
+    /// exists (transparent-PTY-proxy architecture: `som-tmux` must
     /// emit plain ANSI on its own stdout, not a structured protocol, so
     /// Som's own unmodified `TerminalElement` can parse it like any other
     /// shell). `redrawer` carries the diff state; pass the SAME `Redrawer`

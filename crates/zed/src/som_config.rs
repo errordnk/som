@@ -114,7 +114,7 @@ pub struct TabProfile {
     pub shell: Option<String>,
     pub home: Option<String>,
     /// Opt-in to som-tmux: the tab's terminal(s) run inside a detached
-    /// `som-tmux-server` process that survives Som closing, instead of a
+    /// `som-tmux` process that survives Som closing, instead of a
     /// plain PTY owned directly by Som. Defaults to `false` (explicit
     /// opt-in) for now; the long-term direction is to default this to
     /// `true` everywhere it's supported, keeping the field only as an

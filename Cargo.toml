@@ -33,7 +33,7 @@ members = [
     "crates/settings_content",
     "crates/settings_json",
     "crates/settings_macros",
-    "crates/som_tmux_server",
+    "crates/som_tmux",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/sum_tree",
@@ -115,7 +115,7 @@ settings = { path = "crates/settings" }
 settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
-som_tmux_server = { path = "crates/som_tmux_server" }
+som_tmux = { path = "crates/som_tmux" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 sum_tree = { path = "crates/sum_tree" }

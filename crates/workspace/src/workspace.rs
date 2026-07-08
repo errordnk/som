@@ -5581,7 +5581,19 @@ impl Workspace {
     /// store this used to also write to (`som_tab_splits`/`som_active_tab`/
     /// `som_tab_pane_index`/`som_tab_flexes` keys) is no longer read by
     /// anything; db.json is the sole source of truth for restore-on-launch.
-    fn som_persist_tab_state(&mut self, cx: &mut Context<Self>) {
+    /// `pub` specifically so `MultiWorkspace::app_will_quit` can call it —
+    /// every other call site is an explicit user action (tab switch, split,
+    /// close), but a plain window-close (the "X" button, or the OS closing
+    /// the process) triggers NONE of those, so without an explicit quit-time
+    /// flush, `db.json` is only ever as fresh as the last such action. This
+    /// is the confirmed root cause of a reported bug: a `htop`/`micro`
+    /// process (running in a `som-tmux-server` HOLDER, which itself
+    /// correctly survives Som closing — see `project_som_tmux` memory) was
+    /// started, then Som was closed right away with no other action in
+    /// between — `db.json` never got the chance to record that tab's
+    /// `pane_id`, so the NEXT launch created a fresh HOLDER instead of
+    /// reattaching to the one `htop` was actually running in.
+    pub fn som_persist_tab_state(&mut self, cx: &mut Context<Self>) {
         // Only sync parked tabs — active tab flexes are snapshotted explicitly at parking/close
         for (tab_idx, (_, parked_flexes, _)) in &self.som_parked_splits {
             self.som_tab_flexes.insert(*tab_idx, parked_flexes.clone());

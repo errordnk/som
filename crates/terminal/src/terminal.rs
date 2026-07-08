@@ -3874,20 +3874,24 @@ mod tests {
     async fn test_ssh_remote_tmux_close_kills_the_holder(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        const SSH_HOST: &str = "192.168.50.6";
+        // Overridable via env var so this same test can be pointed at any
+        // reachable SSH host with `~/.local/bin/som-tmux-server` already
+        // built there (Mac, deb, pi5, ...) without editing this file each
+        // time — defaults to the Mac used when this test was first written.
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.6".to_string());
         let pane_id = format!("test-mac-close-{}", std::process::id());
         let profile_name = "test-mac-close";
 
         // Mirrors `wrap_remote_command_args`'s exact argv shape: the ssh
         // host/flags first, then the remote-side command appended after —
-        // `ssh 192.168.50.6 ~/.local/bin/som-tmux-server <profile> <pane-id>
+        // `ssh <host> ~/.local/bin/som-tmux-server <profile> <pane-id>
         // $SHELL --cursor-shape ...`, letting the remote login shell expand
-        // `$SHELL` to whatever the Mac user's default shell is.
+        // `$SHELL` to whatever the remote user's default shell is.
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
             "ssh".to_string(),
             vec![
-                SSH_HOST.to_string(),
+                ssh_host.clone(),
                 "~/.local/bin/som-tmux-server".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
@@ -3941,36 +3945,43 @@ mod tests {
         // natural schedule).
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // NOT `~/.config/som/logs/` — `paths::logs_dir()` has a macOS-only
-        // branch (`crates/paths/src/paths.rs`) that resolves to
-        // `~/Library/Logs/Som/` instead, unlike every other Unix platform
-        // (Linux/WSL use `~/.config/som/logs/` same as Windows). Confirmed
-        // the hard way: earlier manual `ssh`-based diagnosis of this test
-        // kept finding an empty log because it looked in the Linux-style
-        // path on a real Mac.
-        let holder_log_path =
-            format!("~/Library/Logs/Som/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+        // `paths::logs_dir()` (`crates/paths/src/paths.rs`) resolves
+        // differently per platform: macOS gets `~/Library/Logs/Som/`;
+        // plain Linux (confirmed against a real Debian box, NOT just
+        // assumed) goes through `dirs::data_local_dir()`, i.e.
+        // `$XDG_DATA_HOME/som/logs` — typically `~/.local/share/som/logs/`.
+        // A particular WSL setup was ALSO observed using
+        // `~/.config/som/logs/` at one point, so that's included too even
+        // though it isn't `paths.rs`'s literal Linux branch — evidently
+        // some environment's `$XDG_DATA_HOME` was actually set to
+        // `~/.config`. Since this test doesn't know the remote host's exact
+        // setup ahead of time, it just tries all three.
+        let candidate_log_dirs = ["~/Library/Logs/Som", "~/.local/share/som/logs", "~/.config/som/logs"];
         let mut holder_log = String::new();
-        for _ in 0..50 {
+        let mut holder_log_dir = candidate_log_dirs[0];
+        'outer: for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let output = std::process::Command::new("ssh")
-                .args([SSH_HOST, "cat", &holder_log_path])
-                .output();
-            holder_log = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-            if holder_log.contains("shell process exited, holder shutting down") {
-                break;
+            for dir in candidate_log_dirs {
+                let holder_log_path = format!("{dir}/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+                let output = std::process::Command::new("ssh").args([&ssh_host, "cat", &holder_log_path]).output();
+                let content = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+                if content.contains("shell process exited, holder shutting down") {
+                    holder_log = content;
+                    holder_log_dir = dir;
+                    break 'outer;
+                }
             }
         }
         assert!(
             holder_log.contains("shell process exited, holder shutting down"),
-            "the Mac HOLDER should have died after the NUL byte was forwarded over ssh as \
+            "the remote HOLDER should have died after the NUL byte was forwarded over ssh as \
              RelayInput::Close — got remote holder log: {holder_log:?}"
         );
 
-        std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &holder_log_path]).output().ok();
-        let relay_log_path =
-            format!("~/Library/Logs/Som/som-tmux-server-{profile_name}-{pane_id}-relay.log");
-        std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &relay_log_path]).output().ok();
+        let holder_log_path = format!("{holder_log_dir}/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+        std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &holder_log_path]).output().ok();
+        let relay_log_path = format!("{holder_log_dir}/som-tmux-server-{profile_name}-{pane_id}-relay.log");
+        std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &relay_log_path]).output().ok();
     }
 
     mod perf {

@@ -1,13 +1,13 @@
 //! Manual end-to-end smoke test for the RELAY/HOLDER architecture — not a
-//! `cargo test` because it needs a REAL `som-tmux-server.exe` sitting next
+//! `cargo test` because it needs a REAL `som-tmux.exe` sitting next
 //! to whatever binary runs this (unlike a `cargo test` unit test running
 //! from `target/debug/deps/`, which wouldn't have it, and
 //! `relay::spawn_detached_holder` needs `current_exe()` to actually resolve
 //! to the real binary since it spawns a detached copy of itself as the
 //! HOLDER). Run with:
-//! `cargo run -p som_tmux_server --example relay_smoke_test`
+//! `cargo run -p som_tmux --example relay_smoke_test`
 //!
-//! Spawns `som-tmux-server.exe` in RELAY mode with its stdio piped (the
+//! Spawns `som-tmux.exe` in RELAY mode with its stdio piped (the
 //! same shape Som's own PTY creation gives a shell command), writes a
 //! command to its stdin exactly like a user typing, and asserts the ANSI
 //! bytes that come back out of its stdout contain the real, uncorrupted
@@ -24,9 +24,9 @@ fn main() {
         .unwrap()
         .parent()
         .unwrap()
-        .join("som-tmux-server.exe");
+        .join("som-tmux.exe");
     if !exe.is_file() {
-        eprintln!("som-tmux-server.exe not found at {exe:?} — build it first with `cargo build -p som_tmux_server --bin som-tmux-server`");
+        eprintln!("som-tmux.exe not found at {exe:?} — build it first with `cargo build -p som_tmux --bin som-tmux`");
         std::process::exit(1);
     }
 
@@ -165,7 +165,7 @@ fn main() {
     // exits. Simplest way from here: just kill it directly by profile/pane
     // name isn't available, so rely on it having no more relays and
     // whatever real close-session mechanism the next implementation phase
-    // adds; for THIS smoke test, forcibly kill any som-tmux-server.exe
+    // adds; for THIS smoke test, forcibly kill any som-tmux.exe
     // left over is out of scope (would kill unrelated instances too) — the
     // holder is harmless left running under a "smoke-test" profile name
     // and will be cleaned up by the caller/CI environment.

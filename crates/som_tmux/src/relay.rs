@@ -13,8 +13,8 @@
 //! `crate::redraw`) gets written straight to this process's own stdout,
 //! which is what Som's terminal parser actually reads.
 
-use som_tmux_server::pipe::PipeConnection;
-use som_tmux_server::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
+use som_tmux::pipe::PipeConnection;
+use som_tmux::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -279,6 +279,7 @@ pub fn run(
             Ok(n) => n,
             Err(_) => break,
         };
+        log::warn!("DIAG stdin read {read} bytes: {:?}", &buf[..read]);
         // A lone NUL byte is `TerminalView::on_removed`'s explicit "the user
         // closed this tab, kill the real shell for good" signal — see that
         // function's doc comment for why this can't just be Som killing the
@@ -387,7 +388,7 @@ fn spawn_detached_holder(
     // NOT "don't create one" — without also passing `CREATE_NO_WINDOW`,
     // Windows still allocates a brand-new (visible, briefly flashing)
     // console window for this process, since a normal console-subsystem
-    // binary (which `som-tmux-server.exe` is) otherwise always gets one.
+    // binary (which `som-tmux.exe` is) otherwise always gets one.
     // Confirmed as a real, visible regression report: a `cmd`-looking
     // window flashing every time a `tmux: true` tab is opened, including
     // purely local ones — this HOLDER spawn happens on every such tab, not

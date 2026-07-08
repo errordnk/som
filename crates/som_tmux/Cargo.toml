@@ -1,17 +1,17 @@
 [package]
-name = "som_tmux_server"
+name = "som_tmux"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lib]
-name = "som_tmux_server"
+name = "som_tmux"
 path = "src/lib.rs"
 doctest = false
 
 [[bin]]
-name = "som-tmux-server"
+name = "som-tmux"
 path = "src/main.rs"
 doctest = false
 
@@ -37,3 +37,4 @@ windows.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+nix = { workspace = true, features = ["term"] }

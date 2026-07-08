@@ -30,36 +30,81 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// faster than this would still eventually see.
 const SETTLE_STABLE_READS_REQUIRED: u32 = 2;
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const SETTLE_MAX_ATTEMPTS: u32 = 25; // 25 * 20ms = 500ms worst case
+/// 150 * 20ms = 3s worst case — a WSL profile's PTY goes through an extra
+/// Windows ConPTY -> wsl.exe -> Linux pty translation hop that can keep it
+/// stuck at the placeholder size (see `PLACEHOLDER_SIZE`) noticeably longer
+/// than a local Windows profile's first GPUI layout pass takes, so this
+/// needs real headroom rather than a count tuned for the common (local)
+/// case.
+const SETTLE_MAX_ATTEMPTS: u32 = 150;
+
+/// `TerminalBounds::default()`'s placeholder size (`DEBUG_TERMINAL_WIDTH` /
+/// `DEBUG_TERMINAL_HEIGHT` in `crates/terminal/src/terminal.rs`, 500px/5px
+/// and 30px/5px respectively) — a PTY sitting at exactly this size means
+/// Som's real GPUI layout for this pane almost certainly hasn't run yet,
+/// REGARDLESS of how many consecutive reads agree on it. Confirmed for WSL
+/// profiles specifically: the extra Windows ConPTY -> wsl.exe -> Linux pty
+/// translation hop adds enough latency that this placeholder can stay put
+/// for well over what a short fixed iteration count would tolerate, which
+/// used to make `settled_initial_size` treat the placeholder itself as
+/// "stable" and confidently report the wrong size.
+const PLACEHOLDER_SIZE: (u16, u16) = (100, 6);
 
 /// Polls `term_size::current_size()` repeatedly until two consecutive reads
-/// agree (or a short timeout elapses), instead of trusting the very first
-/// reading — see the call site's doc comment for the full story, but in
-/// short: right when a RELAY first connects (freshly spawned by Som, OR
-/// reattaching after `restore_som_tabs`/a tab switch), Som's own
-/// `TerminalElement` for this specific pane may not have gone through its
-/// first real GPUI layout pass yet, so its PTY (and this RELAY's own
-/// console, sitting inside it) can still be at `TerminalBounds::default()`'s
-/// placeholder size (100x6 — see `crates/terminal/src/terminal.rs`'s
-/// `DEBUG_TERMINAL_WIDTH`/`DEBUG_TERMINAL_HEIGHT`) for a brief moment before
-/// Som's real layout resizes it. Trusting that first reading unconditionally
-/// (the previous behavior) sent a HOLDER a wrong initial size it then had to
-/// correct a moment later via the resize-poll thread — visible to the user
-/// as a stray "flash" where a full-screen app like `htop` briefly renders at
-/// the wrong (too-small, or previously-cached) size before snapping to the
-/// right one. Confirmed root cause of a reported bug: `htop` not filling the
-/// whole pane on Som restart/tab switch until something else (a later real
-/// resize) corrected it — this made the CORRECT size available for the
-/// HOLDER's very first redraw instead, removing the visible flash entirely.
+/// agree on something other than `PLACEHOLDER_SIZE` (or `SETTLE_MAX_WAIT`
+/// elapses), instead of trusting the very first reading — see the call
+/// site's doc comment for the full story, but in short: right when a RELAY
+/// first connects (freshly spawned by Som, OR reattaching after
+/// `restore_som_tabs`/a tab switch), Som's own `TerminalElement` for this
+/// specific pane may not have gone through its first real GPUI layout pass
+/// yet, so its PTY (and this RELAY's own console, sitting inside it) can
+/// still be at `TerminalBounds::default()`'s placeholder size for a brief
+/// moment before Som's real layout resizes it. Trusting that first reading
+/// unconditionally (the original behavior) sent a HOLDER a wrong initial
+/// size it then had to correct a moment later via the resize-poll thread —
+/// visible to the user as a stray "flash" where a full-screen app like
+/// `htop` briefly renders at the wrong (too-small, or previously-cached)
+/// size before snapping to the right one. Confirmed root cause of a
+/// reported bug: `htop` not filling the whole pane on Som restart/tab
+/// switch until something else (a later real resize) corrected it — this
+/// makes the CORRECT size available for the HOLDER's very first redraw
+/// instead, removing the visible flash entirely.
+///
+/// If `SETTLE_MAX_WAIT` elapses without ever seeing anything other than
+/// `PLACEHOLDER_SIZE`, falls back to whatever was last read anyway (even if
+/// that's still the placeholder) — the resize-poll thread will still
+/// eventually correct it, same as before this fix existed; this only makes
+/// the COMMON case flash-free, not a hard guarantee for every possible
+/// timing.
 fn settled_initial_size() -> (u16, u16) {
-    let mut last = crate::term_size::current_size();
-    let mut stable_reads = 1u32;
-    for _ in 0..SETTLE_MAX_ATTEMPTS {
+    settle_from(SETTLE_MAX_ATTEMPTS, || {
+        std::thread::sleep(SETTLE_POLL_INTERVAL);
+        crate::term_size::current_size()
+    })
+}
+
+/// The actual settle algorithm, factored out from `settled_initial_size` so
+/// it can be tested without real sleeps or a real console — `read` blocks
+/// for one polling interval and returns the next reading (called at most
+/// once per loop iteration, exactly like the real one sleeping between
+/// reads); `max_attempts` bounds the loop instead of a wall-clock deadline
+/// so a test can exercise the "never stabilizes in time" path without
+/// actually waiting.
+fn settle_from(max_attempts: u32, mut read: impl FnMut() -> Option<(u16, u16)>) -> (u16, u16) {
+    let mut last = read();
+    let mut stable_reads = if last == Some(PLACEHOLDER_SIZE) { 0 } else { 1 };
+    for _ in 0..max_attempts {
         if stable_reads >= SETTLE_STABLE_READS_REQUIRED {
             break;
         }
-        std::thread::sleep(SETTLE_POLL_INTERVAL);
-        let next = crate::term_size::current_size();
+        let next = read();
+        if next == Some(PLACEHOLDER_SIZE) {
+            // Never counts toward stability, no matter how many times it
+            // repeats — see `settled_initial_size`'s doc comment.
+            stable_reads = 0;
+            last = next;
+            continue;
+        }
         if next == last {
             stable_reads += 1;
         } else {
@@ -447,6 +492,67 @@ fn strip_cr_induced_lf(chunk: &[u8], last_byte_was_cr: &mut bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settles_immediately_when_the_first_two_reads_already_agree_on_a_real_size() {
+        let mut readings = vec![(80, 24), (80, 24), (80, 24)].into_iter();
+        let size = settle_from(10, || readings.next());
+        assert_eq!(size, (80, 24));
+    }
+
+    #[test]
+    fn waits_past_a_transient_placeholder_reading_before_settling() {
+        // Placeholder, then a real size that repeats — the real bug this
+        // whole mechanism exists for (see `settled_initial_size`'s doc
+        // comment): the FIRST reading is the DEBUG_TERMINAL_WIDTH/HEIGHT
+        // placeholder before Som's real GPUI layout pass has run.
+        let mut readings = vec![PLACEHOLDER_SIZE, (171, 52), (171, 52)].into_iter();
+        let size = settle_from(10, || readings.next());
+        assert_eq!(size, (171, 52));
+    }
+
+    #[test]
+    fn never_treats_a_repeating_placeholder_as_settled_even_if_it_never_changes() {
+        // The WSL-specific failure mode this fix targets: the placeholder
+        // can repeat for far longer than a naive "N consecutive identical
+        // reads" check would tolerate, because of the extra Windows ConPTY
+        // -> wsl.exe -> Linux pty translation hop. Every single reading
+        // here is the placeholder — `settle_from` must never lock onto it
+        // as "stable", no matter how many attempts it's given.
+        let size = settle_from(50, || Some(PLACEHOLDER_SIZE));
+        assert_eq!(
+            size, PLACEHOLDER_SIZE,
+            "falls back to the placeholder once attempts run out (nothing better was ever read), \
+             but must not exit EARLY just because the placeholder repeated"
+        );
+    }
+
+    #[test]
+    fn a_real_size_arriving_only_after_many_placeholder_reads_still_wins() {
+        // Simulates the actual WSL timing: several placeholder reads (the
+        // extra translation hop's latency), then the real size shows up
+        // and stabilizes — this must be picked up, not abandoned because
+        // `max_attempts` was tuned for the faster local case.
+        let mut readings = vec![PLACEHOLDER_SIZE; 20]
+            .into_iter()
+            .chain(vec![(189, 50), (189, 50)])
+            .into_iter();
+        let size = settle_from(30, || readings.next());
+        assert_eq!(size, (189, 50));
+    }
+
+    #[test]
+    fn a_size_that_keeps_changing_falls_back_to_the_last_reading_once_attempts_run_out() {
+        // A real, still-in-progress drag-resize never producing two
+        // matching reads within the attempt budget — falls back to
+        // whatever was last seen rather than hanging forever (the
+        // resize-poll thread will correct it soon after anyway).
+        let mut readings = vec![(100, 30), (120, 35), (140, 40), (160, 45)]
+            .into_iter()
+            .chain(std::iter::repeat((160, 45)));
+        let size = settle_from(3, || readings.next());
+        assert_eq!(size, (160, 45));
+    }
 
     #[test]
     fn strips_lf_immediately_after_cr() {

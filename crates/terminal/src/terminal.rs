@@ -3849,6 +3849,92 @@ mod tests {
         std::fs::remove_file(&holder_log_path).ok();
     }
 
+    /// Same mechanism as `test_nul_byte_signals_tmux_relay_to_close_for_good`,
+    /// but exercising the `RemoteKind::Ssh` path
+    /// (`terminal_view::terminal_panel::wrap_remote_command_args`) instead
+    /// of the local one — this is what a `tmux: true` profile whose `shell`
+    /// is `ssh <host>` actually runs (see `project_som_tmux` memory,
+    /// "Обновление 30": adding macOS support turned out to need zero changes
+    /// to this crate or `terminal_view`, since `RemoteKind::Ssh` was already
+    /// handled identically to `RemoteKind::Wsl` — this test is what actually
+    /// proves that claim against a real machine instead of just reading the
+    /// code and assuming).
+    ///
+    /// `#[ignore]`d by default: needs a real, reachable SSH host with
+    /// `~/.local/bin/som-tmux-server` already built there (this test does
+    /// NOT deploy it — see `ensure_remote_binary_deployed` in
+    /// `terminal_panel.rs` for that, which is Som's own production path, not
+    /// this test's job) and its log files live on THAT machine, not
+    /// locally, so this reads them back over a second `ssh` invocation
+    /// rather than `std::fs`. Run explicitly with:
+    /// `cargo test -p terminal test_ssh_remote_tmux_close_kills_the_holder -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_remote_tmux_close_kills_the_holder(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        const SSH_HOST: &str = "192.168.50.6";
+        let pane_id = format!("test-mac-close-{}", std::process::id());
+        let profile_name = "test-mac-close";
+
+        // Mirrors `wrap_remote_command_args`'s exact argv shape: the ssh
+        // host/flags first, then the remote-side command appended after —
+        // `ssh 192.168.50.6 ~/.local/bin/som-tmux-server <profile> <pane-id>
+        // $SHELL --cursor-shape ...`, letting the remote login shell expand
+        // `$SHELL` to whatever the Mac user's default shell is.
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "ssh".to_string(),
+            vec![
+                SSH_HOST.to_string(),
+                "~/.local/bin/som-tmux-server".to_string(),
+                profile_name.to_string(),
+                pane_id.clone(),
+                "$SHELL".to_string(),
+                "--cursor-shape".to_string(),
+                "block".to_string(),
+            ],
+        )
+        .await;
+
+        // SSH handshake + remote process spawn is slower than the local
+        // case's own RELAY spawn — same real-wall-clock-sleep reasoning as
+        // the local test, just a longer budget for the extra network hop.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![0u8]);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(terminal); // triggers Terminal::drop, killing the local ssh process
+
+        let holder_log_path =
+            format!("~/.config/som/logs/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+        let mut holder_log = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let output = std::process::Command::new("ssh")
+                .args([SSH_HOST, "cat", &holder_log_path])
+                .output();
+            holder_log = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            if holder_log.contains("shell process exited, holder shutting down") {
+                break;
+            }
+        }
+        assert!(
+            holder_log.contains("shell process exited, holder shutting down"),
+            "the Mac HOLDER should have died after the NUL byte was forwarded over ssh as \
+             RelayInput::Close — got remote holder log: {holder_log:?}"
+        );
+
+        std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &holder_log_path]).output().ok();
+        let relay_log_path =
+            format!("~/.config/som/logs/som-tmux-server-{profile_name}-{pane_id}-relay.log");
+        std::process::Command::new("ssh").args([SSH_HOST, "rm", "-f", &relay_log_path]).output().ok();
+    }
+
     mod perf {
         use super::super::*;
         use gpui::{

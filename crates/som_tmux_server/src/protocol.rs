@@ -31,18 +31,44 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
     format!(r"\\.\pipe\som-tmux-{}-{}", sanitize(profile_name), sanitize(pane_id))
 }
 
+/// `sockaddr_un::sun_path` is capped at 104-108 bytes depending on platform
+/// (confirmed the hard way: a real HOLDER on macOS failed to bind with
+/// "path must be shorter than SUN_LEN" — see `project_som_tmux` memory,
+/// "Обновление 30"). `std::env::temp_dir()` (`$TMPDIR`) is the culprit on
+/// macOS specifically: it resolves to a long per-user, per-boot path like
+/// `/var/folders/4s/pl2zb02x33d63gxk15l1yvf00000gn/T/` (~47 bytes on its
+/// own, versus Linux's plain `/tmp`, 5 bytes) — add `som-tmux-<uid>/` plus a
+/// profile name and a 36-byte `pane_id` UUID and it overflows easily. Real
+/// tmux sidesteps this the same way: it hardcodes `/tmp/tmux-<uid>/`,
+/// ignoring `$TMPDIR` entirely, which is what this does too now.
 #[cfg(unix)]
 pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
     let sanitize = |s: &str| -> String {
         s.chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect()
     };
-    let dir = std::env::temp_dir().join(format!("som-tmux-{}", unsafe { libc::getuid() }));
+    let dir = std::path::Path::new("/tmp").join(format!("som-tmux-{}", unsafe { libc::getuid() }));
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{}-{}.sock", sanitize(profile_name), sanitize(pane_id)))
-        .to_string_lossy()
-        .into_owned()
+
+    // Even under `/tmp`, a long `profile_name` plus a full UUID `pane_id`
+    // can still overflow `SUN_LEN` once `dir` above is folded in — hash
+    // both down to a short, fixed-width, still-unique-enough hex suffix
+    // rather than trying to guess a length budget that depends on `dir`'s
+    // own (platform-varying) length. Not cryptographic; collision risk is
+    // irrelevant here (a same-machine, same-user socket path only ever
+    // needs to avoid ACCIDENTAL collisions between concurrently open panes,
+    // not resist an adversary).
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    profile_name.hash(&mut hasher);
+    pane_id.hash(&mut hasher);
+    let short_id = format!("{:016x}", hasher.finish());
+
+    let sanitized_profile = sanitize(profile_name);
+    let truncated_profile: String = sanitized_profile.chars().take(16).collect();
+    dir.join(format!("{truncated_profile}-{short_id}.sock")).to_string_lossy().into_owned()
 }
 
 /// Which OS a HOLDER is running on — part of the handshake (see
@@ -155,4 +181,42 @@ pub enum HolderOutput {
     /// other reason (which the RELAY treats as "connection lost, nothing
     /// more to do" without necessarily needing to know why).
     ShellExited,
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// `sockaddr_un::sun_path` is 104 bytes on macOS, 108 on Linux — this
+    /// asserts against the SMALLER (macOS) limit so the same test protects
+    /// both. Regression test for the real bug this fixed: a profile name
+    /// plus a full UUID pane_id, joined under `/tmp/som-tmux-<uid>/`, used
+    /// to overflow this easily (confirmed against a real Mac — see
+    /// `project_som_tmux` memory, "Обновление 30").
+    #[test]
+    fn pipe_name_stays_within_sun_len_even_for_a_long_profile_name_and_a_full_uuid_pane_id() {
+        const MACOS_SUN_LEN: usize = 104;
+        let long_profile_name = "a-fairly-descriptive-profile-name-someone-might-actually-type";
+        let pane_id = uuid::Uuid::new_v4().to_string();
+
+        let path = pipe_name(long_profile_name, &pane_id);
+
+        assert!(
+            path.len() < MACOS_SUN_LEN,
+            "pipe_name produced a {}-byte path (>= the {MACOS_SUN_LEN}-byte SUN_LEN limit): {path:?}",
+            path.len()
+        );
+    }
+
+    #[test]
+    fn pipe_name_is_stable_and_unique_per_profile_and_pane_id_pair() {
+        let a = pipe_name("profile-a", "pane-1");
+        let b = pipe_name("profile-a", "pane-1");
+        let c = pipe_name("profile-a", "pane-2");
+        let d = pipe_name("profile-b", "pane-1");
+
+        assert_eq!(a, b, "same inputs must always produce the same path (RELAY and HOLDER compute it independently)");
+        assert_ne!(a, c, "different pane_id must produce a different path");
+        assert_ne!(a, d, "different profile_name must produce a different path");
+    }
 }

@@ -1332,6 +1332,40 @@ impl Item for TerminalView {
         false
     }
 
+    /// Called exactly when the USER explicitly closes this tab (tab close
+    /// button, `CloseActiveItem`, closing a split, etc) — NOT when the whole
+    /// app quits (see `Item::on_removed`'s doc comment: app-quit drops
+    /// panes/items directly, never through `Pane::_remove_item`, so this is
+    /// naturally skipped then).
+    ///
+    /// For a tmux-wrapped shell (see `project_som_tmux` memory) specifically,
+    /// writes a single NUL byte into the RELAY's own PTY — `relay.rs`'s main
+    /// stdin loop treats a bare `\0` (never produced by real keyboard input)
+    /// as an explicit "kill the real shell for good" signal
+    /// (`RelayInput::Close`), as opposed to the RELAY process simply being
+    /// killed (`Terminal::drop`'s `TerminateProcess`/`SIGTERM`+`SIGKILL`),
+    /// which is indistinguishable — especially on Windows, where there's no
+    /// way to intercept `TerminateProcess` from inside the RELAY — from Som
+    /// itself quitting, and which must NOT kill the detached HOLDER (the
+    /// entire point of the HOLDER/RELAY split: a `tmux: true` pane's session
+    /// survives Som closing). Without this, every closed tmux tab left its
+    /// HOLDER (and whatever was running inside it, e.g. `htop`) running
+    /// forever — confirmed via `ps aux` showing HOLDER processes for panes
+    /// whose tabs had long since been closed.
+    ///
+    /// A plain non-tmux shell's `rebuild_tmux_shell_with_fresh_pane_id`
+    /// returns `None`, so this is a no-op for it — the NUL byte is never
+    /// sent, and closing behaves exactly as before this was added.
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        let shell = self.terminal().read(cx).shell().clone();
+        if crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(&shell).is_none() {
+            return;
+        }
+        self.terminal().update(cx, |terminal, _cx| {
+            terminal.input(vec![0u8]);
+        });
+    }
+
     fn as_searchable(
         &self,
         handle: &Entity<Self>,

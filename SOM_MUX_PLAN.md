@@ -247,18 +247,34 @@ specific modes someone remembered to add tracking for."
       `crates/terminal/src/terminal.rs`, `crates/workspace/`,
       `crates/zed/src/som_config.rs`. Confirmed building clean
       (`cargo build -p som_tmux`, `cargo build -p som`) and existing tests
-      still passing. **NOT yet re-deployed to WSL/Mac/deb** — those still
-      have the OLD `~/.local/bin/som-tmux-server` binary; the NEXT deploy
-      to each needs `mv ~/.local/bin/som-tmux-server ~/.local/bin/som-tmux`
-      (or a fresh build+copy under the new name) or `tmux: true` profiles
-      on those hosts will fail to find their binary.
-- [ ] Fork `zed-industries/alacritty` under our own account/org; cherry-pick
-      `36fd512f` (serialize.rs + term/mod.rs + grid/mod.rs changes) onto our
-      current pin (`fcf32feacb367b`); confirm it builds and its own tests
-      (`grid_serde_round_trip` and friends) pass.
-- [ ] Update `Cargo.toml`'s `alacritty_terminal` git dependency to point at
-      the new fork/rev; confirm the whole workspace still builds
-      (`cargo build -p som` etc.) with no regressions from the cherry-pick.
+      still passing. Deployed binaries on WSL/Mac/deb also renamed on disk
+      (`mv ~/.local/bin/som-tmux-server ~/.local/bin/som-tmux`) so existing
+      `tmux: true` profiles keep finding their binary — done for all
+      three hosts.
+- [x] Forked `zed-industries/alacritty` -> `errordnk/alacritty`; created
+      branch `som-snapshot-restore` off our exact pin
+      (`fcf32feacb367b75ec84dd40f041e4fd411d3cc1`); cherry-picked
+      `36fd512f` from `dsturnbull/alacritty` — applied clean except a
+      `Cargo.lock` conflict (resolved by keeping our side, harmless: we
+      don't depend on that repo's own lockfile). Confirmed
+      `cargo test -p alacritty_terminal --features serde` passes (11/11
+      new snapshot/restore tests including `snapshot_restore_preserves_
+      modes` — the one that actually covers full `TermMode`/DECCKM — plus
+      all 45 pre-existing tests, 0 regressions). Pushed to
+      `errordnk/alacritty@c61de4be`.
+- [x] Updated `Cargo.toml`'s `alacritty_terminal` git dependency to
+      `errordnk/alacritty` at `c61de4be`. Confirmed `cargo build -p
+      som_tmux` and `cargo build -p som` (the whole editor) build clean.
+      `cargo test -p terminal` shows 28 pre-existing failures in
+      `terminal_hyperlinks` (fragile hardcoded Windows test paths like
+      `test\cool.rs`) — confirmed via `git stash` that these ALSO fail on
+      the OLD fork pin, so NOT a regression from this change. Full
+      regression pass DONE and clean: `cargo test -p som_tmux -p
+      terminal_view -p terminal --lib -- --skip terminal_hyperlinks` ->
+      27+30 passed, 0 failed; `cargo test -p som_tmux` (own suite,
+      including all the `redraw.rs`/v1 tests that still exist pending
+      deletion below) -> 28/28 passed. No regressions anywhere from the
+      alacritty_terminal fork swap.
 - [ ] Delete `crates/som_tmux/src/tmux_backend.rs` and the
       `<minimal.conf>` writing logic — the v2 architecture in full.
 - [ ] Delete `crates/som_tmux/src/redraw.rs` and its test suite —

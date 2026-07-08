@@ -50,6 +50,7 @@ percent-encoding.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+dirs.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 settings = { workspace = true, features = ["test-support"] }

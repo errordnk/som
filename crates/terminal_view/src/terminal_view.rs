@@ -1364,6 +1364,20 @@ impl Item for TerminalView {
         self.terminal().update(cx, |terminal, _cx| {
             terminal.input(vec![0u8]);
         });
+        // `Terminal::input` only QUEUES the write onto alacritty's own PTY
+        // I/O thread (`Notifier::notify` sends across an mpsc channel,
+        // consumed asynchronously — see `event_loop.rs`); it does not
+        // block until the byte is actually on the wire. Without this,
+        // `Terminal::drop` (which runs moments after this function returns,
+        // once `Pane::_remove_item` drops its last reference to this item)
+        // can kill the RELAY process before its I/O thread ever gets
+        // scheduled to write the NUL byte — confirmed via the HOLDER's own
+        // log showing a bare "pipe closed" with no `RelayInput::Close`
+        // ever having arrived. A short, deliberately blocking sleep here
+        // is not elegant, but tab-close is not a hot path, and there is no
+        // synchronous/blocking write path exposed through `Terminal` to
+        // wait on instead.
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     fn as_searchable(

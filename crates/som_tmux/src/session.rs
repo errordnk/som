@@ -49,6 +49,40 @@ impl EventListener for ServerListener {
     }
 }
 
+/// A `std::io::Write` sink that broadcasts every write to every currently
+/// registered raw-bytes subscriber — passed to `EventLoop::with_raw_byte_
+/// sink` (see that method's doc comment on the `errordnk/alacritty` fork)
+/// so each byte the event loop reads off the real PTY, BEFORE it's parsed
+/// into the HOLDER's own headless `Term`, also reaches every connected
+/// RELAY directly. This is what lets a (re)connected RELAY get an initial
+/// `Session::snapshot()` (the full, already-parsed state) and then stay
+/// current via this raw byte stream afterward, without the HOLDER ever
+/// needing to diff/replay ANSI itself (v1's `redraw.rs`, which this
+/// architecture replaces) — the RELAY just feeds these same bytes through
+/// its OWN local `Term`'s ordinary ANSI parser, same as Som's regular
+/// (non-tmux) terminal already does for a directly-owned shell.
+struct RawByteBroadcaster {
+    subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<Vec<u8>>>>>,
+}
+
+impl std::io::Write for RawByteBroadcaster {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let subs = self.subscribers.lock().unwrap();
+        for sub in subs.iter() {
+            // `try_send`, not `send`/blocking — a slow or vanished RELAY
+            // must never stall the HOLDER's own PTY-reading thread (which
+            // also feeds the headless `Term` that every OTHER RELAY, and
+            // this session's own liveness, depends on).
+            sub.try_send(buf.to_vec()).ok();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// One session = one pane's PTY + its own `alacritty_terminal::Term`. The
 /// server keeps parsing PTY output into this `Term` continuously (whether or
 /// not a client is currently attached), so a (re)attaching client can be
@@ -58,6 +92,13 @@ pub struct Session {
     pub id: Uuid,
     term: Arc<FairMutex<Term<ServerListener>>>,
     pty_tx: Notifier,
+    /// Every currently-connected RELAY's own raw-bytes channel — see
+    /// `RawByteBroadcaster`'s doc comment. Populated via
+    /// `subscribe_raw_bytes`, mirroring `subscribers`'s existing pattern
+    /// for `AlacTermEvent`s (one independent channel per subscriber, not
+    /// one shared receiver — same competing-consumers bug that pattern
+    /// was already designed to avoid).
+    raw_byte_subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<Vec<u8>>>>>,
     /// A `Mutex` (not a plain field) purely so `resize` can take `&self`
     /// instead of `&mut self` — `Session` is shared via `Arc` across
     /// several threads (the shell-exit watcher, the redraw forwarder, the
@@ -154,6 +195,9 @@ impl Session {
         let term = Term::new(term_config, &bounds, ServerListener(raw_events_tx.clone()));
         let term = Arc::new(FairMutex::new(term));
 
+        let raw_byte_subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<Vec<u8>>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
         let event_loop = EventLoop::new(
             term.clone(),
             ServerListener(raw_events_tx),
@@ -161,7 +205,8 @@ impl Session {
             pty_options.drain_on_exit,
             false,
         )
-        .context("failed to create pty event loop")?;
+        .context("failed to create pty event loop")?
+        .with_raw_byte_sink(Box::new(RawByteBroadcaster { subscribers: raw_byte_subscribers.clone() }));
 
         let pty_tx = Notifier(event_loop.channel());
         // Mirrors terminal.rs's own "DANGER" comment: this detaches the IO
@@ -252,7 +297,18 @@ impl Session {
             last_bounds,
             pid,
             subscribers,
+            raw_byte_subscribers,
         })
+    }
+
+    /// Registers a new, independent receiver for this session's raw PTY
+    /// bytes — see `RawByteBroadcaster`'s doc comment. Every RELAY calls
+    /// this once, right after applying the initial `snapshot()`, to start
+    /// receiving live updates from that point on.
+    pub fn subscribe_raw_bytes(&self) -> async_channel::Receiver<Vec<u8>> {
+        let (tx, rx) = async_channel::unbounded();
+        self.raw_byte_subscribers.lock().unwrap().push(tx);
+        rx
     }
 
     /// Registers a new, independent receiver for this session's `Wakeup`/
@@ -368,6 +424,23 @@ impl Session {
     pub fn redraw(&self, redrawer: &mut crate::redraw::Redrawer, out: &mut impl std::io::Write) -> std::io::Result<()> {
         let term = self.term.lock();
         redrawer.redraw(&term, out)
+    }
+
+    /// v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux v3" section):
+    /// captures this session's ENTIRE terminal state — both grid buffers,
+    /// cursor, and the full `TermMode` bitflags — bincode-encoded, ready to
+    /// send as a single `HolderOutput::Snapshot` message. Replaces
+    /// `redraw()`'s role for a freshly-(re)connected RELAY: instead of
+    /// replaying ANSI bytes to reproduce a screen (which cannot carry mode
+    /// flags like DECCKM, since a mode flip has no visible content of its
+    /// own — the actual design flaw v1's `Redrawer`-based approach had),
+    /// the RELAY calls `Term::restore()` with this directly, which is
+    /// correct-by-construction for every mode `TermMode` tracks.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let term = self.term.lock();
+        let state = term.snapshot();
+        bincode::serde::encode_to_vec(&state, bincode::config::standard())
+            .expect("TermState bincode encoding should not fail")
     }
 
     /// Waits for the next `Wakeup` on `events_rx` (i.e. the grid actually

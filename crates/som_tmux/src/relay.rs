@@ -13,6 +13,9 @@
 //! `crate::redraw`) gets written straight to this process's own stdout,
 //! which is what Som's terminal parser actually reads.
 
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::term::{Config, Term};
+use anyhow::Context as _;
 use som_tmux::pipe::PipeConnection;
 use som_tmux::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::io::{Read, Write};
@@ -201,6 +204,45 @@ pub fn run(
         loop {
             let message = read_holder_message(&reader_connection)?;
             match message {
+                // v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux v3"
+                // section): this RELAY is a separate OS process from Som,
+                // not part of the editor — the only way it can affect
+                // what Som's own `Terminal`/`ansi::Processor` actually
+                // renders is by writing plain ANSI bytes to its own
+                // stdout, same as v1/v2 always required. So a `Snapshot`
+                // still needs a one-time "state -> ANSI" step: restore
+                // the bincode-decoded `TermState` onto a throwaway local
+                // `Term` (used for nothing except this one conversion),
+                // then run a SINGLE full-redraw pass over it via a fresh
+                // `Redrawer` (whose very first `redraw()` call is
+                // documented to always be a full, from-scratch repaint —
+                // see `Redrawer::new`'s doc comment) and write those
+                // bytes to stdout once. Unlike v1, no further redraw
+                // calls happen after this — subsequent `HolderOutput::
+                // Bytes` are forwarded completely unmodified below.
+                HolderOutput::Snapshot(encoded) => {
+                    let (state, _): (alacritty_terminal::term::serialize::TermState, usize) =
+                        bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                            .context("failed to decode HOLDER's TermState snapshot")?;
+                    // Any starting size works — `Term::restore` replaces
+                    // `self.grid` (and therefore its dimensions) wholesale
+                    // with `state.grid`, so this placeholder never
+                    // actually gets rendered against.
+                    let placeholder_bounds = crate::bounds::SessionBounds::new(1, 1);
+                    let mut term = Term::new(Config::default(), &placeholder_bounds, VoidListener);
+                    term.restore(state);
+
+                    let mut redrawer = crate::redraw::Redrawer::new();
+                    let mut bytes = Vec::new();
+                    redrawer.redraw(&term, &mut bytes)?;
+                    std::io::stdout().write_all(&bytes)?;
+                    std::io::stdout().flush()?;
+                }
+                // The ongoing stream, post-snapshot: raw bytes straight
+                // from the real shell's PTY (see `Session::subscribe_raw_
+                // bytes`/`RawByteBroadcaster` on the HOLDER side) —
+                // written through unmodified, exactly like a plain
+                // (non-tmux) Som terminal's own PTY output already is.
                 HolderOutput::Bytes(bytes) => {
                     std::io::stdout().write_all(&bytes)?;
                     std::io::stdout().flush()?;

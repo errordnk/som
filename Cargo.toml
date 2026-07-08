@@ -152,7 +152,7 @@ accesskit_unix = "0.21.0"
 accesskit_windows = "0.32.1"
 agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/errordnk/alacritty", rev = "c61de4be" }
+alacritty_terminal = { git = "https://github.com/errordnk/alacritty", rev = "9e31affd" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 ashpd = { version = "0.13", default-features = false, features = [
@@ -189,6 +189,7 @@ aws-smithy-runtime-api = { version = "1.9.2", features = ["http-1x", "client"] }
 aws-smithy-types = { version = "1.3.4", features = ["http-body-1-x"] }
 backtrace = "0.3"
 base64 = "0.22"
+bincode = { version = "2", features = ["serde"] }
 bitflags = "2.6.0"
 brotli = "8.0.2"
 bytes = "1.0"

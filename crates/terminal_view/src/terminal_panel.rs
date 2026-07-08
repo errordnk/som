@@ -1681,7 +1681,18 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
         remote_version
     );
 
-    let deploy_script = "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux) && mkdir -p ~/.local/bin && cp target/release/som-tmux ~/.local/bin/som-tmux";
+    // The trailing `codesign -s - ... || true` re-signs the copy on macOS —
+    // confirmed by direct reproduction that plain `cp` on APFS leaves the
+    // freshly-built binary's ad-hoc code signature invalid at its NEW path
+    // (`codesign -dv` still shows `adhoc,linker-signed`, but launching it
+    // fails with "load code signature error 2" / killed, confirmed via
+    // `log show`'s `AppleSystemPolicy` denial), even though the exact same
+    // binary at its original build path (`target/release/som-tmux`) runs
+    // fine — re-signing after the copy (not before) fixes it. `codesign`
+    // doesn't exist on Linux, so `|| true` makes this a no-op there instead
+    // of failing the whole deploy script over a command that was never
+    // going to matter on that platform.
+    let deploy_script = "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux) && mkdir -p ~/.local/bin && cp target/release/som-tmux ~/.local/bin/som-tmux && (codesign -s - ~/.local/bin/som-tmux 2>/dev/null || true)";
     let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", deploy_script]);
     run_remote_command(remote_kind, &deploy_probe)?;
     Ok(())

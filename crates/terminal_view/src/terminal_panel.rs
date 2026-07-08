@@ -857,8 +857,40 @@ impl TerminalPanel {
                         }
                     };
                     if let Some(created) = created {
-                        let created = cx.background_spawn(async move {
-                            created.await.map(|(item_id, _terminal)| item_id)
+                        let workspace = workspace.clone();
+                        let pane_id = pane_id.clone();
+                        let created = cx.spawn(async move |cx| {
+                            let (item_id, _terminal) = created.await?;
+                            // Restored tabs never otherwise call
+                            // `set_tmux_sessions_for_item` — without this,
+                            // `pane_id` above (correctly reused from
+                            // `db.json`, or freshly generated when this tab
+                            // never had one) never makes it back into
+                            // `Workspace::som_tab_tmux_sessions`, so the
+                            // NEXT `som_persist_db_json` call writes `None`
+                            // for this tab's `tmux_sessions` regardless of
+                            // what pane it's actually backed by — silently
+                            // forgetting the association on every restore.
+                            // Confirmed root cause of a reported bug: a
+                            // `htop`/`micro` process running in a
+                            // `som-tmux-server` HOLDER survives Som closing
+                            // (the whole point of the HOLDER/RELAY design —
+                            // see `project_som_tmux` memory), but the tab
+                            // that opens on the NEXT launch gets a
+                            // brand-new `pane_id` instead of reattaching to
+                            // that same still-alive HOLDER, since db.json
+                            // never remembered which pane_id this tab was
+                            // actually using. Uses `window_handle.update`
+                            // (not `workspace.update` directly) since
+                            // `Workspace::set_tmux_sessions_for_item` needs
+                            // a `Context<Workspace>`, only obtainable
+                            // through the window.
+                            window_handle.update(cx, |_, _, cx| {
+                                workspace.update(cx, |workspace, _cx| {
+                                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                                })
+                            })??;
+                            anyhow::Ok(item_id)
                         });
                         tab_creations.push((db_index, tab.extra_splits, created));
                     }

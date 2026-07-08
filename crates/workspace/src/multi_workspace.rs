@@ -1414,12 +1414,24 @@ impl MultiWorkspace {
         self._serialize_task.take().unwrap_or(Task::ready(()))
     }
 
-    fn app_will_quit(&mut self, _cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
+    fn app_will_quit(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
         let mut tasks: Vec<Task<()>> = Vec::new();
         if let Some(task) = self._serialize_task.take() {
             tasks.push(task);
         }
         tasks.extend(std::mem::take(&mut self.pending_removal_tasks));
+
+        // Flushes `db.json` one last time before the process actually
+        // exits — see `Workspace::som_persist_tab_state`'s doc comment for
+        // why this is needed at all: every other call site is triggered by
+        // an explicit user action (tab switch, split, close), which a plain
+        // window-close/quit never generates on its own, so without this
+        // `db.json` can be stale by however long it's been since the last
+        // such action (confirmed to lose a just-started tmux pane's
+        // `pane_id` entirely when quit happened right after opening it).
+        self.workspace().update(cx, |workspace, cx| {
+            workspace.som_persist_tab_state(cx);
+        });
 
         async move {
             futures::future::join_all(tasks).await;

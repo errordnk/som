@@ -458,19 +458,48 @@ mod tests {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term::Config;
 
+    /// Cross-platform "run this one-shot command line, then stay alive
+    /// after it finishes" spawn — used by every test in this file that
+    /// only needs SOME shell to produce specific output (echo, colors,
+    /// escape sequences), not any Windows/PowerShell-specific behavior of
+    /// its own. Mirrors `cmd.exe /K "<command> & timeout /T 3600"`'s shape
+    /// on Windows (run the command, then keep the shell alive instead of
+    /// exiting) with `sh -c '<command>; sleep 3600'` on Unix.
+    fn one_shot_command_shell(command: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("C:\\Windows\\System32\\cmd.exe".into(), vec!["/K".into(), format!("echo off & {command}")])
+        } else {
+            ("sh".into(), vec!["-c".into(), format!("{command}; sleep 3600")])
+        }
+    }
+
+    /// Cross-platform "just an interactive shell sitting at its own
+    /// prompt" spawn — used by tests that only care about `Session::write`
+    /// reaching an idle shell / broadcast semantics, not any
+    /// Windows-specific prompt rendering. Unsets `PS1` via `env -u PS1`
+    /// (Unix only) before running `sh` — `Session::spawn` inherits this
+    /// test process's entire environment, and `dash` (a common `/bin/sh`)
+    /// happily uses an inherited `PS1` as-is even though it's not really a
+    /// `dash`-specific setting; on a machine whose OWN interactive shell
+    /// has a Nerd-Font-glyph `PS1` set (as this repo's own dev machine
+    /// does), that leaked straight through and made `sh`'s prompt contain
+    /// no plain `$` at all, which is what this test is actually looking
+    /// for (confirmed by dumping the actual redraw bytes when this test
+    /// failed on WSL for what looked like a timing issue but wasn't).
+    fn interactive_shell() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("C:\\Windows\\System32\\cmd.exe".into(), vec![])
+        } else {
+            ("env".into(), vec!["-u".into(), "PS1".into(), "sh".into()])
+        }
+    }
+
     #[test]
     fn redraw_round_trips_colored_text_through_a_real_parser() {
         let bounds = SessionBounds::new(80, 24);
-        let command = "echo off & echo \x1b[92mgreentext\x1b[0m & timeout /T 3600";
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/C".into(), command.into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn cmd.exe for test");
+        let (program, args) = one_shot_command_shell("echo \x1b[92mgreentext\x1b[0m");
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn a shell for test");
         let events_rx = session.subscribe();
 
         // Wait for the real output to land — poll via a throwaway
@@ -533,15 +562,9 @@ mod tests {
     #[test]
     fn redraw_after_no_change_emits_nothing_new() {
         let bounds = SessionBounds::new(80, 24);
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/C".into(), "echo off & echo idle & timeout /T 3600".into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn cmd.exe for test");
+        let (program, args) = one_shot_command_shell("echo idle");
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn a shell for test");
         let events_rx = session.subscribe();
 
         for _ in 0..50 {
@@ -593,27 +616,27 @@ mod tests {
         // Print more lines than fit on screen (24 rows) so the shell's
         // output forces at least one real scroll-up before this test reads
         // anything back — "line0" through "line39" is 40 lines, well past
-        // the visible height. `for /L` does NOT zero-pad, so the sentinel
-        // checked for below is the bare "line39", not "line0039".
-        //
-        // Deliberately `/K` (keep the shell open after running the command),
-        // NOT `/C <command> & pause` — `&` after a `for /L ... do <cmd>`
-        // binds to the DO clause itself, not to a separate command after the
-        // whole loop, so an earlier version of this test (`for /L ... do
-        // @echo line%i & pause > nul`) called `pause` after EVERY iteration
-        // and hung forever waiting for Enter after just "line0". `/K`
-        // sidesteps the whole grouping question — cmd.exe stays alive on
-        // its own once the command finishes, no trailing command needed.
-        let command = "echo off & for /L %i in (0,1,39) do @echo line%i";
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/K".into(), command.into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn cmd.exe for test");
+        // the visible height. `for /L` (Windows) does NOT zero-pad, and
+        // neither does the `sh` loop below, so the sentinel checked for
+        // below is the bare "line39", not "line0039" on either platform.
+        let (program, args) = if cfg!(windows) {
+            // `/K`, NOT `/C <command> & pause` — `&` after a `for /L ...
+            // do <cmd>` binds to the DO clause itself, not to a separate
+            // command after the whole loop, so an earlier version of this
+            // test (`for /L ... do @echo line%i & pause > nul`) called
+            // `pause` after EVERY iteration and hung forever waiting for
+            // Enter after just "line0". `/K` sidesteps the whole grouping
+            // question — cmd.exe stays alive on its own once the command
+            // finishes, no trailing command needed.
+            (
+                "C:\\Windows\\System32\\cmd.exe".to_string(),
+                vec!["/K".to_string(), "echo off & for /L %i in (0,1,39) do @echo line%i".to_string()],
+            )
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), "for i in $(seq 0 39); do echo line$i; done; sleep 3600".to_string()])
+        };
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn a shell for test");
         let events_rx = session.subscribe();
 
         // Drive one shared Redrawer incrementally, exactly the way
@@ -680,17 +703,17 @@ mod tests {
         let bounds = SessionBounds::new(80, 24);
         // Mirrors the user's actual PowerShell profile.ps1 `prompt` function
         // byte-for-byte (verified via `xxd` against the real file): ESC[36m,
-        // U+F5BA, ESC[0m, ESC[32m, "~", ESC[0m, ESC[36m, U+F101, ESC[0m.
-        let command = "echo off & echo \x1b[36m\u{F5BA}\x1b[0m \x1b[32m~\x1b[0m \x1b[36m\u{F101}\x1b[0m & echo second-line-marker & timeout /T 3600";
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/C".into(), command.into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn cmd.exe for test");
+        // U+F5BA, ESC[0m, ESC[32m, "~", ESC[0m, ESC[36m, U+F101, ESC[0m —
+        // echoed literally by a plain shell here (not `pwsh.exe`'s own
+        // `prompt` function), so this is checking `redraw.rs`'s own
+        // round-tripping of these specific codepoints, not anything
+        // Windows/PowerShell-specific — see `real_pwsh_profile_prompt_
+        // keeps_its_nerd_font_glyphs_in_the_grid` (Windows-only, below) for
+        // the version that checks the real shell's own rendering.
+        let (program, args) =
+            one_shot_command_shell("echo \x1b[36m\u{F5BA}\x1b[0m \x1b[32m~\x1b[0m \x1b[36m\u{F101}\x1b[0m && echo second-line-marker");
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn a shell for test");
         let events_rx = session.subscribe();
 
         let mut ready = false;
@@ -812,34 +835,47 @@ mod tests {
     #[test]
     fn session_write_after_the_shell_is_already_idle_at_its_prompt_actually_reaches_it() {
         let bounds = SessionBounds::new(80, 24);
-        let session = Session::spawn(
-            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
-            vec!["-NoProfile".into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn an interactive pwsh.exe for test");
-        let events_rx = session.subscribe();
+        let (program, args) = interactive_shell();
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn an interactive shell for test");
 
-        // Wait for cmd.exe's own initial prompt (it prints its cwd followed
-        // by ">") to show up — this is the "already idle" state a real
-        // panel is normally sitting in when a user types something.
+        // Polled fixed sleeps, NOT `next_change_blocking` in a loop — that's
+        // fine against `pwsh.exe`/ConPTY (its cursor blink keeps producing
+        // `Wakeup`s even once nothing else is changing, so a bounded
+        // iteration count still bounds wall-clock time), but a plain `sh`
+        // on Unix has no such blink: once it settles at its prompt with
+        // nothing left to redraw, there may be no FURTHER `Wakeup` ever
+        // coming, and `next_change_blocking`'s `recv_blocking()` has no
+        // timeout of its own — so a loop built on it can hang forever
+        // (confirmed: this exact test hung indefinitely against `sh` on
+        // WSL before switching to polling here). Polls in short steps
+        // rather than one single fixed sleep — WSL's PTY/shell startup
+        // latency proved less predictable than Windows/ConPTY's, so a
+        // single guess (500ms) was too short there even though it was
+        // comfortably enough on Windows.
+        let prompt_char = if cfg!(windows) { '>' } else { '$' };
         let mut redrawer = Redrawer::new();
         let mut saw_prompt = false;
+        let mut last_bytes = Vec::new();
         for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let mut bytes = Vec::new();
             session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
-            if String::from_utf8_lossy(&bytes).contains('>') {
+            if !bytes.is_empty() {
+                last_bytes = bytes.clone();
+            }
+            if String::from_utf8_lossy(&bytes).contains(prompt_char) {
                 saw_prompt = true;
                 break;
             }
-            if !session.next_change_blocking(&events_rx) {
-                break;
-            }
         }
-        assert!(saw_prompt, "pwsh.exe's own prompt never appeared — test setup problem, not the bug under test");
+        assert!(
+            saw_prompt,
+            "the shell's own prompt never appeared after 5s — test setup problem, not the bug under test; \
+             last non-empty redraw bytes: {:?}, diag_grid_text: {:?}",
+            String::from_utf8_lossy(&last_bytes),
+            session.diag_grid_text()
+        );
 
         // NOW type a real command, as keystrokes — this is the exact same
         // `Session::write` call `server.rs::read_loop` makes for every
@@ -848,19 +884,17 @@ mod tests {
 
         let mut saw_marker = false;
         for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let mut bytes = Vec::new();
             session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
             if String::from_utf8_lossy(&bytes).contains("write-after-idle-marker") {
                 saw_marker = true;
                 break;
             }
-            if !session.next_change_blocking(&events_rx) {
-                break;
-            }
         }
         assert!(
             saw_marker,
-            "typed command's output never appeared after the shell was already idle at its prompt — \
+            "typed command's output never appeared after 5s of the shell being already idle at its prompt — \
              this is the actual bug: Session::write after the initial redraw doesn't reach a shell \
              that's already sitting idle"
         );
@@ -889,15 +923,9 @@ mod tests {
     #[test]
     fn two_independent_subscribers_each_see_every_wakeup_not_just_one_of_them() {
         let bounds = SessionBounds::new(80, 24);
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec![],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn an interactive cmd.exe for test");
+        let (program, args) = interactive_shell();
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn an interactive shell for test");
 
         // Two subscribers, mimicking the shell-exit watcher and a redraw
         // forwarder both wanting every change — spawned BEFORE the shell
@@ -906,9 +934,9 @@ mod tests {
         let subscriber_a = session.subscribe();
         let subscriber_b = session.subscribe();
 
-        // cmd.exe prints its own startup prompt unprompted — that alone is
-        // enough real PTY activity to generate at least one real Wakeup for
-        // both subscribers to (correctly) both see.
+        // The shell prints its own startup prompt unprompted — that alone
+        // is enough real PTY activity to generate at least one real Wakeup
+        // for both subscribers to (correctly) both see.
         assert!(
             session.next_change_blocking(&subscriber_a),
             "subscriber A should see the shell's own startup activity as a Wakeup"
@@ -934,6 +962,11 @@ mod tests {
     /// sees it (inside PowerShell/PSReadLine's own rendering, or in how
     /// `alacritty_terminal`'s VTE parser interprets whatever PowerShell
     /// sends for that specific codepoint), not in this crate's diffing.
+    ///
+    /// `#[cfg(windows)]` — genuinely needs the real `pwsh.exe` binary AND
+    /// the user's own `profile.ps1` (Nerd Font prompt glyphs, PSReadLine's
+    /// own coloring), neither of which has a meaningful Unix equivalent.
+    #[cfg(windows)]
     #[test]
     fn real_pwsh_profile_prompt_keeps_its_nerd_font_glyphs_in_the_grid() {
         let bounds = SessionBounds::new(80, 24);
@@ -990,6 +1023,10 @@ mod tests {
     /// 80x24, since nothing here ever calls `session.resize()`) failed to
     /// reproduce it. This tests whether the SIZE itself (not timing, not
     /// the profile's glyphs) is what triggers it.
+    ///
+    /// `#[cfg(windows)]` — needs the real `pwsh.exe`/PSReadLine rendering
+    /// path this bug was found in; no Unix equivalent.
+    #[cfg(windows)]
     #[test]
     fn pressing_enter_at_a_wide_pane_size_does_not_produce_a_stray_continuation_prompt() {
         let bounds = SessionBounds::new(80, 24); // control: exact same size other tests use
@@ -1060,6 +1097,11 @@ mod tests {
     /// time (mimicking real keystrokes arriving as separate
     /// `RelayInput::Bytes` messages, NOT one bulk write) and checks the
     /// FULL string survived, not just that something arrived.
+    ///
+    /// `#[cfg(windows)]` — the bug this chases was specifically about
+    /// `pwsh.exe`/PSReadLine's own input handling; no Unix equivalent
+    /// confirmed yet.
+    #[cfg(windows)]
     #[test]
     fn typing_a_multi_character_word_one_keystroke_at_a_time_does_not_lose_any_characters() {
         let bounds = SessionBounds::new(80, 24);
@@ -1395,6 +1437,10 @@ mod tests {
     /// colors typed command text differently (its own "Command" token
     /// color, not the prompt's cyan) — as if the prompt's color "leaked"
     /// onto the typed text instead of PSReadLine's own coloring taking over.
+    ///
+    /// `#[cfg(windows)]` — needs the real `pwsh.exe`/PSReadLine coloring
+    /// this bug was found in; no Unix equivalent.
+    #[cfg(windows)]
     #[test]
     fn typed_text_after_the_cyan_prompt_is_not_painted_with_the_prompts_leftover_color() {
         let bounds = SessionBounds::new(80, 24);
@@ -1482,19 +1528,13 @@ mod tests {
         // parser to ever see it and raise `Event::TextAreaSizeRequest` in
         // the first place — sending it as if it were user KEYBOARD INPUT
         // (`Session::write`) instead just hands raw bytes to the shell's
-        // own stdin, which for `cmd.exe` means it's echoed back completely
-        // literally as typed text, never interpreted as a query at all. So
-        // this test has cmd.exe itself PRINT the escape sequence (`echo`),
-        // exactly mirroring how a real full-screen program emits it.
-        let session = Session::spawn(
-            "C:\\Windows\\System32\\cmd.exe".into(),
-            vec!["/C".into(), "echo off & echo \x1b[18t & timeout /T 3600".into()],
-            None,
-            bounds,
-            None,
-            None,
-        )
-        .expect("failed to spawn cmd.exe for test");
+        // own stdin, which just echoes it back completely literally as
+        // typed text, never interpreted as a query at all. So this test has
+        // the shell itself PRINT the escape sequence (`echo`), exactly
+        // mirroring how a real full-screen program emits it.
+        let (program, args) = one_shot_command_shell("echo \x1b[18t");
+        let session =
+            Session::spawn(program, args, None, bounds, None, None).expect("failed to spawn a shell for test");
 
         // Fixed sleep, NOT `next_change_blocking` in a loop — a bounded
         // Wakeup stream isn't guaranteed here, and looping on it risks

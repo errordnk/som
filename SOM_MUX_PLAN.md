@@ -313,10 +313,14 @@ specific modes someone remembered to add tracking for."
       including all the `redraw.rs`/v1 tests that still exist pending
       deletion below) -> 28/28 passed. No regressions anywhere from the
       alacritty_terminal fork swap.
-- [ ] Delete `crates/som_tmux/src/tmux_backend.rs` and the
-      `<minimal.conf>` writing logic — the v2 architecture in full. NOT
-      done yet — file still exists, unused (nothing calls into it after
-      `main.rs`'s dispatch is updated — see below).
+- [x] Deleted `crates/som_tmux/src/tmux_backend.rs` (v2 architecture in
+      full, including its `<minimal.conf>`-writing logic) and its
+      `#[cfg(unix)] mod tmux_backend;` declaration in `main.rs` — grepped
+      the whole crate first to confirm nothing else referenced it
+      (`minimal.conf`, `tmux new-session`, `tmux attach-session` all came
+      back empty). `cargo build -p som_tmux` and `cargo test -p som_tmux
+      --bin som-tmux` (28/28) both still clean on Windows after the
+      deletion.
 - [x] **IMPORTANT CORRECTION found mid-implementation** (see
       "Architecture" above, RELAY section — updated in place): RELAY is a
       SEPARATE OS PROCESS from Som, not part of the editor like
@@ -370,22 +374,81 @@ specific modes someone remembered to add tracking for."
       gives each connecting RELAY its own independent channel — same
       one-channel-per-subscriber pattern `subscribe()` (for `AlacTermEvent`)
       already used, for the same competing-consumers reason.
-- [ ] RELAY (`relay.rs`) — **NOT YET REWRITTEN, next step**. Currently
-      still has the OLD `HolderOutput::Bytes`-means-"write straight to
-      stdout" loop, which will misinterpret v3's raw PTY bytes as
-      already-final ANSI (mostly harmless since v3's raw bytes basically
-      ARE what should reach stdout for the ONGOING stream — but the new
-      `HolderOutput::Snapshot` variant has NO handler yet, which is the
-      actual compile error blocking everything right now). Needs: on
-      `Snapshot`, decode + `Term::restore()` onto a throwaway local `Term`
-      + one `Redrawer::new()` full-redraw pass + write those bytes to
-      stdout; on subsequent `Bytes`, write straight through unmodified
-      (this part needs NO change from what's already there).
-- [ ] `main.rs` dispatch: decide whether Unix builds should still route
-      through `tmux_backend::run` (v2, currently what Unix uses) or the
-      rewritten `relay.rs`/`server.rs` (v3) — NOT switched over yet, v3
-      code isn't wired into `main()` at all currently. This is likely the
-      very next thing to do once `relay.rs` compiles.
+- [x] RELAY (`relay.rs`) rewritten: `writer_thread`'s match now handles
+      `HolderOutput::Snapshot(encoded)` — bincode-decodes the `TermState`,
+      restores it onto a throwaway local `Term` (`Config::default()`, a
+      1x1 `SessionBounds` placeholder since the real bounds are already
+      baked into the restored grid), runs ONE `Redrawer::new()` full-redraw
+      pass over it, writes those bytes to stdout once. Subsequent
+      `HolderOutput::Bytes` keep writing straight through unmodified (no
+      change needed there — confirmed already correct for the ongoing raw
+      stream).
+- [x] `main.rs` dispatch unified: removed all `#[cfg(windows)]`/
+      `#[cfg(unix)]` gating from the `bounds`/`redraw`/`relay`/`server`/
+      `session` modules and from `main()` itself — HOLDER/RELAY dispatch is
+      now one unconditional code path on both platforms, since
+      `alacritty_terminal::tty::new()` already works on both. `tmux_backend`
+      (v2) stays `#[cfg(unix)]`-gated and unreferenced, waiting on the
+      delete-it item above.
+- [x] Cross-platform `cargo test -p som_tmux --bin som-tmux` sanity pass:
+      confirmed on Windows (28/28) and WSL/Unix (17/28, 11 failures) that
+      the v3 pipeline itself builds and the platform-agnostic
+      alt-screen/DECCKM/resize tests (which drive `Term`/`Redrawer` directly,
+      no real PTY) already passed on both — the 11 Unix failures were ALL
+      pre-existing tests that had never run on Unix before (the whole
+      `redraw.rs` module used to be `#[cfg(windows)]`-gated), hardcoding
+      `C:\Windows\System32\cmd.exe`/`C:\Program Files\PowerShell\7\pwsh.exe`
+      paths — not a v3 regression.
+- [x] Parameterized the subset of those 11 tests whose logic is genuinely
+      platform-agnostic (7 of 11: colored-text round-trip, no-op redraw,
+      scroll-without-stale-cells, Nerd Font byte round-trip via literal
+      `echo`, text-area-size query, write-after-idle, and the two-
+      subscribers broadcast test) via two new helpers at the top of
+      `redraw.rs`'s test module — `one_shot_command_shell(command)` (cmd.exe
+      `/K "echo off & <command>"` on Windows, `sh -c "<command>; sleep
+      3600"` on Unix) and `interactive_shell()` (bare `cmd.exe`/`sh`, no
+      args) — both picked via `cfg!(windows)`. Confirmed 28/28 passing again
+      on Windows after this change (no regression from the refactor).
+      The remaining 4 of 11 (`real_pwsh_profile_prompt_keeps_its_nerd_
+      font_glyphs_in_the_grid`, `pressing_enter_at_a_wide_pane_size_...`,
+      `typing_a_multi_character_word_...`, `typed_text_after_the_cyan_
+      prompt_...`) are genuinely Windows/PowerShell-specific regression
+      tests (real `pwsh.exe` + the user's own `profile.ps1`, PSReadLine's
+      own coloring/input-handling) with no honest Unix equivalent — left
+      `#[cfg(windows)]`-gated rather than faked onto `sh`.
+- [x] Re-ran full `cargo test -p som_tmux --bin som-tmux` on WSL after
+      syncing the parameterization there (copied `redraw.rs`/`main.rs`
+      directly for quick iteration before committing; local WSL clone also
+      had a stale untracked `crates/som_tmux_server/` directory left over
+      from before the crate rename, removed since `crates/som_tmux/` already
+      had everything from it plus the v3 rewrite). Hit and fixed TWO real
+      cross-platform issues in the process, not just recompiled the same
+      thing:
+      1. `session_write_after_the_shell_is_already_idle_at_its_prompt_
+         actually_reaches_it` hung indefinitely on WSL — traced to
+         `next_change_blocking`'s `recv_blocking()` having no timeout of
+         its own; `pwsh.exe`/ConPTY's continuous cursor-blink `Wakeup`s
+         happened to mask this on Windows (a bounded iteration count only
+         bounds wall-clock time if each blocking call eventually returns),
+         but a plain `sh` on Unix produces no such blink once idle at its
+         prompt. Fixed by switching this one test's polling to bounded
+         `sleep(100ms)`-then-redraw loops (matching the pattern the file's
+         OTHER real-pwsh tests already used for the identical reason, per
+         their own comments) instead of `next_change_blocking`.
+      2. Same test then failed for a totally different reason once the
+         hang was fixed: `Session::spawn` inherits this test process's
+         entire environment, and this dev machine's own interactive shell
+         has a Nerd-Font-glyph `PS1` set — `dash` (WSL's `/bin/sh`) happily
+         renders an inherited `PS1` verbatim even though it's not really a
+         `dash`-specific setting, so the spawned `sh`'s prompt never
+         contained a plain `$` at all (confirmed by dumping the actual
+         redraw bytes: real Nerd Font codepoints, not `$`). Fixed by
+         changing `interactive_shell()`'s Unix branch to spawn `env -u PS1
+         sh` instead of bare `sh`.
+      Both fixes are in the test helpers only, no production code changed.
+      Final confirmed result: Windows 28/28, WSL 24/24 (+1 `#[ignore]`d
+      `htop` F2 test not run by default on either platform) — genuinely
+      cross-platform now, not just "compiles on both."
 - [ ] Re-run (and expect to newly PASS, this time for real) the F2/htop
       regression test — `test_ssh_tmux_backend_htop_f2_opens_setup_screen`
       style, renamed for v3 — against a real remote host.

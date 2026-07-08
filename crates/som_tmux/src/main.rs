@@ -16,11 +16,6 @@ mod relay;
 mod server;
 mod session;
 mod term_size;
-// v2 (thin wrapper around a real, installed `tmux` binary) — SUPERSEDED
-// by v3 above, kept only until `SOM_MUX_PLAN.md`'s checklist item to
-// delete this file is done; nothing currently calls into it.
-#[cfg(unix)]
-mod tmux_backend;
 
 /// Parsed command line — two shapes depending on whether this process is
 /// starting as a RELAY (Som's direct PTY child, the normal case) or a

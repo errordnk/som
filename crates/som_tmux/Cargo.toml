@@ -22,6 +22,7 @@ workspace = true
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
+bincode.workspace = true
 futures.workspace = true
 log.workspace = true
 paths.workspace = true

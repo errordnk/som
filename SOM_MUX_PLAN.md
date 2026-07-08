@@ -193,16 +193,35 @@ specific modes someone remembered to add tracking for."
      as v1's incremental updates, but the RELAY applies them by feeding
      its OWN local `Term` (see below), not by interpreting an already-
      diffed byte stream `redraw.rs` produced.
-- **RELAY** (short-lived, Som's own PTY child, same role as v1/v2):
+- **RELAY** (short-lived, Som's own PTY child, same role as v1/v2)
+  — **CORRECTED mid-implementation, see below**: RELAY is a SEPARATE OS
+  process from Som, communicating only through its own stdout (the ConPTY
+  Som created for it) — unlike `pty-host`'s own client, which IS the
+  editor's terminal in-process and can call `term.restore()` directly on
+  the exact `Term` the UI renders. RELAY has no such access; the only way
+  it can affect what Som's own `Terminal`/`TerminalElement` shows is by
+  writing bytes to its stdout for Som's own `ansi::Processor` to parse,
+  same as v1/v2 always required.
   1. Connects to (or spawns) the HOLDER, same as v1.
   2. On the initial snapshot message: `bincode::deserialize::<TermState>`,
-     then `term.restore(state)` on ITS OWN local `Term` — instantly
-     correct grid + cursor + full mode flags, no ANSI replay.
-  3. From then on, feeds subsequent HOLDER->RELAY bytes through the SAME
-     `ansi::Processor::advance` path any normal (non-tmux) Som terminal
-     already uses — this `Term` IS what Som's own `TerminalView` renders,
-     so there's no "translate holder's diff back into something
-     TerminalView understands" step at all once the snapshot has landed.
+     `term.restore(state)` onto a LOCAL, throwaway `Term` (used only to
+     hold the deserialized state long enough to serialize it back out —
+     see item 3), then serializes that `Term`'s content (including mode-
+     switching escapes for anything `TermMode` tracks, e.g. DECCKM) into
+     a plain ANSI byte stream and writes THAT to its own stdout. This is
+     a full, not incremental, repaint — no previous-state diffing needed
+     (unlike v1's `Redrawer`, which HAD to diff since it ran continuously)
+     since this only happens once per (re)connect. Still meaningfully
+     simpler than v1's `Redrawer`: no per-cell last-painted-cache, no
+     incremental-diff logic — literally "walk the restored grid, emit
+     what's there," plus (the part v1 got wrong) the mode escapes.
+  3. From then on, forwards subsequent HOLDER->RELAY raw bytes STRAIGHT to
+     its own stdout, unmodified — Som's own unmodified `Terminal`/
+     `ansi::Processor` (the SAME one that already parses a plain, non-tmux
+     shell's output) does the actual parsing/rendering, exactly as it
+     always has. RELAY itself needs no persistent `Term` of its own for
+     this ongoing stream — only transiently, in step 2, to go from
+     `TermState` back to bytes.
   4. Keystrokes/resize continue to flow RELAY -> HOLDER -> real PTY,
      same direction as v1/v2.
 - **Protocol**: two message shapes cover everything — `Snapshot(Vec<u8>)`
@@ -262,8 +281,27 @@ specific modes someone remembered to add tracking for."
       modes` — the one that actually covers full `TermMode`/DECCKM — plus
       all 45 pre-existing tests, 0 regressions). Pushed to
       `errordnk/alacritty@c61de4be`.
+- [x] **Discovered mid-implementation and fixed with a second, small patch
+      on the same fork**: `alacritty_terminal::EventLoop` never exposes
+      the raw PTY bytes it reads — only a `Wakeup`/"something changed"
+      event — which blocks v3's HOLDER from forwarding a live byte stream
+      to RELAYs (only sending a full ~27KB bincode snapshot on EVERY
+      single change would be wasteful; measured directly via a throwaway
+      test). Rather than reimplementing the entire PTY read loop from
+      scratch (`pty-host`'s own approach, ~980 lines, and Windows-only
+      incompatible besides — its own `Pty` has no `.file()`/raw-fd
+      equivalent, only a ConPTY-specific `child_watcher()`), added
+      `EventLoop::with_raw_byte_sink(Box<dyn Write + Send>)` — a ~15-line
+      patch reusing the event loop's EXISTING (but previously
+      file-hardcoded, `ref_test`-only) "copy raw bytes somewhere before
+      parsing" mechanism, now exposed as a public, generic sink. Does not
+      change `EventLoop::new`'s signature; existing callers (Som's own
+      `terminal` crate) need no changes. Confirmed 56/56 tests still pass
+      after this second patch too. Pushed to
+      `errordnk/alacritty@9e31affd`; `Cargo.toml` updated to this rev.
 - [x] Updated `Cargo.toml`'s `alacritty_terminal` git dependency to
-      `errordnk/alacritty` at `c61de4be`. Confirmed `cargo build -p
+      `errordnk/alacritty` at `c61de4be` (then `9e31affd`, see above).
+      Confirmed `cargo build -p
       som_tmux` and `cargo build -p som` (the whole editor) build clean.
       `cargo test -p terminal` shows 28 pre-existing failures in
       `terminal_hyperlinks` (fragile hardcoded Windows test paths like
@@ -276,22 +314,78 @@ specific modes someone remembered to add tracking for."
       deletion below) -> 28/28 passed. No regressions anywhere from the
       alacritty_terminal fork swap.
 - [ ] Delete `crates/som_tmux/src/tmux_backend.rs` and the
-      `<minimal.conf>` writing logic — the v2 architecture in full.
-- [ ] Delete `crates/som_tmux/src/redraw.rs` and its test suite —
-      the v1 diffing logic — replacing its role with `term.snapshot()`/
-      `term.restore()` calls in `server.rs`/`relay.rs`.
-- [ ] Add `Snapshot(Vec<u8>)` to the protocol (`protocol.rs`), replacing
-      the old `HolderOutput::Bytes`-as-full-redraw-on-connect usage; keep
-      (or reintroduce, now bincode-encoded rather than ANSI) a `Bytes`
-      variant for the ongoing stream after the initial snapshot.
-- [ ] HOLDER (`server.rs`): own a headless `Term<VoidListener>` fed by the
-      real PTY's output (mirrors `pty-host`'s `headless.rs`); on new RELAY
-      connection, `term.snapshot()` -> bincode -> `Snapshot` message before
-      anything else.
-- [ ] RELAY (`relay.rs`): on receiving `Snapshot`, deserialize + `term.
-      restore()` onto its own local `Term` (the same one `Terminal`'s own
-      rendering already reads); confirm this actually removes the need for
-      RELAY to have ever run its own ANSI-diff/redraw logic at all.
+      `<minimal.conf>` writing logic — the v2 architecture in full. NOT
+      done yet — file still exists, unused (nothing calls into it after
+      `main.rs`'s dispatch is updated — see below).
+- [x] **IMPORTANT CORRECTION found mid-implementation** (see
+      "Architecture" above, RELAY section — updated in place): RELAY is a
+      SEPARATE OS PROCESS from Som, not part of the editor like
+      `pty-host`'s own client is. It cannot call `Term::restore()` on
+      whatever `Term` Som's `TerminalElement` actually renders — the only
+      channel it has is writing bytes to its own stdout for Som's
+      existing `ansi::Processor` to parse, same as v1/v2 always required.
+      So RELAY DOES still need SOME "turn a Term's state into ANSI bytes"
+      step after `restore()`ing a snapshot onto a local, throwaway `Term`
+      — just a ONE-TIME full repaint per (re)connect, not v1's
+      continuously-running incremental diffing.
+      **Resolved by reusing `redraw.rs`, not deleting it**: a fresh
+      `Redrawer::new()`'s very first `redraw()` call already IS a full,
+      from-scratch repaint (documented behavior, unchanged from v1) — so
+      RELAY can restore a snapshot onto a throwaway `Term`, run ONE
+      `Redrawer::new()` + `redraw()` pass over it, write those bytes to
+      its own stdout once, and then switch to forwarding subsequent raw
+      HOLDER bytes UNMODIFIED afterward (no further redraw calls, no
+      diff-state to maintain — this is the part that's simpler than v1).
+      `redraw.rs` survives, but its ROLE shrinks to "one-shot state-to-
+      ANSI serializer for a fresh (re)connect," never running continuously
+      again. Still needs: extending `Redrawer`/its full-redraw path to
+      emit ALL of `TermMode`'s relevant bits from the restored `Term`
+      (currently only `ALT_SCREEN`-triggers-repaint and an explicit
+      `APP_CURSOR`/DECCKM re-emit exist, added in v1's own bugfixing —
+      NOT a generic "emit every mode bit `TermState.mode()` carries"
+      pass yet, which is what actually delivers v3's core promise).
+- [x] Added `Snapshot(Vec<u8>)` to `protocol.rs`'s `HolderOutput` (bincode-
+      encoded `TermState`), replacing the old "Bytes-as-full-redraw-on-
+      connect" role; `Bytes(Vec<u8>)` kept for the ongoing raw-byte stream
+      after the initial snapshot (now literally raw PTY output, not
+      already-diffed ANSI).
+- [x] `Session::snapshot()` (`session.rs`) added — locks the HOLDER's own
+      `Term`, calls `term.snapshot()`, bincode-encodes it
+      (`bincode::serde::encode_to_vec`, bincode v2 API).
+- [x] HOLDER (`server.rs`) rewritten: `handle_relay` now sends
+      `HolderOutput::Snapshot(session.snapshot())` right after the
+      handshake+resize (replacing the old `send_redraw`/`Redrawer::new()`
+      call), subscribing to raw bytes (`Session::subscribe_raw_bytes`,
+      see below) BEFORE sending the snapshot so nothing written by the
+      real shell in the gap between "snapshot captured" and "subscribed"
+      is lost. `spawn_forwarder` now runs TWO independent threads per
+      connected RELAY: one forwards live raw bytes as `HolderOutput::
+      Bytes`, the other still watches `Session::subscribe()`'s `Exit`
+      event for `HolderOutput::ShellExited` (its `Wakeup` case is now a
+      no-op — the raw-bytes thread already covers what changed).
+- [x] `Session` (`session.rs`) extended: `RawByteBroadcaster` (a `Write`
+      impl that fans out every write to every subscriber) is registered
+      via the NEW `EventLoop::with_raw_byte_sink` (from the alacritty
+      fork patch above) at session-spawn time; `subscribe_raw_bytes()`
+      gives each connecting RELAY its own independent channel — same
+      one-channel-per-subscriber pattern `subscribe()` (for `AlacTermEvent`)
+      already used, for the same competing-consumers reason.
+- [ ] RELAY (`relay.rs`) — **NOT YET REWRITTEN, next step**. Currently
+      still has the OLD `HolderOutput::Bytes`-means-"write straight to
+      stdout" loop, which will misinterpret v3's raw PTY bytes as
+      already-final ANSI (mostly harmless since v3's raw bytes basically
+      ARE what should reach stdout for the ONGOING stream — but the new
+      `HolderOutput::Snapshot` variant has NO handler yet, which is the
+      actual compile error blocking everything right now). Needs: on
+      `Snapshot`, decode + `Term::restore()` onto a throwaway local `Term`
+      + one `Redrawer::new()` full-redraw pass + write those bytes to
+      stdout; on subsequent `Bytes`, write straight through unmodified
+      (this part needs NO change from what's already there).
+- [ ] `main.rs` dispatch: decide whether Unix builds should still route
+      through `tmux_backend::run` (v2, currently what Unix uses) or the
+      rewritten `relay.rs`/`server.rs` (v3) — NOT switched over yet, v3
+      code isn't wired into `main()` at all currently. This is likely the
+      very next thing to do once `relay.rs` compiles.
 - [ ] Re-run (and expect to newly PASS, this time for real) the F2/htop
       regression test — `test_ssh_tmux_backend_htop_f2_opens_setup_screen`
       style, renamed for v3 — against a real remote host.

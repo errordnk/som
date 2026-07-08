@@ -1,11 +1,11 @@
-//! HOLDER side of the transparent-PTY-proxy architecture (see
-//! `project_som_tmux` memory, "Обновление 16"-19 for the full design
-//! history): this is the long-lived process that actually owns the real
-//! shell's PTY and keeps parsing its output into a grid, independent of
-//! whether any RELAY is currently connected. A RELAY (the process Som
-//! itself spawned into its own PTY — see `crate::relay`) connects here,
-//! gets a full ANSI redraw of the current screen, then a live stream of
-//! incremental updates for as long as it stays connected.
+//! HOLDER side of the v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux
+//! v3" section): this is the long-lived process that actually owns the
+//! real shell's PTY and keeps a headless `alacritty_terminal::Term` (owned
+//! by `Session`) up to date, independent of whether any RELAY is
+//! currently connected. A RELAY (the process Som itself spawned into its
+//! own PTY — see `crate::relay`) connects here, gets a full state snapshot
+//! (`Session::snapshot()`) of the current screen, then a live stream of
+//! raw PTY bytes for as long as it stays connected.
 //!
 //! One HOLDER = exactly one pane (see `protocol::pipe_name`'s doc comment
 //! for why this changed from the old per-profile multiplexed design) — so
@@ -13,7 +13,6 @@
 //! process's entire lifetime.
 
 use crate::bounds::SessionBounds;
-use crate::redraw::Redrawer;
 use crate::session::Session;
 use som_tmux::pipe::{self, PipeConnection};
 use som_tmux::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
@@ -142,17 +141,21 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
         other => anyhow::bail!("expected an initial Resize as the second message from a relay, got {other:?}"),
     }
 
-    // Full redraw immediately after the handshake+initial resize — a fresh
-    // Redrawer has no prior state, so the very first `Session::redraw` call
-    // against it emits the entire current screen (see `Redrawer::new`'s doc
-    // comment). This is what gives a (re)attaching RELAY the "restore the
-    // screen as it was" behavior without ever replaying raw historical
-    // bytes.
-    let redrawer = Arc::new(Mutex::new(Redrawer::new()));
-    send_redraw(&connection, &writer, session, &redrawer)?;
+    // Snapshot immediately after the handshake+initial resize — see
+    // `protocol::HolderOutput::Snapshot`'s doc comment for why this
+    // replaces v1's "full ANSI redraw on connect" entirely: a
+    // (re)attaching RELAY gets the ENTIRE terminal state (grid, cursor,
+    // and the full `TermMode` bitflags) directly, correct from the first
+    // frame, with nothing to replay. Subscribing to raw bytes BEFORE
+    // sending the snapshot (not after) is deliberate — otherwise a byte
+    // written by the real shell in the gap between "snapshot captured"
+    // and "subscription registered" would be silently lost, visible to
+    // the user as dropped output right after a reattach.
+    let raw_bytes_rx = session.subscribe_raw_bytes();
+    send(&connection, &writer, &HolderOutput::Snapshot(session.snapshot()))?;
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_forwarder(connection.clone(), writer.clone(), session.clone(), redrawer, stop.clone());
+    spawn_forwarder(connection.clone(), writer.clone(), session.clone(), raw_bytes_rx, stop.clone());
 
     let result = read_loop(&connection, session);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -187,18 +190,47 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
     }
 }
 
+/// Spawns two independent threads for one connected RELAY: one forwards
+/// live raw PTY bytes (`raw_bytes_rx`, from `Session::subscribe_raw_bytes`)
+/// as `HolderOutput::Bytes` messages, the other watches for the real shell
+/// exiting (`Session::subscribe`'s `AlacTermEvent::Exit`) to send a final
+/// `HolderOutput::ShellExited`. Two separate threads/channels rather than
+/// one, since they're fundamentally different event streams now (v1 had
+/// only `Wakeup`/`Exit` to work with, so one `next_change_blocking` loop
+/// covered both "something changed, redraw" and "it exited" — v3 gets a
+/// live byte stream directly, so there's no "redraw" step to trigger off
+/// `Wakeup` for anymore, only `Exit` still matters here).
 fn spawn_forwarder(
     connection: Arc<PipeConnection>,
     writer: Arc<Mutex<()>>,
     session: Arc<Session>,
-    redrawer: Arc<Mutex<Redrawer>>,
+    raw_bytes_rx: async_channel::Receiver<Vec<u8>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    {
+        let connection = connection.clone();
+        let writer = writer.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(bytes) = raw_bytes_rx.recv_blocking() else {
+                    return; // session gone (all senders dropped)
+                };
+                if send(&connection, &writer, &HolderOutput::Bytes(bytes)).is_err() {
+                    return; // relay disconnected
+                }
+            }
+        });
+    }
+
     // Its OWN subscription — see `Session::subscribe`'s doc comment. Every
     // connected RELAY gets one of these (a fresh `spawn_forwarder` call per
-    // `handle_relay`), and each one now genuinely sees every `Wakeup`
-    // rather than competing with the others (and with the shell-exit
-    // watcher in `run`) over a single shared receiver.
+    // `handle_relay`), and each one now genuinely sees every `Exit` rather
+    // than competing with the others (and with the shell-exit watcher in
+    // `run`) over a single shared receiver.
     let events_rx = session.subscribe();
     std::thread::spawn(move || {
         loop {
@@ -209,25 +241,12 @@ fn spawn_forwarder(
                 send(&connection, &writer, &HolderOutput::ShellExited).ok();
                 return;
             }
-            if send_redraw(&connection, &writer, &session, &redrawer).is_err() {
-                return; // relay disconnected
-            }
+            // `next_change_blocking` returning `true` means `Wakeup` —
+            // irrelevant here now (the raw-bytes thread above already
+            // forwards the actual content independently); loop back
+            // around waiting specifically for `Exit`.
         }
     });
-}
-
-fn send_redraw(
-    connection: &PipeConnection,
-    writer: &Mutex<()>,
-    session: &Session,
-    redrawer: &Mutex<Redrawer>,
-) -> anyhow::Result<()> {
-    let mut bytes = Vec::new();
-    session.redraw(&mut redrawer.lock().unwrap(), &mut bytes)?;
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    send(connection, writer, &HolderOutput::Bytes(bytes))
 }
 
 fn send(connection: &PipeConnection, writer: &Mutex<()>, message: &HolderOutput) -> anyhow::Result<()> {

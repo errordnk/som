@@ -22,6 +22,54 @@ use std::time::Duration;
 const CONNECT_RETRY_ATTEMPTS: u32 = 20;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How many consecutive identical readings of `term_size::current_size()`
+/// are required before treating it as "settled" (see `settled_initial_size`'s
+/// doc comment) — 2 is enough to reject a single stale reading, without
+/// making a genuinely-still-changing size (a real drag-resize in progress)
+/// wait indefinitely for a quiet moment that current_size polling any
+/// faster than this would still eventually see.
+const SETTLE_STABLE_READS_REQUIRED: u32 = 2;
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SETTLE_MAX_ATTEMPTS: u32 = 25; // 25 * 20ms = 500ms worst case
+
+/// Polls `term_size::current_size()` repeatedly until two consecutive reads
+/// agree (or a short timeout elapses), instead of trusting the very first
+/// reading — see the call site's doc comment for the full story, but in
+/// short: right when a RELAY first connects (freshly spawned by Som, OR
+/// reattaching after `restore_som_tabs`/a tab switch), Som's own
+/// `TerminalElement` for this specific pane may not have gone through its
+/// first real GPUI layout pass yet, so its PTY (and this RELAY's own
+/// console, sitting inside it) can still be at `TerminalBounds::default()`'s
+/// placeholder size (100x6 — see `crates/terminal/src/terminal.rs`'s
+/// `DEBUG_TERMINAL_WIDTH`/`DEBUG_TERMINAL_HEIGHT`) for a brief moment before
+/// Som's real layout resizes it. Trusting that first reading unconditionally
+/// (the previous behavior) sent a HOLDER a wrong initial size it then had to
+/// correct a moment later via the resize-poll thread — visible to the user
+/// as a stray "flash" where a full-screen app like `htop` briefly renders at
+/// the wrong (too-small, or previously-cached) size before snapping to the
+/// right one. Confirmed root cause of a reported bug: `htop` not filling the
+/// whole pane on Som restart/tab switch until something else (a later real
+/// resize) corrected it — this made the CORRECT size available for the
+/// HOLDER's very first redraw instead, removing the visible flash entirely.
+fn settled_initial_size() -> (u16, u16) {
+    let mut last = crate::term_size::current_size();
+    let mut stable_reads = 1u32;
+    for _ in 0..SETTLE_MAX_ATTEMPTS {
+        if stable_reads >= SETTLE_STABLE_READS_REQUIRED {
+            break;
+        }
+        std::thread::sleep(SETTLE_POLL_INTERVAL);
+        let next = crate::term_size::current_size();
+        if next == last {
+            stable_reads += 1;
+        } else {
+            stable_reads = 1;
+            last = next;
+        }
+    }
+    last.unwrap_or((80, 24))
+}
+
 /// Runs the RELAY: connects to (or spawns) the HOLDER for this pane, then
 /// blocks for the lifetime of the connection, shuttling bytes both ways.
 /// Returns once the HOLDER disconnects or the shell it holds exits — at
@@ -100,7 +148,7 @@ pub fn run(
     // can't read a real size (falls back to `SessionBounds::default()`'s
     // 80x24) — the HOLDER unconditionally waits for exactly one message
     // here, so this side must unconditionally send exactly one.
-    let initial_size = crate::term_size::current_size().unwrap_or((80, 24));
+    let initial_size = settled_initial_size();
     send(&connection, &writer, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
 
     let reader_connection = connection.clone();

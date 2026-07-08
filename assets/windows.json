@@ -41,7 +41,7 @@
       "name": "shell",
       "icon": "",
       "shell": "$SHELL",
-      "workingDir": "~"
+      "home": "~"
     }
   ],
   "keys": {

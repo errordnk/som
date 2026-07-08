@@ -440,7 +440,7 @@ fn main() {
                     shell: t.shell.clone(),
                     keystroke,
                     icon: t.icon.clone(),
-                    working_dir: t.working_dir.clone(),
+                    home: t.home.clone(),
                     tmux: t.tmux,
                 }
             })

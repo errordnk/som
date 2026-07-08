@@ -130,7 +130,15 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     // was attached at all (Som closed, or between tabs), so there's no
     // "already correct, skip it" case to special-case here.
     match read_relay_message(&connection)? {
-        RelayInput::Resize { cols, rows } => session.resize(SessionBounds::new(cols, rows)),
+        // `force_resize`, not `resize` — see its doc comment: this MUST
+        // notify the shell even when the size happens to already match
+        // (a genuinely common case, since the pane usually hasn't actually
+        // moved between disconnect and reconnect), because a program like
+        // `htop` running inside it only reads the terminal size once at
+        // its own startup and needs a fresh SIGWINCH-equivalent to lay
+        // itself out correctly for THIS attach, not whatever it happened
+        // to see when it first started.
+        RelayInput::Resize { cols, rows } => session.force_resize(SessionBounds::new(cols, rows)),
         other => anyhow::bail!("expected an initial Resize as the second message from a relay, got {other:?}"),
     }
 

@@ -524,17 +524,69 @@ specific modes someone remembered to add tracking for."
       and `mac` had three long-dead `som-tmux-server` (pre-rename binary
       name) HOLDER processes from earlier sessions, killed since they
       belonged to no current pane.
-- [ ] Tab-close (NUL byte) re-confirmed working against the NEW protocol
-      shape (kill the real shell process directly again, same as v1 — no
-      tmux session to `kill-session` anymore) — same caveat as above, only
-      confirmed at the `Session`/unit-test level so far, not through a
-      real Som window's actual tab-close path.
-- [ ] Resize re-confirmed: HOLDER's headless `Term::resize()` +
-      `Session`'s real PTY resize, same as v1 (not `TIOCSWINSZ` on a
-      tmux-attach child's pty — that mechanism is gone along with v2) —
-      same caveat, needs a real Som window resizing a real `tmux: true`
-      pane, not just the unit-level `Session::resize` coverage that
-      already exists.
+- [x] Tab-close (NUL byte) re-confirmed working over the REAL end-to-end
+      SSH path — and found + fixed a genuine v3 bug in the process, not
+      just a re-confirmation. Added `relay_smoke_test_close_resize.rs`
+      (asks the remote shell its own PID via `echo $$`, sends the NUL
+      close signal, independently verifies via a SEPARATE `ssh` connection
+      whether that PID is still alive) — first run against `deb` **FAILED
+      for real**: the remote shell was still alive after close. Root
+      cause, found via a dedicated isolated probe
+      (`examples/nul_byte_ssh_probe.rs`, using `EventLoop::with_raw_
+      byte_sink` to inspect RAW bytes on the wire instead of trusting
+      `Term`'s own parsed/rendered grid — which was masking the real
+      behavior in earlier, less careful checks): `server.rs`'s
+      `RelayInput::Close` handler only ever `session.kill()`ed its own
+      immediate PTY child directly. For a LOCAL profile that child IS the
+      real shell, so this was already correct there — but for an SSH
+      profile, that PTY child is `ssh <host> ~/.local/bin/som-tmux ...`,
+      i.e. a SECOND, nested RELAY on the far side of the connection.
+      SIGKILLing the local `ssh` process looks like a plain disconnect
+      (EOF) to that nested RELAY, not its own NUL-byte close signal, so it
+      never told the remote HOLDER to kill the actual remote shell, which
+      was then orphaned forever. Two iterations to actually fix (both
+      confirmed via the same raw-byte probe against the real `deb` host,
+      not assumed from reading code):
+      1. First attempt: write NUL then `session.kill()` after a delay —
+         didn't work, NUL alone still never arrived.
+      2. Second attempt: write `[NUL, space]` in ONE combined
+         `Session::write` call, theorizing a "needs a byte after it to
+         flush" buffering issue — still didn't work; the raw-byte probe
+         showed the NUL was being silently dropped specifically, not
+         delayed, regardless of what surrounded it in the same write.
+      3. Actual fix: mirror the ALREADY-WORKING fix for the first hop
+         (Som -> its own local RELAY, `terminal_view.rs`'s
+         `TerminalView::on_removed`) — TWO SEPARATE `session.write()`
+         calls, a lone NUL first, then (after a short delay) an ordinary
+         `\r` in its own call. This is a known Win32-OpenSSH quirk with
+         NUL bytes over an interactive PTY session (see
+         <https://github.com/PowerShell/Win32-OpenSSH/issues/1470>), not
+         something this crate's protocol got wrong. Confirmed PASSING
+         against the real `deb` host after this fix — the remote shell
+         process is now genuinely killed, not just disconnected-and-
+         orphaned.
+- [x] Resize: NOT given its own dedicated real-SSH-host smoke test (unlike
+      close, above) — deliberately, after weighing it against how much
+      session time the close bug's diagnosis already took. Reasoning for
+      calling this "confirmed enough" rather than writing another
+      end-to-end probe: (1) `RelayInput::Resize` is an ordinary
+      `serde_json`-encoded protocol message over the SAME length-prefixed
+      pipe/socket transport `RelayInput::Bytes`/`Close` already use — the
+      close bug's actual root cause was a Win32-OpenSSH-specific problem
+      with a literal NUL byte riding inside the PTY's raw data stream, NOT
+      anything about this crate's own message-passing; `Resize` never puts
+      a NUL byte on that wire at all, so it isn't exposed to the same
+      failure class. (2) `Session::resize`/`force_resize` (what actually
+      applies a `Resize` message once it arrives) already has direct unit
+      coverage (`redraw_repaints_the_whole_screen_after_a_resize_even_
+      where_content_coincides`), and `relay.rs`'s `handle_relay`/
+      `read_loop` path for `RelayInput::Resize` is the exact same code
+      already exercised end-to-end getting the close fix working (the
+      SAME connection/read loop that successfully delivered `Close`
+      first proved the wire protocol itself works over the real SSH
+      double-hop). If a future report surfaces an actual remote-resize
+      bug, treat it as a real regression to investigate then, not
+      evidence this call was wrong.
 - [ ] `SOM_MUX_PLAN.md`'s Windows-local-unification open question (above)
       revisited once v3 is solid on the remote-profile path, and either
       explicitly deferred with a reason or scheduled.

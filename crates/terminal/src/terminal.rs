@@ -2407,7 +2407,7 @@ impl Terminal {
     /// This terminal's own shell command, as it was originally spawned —
     /// exposed so callers that need to inspect (not just blindly reuse) it
     /// before cloning can do so. Notably, `terminal_view`'s `clone_on_split`
-    /// needs this to detect a `som-tmux-server`-wrapped shell (see
+    /// needs this to detect a `som-tmux`-wrapped shell (see
     /// `project_som_tmux` memory) and rebuild it with a fresh pane id rather
     /// than reusing this exact command — `clone_builder` alone always
     /// copies it byte-for-byte, which for a tmux-wrapped shell would
@@ -3704,21 +3704,21 @@ mod tests {
         );
     }
 
-    /// Finds `som-tmux-server(.exe)` next to whichever `target/debug` this
+    /// Finds `som-tmux(.exe)` next to whichever `target/debug` this
     /// test binary itself was built into — mirrors
-    /// `terminal_view::terminal_panel::som_tmux_server_binary_path`'s own
+    /// `terminal_view::terminal_panel::som_tmux_binary_path`'s own
     /// resolution logic (that one looks next to `som.exe`; this one looks
     /// next to `target/debug/deps/terminal-<hash>.exe`, one directory
     /// shallower, since `cargo test` binaries live in `deps/` while
     /// `cargo build`'s bin targets land directly in `target/debug/`).
     /// Returns `None` (causing the test to skip, not fail) if the binary
-    /// hasn't been built yet — this test exercises the REAL som-tmux-server
+    /// hasn't been built yet — this test exercises the REAL som-tmux
     /// binary as an external process (deliberately, since the whole point is
     /// testing the wire protocol between a real `Terminal`'s PTY and it),
     /// not something `cargo test` builds automatically as a dependency.
-    fn find_som_tmux_server_binary() -> Option<std::path::PathBuf> {
+    fn find_som_tmux_binary() -> Option<std::path::PathBuf> {
         let test_exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let binary_name = if cfg!(target_os = "windows") { "som-tmux-server.exe" } else { "som-tmux-server" };
+        let binary_name = if cfg!(target_os = "windows") { "som-tmux.exe" } else { "som-tmux" };
         for candidate_dir in [test_exe_dir.clone(), test_exe_dir.parent()?.to_path_buf()] {
             let candidate = candidate_dir.join(binary_name);
             if candidate.is_file() {
@@ -3736,7 +3736,7 @@ mod tests {
     /// `feedback_gpui_test_framework_priority` memory for why this is the
     /// preferred way to test Som's UI-adjacent logic).
     ///
-    /// Spawns a REAL `som-tmux-server` RELAY (as this `Terminal`'s own
+    /// Spawns a REAL `som-tmux` RELAY (as this `Terminal`'s own
     /// shell command, exactly like a `tmux: true` profile does), lets it
     /// spawn its own detached HOLDER, then writes a single NUL byte via
     /// `Terminal::input` — the same call `on_removed` makes — and asserts
@@ -3749,8 +3749,8 @@ mod tests {
     async fn test_nul_byte_signals_tmux_relay_to_close_for_good(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let Some(server_path) = find_som_tmux_server_binary() else {
-            eprintln!("skipping: som-tmux-server binary not built, run `cargo build -p som_tmux_server` first");
+        let Some(server_path) = find_som_tmux_binary() else {
+            eprintln!("skipping: som-tmux binary not built, run `cargo build -p som_tmux` first");
             return;
         };
 
@@ -3774,7 +3774,7 @@ mod tests {
         // GPUI's deterministic test executor, which fast-forwards its own
         // timers instantly rather than sleeping wall-clock time (there's
         // nothing else scheduled on it to make waiting on it meaningful).
-        // The real `som-tmux-server` RELAY/HOLDER pair are genuine external
+        // The real `som-tmux` RELAY/HOLDER pair are genuine external
         // OS processes running on real wall-clock time regardless, so
         // waiting on them requires actually blocking this thread — safe
         // here only because `cx.executor().allow_parking()` was called
@@ -3806,11 +3806,11 @@ mod tests {
         // NOT `paths::logs_dir()` — under `cfg!(test)`,
         // `util::paths::home_dir()` is hardcoded to a fake `C:\Users\zed`
         // fixture home (test isolation, so tests never touch the real
-        // user's actual home directory), but the `som-tmux-server.exe`
+        // user's actual home directory), but the `som-tmux.exe`
         // child process spawned above is a separate, non-test binary that
         // has no such override and logs to the REAL home directory. This
         // test needs to read what that real child process actually wrote,
-        // so it computes the log path the same way `som_tmux_server::main`
+        // so it computes the log path the same way `som_tmux::main`
         // does when not built under `cfg!(test)` — via `dirs::home_dir()`
         // directly.
         let real_home = dirs::home_dir().expect("failed to determine home directory");
@@ -3818,7 +3818,7 @@ mod tests {
             .join(".config")
             .join("som")
             .join("logs")
-            .join(format!("som-tmux-server-{profile_name}-{pane_id}-holder.log"));
+            .join(format!("som-tmux-{profile_name}-{pane_id}-holder.log"));
         let mut holder_log = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3838,7 +3838,7 @@ mod tests {
             .join(".config")
             .join("som")
             .join("logs")
-            .join(format!("som-tmux-server-{profile_name}-{pane_id}-relay.log"));
+            .join(format!("som-tmux-{profile_name}-{pane_id}-relay.log"));
         let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
             log_contents.contains("holder handshake"),
@@ -3861,7 +3861,7 @@ mod tests {
     /// code and assuming).
     ///
     /// `#[ignore]`d by default: needs a real, reachable SSH host with
-    /// `~/.local/bin/som-tmux-server` already built there (this test does
+    /// `~/.local/bin/som-tmux` already built there (this test does
     /// NOT deploy it — see `ensure_remote_binary_deployed` in
     /// `terminal_panel.rs` for that, which is Som's own production path, not
     /// this test's job) and its log files live on THAT machine, not
@@ -3875,7 +3875,7 @@ mod tests {
         cx.executor().allow_parking();
 
         // Overridable via env var so this same test can be pointed at any
-        // reachable SSH host with `~/.local/bin/som-tmux-server` already
+        // reachable SSH host with `~/.local/bin/som-tmux` already
         // built there (Mac, deb, pi5, ...) without editing this file each
         // time — defaults to the Mac used when this test was first written.
         let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.6".to_string());
@@ -3884,7 +3884,7 @@ mod tests {
 
         // Mirrors `wrap_remote_command_args`'s exact argv shape: the ssh
         // host/flags first, then the remote-side command appended after —
-        // `ssh <host> ~/.local/bin/som-tmux-server <profile> <pane-id>
+        // `ssh <host> ~/.local/bin/som-tmux <profile> <pane-id>
         // $SHELL --cursor-shape ...`, letting the remote login shell expand
         // `$SHELL` to whatever the remote user's default shell is.
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
@@ -3892,7 +3892,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/som-tmux-server".to_string(),
+                "~/.local/bin/som-tmux".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "$SHELL".to_string(),
@@ -3962,7 +3962,7 @@ mod tests {
         'outer: for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             for dir in candidate_log_dirs {
-                let holder_log_path = format!("{dir}/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+                let holder_log_path = format!("{dir}/som-tmux-{profile_name}-{pane_id}-holder.log");
                 let output = std::process::Command::new("ssh").args([&ssh_host, "cat", &holder_log_path]).output();
                 let content = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
                 if content.contains("shell process exited, holder shutting down") {
@@ -3978,10 +3978,393 @@ mod tests {
              RelayInput::Close — got remote holder log: {holder_log:?}"
         );
 
-        let holder_log_path = format!("{holder_log_dir}/som-tmux-server-{profile_name}-{pane_id}-holder.log");
+        let holder_log_path = format!("{holder_log_dir}/som-tmux-{profile_name}-{pane_id}-holder.log");
         std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &holder_log_path]).output().ok();
-        let relay_log_path = format!("{holder_log_dir}/som-tmux-server-{profile_name}-{pane_id}-relay.log");
+        let relay_log_path = format!("{holder_log_dir}/som-tmux-{profile_name}-{pane_id}-relay.log");
         std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &relay_log_path]).output().ok();
+    }
+
+    /// Regression test for a real user report ("не работают F-клавиши в
+    /// терминалах wsl/ssh" — F-keys and other special keys don't work in
+    /// tmux-wrapped wsl/ssh terminals): sends the EXACT byte sequences
+    /// `mappings::keys::to_esc_str` generates for a representative set of
+    /// special keys (F1-F12, arrows, Home/End, Insert/Delete, Tab,
+    /// Backspace, a Ctrl-letter combo) through a real tmux RELAY/HOLDER
+    /// pair over a real SSH tunnel, and confirms each one arrives at the
+    /// remote shell byte-for-byte unmangled.
+    ///
+    /// Uses `cat -v` (with the remote pty put into raw, non-canonical mode
+    /// via `stty raw -echo` first, so `cat` sees each byte immediately
+    /// rather than only after a line's worth arrives) as the "remote
+    /// shell" — `-v` prints control/escape bytes in caret notation (e.g.
+    /// `\x1bOP` becomes the literal text `^[OP`), which is easy to match
+    /// against without needing to parse real ANSI back out of the
+    /// terminal's own already-parsed screen grid.
+    ///
+    /// This test doesn't (yet) pin down WHY any particular key fails if it
+    /// does — see `strip_cr_induced_lf`/the NUL-byte-as-Close-signal check
+    /// in `som_tmux::relay::run`'s stdin loop, both of which
+    /// inspect raw bytes and are the most likely place an escape sequence
+    /// could get mangled — but it gives a fast, repeatable way to check
+    /// the full RELAY/HOLDER pipeline against every key at once, on a real
+    /// remote host, without a human touching a real keyboard.
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_remote_tmux_forwards_special_keys_unmangled(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.6".to_string());
+        let pane_id = format!("test-keys-{}", std::process::id());
+        let profile_name = "test-keys";
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "ssh".to_string(),
+            vec![
+                ssh_host.clone(),
+                "~/.local/bin/som-tmux".to_string(),
+                profile_name.to_string(),
+                pane_id.clone(),
+                "bash".to_string(),
+                "-c".to_string(),
+                "'stty raw -echo;exec stdbuf -o0 cat -v'".to_string(),
+                "--cursor-shape".to_string(),
+                "block".to_string(),
+            ],
+        )
+        .await;
+
+        std::thread::sleep(std::time::Duration::from_secs(4));
+
+        // (key name for the failure message, the exact bytes `to_esc_str`
+        // produces, what `cat -v` prints for those bytes). Covers every
+        // "manual" special-key mapping family in `mappings::keys::
+        // to_esc_str` — F-keys via both the `\x1bO_` (F1-F4) and `\x1b[N~`
+        // (F5+) shapes, arrows, Home/End, Insert/Delete, Tab, Backspace,
+        // and a Ctrl-letter combo — not an exhaustive list of every single
+        // key it maps, which would make this test unwieldy without adding
+        // real coverage beyond what these representative shapes already
+        // exercise.
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("F1", b"\x1bOP", "^[OP"),
+            ("F4", b"\x1bOS", "^[OS"),
+            ("F5", b"\x1b[15~", "^[[15~"),
+            ("F12", b"\x1b[24~", "^[[24~"),
+            ("Up (app cursor off)", b"\x1b[A", "^[[A"),
+            ("Home (app cursor off)", b"\x1b[H", "^[[H"),
+            ("Insert", b"\x1b[2~", "^[[2~"),
+            ("Delete", b"\x1b[3~", "^[[3~"),
+            ("Tab", b"\x09", "^I"),
+            ("Backspace", b"\x7f", "^?"),
+            ("Ctrl-A", b"\x01", "^A"),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, bytes, expected_marker) in cases {
+            // NOT a `before.len() < seen.len()` comparison — `get_content()`
+            // returns the WHOLE fixed-size screen grid (padded with blank
+            // spaces/newlines to the pane's actual rows/cols), so printing
+            // new characters typically overwrites existing blank cells IN
+            // PLACE rather than growing the string at all. The only
+            // reliable check is whether the expected marker text showed up
+            // somewhere that wasn't there before.
+            let before = terminal.update(cx, |term, _| term.get_content());
+            terminal.update(cx, |terminal, _cx| {
+                terminal.input(bytes.to_vec());
+            });
+            cx.run_until_parked();
+
+            let mut seen = String::new();
+            let mut arrived = false;
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                seen = terminal.update(cx, |term, _| term.get_content());
+                if seen.contains(expected_marker) && !before.contains(expected_marker) {
+                    arrived = true;
+                    break;
+                }
+            }
+            if !arrived {
+                failures.push(format!(
+                    "{name}: sent {bytes:?}, expected {expected_marker:?} to show up via `cat -v` — got screen: {seen:?}"
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "special keys failed to arrive unmangled through the ssh-remote tmux RELAY/HOLDER pipeline:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Regression test for a real user report ("F-клавиши не работают в
+    /// терминалах wsl" — F2 specifically, confirmed against a real `htop`
+    /// on WSL: pressing F2 printed the literal text `^[OQ` onto the screen
+    /// instead of opening htop's Setup screen). Runs the EXACT same
+    /// `wsl.exe`-fronted tmux path a real `tmux: true` "wsl" profile uses
+    /// (`RemoteKind::Wsl` in `terminal_view::terminal_panel`), with `htop`
+    /// itself as the wrapped program — as close to the real, reported
+    /// failure as a headless test gets.
+    ///
+    /// `#[ignore]`d by default: needs WSL installed with
+    /// `~/.local/bin/som-tmux` already built there, and `htop`
+    /// installed inside that WSL distro. Run explicitly with:
+    /// `cargo test -p terminal test_wsl_htop_f2_opens_setup_screen -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_wsl_htop_f2_opens_setup_screen(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let pane_id = format!("test-wsl-f2-{}", std::process::id());
+        let profile_name = "test-wsl-f2";
+
+        // Mirrors `wrap_remote_command_args`'s exact argv shape for a
+        // `wsl`-classified profile: `wsl.exe --cd ~ -- ~/.local/bin/
+        // som-tmux <profile> <pane-id> htop ...` — `RemoteKind::Wsl`
+        // is matched on the program name being `wsl`/`wsl.exe` (see
+        // `classify_remote`), same remote-command-appending path as ssh.
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "wsl.exe".to_string(),
+            vec![
+                "--cd".to_string(),
+                "~".to_string(),
+                "--".to_string(),
+                "~/.local/bin/som-tmux".to_string(),
+                profile_name.to_string(),
+                pane_id.clone(),
+                "htop".to_string(),
+                "--cursor-shape".to_string(),
+                "block".to_string(),
+            ],
+        )
+        .await;
+
+        // Wait for htop's own real screen to render — its header shows
+        // "Tasks:" unconditionally.
+        let mut ready = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let content = terminal.update(cx, |term, _| term.get_content());
+            if content.contains("Tasks:") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "htop's own header never appeared after 15s through the wsl tmux pipeline — test setup problem");
+
+        // F2, exactly as `mappings::keys::to_esc_str` generates it.
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(b"\x1bOQ".to_vec());
+        });
+        cx.run_until_parked();
+
+        let mut seen = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            seen = terminal.update(cx, |term, _| term.get_content());
+            if seen.contains("Setup") || seen.contains("OQ") {
+                break;
+            }
+        }
+
+        assert!(
+            !seen.contains("OQ"),
+            "F2's escape sequence leaked onto the screen as literal text instead of being consumed \
+             by htop as the F2 keypress through the real wsl tmux RELAY/HOLDER pipeline — this is \
+             the exact reported bug. Got screen: {seen:?}"
+        );
+        assert!(
+            seen.contains("Setup") || seen.contains("Display options") || seen.contains("Meters"),
+            "F2 should have opened htop's Setup screen through the wsl tmux pipeline — got screen: {seen:?}"
+        );
+    }
+
+    /// Same as `test_wsl_htop_f2_opens_setup_screen`, but over a real SSH
+    /// connection instead of `wsl.exe` — verifies the new `tmux_backend`
+    /// module (see `SOM_MUX_PLAN.md`'s "som-tmux v2" section) against the
+    /// `RemoteKind::Ssh` path specifically, on a real reachable host with
+    /// the new tmux-wrapping `som-tmux` binary already built there.
+    ///
+    /// `#[ignore]`d by default. Run explicitly with:
+    /// `SOM_TEST_SSH_HOST=<host> cargo test -p terminal test_ssh_tmux_backend_htop_f2_opens_setup_screen -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_tmux_backend_htop_f2_opens_setup_screen(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let pane_id = format!("test-ssh-tmuxv2-f2-{}", std::process::id());
+        let profile_name = "test-ssh-tmuxv2-f2";
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "ssh".to_string(),
+            vec![
+                ssh_host.clone(),
+                "~/.local/bin/som-tmux".to_string(),
+                profile_name.to_string(),
+                pane_id.clone(),
+                "htop".to_string(),
+                "--cursor-shape".to_string(),
+                "block".to_string(),
+            ],
+        )
+        .await;
+
+        let mut ready = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let content = terminal.update(cx, |term, _| term.get_content());
+            if content.contains("Tasks:") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "htop's own header never appeared after 15s through the ssh tmux_backend pipeline — test setup problem");
+
+        // A LONE escape sequence in one isolated `input()` call has been
+        // confirmed (separately, for the old architecture, but the
+        // underlying transport is identical here) to sometimes vanish
+        // between Som's ConPTY and a remote RELAY's stdin — a harmless
+        // follow-up byte in a SEPARATE call reliably makes the first one
+        // arrive too. Sending both defensively here since this test's job
+        // is to check tmux_backend's OWN correctness, not re-litigate that
+        // already-understood transport quirk.
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(b"\x1bOQ".to_vec());
+        });
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![b' ']);
+        });
+        cx.run_until_parked();
+
+        let mut seen = String::new();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            seen = terminal.update(cx, |term, _| term.get_content());
+            if seen.contains("Setup") || seen.contains("OQ") {
+                break;
+            }
+        }
+
+        assert!(
+            !seen.contains("OQ"),
+            "F2's escape sequence leaked onto the screen as literal text instead of being consumed \
+             by htop through the new tmux_backend pipeline — got screen: {seen:?}"
+        );
+        assert!(
+            seen.contains("Setup") || seen.contains("Display options") || seen.contains("Meters"),
+            "F2 should have opened htop's Setup screen through the new tmux_backend pipeline — got screen: {seen:?}"
+        );
+    }
+
+    /// Fast sanity check for `tmux_backend` — deliberately simpler than
+    /// the F2/htop test, to isolate whether basic text I/O through the
+    /// new pipeline is clean BEFORE chasing htop/F2-specific symptoms.
+    /// Checks: (1) a plain typed command echoes back correctly with no
+    /// corruption, (2) the NUL-byte tab-close signal actually reaches
+    /// `tmux_backend::run` and kills the real tmux session (confirmed by
+    /// polling the remote host's own `tmux has-session` over a second ssh
+    /// call, not just trusting the local `Terminal` dropped cleanly).
+    ///
+    /// `#[ignore]`d by default. Run explicitly with:
+    /// `SOM_TEST_SSH_HOST=<host> cargo test -p terminal test_ssh_tmux_backend_basic_io_and_close -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_tmux_backend_basic_io_and_close(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let pane_id = format!("test-tmuxv2-basic-{}", std::process::id());
+        let profile_name = "test-tmuxv2-basic";
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "ssh".to_string(),
+            vec![ssh_host.clone(), "~/.local/bin/som-tmux".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+        )
+        .await;
+
+        // Wait for a real bash prompt — NOT a `$`-suffix check (this host's
+        // shell has a custom PS1, confirmed via `tmux capture-pane`: just
+        // `~` with no `$`), so instead wait for ANY non-blank content to
+        // show up at all, which is enough to know the shell is actually
+        // ready to receive input.
+        let mut ready = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let content = terminal.update(cx, |term, _| term.get_content());
+            if content.trim().len() > 1 {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "bash prompt never appeared after 15s through the tmux_backend pipeline — test setup problem");
+
+        // Plain echo command, byte by byte then Enter — same style as this
+        // file's other "does typed text arrive uncorrupted" tests.
+        let command = "echo SANITY_CHECK_MARKER_12345\r";
+        for byte in command.bytes() {
+            terminal.update(cx, |terminal, _cx| {
+                terminal.input(vec![byte]);
+            });
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut echoed = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            echoed = terminal.update(cx, |term, _| term.get_content());
+            if echoed.matches("SANITY_CHECK_MARKER_12345").count() >= 2 {
+                break; // once for the typed command itself, once for its own echoed output
+            }
+        }
+        assert!(
+            echoed.matches("SANITY_CHECK_MARKER_12345").count() >= 2,
+            "plain typed text should echo back uncorrupted (typed once, echoed by `echo` once) \
+             through the tmux_backend pipeline — got screen: {echoed:?}"
+        );
+
+        // Tab-close signal: a lone NUL byte, mirroring `TerminalView::
+        // on_removed` exactly (including its follow-up-byte workaround —
+        // see that function's doc comment for why the second call exists).
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![0u8]);
+        });
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![b'\r']);
+        });
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(terminal);
+
+        let mut session_gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let output = std::process::Command::new("ssh")
+                .args([&ssh_host, "tmux", "-f", "/home/dnk/.config/som/som-tmux.conf", "has-session", "-t", &pane_id])
+                .output();
+            if output.map(|o| !o.status.success()).unwrap_or(false) {
+                session_gone = true;
+                break;
+            }
+        }
+        assert!(
+            session_gone,
+            "tab-close (NUL byte) should have killed the real tmux session {pane_id:?} on the remote host, \
+             but `tmux has-session` still reports it alive after 10s"
+        );
     }
 
     mod perf {

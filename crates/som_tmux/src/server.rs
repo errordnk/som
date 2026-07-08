@@ -15,8 +15,8 @@
 use crate::bounds::SessionBounds;
 use crate::redraw::Redrawer;
 use crate::session::Session;
-use som_tmux_server::pipe::{self, PipeConnection};
-use som_tmux_server::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
+use som_tmux::pipe::{self, PipeConnection};
+use som_tmux::protocol::{HandshakeInfo, HolderOutput, RelayInput, pipe_name};
 use std::sync::{Arc, Mutex};
 
 /// Runs as the HOLDER for `profile_name`/`pane_id`: spawns `program`/`args`

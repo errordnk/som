@@ -1,32 +1,48 @@
 # Som Multiplexer — Plan
 
-## Status (2026-07-06)
+## Status (2026-07-09)
 
-The original version of this plan proposed a separate `crates/som_mux/`
-crate with its own `SomLayout` enum (`Single/SplitH/SplitV/SplitH3/Quad`).
-That was never built. What actually shipped instead — directly inside
-`crates/workspace/src/workspace.rs` and `crates/terminal_view/src/terminal_panel.rs`
-— is simpler and already working:
+Tabs/splits/db.json restore (the "Core Concepts" / "Persistence" /
+"Keybindings" sections below) are unchanged and already shipped — see those
+sections for the real, working design.
 
-- Tabs are plain `Workspace` main-pane items (no separate tab data structure).
-- Each tab can have up to **3 extra split panes** (4 panes total: main + 3),
-  tracked in `Workspace::som_split_panes: Vec<WeakEntity<Pane>>` and
-  `som_level_locked: [bool; 3]`. Split directions are fixed:
-  `[Right, Down, Right]` (level 0 splits right, level 1 splits that pane down,
-  level 2 splits that pane right again) — not a freeform grid.
-- Switching tabs parks the current tab's splits (`som_parked_splits`) and
-  unparks the target tab's, rather than destroying/recreating panes.
-- Persistence is a flat `~/.config/som/db.json`, not a `session.json` with
-  the shape this doc originally proposed. See "Persistence" below for the
-  real schema.
-- `TabProfile` (`crates/workspace/src/workspace.rs:443`) has 5 fields:
-  `name`, `shell: Option<String>`, `keystroke`, `icon`, `working_dir`.
+**`som-tmux` is on its THIRD architecture.** Two previous designs were
+built, tested against real terminal apps, and abandoned for concrete,
+confirmed reasons:
 
-The old "SSH Reconnect After Disconnect" design sketch that used to live in
-this doc has been **superseded entirely** by `som-tmux` (below) — a real
-detached PTY server that survives Som closing, rather than a reconnect-retry
-layer bolted onto a plain PTY. That old section is gone; this doc now covers
-what's actually being built.
+1. **v1 — from-scratch ANSI-diff proxy** (HOLDER owns a real
+   `alacritty_terminal::Term`, `redraw.rs` diffs it against a
+   last-painted-cell cache and replays minimal ANSI to the RELAY,
+   reimplementing tmux's own `tty.c` model from scratch). Abandoned:
+   diffing visible grid content structurally cannot carry anything that
+   ISN'T content — terminal modes (DECCKM), Device Attributes queries,
+   etc. — so real full-screen apps kept surfacing new categories of bugs.
+2. **v2 — thin wrapper around a real, installed `tmux` binary** (RELAY
+   execs `tmux attach-session`, HOLDER just ensures a detached tmux
+   session exists). Abandoned: confirmed via direct testing that this
+   architecture has TWO terminal emulators in the round-trip (tmux's own,
+   plus Som's own `alacritty_terminal::Term` upstream of it) — both
+   answering mode/identification queries independently — which corrupted
+   plain typed text with garbled escape-sequence fragments, not just
+   htop/F2. This is a KNOWN, already-documented failure mode: see
+   <https://github.com/zed-industries/zed/discussions/50584>, where a
+   Zed contributor (`@dsturnbull`) explicitly rejected embedding tmux for
+   exactly this reason ("double terminal emulation ... incompatibilities
+   with less common escape sequences").
+3. **v3 (current) — headless `alacritty_terminal::Term` + serde
+   snapshot/restore**, see below. This is what that same `dsturnbull`
+   discussion/prototype landed on instead of tmux, and it maps closely
+   onto our OWN v1 design's actual shape (a HOLDER-side `Term` tracking
+   real state) — just fixing v1's actual flaw (replaying only visible
+   content) by sending the terminal's full, already-parsed STATE instead
+   of diffing bytes. Sources:
+   - Discussion/RFC: <https://github.com/zed-industries/zed/discussions/50584>
+   - Prototype daemon (Apache-2.0): <https://github.com/dsturnbull/pty-host>
+   - `alacritty_terminal` fork adding `Term::snapshot()`/`Term::restore()`:
+     <https://github.com/dsturnbull/alacritty> (the specific, isolated
+     commit this borrows from is `36fd512f` — see "Where snapshot/restore
+     comes from" below; the rest of that fork's history, an unrelated
+     zstd scrollback-compression feature, is NOT used here).
 
 ---
 
@@ -82,8 +98,11 @@ what's actually being built.
     ssh-MOTD duplication bug (see below).
   - The saved active split pane is restored via
     `Workspace::som_focus_pane_by_index`.
-- **Will be extended** for `som-tmux` tabs with a per-panel session-id field
-  (see below) — not yet implemented.
+- Per-pane tmux session tracking: `Workspace::som_tab_tmux_sessions:
+  HashMap<EntityId, Vec<String>>`, one `pane_id` (a UUID Som itself
+  generates, used as the real tmux session name — see below) per pane in
+  that tab. Populated via `set_tmux_sessions_for_item`, persisted through
+  `som_persist_tab_state`/`som_persist_db_json`.
 
 ### Bugs fixed during db.json rollout (2026-07-02), kept here for context
 - **Tab order / wrong split content after restore**: fixed by matching
@@ -121,215 +140,164 @@ no default keybinding.
 
 ---
 
-## som-tmux — detached PTY server (in progress)
+## som-tmux v3 — headless `alacritty_terminal::Term` + serde snapshot/restore (in progress, 2026-07-09)
 
-### Why
+### Where snapshot/restore comes from
 
-Even with tabs/splits/db.json restore working, a process in a pane still
-dies when Som closes: restore re-spawns the *same command* on next launch
-(new PID, no continuity), it doesn't reattach to a still-running one. E.g. a
-`ping google.com` running in a pane does not survive closing Som via the X
-button or Alt+F4 — restore just runs `ping google.com` again from scratch.
+Borrowed from `dsturnbull/alacritty`'s isolated commit `36fd512f`
+(<https://github.com/dsturnbull/alacritty/commit/36fd512f>), NOT the rest
+of that fork's history — the fork also contains ~9 unrelated commits
+adding zstd-based scrollback compression (a real feature, but a separate
+concern this project doesn't need). `36fd512f` alone is 420 lines: a new
+`alacritty_terminal/src/term/serialize.rs` (345 lines, self-contained) plus
+small additions to `term/mod.rs` (+35: `Term::snapshot()`/`Term::restore()`)
+and `grid/mod.rs` (+4/-2: makes `Cursor<T>` serde-serializable, which was
+previously explicitly skipped).
 
-`som-tmux` fixes this properly: for tabs whose profile opts in, the actual
-PTY/shell process lives in a **separate, detached server process** that
-outlives Som's own window. Closing/reopening a tab reattaches to it instead
-of respawning. This is deliberately *not* full tmux (no tmux panes, splits,
-or keybindings are reused — Som has its own for all of that) — only the
-server/session-survival part is our own, built from scratch (evaluated
-reusing an existing Windows tmux port, `psmux` — not viable: no separable
-server crate, no documented/stable wire protocol, would mean vendoring an
-actively-changing external codebase).
+Confirmed compatible with our fork before committing to this: our
+`alacritty_terminal` pin (`zed-industries/alacritty` at `fcf32feacb367b`)
+is 37 commits AHEAD of `dsturnbull`'s fork's base (their fork branched
+earlier), but `grid/mod.rs`'s existing `#[cfg(feature = "serde")]`
+infrastructure is IDENTICAL in both — same lines, same `serde(skip)`
+pattern the patch modifies — so this is expected to cherry-pick cleanly
+rather than needing a from-scratch reimplementation.
 
-### Activation
+`TermState` (the snapshot struct) captures: both grid buffers (active +
+inactive, i.e. covers alt-screen), cursor position/template, and —
+critically, this is the part that actually fixes v1's flaw — **the full
+`TermMode` bitflags** (`mode_bits: u32`, not a hand-picked subset like
+v1's `ALT_SCREEN`-only-then-`APP_CURSOR`-added-later approach). Restoring
+`mode_bits` directly onto the client's own `Term` means DECCKM, Device
+Attributes negotiation state, and anything else `TermMode` tracks are ALL
+correct after every reconnect, by construction — not "correct for the
+specific modes someone remembered to add tracking for."
 
-A tab's profile in `settings.json` opts in with `"tmux": true` (default
-`false` — must be explicit). Applies to **all** panes in that tab (main +
-up to 3 splits).
+### Architecture
 
-**Guiding goal for the whole feature**: maximum context restoration across
-all panes on Som restart, at maximum zero-config. Both matter equally —
-where they conflict (e.g. fully recovering a session after the remote
-server machine itself rebooted would require root access there to
-auto-restart the server), zero-config wins; that specific case falls back
-to plain new-session creation instead (see health-check, below).
+- **HOLDER** (long-lived, detached, survives Som restart — same role as
+  v1/v2's HOLDER):
+  1. Owns a REAL PTY + the real shell process (same
+     `alacritty_terminal::tty` usage v1's `session.rs` already had — this
+     part of v1 was never the problem, only `redraw.rs`'s diffing was).
+  2. ALSO owns a headless `Term<VoidListener>` (mirrors v1's `Session`
+     having a `Term`, and mirrors `pty-host`'s `headless.rs`) that
+     consumes every byte read from the real PTY through the normal
+     `ansi::Processor::advance` path — so the HOLDER's own `Term` is
+     always a fully accurate, live mirror of the real shell's terminal
+     state, same as v1.
+  3. On a RELAY (re)connecting: calls `term.snapshot()`, serializes with
+     bincode, sends it as ONE message — not a stream of ANSI bytes trying
+     to reproduce the screen, and not tmux's own control-mode protocol.
+  4. After the initial snapshot, forwards live PTY output to the RELAY
+     as an "apply these bytes to your own `Term`" message — same shape
+     as v1's incremental updates, but the RELAY applies them by feeding
+     its OWN local `Term` (see below), not by interpreting an already-
+     diffed byte stream `redraw.rs` produced.
+- **RELAY** (short-lived, Som's own PTY child, same role as v1/v2):
+  1. Connects to (or spawns) the HOLDER, same as v1.
+  2. On the initial snapshot message: `bincode::deserialize::<TermState>`,
+     then `term.restore(state)` on ITS OWN local `Term` — instantly
+     correct grid + cursor + full mode flags, no ANSI replay.
+  3. From then on, feeds subsequent HOLDER->RELAY bytes through the SAME
+     `ansi::Processor::advance` path any normal (non-tmux) Som terminal
+     already uses — this `Term` IS what Som's own `TerminalView` renders,
+     so there's no "translate holder's diff back into something
+     TerminalView understands" step at all once the snapshot has landed.
+  4. Keystrokes/resize continue to flow RELAY -> HOLDER -> real PTY,
+     same direction as v1/v2.
+- **Protocol**: two message shapes cover everything — `Snapshot(Vec<u8>)`
+  (bincode-encoded `TermState`, sent once per connect/reconnect) and
+  `Bytes(Vec<u8>)` (raw PTY output, sent continuously afterward). No
+  `RelayInput::Resize`/`HolderOutput::ShellExited`-style enumeration
+  needed beyond what v1 already had for the non-content-diffing parts
+  (resize, close) — only the CONTENT-carrying message shape changes.
+- **What v1 code survives essentially unchanged**: `session.rs`'s real
+  PTY/shell ownership, the pipe transport (`pipe.rs`), the NUL-byte
+  tab-close convention, resize forwarding. **What goes away**: `redraw.rs`
+  entirely (grid-diffing, `Redrawer`, per-cell last-painted-state
+  tracking) — replaced by `term.snapshot()`/`term.restore()`, which
+  `alacritty_terminal` itself now does the work for.
+- **What v2 code goes away entirely**: `tmux_backend.rs`, the
+  `<minimal.conf>` tmux config, `nix::pty::openpty`-based
+  attach-session-over-a-real-pty plumbing, the `tmux`-installed-on-remote-
+  host requirement and its settings-validation/fallback design (all of
+  v2's open questions 1-7 in the prior version of this doc are now moot —
+  not carried forward).
+- **Windows-local case**: unlike v2 (which needed a permanent separate
+  path for Windows since real tmux has no Windows PTY port), v3's
+  `alacritty_terminal::Term`-based approach is PLATFORM-AGNOSTIC — the
+  same HOLDER/RELAY snapshot/restore design can apply to the Windows-local
+  profile too, once implemented. Whether to actually unify the local-
+  Windows path onto v3 (retiring the CURRENT Windows-only HOLDER/RELAY
+  code, which already works and was never buggy) or leave it alone since
+  it isn't broken is an open question, not decided yet — no urgency
+  either way since it isn't blocking anything.
 
-The `tmux` field stays in the config schema permanently — what changes over
-time is its **default**, not its existence. Right now it's an explicit
-opt-in (`false` by default, must write `"tmux": true`). The long-term goal
-is for the default to flip to `true` — tmux behavior on for every profile
-with zero config needed — while the field remains available as an explicit
-**opt-out** (`"tmux": false`) for anyone who wants the plain direct-PTY path
-for a specific profile. The only *automatic* (non-user-driven) fallback to
-the plain path is on setups where `som-tmux-server` genuinely can't be run
-at all (silent, no user action needed). So: the requirement to *write* the
-setting to get tmux behavior disappears; the setting itself does not.
+### Implementation checklist
 
-### Where the server actually runs — real tmux semantics, not "Windows-only helper"
+- [x] Renamed the crate/binary from `som_tmux_server`/`som-tmux-server` to
+      `som_tmux`/`som-tmux` (dropping "server" — the crate now covers both
+      RELAY and HOLDER roles, "server" was never an accurate name for the
+      RELAY half). `crates/som_tmux_server/` -> `crates/som_tmux/` via
+      `git mv`; every `use som_tmux_server::...`, `~/.local/bin/som-tmux-
+      server` deploy path, log-file naming
+      (`som-tmux-server-<profile>-<pane>-<role>.log` ->
+      `som-tmux-<profile>-<pane>-<role>.log`), and doc-comment reference
+      updated across `crates/terminal_view/src/terminal_panel.rs`,
+      `crates/terminal/src/terminal.rs`, `crates/workspace/`,
+      `crates/zed/src/som_config.rs`. Confirmed building clean
+      (`cargo build -p som_tmux`, `cargo build -p som`) and existing tests
+      still passing. **NOT yet re-deployed to WSL/Mac/deb** — those still
+      have the OLD `~/.local/bin/som-tmux-server` binary; the NEXT deploy
+      to each needs `mv ~/.local/bin/som-tmux-server ~/.local/bin/som-tmux`
+      (or a fresh build+copy under the new name) or `tmux: true` profiles
+      on those hosts will fail to find their binary.
+- [ ] Fork `zed-industries/alacritty` under our own account/org; cherry-pick
+      `36fd512f` (serialize.rs + term/mod.rs + grid/mod.rs changes) onto our
+      current pin (`fcf32feacb367b`); confirm it builds and its own tests
+      (`grid_serde_round_trip` and friends) pass.
+- [ ] Update `Cargo.toml`'s `alacritty_terminal` git dependency to point at
+      the new fork/rev; confirm the whole workspace still builds
+      (`cargo build -p som` etc.) with no regressions from the cherry-pick.
+- [ ] Delete `crates/som_tmux/src/tmux_backend.rs` and the
+      `<minimal.conf>` writing logic — the v2 architecture in full.
+- [ ] Delete `crates/som_tmux/src/redraw.rs` and its test suite —
+      the v1 diffing logic — replacing its role with `term.snapshot()`/
+      `term.restore()` calls in `server.rs`/`relay.rs`.
+- [ ] Add `Snapshot(Vec<u8>)` to the protocol (`protocol.rs`), replacing
+      the old `HolderOutput::Bytes`-as-full-redraw-on-connect usage; keep
+      (or reintroduce, now bincode-encoded rather than ANSI) a `Bytes`
+      variant for the ongoing stream after the initial snapshot.
+- [ ] HOLDER (`server.rs`): own a headless `Term<VoidListener>` fed by the
+      real PTY's output (mirrors `pty-host`'s `headless.rs`); on new RELAY
+      connection, `term.snapshot()` -> bincode -> `Snapshot` message before
+      anything else.
+- [ ] RELAY (`relay.rs`): on receiving `Snapshot`, deserialize + `term.
+      restore()` onto its own local `Term` (the same one `Terminal`'s own
+      rendering already reads); confirm this actually removes the need for
+      RELAY to have ever run its own ANSI-diff/redraw logic at all.
+- [ ] Re-run (and expect to newly PASS, this time for real) the F2/htop
+      regression test — `test_ssh_tmux_backend_htop_f2_opens_setup_screen`
+      style, renamed for v3 — against a real remote host.
+- [ ] Re-run the plain-text-through-the-pipeline sanity check
+      (`test_ssh_tmux_backend_basic_io_and_close`-style) to confirm the v2
+      double-emulation corruption (garbled `1c0`/`☁`-style fragments) is
+      actually gone, not just no-longer-triggered-by-this-specific-test.
+- [ ] Tab-close (NUL byte) re-confirmed working against the NEW protocol
+      shape (kill the real shell process directly again, same as v1 — no
+      tmux session to `kill-session` anymore).
+- [ ] Resize re-confirmed: HOLDER's headless `Term::resize()` +
+      `Session`'s real PTY resize, same as v1 (not `TIOCSWINSZ` on a
+      tmux-attach child's pty — that mechanism is gone along with v2).
+- [ ] Deployed and verified end-to-end on WSL, Mac, and deb.
+- [ ] `SOM_MUX_PLAN.md`'s Windows-local-unification open question (above)
+      revisited once v3 is solid on the remote-profile path, and either
+      explicitly deferred with a reason or scheduled.
 
-This is the single most important design point, revisited and corrected
-mid-implementation: **`som-tmux-server` runs on whichever machine actually
-executes the shell**, not always next to Som:
-
-- Local Windows profile (e.g. `dnk`, running `pwsh.exe`) → server runs on
-  this same Windows machine. Transport: a Windows named pipe.
-- WSL profile (`wsl --cd ~`) → server is a **separate Linux binary**,
-  running *inside* WSL. Transport to it from Windows-side Som: **not yet
-  decided** (candidates: `wsl.exe` as a transport wrapper, a TCP port
-  forwarded from WSL2 to Windows localhost).
-- SSH profiles (`ssh host`) → server is a binary built for the **remote**
-  machine's platform, running *there*, launched over the same SSH
-  connection the shell itself would have used (same idea as real tmux's
-  `ssh host tmux attach`) — not a separate direct network channel by IP.
-  - Being tested via a `loc` profile (`"shell": "ssh localhost"`) added
-    specifically to exercise the SSH transport without needing to
-    cross-compile for another OS or touch a real remote box — `ssh
-    localhost` on this same Windows machine, once its OpenSSH server
-    (`sshd` Windows service) is running.
-  - Leading transport design (not fully locked in yet): Som spawns
-    `ssh <host> som-tmux-server <profile>` as a child process and talks to
-    the server directly over that child's stdin/stdout — no named pipe on
-    the far side in this mode. Requires abstracting the pipe-connection
-    type behind a small trait/enum (`WindowsNamedPipe` vs
-    `ChildProcessStdio`, same read/write interface) and a `--stdio` launch
-    mode for the server binary.
-- Protocol itself (`ClientMessage`/`ServerMessage`, length-prefixed JSON)
-  is transport-agnostic — none of this changes `protocol.rs`, only how its
-  bytes physically move.
-
-**Deliberate divergence from real tmux**, called out explicitly because
-it's easy to "fix" this the wrong way later: real tmux runs *one server per
-user per host*. Som instead runs **one server per profile**, always — even
-if several profiles point at the exact same host (three profiles all SSHing
-to the same Mac = three independent `som-tmux-server` processes there, not
-one shared one). This avoids needing to resolve "are `mac` and
-`192.168.50.6` the same host" (hostname/IP/alias equivalence is exactly the
-kind of fragile check this design sidesteps) at the cost of some duplicate
-server processes on hosts with multiple profiles. Chosen intentionally for
-simplicity, not an oversight.
-
-**Practical rollout order**: get the Windows-local case (profile `dnk`,
-named-pipe transport) fully working end-to-end first — it already is, see
-below — before tackling WSL/SSH transports, which are meaningfully
-different problems (cross-compilation, remote spawn-and-connect).
-
-### Server core — implemented and tested (`crates/som_tmux_server/`)
-
-- Separate crate, split into a `[lib]` (transport: `pipe.rs`, `protocol.rs`
-  — the only parts Som's client side needs) and a `[[bin]]` `som-tmux-server`
-  (PTY/session internals: `bounds.rs`, `session.rs`, `server.rs` — private
-  to the server process).
-- **Grouping**: one server process per profile name. It multiplexes many
-  sessions (= panes, across any number of tabs of that profile) over a
-  single pipe, keyed by `session_id: Uuid` in the protocol — not one pipe
-  per session.
-- **Protocol** (`protocol.rs`): `ClientMessage::{NewSession, Attach, Write,
-  Resize, CloseSession}`, `ServerMessage::{SessionCreated, GridUpdate,
-  AttachFailed, SessionClosed, Error}`. `GridUpdate` carries a full
-  plain-text grid snapshot (`grid_text: String`) sent on `Attach` and again
-  on every change — not raw PTY bytes (alacritty's IO thread parses bytes
-  into its own `Term` and never exposes them raw, only a "something
-  changed" signal) and not a diff (first-iteration simplicity; no
-  colors/attributes/cursor position carried yet — known, deliberate
-  limitation).
-- **Session lifecycle** (`session.rs`): each session owns a real PTY
-  (`alacritty_terminal::tty`) and its own `Term`, plus a permanent internal
-  "pump" thread that answers terminal escape-sequence queries
-  (`PtyWrite` events, e.g. a Device Attributes request PowerShell sends on
-  startup) immediately — without this, the shell sits waiting for a reply
-  that never comes and produces no further output (found the hard way: an
-  empty 1920-blank-cell grid).
-- **Detach vs. kill semantics**:
-  - Detach = the connection drops but the session keeps running. Happens
-    passively whenever Som just exits/crashes (no command sent, nothing to
-    do differently).
-  - Closing a tab/pane through the UI sends an explicit
-    `CloseSession(session_id)` — this really kills the PTY process, it's
-    not a "leave it running" detach.
-  - When a server's last session is closed this way, the server exits
-    itself (`std::process::exit(0)`).
-  - On next launch, Som attempts `Attach` for any `tmux:true` tab's saved
-    session id; if the server isn't there/doesn't know it (didn't survive,
-    e.g. a reboot), falls back to creating a fresh session.
-- **IPC transport (Windows-local case)**: `\\.\pipe\som-tmux-<profile>`,
-  using **overlapped I/O** (`FILE_FLAG_OVERLAPPED`), not synchronous pipe
-  calls. This was a real, subtle bug: a synchronous (non-overlapped) named
-  pipe handle serializes *all* I/O through the OS — a blocking `ReadFile`
-  pending on one thread will block a concurrent `WriteFile` from another
-  thread on the *same handle* until the read completes. Since the server
-  needs one thread reading incoming client messages while another streams
-  `GridUpdate`s out on the same connection, this deadlocked reliably after
-  the first update. Confirmed as documented Windows behavior (Microsoft
-  Learn: "Synchronous and Overlapped Pipe I/O"), fixed by giving every
-  read/write its own `OVERLAPPED` + manual-reset event.
-- **Verified end-to-end** via a manual PowerShell test client
-  (`test_client.ps1`, kept in the repo root for further manual testing):
-  spawn a session, attach, type an interactive command, see live streamed
-  grid updates land, see the echoed output actually appear, explicitly
-  close the session, confirm the server process exits on its own.
-
-### Not yet done
-
-1. **UI rendering component.** Decided: a **new, separate view component**
-   for `tmux:true` panes rather than patching the existing `TerminalView` —
-   `TerminalView` is tightly coupled to a live local `alacritty_terminal::Term`
-   in nearly every method (render, scrolling, hover, resize all read/write
-   `self.terminal`), and tmux panes have fundamentally different data (a
-   plain-text grid snapshot arriving over IPC, no colors/attributes yet).
-   Patching would mean threading an `if tmux {...} else {...}` branch
-   through ~90 methods; a new component keeps the existing, already-solid
-   `tmux:false` path completely untouched while this is being built out.
-   Since the long-term direction may make `tmux:true` the *only* mode
-   someday (except where the server can't run), the new component should be
-   designed as a real, full replacement candidate (not a throwaway shim) —
-   just only wired up for `tmux:true` panes for now.
-2. `som_config::TabProfile` / `workspace::TabProfile` — add `tmux: bool`
-   (default false).
-3. `db.json` schema — add a per-tab session-id list for `tmux:true` tabs.
-4. Client-side connect-or-spawn logic (detached process creation on
-   Windows, `PipeConnection::connect` retry loop) — not yet written.
-5. Wire the new view component into tab creation / close / restore paths.
-6. WSL and SSH transports (see above) — separate follow-up work, not
-   started; `sshd` (Windows OpenSSH Server) needs to be running locally to
-   test the `loc` (`ssh localhost`) profile once SSH transport exists.
-7. **Per-pane health-check.** Each `tmux:true` pane needs to detect a
-   dropped connection — deliberately kept simple, on the user's own
-   correction mid-design: don't try to distinguish *why* the channel died
-   (client-side network blip vs. the server's own machine rebooting) and
-   don't try to build a special "resurrect the exact same session after the
-   server host reboots" mechanism. Instead: on a detected drop, retry
-   `Attach` to the same `session_id` (cheap, handles the common
-   "network blipped, server's still there" case transparently); if that
-   doesn't succeed after some retries, just fall back to creating a **brand
-   new session**, via the exact same attach-or-create path restore already
-   uses when a server doesn't respond on launch. No new third state, no
-   separate server-side recovery mechanism — health-check is this same
-   fallback path, just triggered live during a session instead of only at
-   Som startup.
-   **Why no server-side auto-recovery**: making `som-tmux-server`
-   auto-start itself after the remote machine reboots (e.g. a systemd unit
-   on Linux/a router, launchd on Mac) and re-register old sessions would
-   need root/admin access on that remote machine to set up the OS-level
-   autostart. That's an unacceptable requirement on the user's environment
-   (ARM routers often don't grant root at all; personal servers — the user
-   may not want to hand an app that kind of access). This isn't a "simplify
-   now, revisit later" shortcut — it's a firm constraint: som-tmux must
-   never require root on the remote side, so it will never try to
-   self-restart/recover itself at the OS level. Falling back to a plain new
-   session is the only approach compatible with that.
-   Not designed yet — open questions: detection mechanism
-   (heartbeat/ping-pong in the protocol vs. a timeout on missing
-   `GridUpdate`s), retry count/backoff before falling back to a new session,
-   what the new view component (item 1) shows while a reconnect attempt is
-   in flight. This subsumes what used to be a separate "SSH Reconnect After
-   Disconnect" idea in an earlier version of this doc — folded into
-   som-tmux's health-check rather than a standalone reconnect layer bolted
-   onto a plain PTY.
-
-Full blow-by-blow implementation log, exact file states, and the discovery
-process for each bug above lives in this session's `project_som_tmux`
-memory note (not duplicated here) — this doc is the durable summary, that
-memory is the working log.
+Full blow-by-blow implementation log for v1 and v2 (exact file states,
+the discovery process for each abandoned design's bugs) lives in this
+session's `project_som_tmux` memory note (not duplicated here) — this doc
+is the durable summary, that memory is the working log.
 
 ---
 

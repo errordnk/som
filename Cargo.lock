@@ -7559,6 +7559,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "collections",
+ "dirs",
  "futures",
  "futures-lite 1.13.0",
  "gpui",

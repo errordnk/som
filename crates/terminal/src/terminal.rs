@@ -3704,6 +3704,151 @@ mod tests {
         );
     }
 
+    /// Finds `som-tmux-server(.exe)` next to whichever `target/debug` this
+    /// test binary itself was built into — mirrors
+    /// `terminal_view::terminal_panel::som_tmux_server_binary_path`'s own
+    /// resolution logic (that one looks next to `som.exe`; this one looks
+    /// next to `target/debug/deps/terminal-<hash>.exe`, one directory
+    /// shallower, since `cargo test` binaries live in `deps/` while
+    /// `cargo build`'s bin targets land directly in `target/debug/`).
+    /// Returns `None` (causing the test to skip, not fail) if the binary
+    /// hasn't been built yet — this test exercises the REAL som-tmux-server
+    /// binary as an external process (deliberately, since the whole point is
+    /// testing the wire protocol between a real `Terminal`'s PTY and it),
+    /// not something `cargo test` builds automatically as a dependency.
+    fn find_som_tmux_server_binary() -> Option<std::path::PathBuf> {
+        let test_exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let binary_name = if cfg!(target_os = "windows") { "som-tmux-server.exe" } else { "som-tmux-server" };
+        for candidate_dir in [test_exe_dir.clone(), test_exe_dir.parent()?.to_path_buf()] {
+            let candidate = candidate_dir.join(binary_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Reproduces the exact mechanism `TerminalView::on_removed`
+    /// (`crates/terminal_view/src/terminal_view.rs`) relies on to make a
+    /// tmux-wrapped tab's HOLDER actually die when the user explicitly
+    /// closes that tab — entirely headless, no window, no OS-level
+    /// keystrokes, no screenshots (see `project_som_tmux`/
+    /// `feedback_gpui_test_framework_priority` memory for why this is the
+    /// preferred way to test Som's UI-adjacent logic).
+    ///
+    /// Spawns a REAL `som-tmux-server` RELAY (as this `Terminal`'s own
+    /// shell command, exactly like a `tmux: true` profile does), lets it
+    /// spawn its own detached HOLDER, then writes a single NUL byte via
+    /// `Terminal::input` — the same call `on_removed` makes — and asserts
+    /// that the RELAY's own log ends up showing it forwarded
+    /// `RelayInput::Close` to the HOLDER, which is the signal that actually
+    /// kills the real shell process for good (as opposed to the HOLDER
+    /// surviving forever, which was the original bug report).
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    async fn test_nul_byte_signals_tmux_relay_to_close_for_good(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let Some(server_path) = find_som_tmux_server_binary() else {
+            eprintln!("skipping: som-tmux-server binary not built, run `cargo build -p som_tmux_server` first");
+            return;
+        };
+
+        let pane_id = format!("test-nul-close-{}", std::process::id());
+        let profile_name = "test-nul-close";
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            server_path.to_string_lossy().into_owned(),
+            vec![
+                profile_name.to_string(),
+                pane_id.clone(),
+                "C:\\Windows\\System32\\cmd.exe".to_string(),
+            ],
+        )
+        .await;
+
+        // Give the RELAY a moment to spawn its detached HOLDER and complete
+        // the handshake. Deliberately a REAL `std::thread::sleep`, not
+        // `cx.executor().timer(...)` — this test's `TestAppContext` uses
+        // GPUI's deterministic test executor, which fast-forwards its own
+        // timers instantly rather than sleeping wall-clock time (there's
+        // nothing else scheduled on it to make waiting on it meaningful).
+        // The real `som-tmux-server` RELAY/HOLDER pair are genuine external
+        // OS processes running on real wall-clock time regardless, so
+        // waiting on them requires actually blocking this thread — safe
+        // here only because `cx.executor().allow_parking()` was called
+        // above.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(vec![0u8]);
+        });
+
+        // Give the async PTY I/O thread time to actually deliver the byte
+        // before killing the RELAY — see `TerminalView::on_removed`'s own
+        // doc comment for why this same delay exists in production code.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(terminal); // triggers Terminal::drop, killing the RELAY process
+
+        // `session.kill()` (server.rs's `RelayInput::Close` branch) kills
+        // the real shell process; the HOLDER's own change-watcher thread
+        // then observes that exit and logs the line asserted on below right
+        // before calling `std::process::exit(0)` — see
+        // `server::run`'s doc comment. That log line is the ONLY
+        // unambiguous proof the HOLDER actually died for good, as opposed
+        // to merely seeing its one RELAY connection drop (which also
+        // happens on every ordinary disconnect-without-Close, i.e. the
+        // pre-fix buggy behavior this test exists to catch). Poll (with
+        // real sleeps, same reasoning as above) rather than a single fixed
+        // wait since real process teardown time isn't bounded tightly
+        // enough for one guess to be reliable.
+        // NOT `paths::logs_dir()` — under `cfg!(test)`,
+        // `util::paths::home_dir()` is hardcoded to a fake `C:\Users\zed`
+        // fixture home (test isolation, so tests never touch the real
+        // user's actual home directory), but the `som-tmux-server.exe`
+        // child process spawned above is a separate, non-test binary that
+        // has no such override and logs to the REAL home directory. This
+        // test needs to read what that real child process actually wrote,
+        // so it computes the log path the same way `som_tmux_server::main`
+        // does when not built under `cfg!(test)` — via `dirs::home_dir()`
+        // directly.
+        let real_home = dirs::home_dir().expect("failed to determine home directory");
+        let holder_log_path = real_home
+            .join(".config")
+            .join("som")
+            .join("logs")
+            .join(format!("som-tmux-server-{profile_name}-{pane_id}-holder.log"));
+        let mut holder_log = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            holder_log = std::fs::read_to_string(&holder_log_path).unwrap_or_default();
+            if holder_log.contains("shell process exited, holder shutting down") {
+                break;
+            }
+        }
+        assert!(
+            holder_log.contains("shell process exited, holder shutting down"),
+            "HOLDER should have died after the NUL byte was forwarded as RelayInput::Close — \
+             this is the exact bug this test guards against (HOLDER outliving an explicitly \
+             closed tab). Got holder log: {holder_log:?}"
+        );
+
+        let log_path = real_home
+            .join(".config")
+            .join("som")
+            .join("logs")
+            .join(format!("som-tmux-server-{profile_name}-{pane_id}-relay.log"));
+        let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_contents.contains("holder handshake"),
+            "sanity check: relay should have at least completed its handshake — got log: {log_contents:?}"
+        );
+
+        std::fs::remove_file(&log_path).ok();
+        std::fs::remove_file(&holder_log_path).ok();
+    }
+
     mod perf {
         use super::super::*;
         use gpui::{

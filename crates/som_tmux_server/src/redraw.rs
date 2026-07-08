@@ -102,6 +102,30 @@ pub struct Redrawer {
     /// wrongly skip repainting a cell that actually holds unrelated,
     /// reflowed-into-place content now.
     last_size: Option<(usize, usize)>,
+    /// Whether DECCKM (Application Cursor Keys, `TermMode::APP_CURSOR`) was
+    /// active on the HOLDER's `Term` as of the last `redraw` call — `None`
+    /// before the first call. Unlike `last_alt_screen`/`last_size`, this
+    /// isn't consulted to decide whether to force a full repaint (a cursor-
+    /// key mode change doesn't invalidate on-screen content the way an
+    /// alt-screen swap or resize does) — it exists purely so `redraw` can
+    /// detect the FLIP and re-emit the real `\x1b[?1h`/`\x1b[?1l` DECCKM
+    /// sequence to the client. Without this, the client-side `Term` (the
+    /// RELAY's own, on Som's side of the connection) never learns the real
+    /// shell/app enabled application cursor keys at all — confirmed root
+    /// cause of a real user report ("не работают F-клавиши в терминалах
+    /// wsl/ssh"): `redraw`'s diffing walks the HOLDER's PARSED GRID
+    /// content (mirroring tmux's own `tty.c` model — see this module's doc
+    /// comment), which by design never replays raw mode-switching escape
+    /// codes the way a naive byte-forwarding proxy would, since they carry
+    /// no visible on-screen content of their own. That's correct for
+    /// everything that actually painted a cell, but DECCKM controls
+    /// nothing about what's ON screen — only how Som should encode the
+    /// user's NEXT keypress (`mappings::keys::to_esc_str` checks
+    /// `TermMode::APP_CURSOR` to choose between e.g. `\x1b[A` and `\x1bOA`
+    /// for the up arrow) — so it has to be forwarded explicitly, the same
+    /// way `ALT_SCREEN` already gets tracked (just for a different
+    /// purpose: forcing a repaint, not re-emitting anything).
+    last_app_cursor: Option<bool>,
 }
 
 impl Redrawer {
@@ -121,6 +145,7 @@ impl Redrawer {
             real_cursor: None,
             last_alt_screen: None,
             last_size: None,
+            last_app_cursor: None,
         }
     }
 
@@ -177,6 +202,20 @@ impl Redrawer {
             self.real_cursor = None;
         }
         self.last_size = Some(size);
+
+        // See `last_app_cursor`'s doc comment: unlike `alt_screen`/`size`
+        // above, this doesn't invalidate `last_grid` — DECCKM has no
+        // effect on what's actually painted on screen. It DOES need to be
+        // re-sent to the client explicitly on every flip, since (also
+        // unlike alt-screen/resize) there's no other mechanism that would
+        // ever tell the client-side `Term` this happened — the grid
+        // diffing below only reproduces visible cell content, never mode-
+        // switching escapes, by design (see this module's doc comment).
+        let app_cursor = term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR);
+        if self.last_app_cursor.is_some_and(|was_set| was_set != app_cursor) || self.last_app_cursor.is_none() {
+            out.write_all(if app_cursor { b"\x1b[?1h" } else { b"\x1b[?1l" })?;
+        }
+        self.last_app_cursor = Some(app_cursor);
 
         let content = term.renderable_content();
         let mut new_grid: Vec<Vec<PaintedCell>> = Vec::new();
@@ -1165,6 +1204,73 @@ mod tests {
         assert!(
             !stale_cyan,
             "no cell should still be showing the alt-screen app's cyan coloring after exiting back to the plain primary screen"
+        );
+    }
+
+    /// Regression test for a real user report ("не работают F-клавиши в
+    /// терминалах wsl/ssh"): `redraw`'s grid-diffing (mirroring tmux's
+    /// `tty.c` model — see this module's doc comment) only ever replays
+    /// VISIBLE cell content, never mode-switching escape codes, since those
+    /// carry no on-screen content of their own. That's correct for
+    /// everything that actually painted a cell, but DECCKM (`\x1b[?1h`/
+    /// `\x1b[?1l`, Application Cursor Keys mode — what `htop`/`vim`/`less`
+    /// and most full-screen TUI apps enable) controls nothing about what's
+    /// ON screen, only how the client (Som, via `mappings::keys::
+    /// to_esc_str`) should encode the user's NEXT arrow-key/Home/End
+    /// press. Left unforwarded, the client-side `Term` never learns the
+    /// real app enabled it, so Som keeps sending non-application-mode
+    /// sequences (`\x1b[A`) that many such apps don't recognize as arrow
+    /// keys at all.
+    ///
+    /// Deliberately drives `Term`/`Redrawer` directly (no real PTY/
+    /// `Session`), same reasoning as the alt-screen tests above.
+    #[test]
+    fn redraw_forwards_decckm_app_cursor_mode_changes_to_the_client() {
+        let bounds = SessionBounds::new(80, 24);
+        let mut term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        let mut redrawer = Redrawer::new();
+
+        // A bare prompt, app cursor mode not yet enabled — the very first
+        // redraw should already reflect that (explicitly, not just by
+        // omission), since a freshly (re)attaching client has no other way
+        // to know the CURRENT mode either.
+        parser.advance(&mut term, b"PS>");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("initial redraw should succeed");
+
+        let mut client_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut client_parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            !client_term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR),
+            "client should start without APP_CURSOR set, matching the real shell's own initial state"
+        );
+
+        // The real app (e.g. htop) enables application cursor keys.
+        parser.advance(&mut term, b"\x1b[?1h");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("redraw after enabling DECCKM should succeed");
+        assert!(
+            bytes.windows(5).any(|w| w == b"\x1b[?1h"),
+            "redraw should have forwarded the literal DECCKM-enable sequence — got bytes: {bytes:?}"
+        );
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            client_term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR),
+            "client-side Term should have APP_CURSOR set after redraw forwarded the real app's DECCKM-enable — \
+             this is the exact bug: without forwarding it, Som keeps encoding arrow keys in the WRONG mode for \
+             apps like htop/vim/less that rely on APP_CURSOR being correctly mirrored"
+        );
+
+        // The app exits, or otherwise disables it again.
+        parser.advance(&mut term, b"\x1b[?1l");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("redraw after disabling DECCKM should succeed");
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            !client_term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR),
+            "client-side Term should have APP_CURSOR cleared again after redraw forwarded the real app's DECCKM-disable"
         );
     }
 

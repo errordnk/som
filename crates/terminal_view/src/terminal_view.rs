@@ -1378,6 +1378,25 @@ impl Item for TerminalView {
         // synchronous/blocking write path exposed through `Terminal` to
         // wait on instead.
         std::thread::sleep(std::time::Duration::from_millis(50));
+        // A LONE all-NUL write frequently never arrives at all for an
+        // `ssh`-tunneled tmux profile (e.g. the `mac` profile talking to a
+        // real Mac) — confirmed against a real remote host while adding
+        // macOS support: a bare `vec![0u8]` (or even two of them back to
+        // back) reliably vanished somewhere between this process's ConPTY
+        // and the far side's RELAY, while a SECOND, separate `input()` call
+        // containing ordinary (non-NUL) bytes right after it reliably makes
+        // the first one arrive too. This harmless carriage return is that
+        // second call — on a real (non-tmux-closing) shell it would just be
+        // an empty Enter press, but by the time it's actually forwarded the
+        // RELAY has almost always already seen the NUL byte above and torn
+        // the connection down, so in practice nothing ever reads it. Local
+        // (non-SSH) tmux profiles don't seem to need this, but sending it
+        // unconditionally is harmless there too, so this isn't gated on
+        // local-vs-remote.
+        self.terminal().update(cx, |terminal, _cx| {
+            terminal.input(vec![b'\r']);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     fn as_searchable(

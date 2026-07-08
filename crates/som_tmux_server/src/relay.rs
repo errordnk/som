@@ -279,6 +279,19 @@ pub fn run(
             Ok(n) => n,
             Err(_) => break,
         };
+        // A lone NUL byte is `TerminalView::on_removed`'s explicit "the user
+        // closed this tab, kill the real shell for good" signal — see that
+        // function's doc comment for why this can't just be Som killing the
+        // RELAY process directly (indistinguishable, on Windows especially,
+        // from Som's own app-quit killing the SAME RELAY process the SAME
+        // way, which must NOT kill the HOLDER). A real keyboard/paste never
+        // produces a bare `\0` on its own, so this is unambiguous — checked
+        // BEFORE the CRLF filter/forwarding below since it's a control
+        // signal, not shell input to relay.
+        if buf[..read].contains(&0u8) {
+            send(&connection, &writer, &RelayInput::Close).ok();
+            break;
+        }
         let filtered = strip_cr_induced_lf(&buf[..read], &mut last_byte_was_cr);
         if filtered.is_empty() {
             continue;

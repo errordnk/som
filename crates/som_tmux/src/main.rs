@@ -1,20 +1,24 @@
-// `redraw`/`relay`/`server`/`session`/`bounds` are the old from-scratch
-// transparent-proxy architecture — kept ONLY for the Windows-local profile
-// (real `tmux` has no Windows PTY port). `tmux_backend` is the new,
-// `tmux`-wrapping architecture used for every Unix case (WSL/SSH remote
-// profiles) — see `SOM_MUX_PLAN.md`'s "som-tmux v2" section and `main`'s
-// dispatch below.
-#[cfg(windows)]
+// `bounds`/`session`/`server`/`relay` are the v3 architecture (see
+// `SOM_MUX_PLAN.md`'s "som-tmux v3" section) — a headless
+// `alacritty_terminal::Term` on the HOLDER side sends its full serialized
+// state (`Term::snapshot()`) to a (re)connecting RELAY, which restores it
+// onto a throwaway local `Term` and does ONE full ANSI repaint via
+// `redraw.rs` (which now only ever runs that one-shot, not continuously —
+// see that module's own doc comment) before switching to forwarding raw
+// PTY bytes unmodified. Cross-platform: `alacritty_terminal::tty::new()`
+// already works on both Windows and Unix, so this single implementation
+// covers the Windows-local profile AND every Unix (WSL/SSH) profile —
+// unlike v2 (`tmux_backend`, below), which needed Windows kept on a
+// permanently separate path since real tmux has no Windows PTY port.
 mod bounds;
-#[cfg(windows)]
 mod redraw;
-#[cfg(windows)]
 mod relay;
-#[cfg(windows)]
 mod server;
-#[cfg(windows)]
 mod session;
 mod term_size;
+// v2 (thin wrapper around a real, installed `tmux` binary) — SUPERSEDED
+// by v3 above, kept only until `SOM_MUX_PLAN.md`'s checklist item to
+// delete this file is done; nothing currently calls into it.
 #[cfg(unix)]
 mod tmux_backend;
 
@@ -120,26 +124,12 @@ fn main() {
     let args = parse_args();
     init_logging(&args.profile, &args.pane_id, args.holder);
 
-    #[cfg(windows)]
+    // v3 architecture (see `SOM_MUX_PLAN.md`) is cross-platform — same
+    // HOLDER/RELAY split, same dispatch, on both Windows and Unix now.
     let result = if args.holder {
         server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     } else {
         relay::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
-    };
-
-    // No `--holder` mode on Unix at all — `tmux_backend::run` both ensures
-    // the session exists AND proxies to it in one call (see that module's
-    // doc comment for why a separate detached-HOLDER process, needed on
-    // Windows because there's no real tmux to hand session-survival off
-    // to, is unnecessary here: real tmux's own detached server process
-    // already IS the thing that outlives Som).
-    #[cfg(unix)]
-    let result = {
-        if args.holder {
-            log::error!("--holder is a Windows-only concept; this Unix build never spawns one");
-            std::process::exit(2);
-        }
-        tmux_backend::run(&args.pane_id, &args.program, &args.args, args.cwd.as_deref(), args.scrollback)
     };
 
     if let Err(err) = result {

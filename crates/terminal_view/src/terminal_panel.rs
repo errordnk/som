@@ -785,7 +785,7 @@ impl TerminalPanel {
                 };
 
                 let cwd = profile
-                    .working_dir
+                    .home
                     .as_deref()
                     .and_then(|dir| shellexpand::full(dir).ok())
                     .map(|dir| PathBuf::from(dir.to_string()))

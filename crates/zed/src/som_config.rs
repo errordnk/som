@@ -112,7 +112,7 @@ pub struct TabProfile {
     pub name: String,
     pub icon: Option<String>,
     pub shell: Option<String>,
-    pub working_dir: Option<String>,
+    pub home: Option<String>,
     /// Opt-in to som-tmux: the tab's terminal(s) run inside a detached
     /// `som-tmux-server` process that survives Som closing, instead of a
     /// plain PTY owned directly by Som. Defaults to `false` (explicit

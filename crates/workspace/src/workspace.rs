@@ -445,7 +445,7 @@ pub struct TabProfile {
     pub shell: Option<String>,
     pub keystroke: Option<String>,
     pub icon: Option<String>,
-    pub working_dir: Option<String>,
+    pub home: Option<String>,
     /// See `som_config::TabProfile::tmux` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub tmux: bool,

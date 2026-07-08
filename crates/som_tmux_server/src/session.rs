@@ -65,7 +65,7 @@ pub struct Session {
     /// and resize is rare/cheap enough that a `Mutex` here isn't worth
     /// restructuring the rest of `Session` around a `Mutex<Session>`
     /// wrapper just to support this one method.
-    last_bounds: std::sync::Mutex<SessionBounds>,
+    last_bounds: Arc<std::sync::Mutex<SessionBounds>>,
     /// PID of the spawned shell/program, captured before the `Pty` handle is
     /// moved into `EventLoop` (which owns it from then on and doesn't expose
     /// it back out) — this is the only way to actually kill the process on
@@ -199,10 +199,34 @@ impl Session {
         let subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<AlacTermEvent>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let pump_subscribers = subscribers.clone();
+        let last_bounds = Arc::new(std::sync::Mutex::new(bounds));
+        let pump_last_bounds = last_bounds.clone();
         std::thread::spawn(move || {
             while let Ok(event) = raw_events_rx.recv_blocking() {
                 match event {
                     AlacTermEvent::PtyWrite(bytes) => pump_pty_tx.notify(bytes.into_bytes()),
+                    // Answers a program's own terminal-size query (e.g. the
+                    // `\x1b[18t` "report text area size" escape a full-
+                    // screen editor like `micro` sends on startup) with this
+                    // session's ACTUAL current bounds — mirrors
+                    // `terminal::Terminal::process_event`'s identical
+                    // handling of the same event for Som's own regular
+                    // (non-tmux) terminal. Left unanswered (as this used to
+                    // be, falling into the `_ => {}` catch-all below), a
+                    // program that sizes its own layout off this reply
+                    // rather than the PTY's actual `WindowSize` has no way
+                    // to learn the real pane dimensions — confirmed root
+                    // cause of a reported "`micro` doesn't fill the whole
+                    // pane width" bug (unlike `htop`, which apparently sizes
+                    // itself off the PTY dimensions directly and doesn't
+                    // send this query at all, which is why fixing THIS
+                    // session's resize-propagation earlier fixed htop but
+                    // not micro).
+                    AlacTermEvent::TextAreaSizeRequest(format) => {
+                        let bounds = *pump_last_bounds.lock().unwrap();
+                        let window_size: WindowSize = bounds.into();
+                        pump_pty_tx.notify(format(window_size).into_bytes());
+                    }
                     AlacTermEvent::Wakeup => {
                         let subs = pump_subscribers.lock().unwrap();
                         for sub in subs.iter() {
@@ -225,7 +249,7 @@ impl Session {
             id: Uuid::new_v4(),
             term,
             pty_tx,
-            last_bounds: std::sync::Mutex::new(bounds),
+            last_bounds,
             pid,
             subscribers,
         })

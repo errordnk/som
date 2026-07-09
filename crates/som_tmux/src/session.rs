@@ -541,6 +541,9 @@ impl Session {
 fn motd_wrapped_command(program: String, args: Vec<String>) -> (String, Vec<String>) {
     let script = "if [ -d /etc/update-motd.d ]; then run-parts /etc/update-motd.d 2>/dev/null; fi; \
                    if [ -f /etc/motd ]; then cat /etc/motd 2>/dev/null; fi; \
+                   if command -v last >/dev/null 2>&1; then \
+                     last -F \"$(whoami)\" 2>/dev/null | head -1 | awk '{if (NF >= 8) printf \"Last login: %s %s %2d %s %s from %s\\n\", $4, $5, $6, $7, $8, $3}'; \
+                   fi; \
                    exec \"$0\" \"$@\"";
     let mut wrapped_args = vec!["-c".to_string(), script.to_string(), program.clone()];
     wrapped_args.extend(args);
@@ -658,9 +661,11 @@ mod tests {
     /// explicit command, so sshd never prints it no matter what
     /// `som-tmux` does after the fact. `motd_wrapped_command` reproduces
     /// the same content sshd's own `pam_motd` would have (`run-parts
-    /// /etc/update-motd.d` + `/etc/motd`) by running it itself, then
-    /// `exec`ing the real shell in its own place — doubles as a visible
-    /// "this HOLDER was just created, not reattached to an existing one"
+    /// /etc/update-motd.d` + `/etc/motd` + a "Last login: ..." line built
+    /// from `last -F`, since `lastlog` itself isn't installed on every
+    /// real host this runs against) by running it itself, then `exec`ing
+    /// the real shell in its own place — doubles as a visible "this
+    /// HOLDER was just created, not reattached to an existing one"
     /// signal, since it only ever runs once per HOLDER lifetime.
     #[cfg(unix)]
     #[test]
@@ -670,6 +675,8 @@ mod tests {
         assert_eq!(args[0], "-c");
         assert!(args[1].contains("run-parts /etc/update-motd.d"), "should attempt the dynamic MOTD pieces");
         assert!(args[1].contains("/etc/motd"), "should attempt the static MOTD file");
+        assert!(args[1].contains("last -F"), "should attempt the Last login line");
+        assert!(args[1].contains("Last login:"), "should format a Last login line matching sshd's own wording");
         assert!(args[1].trim_end().ends_with("exec \"$0\" \"$@\""), "must end by exec'ing the real program in its own place");
         assert_eq!(&args[2..], &["/bin/bash", "-l"], "the real program/args must follow as $0/$@ for the exec");
     }

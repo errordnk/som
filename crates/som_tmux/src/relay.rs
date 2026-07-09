@@ -334,18 +334,7 @@ pub fn run(
             send(&connection, &writer, &RelayInput::Close).ok();
             break;
         }
-        // Strips out `crates/terminal::terminal.rs`'s `RESIZE_MARKER_PREFIX`/
-        // `_SUFFIX`-wrapped size update, if this read happens to contain
-        // one, BEFORE the CRLF filter below — see `extract_resize_marker`'s
-        // doc comment for why this exists and why it's a DCS sequence
-        // rather than some other framing.
-        let (without_marker, resize) = extract_resize_marker(&buf[..read]);
-        if let Some((cols, rows)) = resize
-            && send(&connection, &writer, &RelayInput::Resize { cols, rows }).is_err()
-        {
-            break; // holder gone
-        }
-        let filtered = strip_cr_induced_lf(&without_marker, &mut last_byte_was_cr);
+        let filtered = strip_cr_induced_lf(&buf[..read], &mut last_byte_was_cr);
         if filtered.is_empty() {
             continue;
         }
@@ -565,61 +554,6 @@ fn strip_cr_induced_lf(chunk: &[u8], last_byte_was_cr: &mut bool) -> Vec<u8> {
     filtered
 }
 
-/// The exact wrapper `crates/terminal::terminal.rs`'s `RESIZE_MARKER_PREFIX`/
-/// `_SUFFIX` constants build — duplicated here (not shared via a common
-/// crate) since `crates/terminal` pulls in GPUI and the rest of Som's
-/// editor-side machinery, entirely unwanted in this small standalone
-/// binary's dependency graph, for two string literals.
-const RESIZE_MARKER_PREFIX: &[u8] = b"\x1bPsom-tmux-resize;";
-const RESIZE_MARKER_SUFFIX: &[u8] = b"\x1b\\";
-
-/// Finds and strips a `RESIZE_MARKER_PREFIX`/`_SUFFIX`-wrapped `cols;rows`
-/// size update out of `chunk` (if present), returning the chunk with the
-/// marker removed plus the parsed size, if any. See `crates/terminal::
-/// terminal.rs`'s `is_tmux_relay_shell` field doc comment for the full
-/// "why" — in short, an SSH `tmux: true` profile's RELAY has no
-/// `TIOCGWINSZ`/window-change path of its own to learn Som's real pane
-/// size from (its own stdin/stdout are plain pipes over the SSH channel,
-/// not a tty), so the Windows side encodes size updates directly into the
-/// PTY byte stream instead, wrapped in a DCS sequence real shells silently
-/// ignore as an unrecognized control string if this interception ever
-/// somehow doesn't happen.
-///
-/// Assumes the marker arrives whole within a single `read()` call (not
-/// split across two) — a reasonable assumption for a resize event (user-
-/// driven, not a tight byte stream) landing in a 4KB read buffer, unlike
-/// e.g. a `\r`/`\n` pair that genuinely can split under load. If a marker
-/// ever WAS split across reads, this would just forward its two halves as
-/// ordinary (garbage, harmless) bytes to the real shell rather than losing
-/// the resize entirely — a degraded-but-safe failure mode, not a silent
-/// data-loss one.
-fn extract_resize_marker(chunk: &[u8]) -> (Vec<u8>, Option<(u16, u16)>) {
-    let Some(start) = chunk
-        .windows(RESIZE_MARKER_PREFIX.len())
-        .position(|window| window == RESIZE_MARKER_PREFIX)
-    else {
-        return (chunk.to_vec(), None);
-    };
-    let after_prefix = start + RESIZE_MARKER_PREFIX.len();
-    let Some(suffix_offset) = chunk[after_prefix..]
-        .windows(RESIZE_MARKER_SUFFIX.len())
-        .position(|window| window == RESIZE_MARKER_SUFFIX)
-    else {
-        return (chunk.to_vec(), None);
-    };
-    let end = after_prefix + suffix_offset;
-    let payload = std::str::from_utf8(&chunk[after_prefix..end]).ok();
-    let size = payload.and_then(|payload| {
-        let (cols, rows) = payload.split_once(';')?;
-        Some((cols.parse().ok()?, rows.parse().ok()?))
-    });
-
-    let mut without_marker = Vec::with_capacity(chunk.len());
-    without_marker.extend_from_slice(&chunk[..start]);
-    without_marker.extend_from_slice(&chunk[end + RESIZE_MARKER_SUFFIX.len()..]);
-    (without_marker, size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,51 +672,5 @@ mod tests {
         let mut last_byte_was_cr = false;
         let out = strip_cr_induced_lf(b"echo write-after-idle-marker\r\n", &mut last_byte_was_cr);
         assert_eq!(out, b"echo write-after-idle-marker\r");
-    }
-
-    #[test]
-    fn extracts_a_resize_marker_and_removes_it_from_the_chunk_entirely() {
-        let chunk = b"\x1bPsom-tmux-resize;171;52\x1b\\";
-        let (without_marker, size) = extract_resize_marker(chunk);
-        assert_eq!(size, Some((171, 52)));
-        assert!(without_marker.is_empty());
-    }
-
-    #[test]
-    fn extracts_a_resize_marker_sitting_between_real_keystrokes() {
-        let mut chunk = b"echo hi".to_vec();
-        chunk.extend_from_slice(b"\x1bPsom-tmux-resize;80;24\x1b\\");
-        chunk.extend_from_slice(b"\r");
-        let (without_marker, size) = extract_resize_marker(&chunk);
-        assert_eq!(size, Some((80, 24)));
-        assert_eq!(without_marker, b"echo hi\r");
-    }
-
-    #[test]
-    fn leaves_a_chunk_with_no_marker_completely_untouched() {
-        let (without_marker, size) = extract_resize_marker(b"echo hello\r");
-        assert_eq!(size, None);
-        assert_eq!(without_marker, b"echo hello\r");
-    }
-
-    #[test]
-    fn ignores_an_unterminated_prefix_with_no_matching_suffix() {
-        // A DCS prefix with no closing ESC\ yet (e.g. genuinely truncated,
-        // or just coincidentally similar bytes typed by the user) must not
-        // be treated as a resize and must not corrupt the chunk.
-        let chunk = b"\x1bPsom-tmux-resize;80;24 still typing...";
-        let (without_marker, size) = extract_resize_marker(chunk);
-        assert_eq!(size, None);
-        assert_eq!(without_marker, chunk);
-    }
-
-    #[test]
-    fn ignores_malformed_marker_payload_without_crashing() {
-        let chunk = b"\x1bPsom-tmux-resize;not-a-number;24\x1b\\";
-        let (without_marker, size) = extract_resize_marker(chunk);
-        assert_eq!(size, None);
-        // Still strips the (unparseable) marker out so garbage doesn't
-        // leak through to the real shell either.
-        assert!(without_marker.is_empty());
     }
 }

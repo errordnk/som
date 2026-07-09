@@ -122,22 +122,6 @@ const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 /// for anything but its first size-set. See `created_at` on `Terminal`.
 const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Wraps a `cols;rows` size update sent through a `tmux: true` SSH/WSL
-/// profile's own PTY byte stream — see `is_tmux_relay_shell`'s doc comment
-/// for why this exists at all (the RELAY on the far end of such a profile
-/// has no `TIOCGWINSZ`/window-change path of its own to learn the real pane
-/// size from). A DCS (Device Control String, `ESC P ... ESC \`) rather than
-/// some ad-hoc delimiter — real terminals/shells that DON'T know this
-/// specific DCS silently ignore the whole thing as an unrecognized control
-/// string instead of ever displaying it as visible text, so this is safe to
-/// send even in the (should-never-happen) case a non-`som_tmux` remote
-/// program is on the receiving end. `som_tmux`'s RELAY (`relay.rs`'s stdin-
-/// forwarding loop) is the only thing that ever specifically recognizes and
-/// strips this out before forwarding the rest of the stream on to the real
-/// shell.
-const RESIZE_MARKER_PREFIX: &str = "\x1bPsom-tmux-resize;";
-const RESIZE_MARKER_SUFFIX: &str = "\x1b\\";
-
 /// Inserts Zed-specific environment variables for terminal sessions.
 /// Used by both local terminals and remote terminals (via SSH).
 pub fn insert_zed_terminal_env(
@@ -423,7 +407,6 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
-            is_tmux_relay_shell: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -542,23 +525,6 @@ impl TerminalBuilder {
             };
             let terminal_title_override =
                 shell_params.as_ref().and_then(|e| e.title_override.clone());
-
-            // Detects a `som_tmux`-wrapped `ssh`/`wsl` profile by shape,
-            // the same way `rebuild_tmux_shell_with_fresh_pane_id`
-            // (`terminal_panel.rs`) does — rather than threading a new
-            // explicit parameter through every caller of `TerminalBuilder::
-            // new`, which would need updating at every existing call site
-            // (most of which just want an ordinary shell and have no
-            // reason to know or care about this) for a property this
-            // constructor can already tell just from the program/args it
-            // was handed. `wrap_remote_command_args` always inserts a
-            // literal `"~/.local/bin/som-tmux"` argument right after the
-            // `ssh`/`wsl` connection's own args — see `is_tmux_relay_shell`
-            // field's doc comment for why this matters.
-            let is_tmux_relay_shell = shell_params
-                .as_ref()
-                .and_then(|params| params.args.as_ref())
-                .is_some_and(|args| args.iter().any(|arg| arg.contains("som-tmux")));
 
             #[cfg(windows)]
             let shell_program = shell_params.as_ref().map(|params| {
@@ -702,7 +668,6 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
-                is_tmux_relay_shell,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -936,28 +901,6 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
-    /// Whether this `Terminal`'s PTY carries a `som_tmux` RELAY connection
-    /// (an `ssh`/`wsl` profile with `tmux: true`) rather than a plain
-    /// shell — see `is_tmux_relay_shell`'s doc comment for how this is
-    /// detected and `InternalEvent::Resize`'s handler for why it matters:
-    /// the RELAY process on the far end of an SSH `tmux: true` profile has
-    /// no way to learn the real pane size on its own (its own stdin/
-    /// stdout are plain pipes over the SSH channel, not a tty — `ssh host
-    /// <explicit command>` never allocates a remote pty at all, so there's
-    /// no `TIOCGWINSZ`/window-change path for it to read from), so the
-    /// HOLDER's headless `Term` was permanently stuck at its hardcoded
-    /// 80x24 fallback regardless of the pane's actual size — confirmed
-    /// root cause of a reported bug: the remote shell's own line-wrapping
-    /// (readline redrawing its prompt against what it believes is an
-    /// 80-column terminal) visibly disagreeing with what Som's own
-    /// `TerminalElement` renders at the pane's REAL width, showing up as
-    /// systematic extra blank lines between prompts. This flag is what
-    /// tells the resize handler to also encode the real size into the PTY
-    /// byte stream itself (see `RESIZE_MARKER_PREFIX`), which `som_tmux`'s
-    /// RELAY (`relay.rs`'s stdin-forwarding loop) intercepts and turns
-    /// into a real `RelayInput::Resize` instead of forwarding it to the
-    /// remote shell as ordinary keystroke bytes.
-    is_tmux_relay_shell: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
     mouse_down_hyperlink: Option<(String, bool, Match)>,
@@ -1160,27 +1103,6 @@ impl Terminal {
                 {
                     self.last_pty_grid_size = Some(grid_size);
                     pty_tx.0.send(Msg::Resize(new_bounds.into())).ok();
-
-                    // For a `tmux: true` SSH/WSL profile, `Msg::Resize`
-                    // above only resizes THIS process's own local PTY
-                    // (Windows' ConPTY wrapping `ssh`/`wsl.exe`) — it never
-                    // reaches the remote HOLDER, which has no window-
-                    // change channel of its own to learn the real size
-                    // from (see `is_tmux_relay_shell`'s doc comment for
-                    // the full "why"). Encode the real size into the byte
-                    // stream itself instead, as a marker `som_tmux`'s
-                    // RELAY (`relay.rs`'s stdin-forwarding loop)
-                    // recognizes and intercepts before it ever reaches the
-                    // remote shell.
-                    if self.is_tmux_relay_shell {
-                        self.write_to_pty(
-                            format!(
-                                "{RESIZE_MARKER_PREFIX}{};{}{RESIZE_MARKER_SUFFIX}",
-                                grid_size.0, grid_size.1
-                            )
-                            .into_bytes(),
-                        );
-                    }
                 }
 
                 term.resize(new_bounds);
@@ -4680,93 +4602,6 @@ mod tests {
             drop(terminal_n);
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-    }
-
-    /// Same reattach shape as `test_ssh_tmux_backend_enter_does_not_double_crlf_after_reattach`,
-    /// but with a REALISTIC gap between disconnect and reattach — the real
-    /// report this test chases involved a HOLDER left running for over 2
-    /// hours between reattaches (confirmed via that HOLDER's own log: three
-    /// `relay connected` events at 09:20, 09:29/09:34 minutes apart, then a
-    /// FOURTH almost 2.5 HOURS later that's when the bug was actually
-    /// re-confirmed), while every other isolated repro attempt used gaps of
-    /// well under a minute and stayed clean. `SOM_TEST_REATTACH_GAP_SECS`
-    /// controls the wait (defaults to 300 = 5 minutes) — deliberately an
-    /// env var, not hardcoded, so this can be run once with a long gap
-    /// without needing a source edit each time.
-    ///
-    /// Points at a specific pre-existing HOLDER via `SOM_TEST_REATTACH_PROFILE`/
-    /// `SOM_TEST_REATTACH_PANE_ID` (rather than spawning its own fresh one
-    /// like the test above) so a long-running manual repro session can be
-    /// set up once, left alone, then reattached to without this test's own
-    /// setup/first-connection phase adding noise to the timing.
-    ///
-    /// `#[ignore]`d by default. Run explicitly with:
-    /// `SOM_TEST_SSH_HOST=<host> SOM_TEST_REATTACH_PROFILE=<profile> SOM_TEST_REATTACH_PANE_ID=<id> \
-    ///  SOM_TEST_REATTACH_GAP_SECS=300 cargo test -p terminal test_ssh_tmux_backend_enter_after_a_long_reattach_gap -- --ignored --nocapture`
-    #[cfg(target_os = "windows")]
-    #[gpui::test]
-    #[ignore]
-    async fn test_ssh_tmux_backend_enter_after_a_long_reattach_gap(cx: &mut TestAppContext) {
-        cx.executor().allow_parking();
-
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
-        let profile_name = std::env::var("SOM_TEST_REATTACH_PROFILE").unwrap_or_else(|_| "diag-wait-test".to_string());
-        let pane_id = std::env::var("SOM_TEST_REATTACH_PANE_ID").unwrap_or_else(|_| "diag-wait-1".to_string());
-        let gap_secs: u64 = std::env::var("SOM_TEST_REATTACH_GAP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-
-        let args = vec![
-            ssh_host,
-            "~/.local/bin/som-tmux".to_string(),
-            profile_name,
-            pane_id,
-            "$SHELL".to_string(),
-            "--cursor-shape".to_string(),
-            "underline".to_string(),
-            "--scrollback".to_string(),
-            "10000".to_string(),
-            "--".to_string(),
-            "-l".to_string(),
-        ];
-
-        eprintln!("waiting {gap_secs}s before reattaching (matching the real report's multi-hour gap)...");
-        std::thread::sleep(std::time::Duration::from_secs(gap_secs));
-
-        let (terminal, _completion_rx) = build_test_terminal_with_arguments(cx, "ssh".to_string(), args).await;
-        let mut ready = false;
-        for _ in 0..150 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let content = terminal.update(cx, |term, _| term.get_content());
-            if content.trim().len() > 1 {
-                ready = true;
-                break;
-            }
-        }
-        assert!(ready, "prompt never appeared after reattach — test setup problem, not the bug under test");
-
-        for _ in 0..10 {
-            terminal.update(cx, |terminal, _cx| terminal.input(vec![b'\r']));
-            cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        cx.run_until_parked();
-
-        let content = terminal.update(cx, |term, _| term.get_content());
-        let all_lines: Vec<&str> = content.lines().map(|l| l.trim_end()).collect();
-        let first_prompt_index = all_lines.iter().position(|line| line.trim() == "\u{e77d} ~ \u{f101}").unwrap_or(0);
-        let max_consecutive_blank = all_lines[first_prompt_index..]
-            .iter()
-            .fold((0usize, 0usize), |(max, cur), line| {
-                let cur = if line.is_empty() { cur + 1 } else { 0 };
-                (max.max(cur), cur)
-            })
-            .0;
-        assert!(
-            max_consecutive_blank <= 1,
-            "found {max_consecutive_blank} consecutive blank lines after 10 Enter presses on a reattach following \
-             a {gap_secs}s gap — this reproduces the doubled-CRLF-between-prompts bug specifically tied to a long \
-             gap before reattach. Screen:\n{content:?}"
-        );
     }
 
     mod perf {

@@ -144,7 +144,7 @@ pub fn run(
     // triggering). Called before anything else touches stdin.
     crate::term_size::enable_raw_input_mode();
 
-    let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd, cursor_shape, scrollback)?);
+    let connection = Arc::new(connect_or_become_holder(profile_name, pane_id, program, args, cwd, cursor_shape.clone(), scrollback)?);
     // Guards every `write_message` call on `connection` — the stdin-forwarding
     // loop (main thread) and the resize-polling thread both write
     // `RelayInput`s onto the SAME underlying pipe/socket handle, and
@@ -200,6 +200,24 @@ pub fn run(
     send(&connection, &writer, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
 
     let reader_connection = connection.clone();
+    // Config for the throwaway `Term` a `Snapshot` is restored onto below —
+    // built with the profile's real cursor shape (from `--cursor-shape`),
+    // NOT `Config::default()`. A restored `TermState` carries the grid and
+    // the DYNAMIC cursor style (whatever the shell last set via DECSCUSR),
+    // but a freshly-connected session's shell hasn't sent a DECSCUSR yet
+    // (this host's does it from `PROMPT_COMMAND`, i.e. only once the first
+    // prompt after an Enter is drawn), so `Term::cursor_style` is `None`
+    // and `cursor_style()` falls back to `config.default_cursor_style`. If
+    // that config default is `Config::default()`'s Block, the very first
+    // frame draws a Block/bar cursor regardless of the configured shape,
+    // only snapping to the right shape once the shell finally emits its own
+    // DECSCUSR — confirmed as a reported bug (underline profile shows a bar
+    // until the first Enter). Seeding the config with the real shape makes
+    // the first frame already correct.
+    let snapshot_term_config = Config {
+        default_cursor_style: crate::session::parse_cursor_shape(cursor_shape.as_deref()),
+        ..Config::default()
+    };
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         loop {
             let message = read_holder_message(&reader_connection)?;
@@ -229,7 +247,7 @@ pub fn run(
                     // with `state.grid`, so this placeholder never
                     // actually gets rendered against.
                     let placeholder_bounds = crate::bounds::SessionBounds::new(1, 1);
-                    let mut term = Term::new(Config::default(), &placeholder_bounds, VoidListener);
+                    let mut term = Term::new(snapshot_term_config.clone(), &placeholder_bounds, VoidListener);
                     term.restore(state);
 
                     let mut redrawer = crate::redraw::Redrawer::new();

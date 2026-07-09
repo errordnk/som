@@ -594,17 +594,115 @@ specific modes someone remembered to add tracking for."
       "Architecture" section above's updated note. Confirmed by grepping
       `main.rs` for `cfg(windows)`/`cfg(unix)`: zero matches.
 
-**Status: v3 is done.** Every checklist item above is checked off. The
-original session goal (F2 doesn't open htop's Setup screen over WSL/SSH,
-plain text gets corrupted through the tmux wrapper) is confirmed fixed —
-by direct reproduction against real remote hosts, not just code review —
-and the architecture is simpler than v2 was (one platform-agnostic
-HOLDER/RELAY implementation instead of a Windows-only path plus a
-Unix-only real-tmux wrapper). Remaining possible follow-ups, none
-blocking anything: extending `Redrawer`'s full-redraw path to emit every
-`TermMode` bit generically (currently only `ALT_SCREEN`/`APP_CURSOR` are
-special-cased — see the note earlier in this file); further real-world
-use to surface anything this session's testing didn't happen to exercise.
+**Status: v3 is done, but two real post-"done" bugs were found and fixed
+(so far confirmed and deployed on the `deb` Linux host only — see
+"Post-v3 fixes (Linux-confirmed)" below).** Every checklist item above is
+checked off. The original session goal (F2 doesn't open htop's Setup
+screen over WSL/SSH, plain text gets corrupted through the tmux wrapper)
+is confirmed fixed — by direct reproduction against real remote hosts,
+not just code review — and the architecture is simpler than v2 was (one
+platform-agnostic HOLDER/RELAY implementation instead of a Windows-only
+path plus a Unix-only real-tmux wrapper). Remaining possible follow-ups,
+none blocking anything: extending `Redrawer`'s full-redraw path to emit
+every `TermMode` bit generically (currently only `ALT_SCREEN`/
+`APP_CURSOR` are special-cased — see the note earlier in this file);
+further real-world use to surface anything this session's testing didn't
+happen to exercise.
+
+### Post-v3 fixes (Linux-confirmed only — deployed to `deb`, NOT yet to
+### Windows/mac/WSL as of this writing)
+
+After declaring v3 done, real usage of the `deb` (SSH, `tmux: true`)
+profile surfaced two further bugs neither the automated tests nor the
+smoke-test examples had caught, both now root-caused and fixed:
+
+- [x] **Doubled `\r\n` between every remote shell prompt.** Root cause: a
+      real, reproducible duplication bug in `alacritty_terminal`'s
+      Windows ConPTY reader path — `Pty::reregister` (called whenever
+      write interest toggles, i.e. whenever a keystroke needs sending
+      right after some output arrived) can re-trigger a synthetic
+      "readable" event via `UnblockedReader::register`'s own "the pipe
+      still has data" check, even when nothing new actually arrived; when
+      that races with the read loop not having fully drained the pipe
+      yet, the exact same bytes get read and forwarded a second time.
+      Three false/incomplete leads chased first (documented here so
+      they aren't re-tried): adding `-t` to force remote pty allocation
+      (reverted — unrelated, didn't touch the actual bug); a narrower
+      `RawByteBroadcaster`-only dedup in `som_tmux::session` (insufficient
+      on its own — only covers som-tmux's own `with_raw_byte_sink`
+      subscribers, but Som's OWN plain `crates/terminal` `EventLoop`,
+      which is what an SSH `tmux: true` profile's Windows side actually
+      uses, never registers a sink at all, so duplicated reads still hit
+      the visible grid unfiltered); a first `pty_read`-level dedup (fork
+      commit `c89b58ec`) that compared the fully-accumulated
+      `buf[..unprocessed]` against the PREVIOUS `pty_read` call's chunk —
+      this looked fixed in isolated testing (a standalone `som_tmux`
+      client with no GPUI render thread contending for the terminal
+      lock) but the real bug persisted in the actual Som UI, matching a
+      real user report of "first Enter is clean, every one after has a
+      duplicated blank line." Root cause of THAT gap: `pty_read`'s
+      `'read: loop` can call the underlying `read()` syscall MULTIPLE
+      times within a single `pty_read` invocation whenever the terminal
+      lock is contended (the `None => continue` branch when
+      `try_lock_unfair()` fails) — a genuine chunk and its ConPTY-
+      duplicated repeat can both land in `buf` and get concatenated
+      into ONE combined slice before the dedup check ever runs, so it no
+      longer matches the previous call's remembered chunk as a whole.
+      Lock contention is far more likely once a render thread is
+      actively repainting (i.e. after the first prompt/output already
+      appeared) than on a session's very first read — which is exactly
+      why only the first Enter came through clean. Actual fix (fork
+      `errordnk/alacritty`, branch `som-snapshot-restore`, commit
+      `07d75efe`): compare each INDIVIDUAL `read()` result against the
+      bytes immediately preceding it in the buffer, inside the read loop
+      itself, in addition to (not instead of) the original per-call
+      50ms-windowed dedup right before the parser. Confirmed via
+      isolated multi-Enter reproduction against the real `deb` host
+      (10/10 doubled CRLFs before, 0/10 after) AND, this time, directly
+      in the real Som UI against `deb` — user confirmed no blank lines
+      after several repeated Enter presses.
+- [x] **Missing MOTD banner on `tmux: true` SSH profiles.** Root cause: a
+      plain (non-tmux) SSH profile gets the MOTD for free because Som
+      runs a bare `ssh host` (no explicit remote command), which makes
+      sshd run its own PAM `pam_motd` login sequence. A `tmux: true`
+      profile's `ssh host ~/.local/bin/som-tmux ...` is an EXPLICIT
+      remote command, which sshd never treats as a login session for —
+      confirmed by direct comparison against the real `deb` host (`ssh
+      host echo hi` -> no MOTD at all; bare `ssh host` -> full MOTD,
+      including a "Last login: ..." line). No flag passed to the
+      eventually-spawned shell can get this back, since sshd's decision
+      happens before `som-tmux` ever starts. Fixed in `Session::spawn`
+      (`#[cfg(unix)]` — Windows-local tmux profiles have no MOTD concept)
+      by wrapping the real shell in `sh -c '...; exec "$0" "$@"'` that
+      reproduces the same content sshd's own `pam_motd` would have,
+      before `exec`ing the real shell in its own place:
+      - `run-parts /etc/update-motd.d` for the dynamic pieces (kernel/
+        distro banner, update-available notices, etc.)
+      - `cat /etc/motd` for the static file
+      - a synthesized "Last login: Thu Jul  9 08:53:46 2026 from
+        192.168.50.2"-shaped line, built from `last -F "$(whoami)" | head
+        -1` — NOT `lastlog` (confirmed absent on the real `deb` host,
+        a minimal Debian install) and NOT `head -2` (confirmed via direct
+        test that a `som-tmux`-spawned shell does NOT itself register a
+        new entry in `wtmp`/`last`'s log — unlike a real interactive `ssh
+        -tt host` session, which does register one before printing this
+        same line — so the freshest existing entry already IS the
+        correct "previous" login to report, no skip needed).
+      All three pieces gracefully do nothing where they don't apply (a
+      real macOS host has neither `/etc/motd` nor `/etc/update-motd.d` by
+      default, confirmed directly). Confirmed on the real `deb` host: the
+      kernel/distro banner, the static MOTD text, and a correctly-dated/
+      correctly-worded "Last login" line all now appear, matching sshd's
+      own real login-sequence output byte-for-byte in wording (verified
+      via a real `ssh -tt` session against the same host as the
+      side-by-side comparison).
+      **NOT yet deployed to mac/WSL/Windows-local** — user explicitly
+      asked to hold off on those until Linux (`deb`) is fully confirmed
+      working; `#[cfg(unix)]` means the code compiles for mac/WSL too
+      once deployed, but hasn't been smoke-tested there yet (macOS in
+      particular has neither `/etc/motd` nor `/etc/update-motd.d` by
+      default, so it should just skip straight to the `Last login` line
+      and then the shell — untested assumption, not confirmed).
 
 Full blow-by-blow implementation log for v1 and v2 (exact file states,
 the discovery process for each abandoned design's bugs) lives in this

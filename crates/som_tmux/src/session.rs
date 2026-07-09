@@ -63,10 +63,56 @@ impl EventListener for ServerListener {
 /// (non-tmux) terminal already does for a directly-owned shell.
 struct RawByteBroadcaster {
     subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<Vec<u8>>>>>,
+    /// The last chunk written, plus when — see `write`'s doc comment.
+    /// `None` until the first real write.
+    last_write: Option<(Vec<u8>, std::time::Instant)>,
 }
 
 impl std::io::Write for RawByteBroadcaster {
+    /// Drops an incoming chunk that is BYTE-FOR-BYTE identical to the
+    /// immediately preceding one AND arrived within a short window of it
+    /// (`DUPLICATE_WRITE_WINDOW`) — a workaround for a confirmed real
+    /// duplication bug in the Windows ConPTY reader path this crate's
+    /// `EventLoop::with_raw_byte_sink` sits downstream of: the exact same
+    /// chunk (confirmed via direct byte-for-byte instrumentation, e.g. a
+    /// literal `[13, 10]` for a lone Enter keystroke's echoed newline) gets
+    /// written to this sink twice in immediate succession (single-digit
+    /// milliseconds apart), specifically once real keystrokes start
+    /// flowing over an SSH `tmux: true` profile — never on the very first,
+    /// read-only snapshot. Root cause not fully isolated in the upstream
+    /// `alacritty_terminal` fork (a `Pty::reregister` fix that looked like
+    /// a strong candidate did not eliminate it in direct reproduction), so
+    /// this dedup is the actual fix point for now. Deliberately narrow
+    /// (exact byte match, short window) so it can't silently eat a
+    /// legitimate repeat happening for an unrelated reason seconds apart —
+    /// confirmed via direct instrumentation that the real duplicate always
+    /// lands within single-digit milliseconds of the original.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const DUPLICATE_WRITE_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+        let now = std::time::Instant::now();
+        let original_len = buf.len();
+        let mut buf = buf;
+        let owned;
+        if let Some((last_buf, last_at)) = &self.last_write {
+            let recent = now.duration_since(*last_at) < DUPLICATE_WRITE_WINDOW;
+            // Case 1: the WHOLE new chunk exactly repeats the last one.
+            if recent && last_buf.as_slice() == buf {
+                return Ok(original_len);
+            }
+            // Case 2: the new chunk STARTS WITH the last one repeated
+            // again (e.g. last write was `[13, 10]`, this write is
+            // `[13, 10, 13, 10, ...]`) — strip just the duplicated
+            // prefix, forward the rest. Confirmed via direct
+            // instrumentation this shape happens too, not just whole-
+            // chunk repeats: the duplication doesn't consistently land on
+            // its own separate `write()` call.
+            if recent && !last_buf.is_empty() && buf.len() > last_buf.len() && buf.starts_with(last_buf.as_slice()) {
+                owned = buf[last_buf.len()..].to_vec();
+                buf = &owned;
+            }
+        }
+        self.last_write = Some((buf.to_vec(), now));
+
         let subs = self.subscribers.lock().unwrap();
         for sub in subs.iter() {
             // `try_send`, not `send`/blocking — a slow or vanished RELAY
@@ -75,7 +121,7 @@ impl std::io::Write for RawByteBroadcaster {
             // this session's own liveness, depends on).
             sub.try_send(buf.to_vec()).ok();
         }
-        Ok(buf.len())
+        Ok(original_len)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -206,7 +252,7 @@ impl Session {
             false,
         )
         .context("failed to create pty event loop")?
-        .with_raw_byte_sink(Box::new(RawByteBroadcaster { subscribers: raw_byte_subscribers.clone() }));
+        .with_raw_byte_sink(Box::new(RawByteBroadcaster { subscribers: raw_byte_subscribers.clone(), last_write: None }));
 
         let pty_tx = Notifier(event_loop.channel());
         // Mirrors terminal.rs's own "DANGER" comment: this detaches the IO
@@ -490,3 +536,83 @@ fn process_pid(pty: &tty::Pty) -> Option<sysinfo::Pid> {
 // parser`), which exercises `Session::redraw` — the actual method used in
 // production now that `Session::snapshot`/the old `GridSnapshot` protocol
 // are gone. No separate test needed here for the same behavior.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Regression test for a real user-reported bug (all `tmux: true` SSH
+    /// profiles showed an extra blank line between every shell prompt):
+    /// confirmed via direct byte-for-byte instrumentation against a real
+    /// remote host that `EventLoop::with_raw_byte_sink`'s sink (this
+    /// `RawByteBroadcaster`) sometimes receives the exact same chunk (or a
+    /// chunk that starts by repeating the previous one) twice in immediate
+    /// succession — a duplication bug somewhere in the Windows ConPTY
+    /// reader path this sits downstream of, not fully root-caused upstream
+    /// (a `Pty::reregister` fix in the `errordnk/alacritty` fork looked
+    /// like a strong candidate but did not eliminate it in direct
+    /// reproduction). This drives the dedup logic directly, without a real
+    /// PTY, to lock in both shapes the real bug actually took.
+    fn collect_broadcast(chunks: &[&[u8]], delay_between: std::time::Duration) -> Vec<u8> {
+        let (tx, rx) = async_channel::unbounded();
+        let mut broadcaster =
+            RawByteBroadcaster { subscribers: Arc::new(std::sync::Mutex::new(vec![tx])), last_write: None };
+        for chunk in chunks {
+            broadcaster.write_all(chunk).expect("write_all should succeed");
+            std::thread::sleep(delay_between);
+        }
+        let mut collected = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            collected.extend(chunk);
+        }
+        collected
+    }
+
+    #[test]
+    fn drops_a_whole_chunk_that_exactly_repeats_the_previous_one_within_the_dedup_window() {
+        let collected = collect_broadcast(&[b"\r\n", b"\r\n"], std::time::Duration::from_millis(1));
+        assert_eq!(
+            collected, b"\r\n",
+            "the second, exactly-repeated chunk arriving milliseconds later should have been dropped as a \
+             duplicate — this is exactly the reported doubled-CRLF-between-prompts bug"
+        );
+    }
+
+    #[test]
+    fn strips_a_duplicated_prefix_when_the_next_chunk_starts_by_repeating_the_last_one() {
+        // Confirmed via real reproduction: the duplication doesn't always
+        // land as its own separate, exactly-matching `write()` call — the
+        // SECOND copy sometimes arrives fused onto the FRONT of the next
+        // genuinely-new chunk instead (e.g. last write was `\r\n`, this
+        // write is `\r\n` + the next real content stuck together).
+        let collected = collect_broadcast(&[b"\r\n", b"\r\nhello"], std::time::Duration::from_millis(1));
+        assert_eq!(
+            collected, b"\r\nhello",
+            "the duplicated `\\r\\n` prefix on the second chunk should have been stripped, keeping only the \
+             genuinely new `hello` that followed it"
+        );
+    }
+
+    #[test]
+    fn does_not_drop_a_repeat_of_the_same_bytes_outside_the_dedup_window() {
+        // A real shell CAN legitimately produce the same short chunk twice
+        // in a row for unrelated reasons (e.g. two blank lines seconds
+        // apart) — the dedup must not eat that. Confirmed via direct
+        // instrumentation that the actual bug's duplicate always lands
+        // within single-digit milliseconds, never anywhere close to this
+        // window.
+        let collected = collect_broadcast(&[b"\r\n", b"\r\n"], std::time::Duration::from_millis(100));
+        assert_eq!(
+            collected, b"\r\n\r\n",
+            "two genuinely separate occurrences of the same short chunk, well outside the dedup window, must \
+             both be forwarded — this must not become a general \"collapse repeated output\" filter"
+        );
+    }
+
+    #[test]
+    fn does_not_touch_unrelated_consecutive_chunks() {
+        let collected = collect_broadcast(&[b"hello", b" world"], std::time::Duration::from_millis(1));
+        assert_eq!(collected, b"hello world", "chunks that don't repeat each other at all must pass through untouched");
+    }
+}

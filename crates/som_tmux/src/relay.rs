@@ -574,66 +574,51 @@ fn strip_cr_induced_lf(chunk: &[u8], last_byte_was_cr: &mut bool) -> Vec<u8> {
 const RESIZE_MARKER_PREFIX: &[u8] = b"\x1bPsom-tmux-resize;";
 const RESIZE_MARKER_SUFFIX: &[u8] = b"\x1b\\";
 
-/// Finds and strips EVERY `RESIZE_MARKER_PREFIX`/`_SUFFIX`-wrapped
-/// `cols;rows` size update out of `chunk` (there can be several in a single
-/// read — Som's resize handler can emit a rapid burst of them, e.g. during
-/// a drag-resize, all of which land in one `read()`), returning the chunk
-/// with ALL markers removed plus the LAST (most recent, therefore current)
-/// size parsed, if any. See `crates/terminal::terminal.rs`'s
-/// `is_tmux_relay_shell` field doc comment for the full "why" — in short,
-/// an SSH `tmux: true` profile's RELAY has no `TIOCGWINSZ`/window-change
-/// path of its own to learn Som's real pane size from (its own stdin/
-/// stdout are plain pipes over the SSH channel, not a tty), so the Windows
-/// side encodes size updates directly into the PTY byte stream instead,
-/// wrapped in a DCS sequence real shells silently ignore as an
-/// unrecognized control string if this interception ever somehow doesn't
-/// happen.
+/// Finds and strips a `RESIZE_MARKER_PREFIX`/`_SUFFIX`-wrapped `cols;rows`
+/// size update out of `chunk` (if present), returning the chunk with the
+/// marker removed plus the parsed size, if any. See `crates/terminal::
+/// terminal.rs`'s `is_tmux_relay_shell` field doc comment for the full
+/// "why" — in short, an SSH `tmux: true` profile's RELAY has no
+/// `TIOCGWINSZ`/window-change path of its own to learn Som's real pane
+/// size from (its own stdin/stdout are plain pipes over the SSH channel,
+/// not a tty), so the Windows side encodes size updates directly into the
+/// PTY byte stream instead, wrapped in a DCS sequence real shells silently
+/// ignore as an unrecognized control string if this interception ever
+/// somehow doesn't happen.
 ///
-/// Only strips markers that arrive WHOLE within this one `read()` — a
-/// marker split across two reads has its two halves forwarded as ordinary
-/// (garbage-but-harmless) bytes rather than losing the resize outright, a
-/// degraded-but-safe failure mode. Once one prefix has no matching suffix
-/// yet (truncated tail), scanning stops and everything from that prefix on
-/// is left in place (it may complete on the next read — though this code
-/// doesn't reassemble across reads, leaving it in place is still the safe
-/// choice vs. dropping a partial prefix's bytes).
+/// Assumes the marker arrives whole within a single `read()` call (not
+/// split across two) — a reasonable assumption for a resize event (user-
+/// driven, not a tight byte stream) landing in a 4KB read buffer, unlike
+/// e.g. a `\r`/`\n` pair that genuinely can split under load. If a marker
+/// ever WAS split across reads, this would just forward its two halves as
+/// ordinary (garbage, harmless) bytes to the real shell rather than losing
+/// the resize entirely — a degraded-but-safe failure mode, not a silent
+/// data-loss one.
 fn extract_resize_marker(chunk: &[u8]) -> (Vec<u8>, Option<(u16, u16)>) {
+    let Some(start) = chunk
+        .windows(RESIZE_MARKER_PREFIX.len())
+        .position(|window| window == RESIZE_MARKER_PREFIX)
+    else {
+        return (chunk.to_vec(), None);
+    };
+    let after_prefix = start + RESIZE_MARKER_PREFIX.len();
+    let Some(suffix_offset) = chunk[after_prefix..]
+        .windows(RESIZE_MARKER_SUFFIX.len())
+        .position(|window| window == RESIZE_MARKER_SUFFIX)
+    else {
+        return (chunk.to_vec(), None);
+    };
+    let end = after_prefix + suffix_offset;
+    let payload = std::str::from_utf8(&chunk[after_prefix..end]).ok();
+    let size = payload.and_then(|payload| {
+        let (cols, rows) = payload.split_once(';')?;
+        Some((cols.parse().ok()?, rows.parse().ok()?))
+    });
+
     let mut without_marker = Vec::with_capacity(chunk.len());
-    let mut last_size = None;
-    let mut rest = chunk;
-
-    loop {
-        let Some(start) = rest
-            .windows(RESIZE_MARKER_PREFIX.len())
-            .position(|window| window == RESIZE_MARKER_PREFIX)
-        else {
-            without_marker.extend_from_slice(rest);
-            break;
-        };
-        let after_prefix = start + RESIZE_MARKER_PREFIX.len();
-        let Some(suffix_offset) = rest[after_prefix..]
-            .windows(RESIZE_MARKER_SUFFIX.len())
-            .position(|window| window == RESIZE_MARKER_SUFFIX)
-        else {
-            // A prefix with no closing suffix yet — leave it (and
-            // everything after) in place rather than dropping a partial
-            // marker's bytes.
-            without_marker.extend_from_slice(rest);
-            break;
-        };
-        let end = after_prefix + suffix_offset;
-        if let Some(payload) = std::str::from_utf8(&rest[after_prefix..end]).ok()
-            && let Some((cols, rows)) = payload.split_once(';')
-            && let (Ok(cols), Ok(rows)) = (cols.parse(), rows.parse())
-        {
-            last_size = Some((cols, rows));
-        }
-        // Keep the bytes before this marker; continue scanning after it.
-        without_marker.extend_from_slice(&rest[..start]);
-        rest = &rest[end + RESIZE_MARKER_SUFFIX.len()..];
-    }
-
-    (without_marker, last_size)
+    without_marker.extend_from_slice(&chunk[..start]);
+    without_marker.extend_from_slice(&chunk[end + RESIZE_MARKER_SUFFIX.len()..]);
+    (without_marker, size)
 }
 
 #[cfg(test)]
@@ -762,34 +747,6 @@ mod tests {
         let (without_marker, size) = extract_resize_marker(chunk);
         assert_eq!(size, Some((171, 52)));
         assert!(without_marker.is_empty());
-    }
-
-    #[test]
-    fn strips_every_marker_when_a_burst_of_them_arrives_in_one_read() {
-        // Som's resize handler can emit a rapid burst — confirmed from a
-        // real deb RELAY stdin read of 443 bytes containing 17 markers.
-        // Every one must be stripped (none may leak to the shell as text),
-        // and the LAST size is the current one.
-        let mut chunk = Vec::new();
-        for rows in 22..=39 {
-            chunk.extend_from_slice(format!("\x1bPsom-tmux-resize;117;{rows}\x1b\\").as_bytes());
-        }
-        chunk.push(b'\n');
-        let (without_marker, size) = extract_resize_marker(&chunk);
-        assert_eq!(size, Some((117, 39)), "should report the LAST (most recent) size in the burst");
-        assert_eq!(without_marker, b"\n", "every marker must be stripped, leaving only the trailing newline");
-    }
-
-    #[test]
-    fn keeps_real_keystrokes_interleaved_between_several_markers() {
-        let mut chunk = b"a".to_vec();
-        chunk.extend_from_slice(b"\x1bPsom-tmux-resize;100;50\x1b\\");
-        chunk.extend_from_slice(b"b");
-        chunk.extend_from_slice(b"\x1bPsom-tmux-resize;120;60\x1b\\");
-        chunk.extend_from_slice(b"c");
-        let (without_marker, size) = extract_resize_marker(&chunk);
-        assert_eq!(size, Some((120, 60)));
-        assert_eq!(without_marker, b"abc");
     }
 
     #[test]

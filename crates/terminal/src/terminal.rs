@@ -4465,6 +4465,145 @@ mod tests {
         );
     }
 
+    /// Regression test for a real user report that the fix above (rolling-
+    /// window dedup, `test_ssh_tmux_backend_enter_does_not_double_crlf`)
+    /// did NOT fully resolve: pressing Enter is clean on a `tmux: true`
+    /// SSH profile's FIRST connection to a freshly-spawned HOLDER, but
+    /// after Som is closed and reopened — reattaching to the SAME still-
+    /// running remote HOLDER, which `wrap_remote_command_args` does simply
+    /// by reusing the same pane ID — the duplicated-blank-line bug comes
+    /// back. This drops one `Terminal` (closing its RELAY connection, the
+    /// same way closing Som does) and spawns a SECOND one with the SAME
+    /// pane_id, which `server.rs::handle_relay` treats as a reattach to
+    /// the still-alive HOLDER (see its `force_resize`/`Snapshot` handling)
+    /// rather than a fresh spawn — then repeats the exact same Enter-
+    /// press check on the second connection.
+    ///
+    /// `#[cfg(target_os = "windows")]` deliberately — same reasoning as
+    /// the fresh-spawn version above.
+    ///
+    /// `#[ignore]`d by default. Run explicitly with:
+    /// `SOM_TEST_SSH_HOST=<host> cargo test -p terminal test_ssh_tmux_backend_enter_after_reattach -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_tmux_backend_enter_does_not_double_crlf_after_reattach(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let pane_id = format!("test-tmuxv2-reattach-{}", std::process::id());
+        let profile_name = "test-tmuxv2-reattach";
+        // Exact `wrap_remote_command_args` shape (terminal_panel.rs), not
+        // just "close enough" — `$SHELL` (not a literal `bash`) and the
+        // trailing `-- -l` login-shell flag matter here specifically: `-l`
+        // is what makes the remote shell run as a LOGIN shell, which is
+        // what triggers `Session::spawn`'s `motd_wrapped_command` MOTD
+        // emulation in the first place. A test spawning a plain `bash`
+        // with no `-l` never exercises that code path at all, and the
+        // real user report showed the bug's SECOND connection still
+        // printing a correct MOTD (confirmed via screenshot) — so if
+        // there's an interaction between the MOTD wrapper's own output
+        // and reattach specifically, only the exact real arg shape can
+        // catch it.
+        let args = || {
+            vec![
+                ssh_host.clone(),
+                "~/.local/bin/som-tmux".to_string(),
+                profile_name.to_string(),
+                pane_id.clone(),
+                "$SHELL".to_string(),
+                "--cursor-shape".to_string(),
+                "underline".to_string(),
+                "--scrollback".to_string(),
+                "10000".to_string(),
+                "--".to_string(),
+                "-l".to_string(),
+            ]
+        };
+
+        async fn wait_for_prompt(terminal: &Entity<Terminal>, cx: &mut TestAppContext) {
+            let mut ready = false;
+            for _ in 0..150 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let content = terminal.update(cx, |term, _| term.get_content());
+                if content.trim().len() > 1 {
+                    ready = true;
+                    break;
+                }
+            }
+            assert!(ready, "prompt never appeared — test setup problem, not the bug under test");
+        }
+
+        fn max_consecutive_blank_after_first_prompt(content: &str) -> usize {
+            let all_lines: Vec<&str> = content.lines().map(|l| l.trim_end()).collect();
+            let first_prompt_index =
+                all_lines.iter().position(|line| line.trim() == "\u{e77d} ~ \u{f101}").unwrap_or(0);
+            all_lines[first_prompt_index..]
+                .iter()
+                .fold((0usize, 0usize), |(max, cur), line| {
+                    let cur = if line.is_empty() { cur + 1 } else { 0 };
+                    (max.max(cur), cur)
+                })
+                .0
+        }
+
+        // First connection: fresh HOLDER spawn.
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(cx, "ssh".to_string(), args()).await;
+        wait_for_prompt(&terminal, cx).await;
+        for _ in 0..5 {
+            terminal.update(cx, |terminal, _cx| terminal.input(vec![b'\r']));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        let first_content = terminal.update(cx, |term, _| term.get_content());
+        let first_max_blank = max_consecutive_blank_after_first_prompt(&first_content);
+        assert!(
+            first_max_blank <= 1,
+            "found {first_max_blank} consecutive blank lines on the FIRST connection (fresh HOLDER spawn) — \
+             test setup problem, not the reattach-specific bug this test targets. Screen:\n{first_content:?}"
+        );
+
+        // Close this connection exactly the way closing a Som tab does —
+        // the NUL-byte tab-close signal, mirroring `TerminalView::
+        // on_removed`'s own follow-up-byte workaround — then drop it,
+        // WITHOUT ever sending `RelayInput::Close`, so the remote HOLDER
+        // stays alive (a real Som restart, as opposed to an explicit tab
+        // close, never signals the HOLDER to exit either — that's the
+        // whole point of a HOLDER surviving across Som restarts).
+        drop(terminal);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Real report was after Som had been closed/reopened SEVERAL times
+        // over the course of a session (confirmed via the HOLDER's own
+        // log: 3 separate `relay connected` events across ~14 minutes) —
+        // repeat the reattach cycle a few times rather than just once, in
+        // case the bug only shows up on the Nth reattach, not the 2nd.
+        for attempt in 2..=4 {
+            let (terminal_n, _completion_rx_n) = build_test_terminal_with_arguments(cx, "ssh".to_string(), args()).await;
+            wait_for_prompt(&terminal_n, cx).await;
+            for _ in 0..10 {
+                terminal_n.update(cx, |terminal, _cx| terminal.input(vec![b'\r']));
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            cx.run_until_parked();
+            let content = terminal_n.update(cx, |term, _| term.get_content());
+            let max_blank = max_consecutive_blank_after_first_prompt(&content);
+            assert!(
+                max_blank <= 1,
+                "found {max_blank} consecutive blank lines after 10 Enter presses on reattach #{attempt} (same \
+                 pane_id as an already-live HOLDER) — this is the reattach-specific variant of the doubled-CRLF-\
+                 between-prompts bug: clean on first connect, broken after Som restarts and reattaches. \
+                 Screen:\n{content:?}"
+            );
+            drop(terminal_n);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
     mod perf {
         use super::super::*;
         use gpui::{

@@ -1639,4 +1639,116 @@ mod tests {
 
         session.kill();
     }
+
+    /// Regression test for a real, repeatedly reproduced bug: pressing
+    /// Enter on an SSH `tmux: true` profile's remote shell showed an extra
+    /// blank line between every prompt (`\r\n\r\n` instead of `\r\n`).
+    /// Root-caused to a duplication bug in `alacritty_terminal`'s Windows
+    /// ConPTY reader path (`Pty::reregister` re-triggering a synthetic
+    /// "readable" event for already-forwarded bytes when write interest
+    /// toggles right after output arrives — see `SOM_MUX_PLAN.md`'s
+    /// "Post-v3 fixes" section for the full writeup) and fixed directly in
+    /// the `errordnk/alacritty` fork, not in this crate — this test exists
+    /// to catch a REGRESSION of that fix (e.g. an accidental
+    /// `alacritty_terminal` version bump that drops it), not to diagnose
+    /// the original bug again.
+    ///
+    /// Deliberately runs on BOTH Windows and Unix (unlike the `htop`/F2
+    /// test above) — the actual bug only ever reproduced on the Windows
+    /// side (`alacritty_terminal::tty::windows`'s ConPTY reader), never
+    /// against a plain Unix `ssh` client, so a Unix-only run of this test
+    /// would never have caught it. `#[ignore]`d by default (needs real
+    /// network access to a real `deb` host) — run explicitly with `cargo
+    /// test -p som_tmux --lib ssh_prompts -- --ignored --nocapture`. Host
+    /// is `SOM_TEST_SSH_HOST` env var if set (defaults to the real `deb`
+    /// box this bug was found and fixed against).
+    #[test]
+    #[ignore]
+    fn pressing_enter_repeatedly_over_ssh_does_not_double_the_crlf_between_prompts() {
+        let host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let bounds = SessionBounds::new(80, 24);
+        // The REAL `tmux: true` SSH profile path, not a plain `ssh host`
+        // login shell — matches exactly what `wrap_remote_command_args`
+        // builds (see `terminal_panel.rs`), including the MOTD-emulation
+        // wrapper this same session sends through `Session::spawn`'s own
+        // `motd_wrapped_command` (Unix-only) once the remote `som-tmux`
+        // itself calls it. A plain `ssh host` (no explicit command) was
+        // confirmed NOT to reproduce this — that path is a genuine
+        // interactive login shell with sshd's OWN `pam_motd` sequence
+        // (different timing/byte pattern entirely), not the nested
+        // RELAY-over-SSH path a real `tmux: true` tab actually uses.
+        let pane_id = format!("{}", uuid::Uuid::new_v4());
+        let session = Session::spawn(
+            "ssh".into(),
+            vec![host, "~/.local/bin/som-tmux".to_string(), "test-profile".to_string(), pane_id, "$SHELL".to_string()],
+            None,
+            bounds,
+            None,
+            None,
+        )
+        .expect("failed to spawn ssh for test");
+        let events_rx = session.subscribe();
+
+        // Wait for the remote shell's own prompt (this host's real PS1
+        // prints a trailing `~`) before typing anything — same reasoning
+        // as this file's other real-shell tests.
+        let mut redrawer = Redrawer::new();
+        let mut ready = false;
+        for _ in 0..50 {
+            let mut bytes = Vec::new();
+            session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
+            if String::from_utf8_lossy(&bytes).contains('~') {
+                ready = true;
+                break;
+            }
+            if !session.next_change_blocking(&events_rx) {
+                break;
+            }
+        }
+        assert!(ready, "the remote shell's own prompt never appeared — test setup problem, not the bug under test");
+
+        // Press Enter 10 times, exactly like the real reproduction —
+        // fixed sleeps between each, not `next_change_blocking` in a loop,
+        // since an idle remote shell may not produce a `Wakeup` for every
+        // single keystroke's worth of output on this timescale.
+        for _ in 0..10 {
+            session.write(b"\r".to_vec());
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let mut bytes = Vec::new();
+        session.redraw(&mut redrawer, &mut bytes).expect("redraw should succeed");
+        let direct_grid_text = session.diag_grid_text();
+
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut target_term, &bytes);
+        let grid_text: String = target_term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+
+        // The actual symptom: a blank grid ROW immediately followed by
+        // another blank row, both sitting between two non-blank prompt
+        // lines — a real idle prompt only ever has ONE blank-ish
+        // separator, never two in a row from a single Enter press. Counts
+        // consecutive blank lines in the reparsed grid directly, rather
+        // than pattern-matching escape bytes, so this doesn't depend on
+        // gridline-vs-escape-sequence details that could shift without
+        // the underlying bug changing.
+        let lines: Vec<&str> = grid_text.lines().map(|l| l.trim_end()).collect();
+        let max_consecutive_blank = lines
+            .iter()
+            .fold((0usize, 0usize), |(max, cur), line| {
+                let cur = if line.is_empty() { cur + 1 } else { 0 };
+                (max.max(cur), cur)
+            })
+            .0;
+        assert!(
+            max_consecutive_blank <= 1,
+            "found {max_consecutive_blank} consecutive blank lines in the reparsed grid after 10 Enter presses over \
+             SSH — this is exactly the reported doubled-CRLF-between-prompts bug. Grid:\n{grid_text:?}\nDirect \
+             term grid: {direct_grid_text:?}"
+        );
+
+        session.kill();
+    }
 }

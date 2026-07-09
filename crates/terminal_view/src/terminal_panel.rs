@@ -1496,31 +1496,7 @@ fn tmux_wrapped_shell(
             let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback);
             Ok((server_path.to_string_lossy().to_string(), wrapped_args))
         }
-        RemoteKind::Ssh => {
-            // `-t` forces a remote pty allocation — without it, `ssh host
-            // <explicit command>` (as opposed to a bare `ssh host` with no
-            // command, an interactive login shell) does NOT allocate one
-            // by default. Confirmed by direct isolated reproduction
-            // (bypassing this crate's own protocol entirely — a plain
-            // `alacritty_terminal::tty::new` PTY running `ssh host bash
-            // -i`) that Windows's OpenSSH client duplicates every `\r\n`
-            // line ending in the OUTPUT it hands back once a remote pty
-            // ISN'T allocated — every prompt after the first showed up as
-            // `\r\n\r\n` instead of `\r\n`, exactly the reported "empty
-            // line between every prompt" bug. The SAME `ssh host bash -i`
-            // WITH `-t` produced clean single `\r\n`s. This is a Windows-
-            // OpenSSH-specific quirk with non-pty remote command channels,
-            // not anything this crate's own protocol/redraw logic got
-            // wrong — `som-tmux`'s own RELAY already forwards HOLDER
-            // bytes completely unmodified (see `relay.rs`'s `HolderOutput
-            // ::Bytes` handling), so there was nothing on this crate's
-            // side to fix.
-            let mut args = args;
-            args.insert(0, "-t".to_string());
-            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback);
-            Ok((program, wrapped_args))
-        }
-        RemoteKind::Wsl => {
+        RemoteKind::Ssh | RemoteKind::Wsl => {
             let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback);
             Ok((program, wrapped_args))
         }
@@ -2344,40 +2320,6 @@ mod tmux_shell_wrapping_tests {
         );
     }
 
-    /// Regression test for a real user report (all four `tmux: true`
-    /// profiles — win, wsl, deb, mac — showed an extra blank line between
-    /// every shell prompt after pressing Enter). Root cause, confirmed by
-    /// isolated reproduction bypassing this crate's protocol entirely
-    /// (a plain `alacritty_terminal::tty::new` PTY running `ssh host bash
-    /// -i`, no som-tmux involved at all): Windows's OpenSSH client
-    /// duplicates every `\r\n` line ending in its OUTPUT when it runs an
-    /// explicit remote command WITHOUT a remote pty allocated — which is
-    /// exactly `tmux_wrapped_shell`'s SSH path, since `ssh host <command>`
-    /// (an explicit command, as opposed to a bare `ssh host` login shell)
-    /// does NOT allocate one by default. `-t` forces the allocation and
-    /// was confirmed (same isolated reproduction) to produce clean single
-    /// `\r\n`s. `tmux_wrapped_shell` inserts it as the very first arg
-    /// (before the host), matching where a real interactive `ssh -t host
-    /// cmd` invocation puts it.
-    #[test]
-    fn ssh_tmux_profiles_force_a_remote_pty_with_dash_t_to_avoid_doubled_line_endings() {
-        let profile = workspace::TabProfile {
-            name: "deb".to_string(),
-            shell: Some("ssh 192.168.50.3".to_string()),
-            keystroke: None,
-            icon: None,
-            home: None,
-            tmux: true,
-        };
-        let (program, args) = tmux_wrapped_shell(&profile, "pane-uuid-9", CursorShape::Block, None).expect("should succeed for an SSH profile");
-        assert_eq!(program, "ssh");
-        assert_eq!(
-            args,
-            vec!["-t", "192.168.50.3", "~/.local/bin/som-tmux", "deb", "pane-uuid-9", "$SHELL", "--cursor-shape", "block"],
-            "the SSH invocation must have -t inserted before the host so a remote pty gets allocated"
-        );
-    }
-
     #[test]
     fn wraps_a_wsl_profile_by_appending_the_remote_holder_invocation() {
         // profile.shell == "wsl --cd ~" -> program="wsl", args=["--cd", "~"].
@@ -2448,33 +2390,6 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(args[2], "pi5"); // profile unchanged
         assert_ne!(args[3], "original-pane-id"); // pane_id replaced
         assert_eq!(&args[4..], &["$SHELL", "--cursor-shape", "block"]);
-    }
-
-    /// Same as the test above, but against the ACTUAL real-world SSH argv
-    /// shape (with `-t` in front, per `tmux_wrapped_shell`'s SSH-only
-    /// fix) — `rebuild_tmux_shell_with_fresh_pane_id`'s `som-tmux`
-    /// position search must still find the right slot even though `-t`
-    /// shifts everything one index to the right versus the test above.
-    #[test]
-    fn rebuild_still_finds_the_pane_id_when_the_ssh_argv_has_a_leading_dash_t() {
-        let mut args = wrap_remote_command_args(
-            "pi5",
-            "original-pane-id",
-            vec!["192.168.50.5".to_string()],
-            CursorShape::Block,
-            None,
-        );
-        args.insert(0, "-t".to_string());
-        let shell = Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
-        let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a remote tmux-wrapped shell even with a leading -t");
-        let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
-        assert_eq!(program, "ssh");
-        assert_eq!(args[0], "-t");
-        assert_eq!(args[1], "192.168.50.5");
-        assert_eq!(args[2], "~/.local/bin/som-tmux");
-        assert_eq!(args[3], "pi5"); // profile unchanged
-        assert_ne!(args[4], "original-pane-id"); // pane_id replaced
-        assert_eq!(&args[5..], &["$SHELL", "--cursor-shape", "block"]);
     }
 
     #[test]

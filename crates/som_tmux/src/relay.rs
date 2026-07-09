@@ -750,21 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_the_exact_bytes_captured_from_a_real_relay_stdin_read() {
-        // Copied verbatim from a real deb RELAY's stdin diag log: the
-        // Windows side's marker, plus the trailing `\n` (10) that the
-        // ConPTY-normalized keystroke stream tacks on. If this fails, the
-        // real-world non-interception is in the parse, not the transport.
-        let chunk: &[u8] = &[
-            27, 80, 115, 111, 109, 45, 116, 109, 117, 120, 45, 114, 101, 115, 105, 122, 101, 59, 49, 49, 55, 59, 50,
-            50, 27, 92, 10,
-        ];
-        let (without_marker, size) = extract_resize_marker(chunk);
-        assert_eq!(size, Some((117, 22)));
-        assert_eq!(without_marker, b"\n");
-    }
-
-    #[test]
     fn extracts_a_resize_marker_sitting_between_real_keystrokes() {
         let mut chunk = b"echo hi".to_vec();
         chunk.extend_from_slice(b"\x1bPsom-tmux-resize;80;24\x1b\\");

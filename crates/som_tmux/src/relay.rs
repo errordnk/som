@@ -321,7 +321,6 @@ pub fn run(
             Ok(n) => n,
             Err(_) => break,
         };
-        log::warn!("DIAG relay stdin read={read} bytes={:?}", &buf[..read]);
         // A lone NUL byte is `TerminalView::on_removed`'s explicit "the user
         // closed this tab, kill the real shell for good" signal — see that
         // function's doc comment for why this can't just be Som killing the

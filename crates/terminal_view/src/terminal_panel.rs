@@ -1565,6 +1565,20 @@ fn wrap_remote_command_args(
         wrapped_args.push("--scrollback".to_string());
         wrapped_args.push(scrollback.to_string());
     }
+    // `--` then `-l`: a login-shell flag passed through to `$SHELL` itself
+    // (`som-tmux`'s own arg parser treats everything after `--` as extra
+    // args for the spawned program, see `main.rs`'s `Args` doc comment).
+    // A plain (non-tmux) SSH profile gets this for free — Som runs a bare
+    // `ssh host` with no explicit command, which makes sshd start a REAL
+    // login shell itself (that's also what prints the MOTD banner). A
+    // `tmux: true` profile's `ssh host ~/.local/bin/som-tmux ...` is an
+    // EXPLICIT remote command, which sshd never treats as a login session
+    // for — so `$SHELL` was starting as a plain non-login shell, silently
+    // skipping `.bash_profile`/`.profile` (only `.bashrc` still ran) and
+    // never printing the MOTD a real login shell would. `-l` mirrors
+    // what the ordinary profile gets automatically, restoring both.
+    wrapped_args.push("--".to_string());
+    wrapped_args.push("-l".to_string());
     wrapped_args
 }
 
@@ -2316,7 +2330,10 @@ mod tmux_shell_wrapping_tests {
         let args = wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()], CursorShape::Block, None);
         assert_eq!(
             args,
-            vec!["192.168.50.5", "~/.local/bin/som-tmux", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block"]
+            vec![
+                "192.168.50.5", "~/.local/bin/som-tmux", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block", "--",
+                "-l"
+            ]
         );
     }
 
@@ -2334,7 +2351,7 @@ mod tmux_shell_wrapping_tests {
             args,
             vec![
                 "--cd", "~", "~/.local/bin/som-tmux", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
-                "--scrollback", "5000"
+                "--scrollback", "5000", "--", "-l"
             ]
         );
     }
@@ -2389,7 +2406,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(args[1], "~/.local/bin/som-tmux");
         assert_eq!(args[2], "pi5"); // profile unchanged
         assert_ne!(args[3], "original-pane-id"); // pane_id replaced
-        assert_eq!(&args[4..], &["$SHELL", "--cursor-shape", "block"]);
+        assert_eq!(&args[4..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
     }
 
     #[test]

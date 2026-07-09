@@ -206,6 +206,8 @@ impl Session {
             && !std::path::Path::new(&program)
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"));
+        #[cfg(unix)]
+        let (program, args) = motd_wrapped_command(program, args);
         let shell = tty::Shell::new(program, args);
         // Mirrors `terminal::insert_zed_terminal_env` — without an explicit
         // `TERM`, the shell/its line editor (confirmed cause: PowerShell's
@@ -513,6 +515,38 @@ impl Session {
     }
 }
 
+/// Wraps `program`/`args` in a `sh -c '...; exec "$@"'` shell that prints
+/// the system MOTD FIRST, then `exec`s the real shell in its place (`exec`
+/// replaces this wrapper process rather than staying around as a parent —
+/// same PID-and-signals shape as running `program` directly, just with the
+/// MOTD printed first).
+///
+/// Why this is needed at all: a normal interactive SSH login (`ssh host`,
+/// no explicit remote command) gets the MOTD banner for free — sshd itself
+/// prints it, via PAM's `pam_motd`, as part of ITS OWN login sequence,
+/// before ever handing control to a shell. A `tmux: true` SSH profile's
+/// `ssh host ~/.local/bin/som-tmux ...` is an EXPLICIT remote command
+/// though, and sshd never runs the login/PAM-motd sequence for those —
+/// confirmed by direct comparison against the same host (`ssh host echo
+/// hi` -> no MOTD at all; bare `ssh host` -> full MOTD) — so by the time
+/// this HOLDER process (`som-tmux`, itself already `exec`'d as that
+/// explicit command) gets to spawn the user's real shell, there is no
+/// mechanism left that would print it. This reproduces the same content
+/// sshd's own `pam_motd` would have shown, the standard Debian/Ubuntu way
+/// (`run-parts /etc/update-motd.d/` for the dynamic pieces — kernel
+/// version, updates-available notices, etc. — plus the static `/etc/motd`
+/// file) — gracefully doing nothing if neither exists (e.g. real macOS
+/// hosts, confirmed to have neither by default).
+#[cfg(unix)]
+fn motd_wrapped_command(program: String, args: Vec<String>) -> (String, Vec<String>) {
+    let script = "if [ -d /etc/update-motd.d ]; then run-parts /etc/update-motd.d 2>/dev/null; fi; \
+                   if [ -f /etc/motd ]; then cat /etc/motd 2>/dev/null; fi; \
+                   exec \"$0\" \"$@\"";
+    let mut wrapped_args = vec!["-c".to_string(), script.to_string(), program.clone()];
+    wrapped_args.extend(args);
+    ("sh".to_string(), wrapped_args)
+}
+
 /// Grabs the spawned process's PID before `pty` is moved into `EventLoop`
 /// (which owns it exclusively from then on). Platform APIs differ: Unix's
 /// `Pty::child()` is a plain `std::process::Child`; Windows's
@@ -614,5 +648,29 @@ mod tests {
     fn does_not_touch_unrelated_consecutive_chunks() {
         let collected = collect_broadcast(&[b"hello", b" world"], std::time::Duration::from_millis(1));
         assert_eq!(collected, b"hello world", "chunks that don't repeat each other at all must pass through untouched");
+    }
+
+    /// Regression test for a real user-reported gap: `tmux: true` SSH
+    /// profiles never showed the system MOTD banner a plain (non-tmux)
+    /// SSH profile gets for free, because sshd only runs its own
+    /// `pam_motd` login sequence for a bare `ssh host` (no explicit
+    /// remote command) — `ssh host ~/.local/bin/som-tmux ...` IS an
+    /// explicit command, so sshd never prints it no matter what
+    /// `som-tmux` does after the fact. `motd_wrapped_command` reproduces
+    /// the same content sshd's own `pam_motd` would have (`run-parts
+    /// /etc/update-motd.d` + `/etc/motd`) by running it itself, then
+    /// `exec`ing the real shell in its own place — doubles as a visible
+    /// "this HOLDER was just created, not reattached to an existing one"
+    /// signal, since it only ever runs once per HOLDER lifetime.
+    #[cfg(unix)]
+    #[test]
+    fn motd_wrapped_command_execs_the_real_program_after_printing_motd() {
+        let (program, args) = motd_wrapped_command("/bin/bash".to_string(), vec!["-l".to_string()]);
+        assert_eq!(program, "sh");
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("run-parts /etc/update-motd.d"), "should attempt the dynamic MOTD pieces");
+        assert!(args[1].contains("/etc/motd"), "should attempt the static MOTD file");
+        assert!(args[1].trim_end().ends_with("exec \"$0\" \"$@\""), "must end by exec'ing the real program in its own place");
+        assert_eq!(&args[2..], &["/bin/bash", "-l"], "the real program/args must follow as $0/$@ for the exec");
     }
 }

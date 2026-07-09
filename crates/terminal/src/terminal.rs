@@ -4367,6 +4367,104 @@ mod tests {
         );
     }
 
+    /// Regression test for a real, repeatedly reproduced bug: pressing
+    /// Enter on an SSH `tmux: true` profile's remote shell shows an extra
+    /// blank line between every prompt after the first — the user's own
+    /// report, confirmed against the real deployed `som.exe`, is "first
+    /// Enter is clean, every one after duplicates a blank line". This test
+    /// exists specifically because two prior isolated repros (a
+    /// `som_tmux::Session`-only test spawning `ssh` directly, and a
+    /// same-shape test against a LOCAL `bash` with no ssh at all) BOTH
+    /// stayed clean even after the `alacritty_terminal::EventLoop::
+    /// pty_read` per-syscall dedup fix, while the bug still reproduced in
+    /// the real Som UI — the working theory is that the race depends on
+    /// GPUI's own render/executor contending for the SAME `Term` lock the
+    /// `pty_read` thread needs, which a headless `som_tmux::Session` test
+    /// (no GPUI at all) can never recreate. This test goes through the
+    /// REAL `crates/terminal::Terminal`/`TerminalBuilder` (same code path
+    /// `terminal_view` uses for an actual tab, including its own GPUI
+    /// executor/subscription plumbing), which is the closest a `#[gpui::
+    /// test]` can get to the real UI without an actual window/keystrokes.
+    ///
+    /// `#[cfg(target_os = "windows")]` deliberately — like the fix itself,
+    /// this is specifically about the Windows-side ConPTY reader, and
+    /// would prove nothing run against a Unix `ssh` client.
+    ///
+    /// `#[ignore]`d by default. Run explicitly with:
+    /// `SOM_TEST_SSH_HOST=<host> cargo test -p terminal test_ssh_tmux_backend_enter_does_not_double_crlf -- --ignored --nocapture`
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    #[ignore]
+    async fn test_ssh_tmux_backend_enter_does_not_double_crlf(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let pane_id = format!("test-tmuxv2-enter-{}", std::process::id());
+        let profile_name = "test-tmuxv2-enter";
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            "ssh".to_string(),
+            vec![ssh_host.clone(), "~/.local/bin/som-tmux".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+        )
+        .await;
+
+        let mut ready = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let content = terminal.update(cx, |term, _| term.get_content());
+            if content.trim().len() > 1 {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "bash prompt never appeared after 15s through the tmux_backend pipeline — test setup problem");
+
+        // Press Enter 10 times, same as the real reproduction — each one
+        // its own `terminal.input` call, with a real sleep in between so
+        // GPUI's own render/executor has room to actually run (and
+        // contend for the `Term` lock) between keystrokes, not just
+        // `run_until_parked` immediately after each one.
+        for _ in 0..10 {
+            terminal.update(cx, |terminal, _cx| {
+                terminal.input(vec![b'\r']);
+            });
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let content = terminal.update(cx, |term, _| term.get_content());
+        let all_lines: Vec<&str> = content.lines().map(|l| l.trim_end()).collect();
+        // Only the prompt-repeat region actually exercises the bug —
+        // everything before the FIRST prompt is the real MOTD text (kernel/
+        // distro banner, `/etc/motd`), which legitimately contains blank
+        // lines between its own paragraphs (confirmed by direct comparison
+        // against a real `ssh -tt` session's own MOTD output). Counting
+        // those would produce false positives unrelated to Enter-triggered
+        // duplication — skip everything up to and including the first
+        // line that's just the prompt's own trailing glyph.
+        let first_prompt_index = all_lines
+            .iter()
+            .position(|line| line.trim() == "\u{e77d} ~ \u{f101}")
+            .unwrap_or(0);
+        let lines = &all_lines[first_prompt_index..];
+        let max_consecutive_blank = lines
+            .iter()
+            .fold((0usize, 0usize), |(max, cur), line| {
+                let cur = if line.is_empty() { cur + 1 } else { 0 };
+                (max.max(cur), cur)
+            })
+            .0;
+        assert!(
+            max_consecutive_blank <= 1,
+            "found {max_consecutive_blank} consecutive blank lines after 10 Enter presses through the real \
+             crates/terminal::Terminal SSH tmux_backend pipeline — this is exactly the reported doubled-CRLF-\
+             between-prompts bug. Screen:\n{content:?}"
+        );
+    }
+
     mod perf {
         use super::super::*;
         use gpui::{

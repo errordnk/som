@@ -176,48 +176,6 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
                 session.resize(SessionBounds::new(cols, rows));
             }
             RelayInput::Close => {
-                // Forwards the NUL byte into the PTY itself FIRST, before
-                // ever force-killing anything — for a plain local shell
-                // (`cmd.exe`/`pwsh.exe`/`sh`) this is harmless (nothing
-                // treats a stray NUL/space as meaningful input, and the
-                // `session.kill()` below still runs regardless), but for a
-                // `tmux: true` SSH profile the PTY child THIS HOLDER owns
-                // isn't the user's real remote shell at all — it's `ssh
-                // <host> ~/.local/bin/som-tmux ...`, i.e. a SECOND, nested
-                // RELAY running on the far side of that SSH connection.
-                // Without this, `session.kill()` alone just SIGKILLs the
-                // local `ssh` process, which the remote RELAY sees as a
-                // plain disconnect (EOF), not as ITS OWN `relay.rs::run`'s
-                // NUL-byte close signal — so it never sends ITS OWN
-                // `Close` to the remote HOLDER, which means the REAL
-                // remote shell is never killed and just sits there
-                // orphaned forever (confirmed by direct reproduction
-                // against a real `deb` host). Mirrors the SAME fix already
-                // applied for the FIRST hop (Som -> its own local RELAY) in
-                // `terminal_view.rs`'s `TerminalView::on_removed` doc
-                // comment — this is the identical problem one hop further
-                // down the chain (local HOLDER -> nested remote RELAY),
-                // needing the identical fix.
-                //
-                // Isolated reproduction (`examples/nul_byte_ssh_probe.rs`)
-                // confirmed the NUL byte itself is what's getting lost —
-                // not a generic "needs a byte after it to flush" buffering
-                // quirk as first suspected (a `[NUL, space]` write in ONE
-                // `Session::write` call still silently dropped the NUL,
-                // confirmed by inspecting RAW bytes on the remote side via
-                // `EventLoop::with_raw_byte_sink`, bypassing `Term`'s own
-                // parsing/rendering which was masking the loss in earlier,
-                // less careful checks). A SEPARATE, later `session.write`
-                // call carrying ordinary bytes (here: `\r`, matching
-                // `on_removed`'s own choice) reliably makes the earlier NUL
-                // arrive too — this is a known Win32-OpenSSH quirk with
-                // NUL bytes over an interactive PTY session (see e.g.
-                // https://github.com/PowerShell/Win32-OpenSSH/issues/1470),
-                // not something introduced by this crate's protocol.
-                session.write(vec![0u8]);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                session.write(vec![b'\r']);
-                std::thread::sleep(std::time::Duration::from_millis(300));
                 session.kill();
                 return Ok(());
             }

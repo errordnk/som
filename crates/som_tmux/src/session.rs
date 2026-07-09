@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// small standalone server binary) for the 4 variants that actually exist.
 /// Parses the plain string Som passes via `--cursor-shape` (see
 /// `main.rs`'s `Args` doc comment) rather than a shared enum type.
-fn parse_cursor_shape(shape: Option<&str>) -> AlacCursorStyle {
+pub(crate) fn parse_cursor_shape(shape: Option<&str>) -> AlacCursorStyle {
     let shape = match shape {
         Some("underline") => AlacCursorShape::Underline,
         Some("bar") => AlacCursorShape::Beam,

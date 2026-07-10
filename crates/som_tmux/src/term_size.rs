@@ -160,14 +160,12 @@ pub fn enable_raw_input_mode() {
     // SAFETY: fd 0 (stdin) is valid for the lifetime of this call — a
     // `BorrowedFd` here doesn't take ownership or close anything.
     let stdin = unsafe { BorrowedFd::borrow_raw(0) };
-    let mut termios = match nix::sys::termios::tcgetattr(stdin) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("DIAG tcgetattr failed: {e:?}");
-            return;
-        }
+    let Ok(mut termios) = nix::sys::termios::tcgetattr(stdin) else {
+        // Not a tty (e.g. this RELAY's stdin is a plain pipe, as it always
+        // was before -tt, or as WSL/local profiles' still are) — nothing
+        // to do.
+        return;
     };
     nix::sys::termios::cfmakeraw(&mut termios);
-    let result = nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, &termios);
-    eprintln!("DIAG tcsetattr result: {:?}", result.is_ok());
+    let _ = nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, &termios);
 }

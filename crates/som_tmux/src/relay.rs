@@ -529,7 +529,7 @@ fn spawn_detached_holder(
     // `$SSH_CLIENT` on it to the real connecting client's IP. See
     // `protocol::ssh_client_ip`'s doc comment for why this is what
     // `kill_orphaned_holders` scopes cleanup to.
-    if let Some(client_ip) = crate::protocol::ssh_client_ip() {
+    if let Some(client_ip) = som_tmux::protocol::ssh_client_ip() {
         command.arg("--client-id").arg(client_ip);
     }
     if let Some(cursor_shape) = cursor_shape {

@@ -28,6 +28,20 @@ struct Args {
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    /// The connecting client machine's IP, as `relay::spawn_detached_holder`
+    /// read it off ITS OWN `$SSH_CLIENT` (set by sshd on the RELAY, which —
+    /// for an SSH `tmux: true` profile — really does run on this same
+    /// remote host) before spawning this `--holder` process. Not read or
+    /// used anywhere in `--holder` mode itself: only parsed here so it
+    /// stays visible in this HOLDER's OWN `ps` command line, which is the
+    /// entire point — `kill_orphaned_holders` (`terminal_panel.rs`, on the
+    /// Som side) greps a live `ps` listing for exactly this flag to decide
+    /// which HOLDERs belong to which client machine before ever touching
+    /// one. See `som_tmux::protocol::ssh_client_ip`'s doc comment for the
+    /// full reasoning. `None` for a local/WSL HOLDER (no sshd involved) or
+    /// one left over from before this field existed.
+    #[allow(dead_code)]
+    client_id: Option<String>,
     /// Mirrors Som's own `TerminalSettings::cursor_shape` — passed through
     /// explicitly rather than the HOLDER guessing/defaulting, since it's
     /// the HOLDER's `Session`, not Som's `TerminalElement`, that actually
@@ -48,6 +62,7 @@ fn parse_args() -> Args {
     let mut pane_id = None;
     let mut program = None;
     let mut cwd = None;
+    let mut client_id = None;
     let mut cursor_shape = None;
     let mut scrollback = None;
     let mut extra_args = Vec::new();
@@ -72,6 +87,7 @@ fn parse_args() -> Args {
             "--pane-id" => pane_id = iter.next(),
             "--program" => program = iter.next(),
             "--cwd" => cwd = iter.next(),
+            "--client-id" => client_id = iter.next(),
             "--cursor-shape" => cursor_shape = iter.next(),
             "--scrollback" => scrollback = iter.next().and_then(|s| s.parse().ok()),
             "--" => {
@@ -103,7 +119,7 @@ fn parse_args() -> Args {
 
     let usage = || -> ! {
         eprintln!(
-            "usage:\n  som-tmux [--cursor-shape <shape>] [--scrollback <n>] <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [--cursor-shape <shape>] [--scrollback <n>] [-- args...]"
+            "usage:\n  som-tmux [--client-id <id>] [--cursor-shape <shape>] [--scrollback <n>] <profile> <pane-id> <program> [args...]   (relay mode, what Som invokes)\n  som-tmux --holder --profile <p> --pane-id <id> --program <prog> [--cwd <dir>] [--client-id <id>] [--cursor-shape <shape>] [--scrollback <n>] [-- args...]"
         );
         std::process::exit(2);
     };
@@ -112,7 +128,7 @@ fn parse_args() -> Args {
     let Some(pane_id) = pane_id.filter(|s| !s.trim().is_empty()) else { usage() };
     let Some(program) = program.filter(|s| !s.trim().is_empty()) else { usage() };
 
-    Args { holder, profile, pane_id, program, args: extra_args, cwd, cursor_shape, scrollback }
+    Args { holder, profile, pane_id, program, args: extra_args, cwd, client_id, cursor_shape, scrollback }
 }
 
 fn main() {

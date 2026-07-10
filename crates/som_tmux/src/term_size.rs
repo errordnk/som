@@ -131,11 +131,41 @@ pub fn current_size() -> Option<(u16, u16)> {
     Some((size.ws_col, size.ws_row))
 }
 
-/// No-op on Unix — see the Windows version's doc comment for what this
-/// fixes there. On Unix, this process's stdin is a real PTY slave (the one
-/// Som created for it), and reading it is a plain `read(2)` on that PTY's
-/// fd — there's no separate `CONSOLE_MODE`-governed input layer sitting in
-/// front of it the way `ReadConsoleW` implies on Windows, so there's
-/// nothing here to disable.
+/// Puts this process's OWN stdin into raw mode (`cfmakeraw`: disables
+/// canonical/line-buffered input, local echo, and signal-generating
+/// control characters) when it's a real tty — a no-op otherwise (e.g. a
+/// local/WSL RELAY, whose stdin is a plain Windows-ConPTY-backed PTY slave
+/// with no separate `CONSOLE_MODE` layer in front of it, same reasoning as
+/// this function's Windows sibling).
+///
+/// Needed specifically for an SSH `tmux: true` profile's RELAY once it's
+/// given a real remote pty (`-tt`, forced so the real pane size can
+/// propagate — see `wrap_remote_command_args`'s doc comment): a freshly
+/// allocated pty defaults to COOKED mode (`ICANON`/`ECHO` on) same as any
+/// other Unix tty, unlike the plain (non-tty) pipe stdin this RELAY used
+/// to have before `-tt`. Left in cooked mode, the kernel's own tty driver
+/// line-buffers everything this process reads off its stdin BEFORE it ever
+/// reaches the code that forwards bytes to the HOLDER — confirmed root
+/// cause of three real reported symptoms once `-tt` shipped: `htop` (and
+/// any other program needing single-keystroke input) needing an extra
+/// Enter to register a `q`, arrow keys/F-keys never reaching the remote
+/// shell at all (ICANON's own line editor intercepts them instead of
+/// passing the raw escape sequence through), and a lost first character on
+/// backspace-heavy edits (the kernel's own line editor, not the real
+/// shell's readline, absorbing it).
 #[cfg(unix)]
-pub fn enable_raw_input_mode() {}
+pub fn enable_raw_input_mode() {
+    use std::os::fd::BorrowedFd;
+
+    // SAFETY: fd 0 (stdin) is valid for the lifetime of this call — a
+    // `BorrowedFd` here doesn't take ownership or close anything.
+    let stdin = unsafe { BorrowedFd::borrow_raw(0) };
+    let Ok(mut termios) = nix::sys::termios::tcgetattr(stdin) else {
+        // Not a tty (e.g. this RELAY's stdin is a plain pipe, as it always
+        // was before -tt, or as WSL/local profiles' still are) — nothing
+        // to do.
+        return;
+    };
+    nix::sys::termios::cfmakeraw(&mut termios);
+    let _ = nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, &termios);
+}

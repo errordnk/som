@@ -152,7 +152,7 @@ accesskit_unix = "0.21.0"
 accesskit_windows = "0.32.1"
 agent-client-protocol = { version = "=0.12.1", features = ["unstable"] }
 aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/errordnk/alacritty", rev = "329bd26e" }
+alacritty_terminal = { git = "https://github.com/errordnk/alacritty", rev = "9e229607" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 ashpd = { version = "0.13", default-features = false, features = [

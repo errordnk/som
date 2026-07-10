@@ -628,6 +628,17 @@ impl TerminalBuilder {
 
             let pty_info = PtyProcessInfo::new(&pty);
 
+            // Detects a `som_tmux`-wrapped `ssh` profile by shape (the
+            // literal `~/.local/bin/som-tmux` argument
+            // `wrap_remote_command_args` always inserts), the same key
+            // `rebuild_tmux_shell_with_fresh_pane_id` uses. Only these go
+            // through the double-pty (`-tt` remote + Windows ConPTY)
+            // output path that produces `\r\r\n` — see `collapse_cr_cr_lf`.
+            let is_tmux_relay_shell = shell_params
+                .as_ref()
+                .and_then(|params| params.args.as_ref())
+                .is_some_and(|args| args.iter().any(|arg| arg.contains("som-tmux")));
+
             //And connect them together
             let event_loop = EventLoop::new(
                 term.clone(),
@@ -636,7 +647,13 @@ impl TerminalBuilder {
                 pty_options.drain_on_exit,
                 false,
             )
-            .context("failed to create event loop")?;
+            .context("failed to create event loop")?
+            // An SSH `tmux: true` profile's output crosses two pty layers
+            // (a `-tt`-forced remote pty plus this Windows ConPTY), each
+            // inserting a CR, so every real newline arrives as `\r\r\n` —
+            // one extra blank line per newline. See `EventLoop::collapse_
+            // cr_cr_lf` and `is_tmux_relay_shell`.
+            .collapse_cr_cr_lf(is_tmux_relay_shell);
 
             let pty_tx = event_loop.channel();
             let _io_thread = event_loop.spawn(); // DANGER

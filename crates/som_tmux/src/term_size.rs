@@ -164,8 +164,10 @@ pub fn enable_raw_input_mode() {
         // Not a tty (e.g. this RELAY's stdin is a plain pipe, as it always
         // was before -tt, or as WSL/local profiles' still are) — nothing
         // to do.
+        eprintln!("DIAG tcgetattr failed, not a tty");
         return;
     };
     nix::sys::termios::cfmakeraw(&mut termios);
-    let _ = nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, &termios);
+    let result = nix::sys::termios::tcsetattr(stdin, nix::sys::termios::SetArg::TCSANOW, &termios);
+    eprintln!("DIAG tcsetattr result: {:?}", result.is_ok());
 }

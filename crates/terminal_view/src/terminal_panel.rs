@@ -762,6 +762,22 @@ impl TerminalPanel {
         cx.spawn(async move |cx| {
             let db_state = workspace::som_db::load_som_db();
 
+            // Every tmux pane_id `db.json` currently knows about, across
+            // every tab (including splits) — the live set `kill_orphaned_
+            // holders` below cleans remote HOLDER processes against. Built
+            // once, up front, from the SAME `db_state` the restore loop
+            // below reads, before that loop can generate any FRESH pane_ids
+            // of its own (a tab whose saved `tmux_sessions` is missing/
+            // corrupt gets a brand new one) — an orphan-cleanup pass must
+            // never race against pane_ids Som itself is about to start
+            // relying on this run.
+            let live_pane_ids: Vec<String> = db_state
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tmux_sessions.iter().flatten())
+                .cloned()
+                .collect();
+
             // Phase 1: create every tab's terminal concurrently — each tab is
             // an independent item in the main pane, so there's no shared
             // state to race on here. Where each tab actually lands in the
@@ -814,12 +830,17 @@ impl TerminalPanel {
                         project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
                     if let RemoteKind::Ssh | RemoteKind::Wsl = classify_remote(&remote_program) {
                         let remote_kind = classify_remote(&remote_program);
+                        let live_pane_ids = live_pane_ids.clone();
                         cx.background_spawn(async move {
                             if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
                                 log::warn!(
                                     "remote som-tmux deploy check failed on restore, proceeding with whatever is already there: {err:#}"
                                 );
                             }
+                            // Piggybacks on the SSH round-trip the deploy
+                            // check above already pays for — see
+                            // `kill_orphaned_holders`'s doc comment.
+                            kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
                         })
                         .await;
                     }
@@ -1547,6 +1568,14 @@ fn wrap_command_args(
 /// default shell" — the remote HOLDER spawns whatever that resolves to,
 /// same zero-conf assumption a bare `ssh host` (no explicit command) already
 /// makes today.
+///
+/// No client identity is threaded through here — a freshly-spawned
+/// HOLDER's `--client-id` comes from the REMOTE RELAY's own `$SSH_CLIENT`
+/// (see `som_tmux::protocol::ssh_client_ip`'s doc comment), read entirely
+/// on the far side once `ssh` has already connected; there's nothing this
+/// Windows-side command-line builder could usefully pass down instead (it
+/// has no reliable view of what source IP sshd will see this connection
+/// arrive from).
 fn wrap_remote_command_args(
     profile_name: &str,
     pane_id: &str,
@@ -1667,6 +1696,140 @@ fn wrap_remote_probe_args(host_args: &[String], remote_program: &str, extra: &[&
     wrapped_args.push(remote_program.to_string());
     wrapped_args.extend(extra.iter().map(|s| s.to_string()));
     wrapped_args
+}
+
+/// Kills every `som-tmux --holder` process on the far end of an SSH `tmux:
+/// true` profile that (a) was spawned by THIS SAME client machine (its
+/// `--client-id` matches this cleanup connection's own `$SSH_CLIENT` IP —
+/// see `som_tmux::protocol::ssh_client_ip`'s doc comment for why that's
+/// the right scope) and (b) whose `--pane-id` isn't in `live_pane_ids` —
+/// i.e. a HOLDER for a pane that isn't (or is no longer) in THIS client's
+/// `db.json` at all, so nothing running on this machine will EVER try to
+/// reattach to it again. Called once per host during `restore_som_tabs`,
+/// right alongside the existing deploy-check SSH round-trip (piggybacking
+/// on that same "we're already paying for one SSH connection to this host
+/// anyway" moment rather than adding a second one).
+///
+/// Deliberately keyed on `db.json` membership, not "how long has this
+/// HOLDER been idle" or "is its shell process busy" — those need per-pane
+/// state this function has no access to and, more importantly, would be
+/// WRONG for a real live pane that's simply not the active tab right now (a
+/// background tab's HOLDER is idle but absolutely not an orphan). A pane_id
+/// db.json doesn't know about at all, by contrast, can never be reattached
+/// to by anything — the ONLY way Som ever learns a pane_id to reattach to
+/// is by reading it back out of db.json in the first place (see
+/// `restore_som_tabs`'s own pane_id lookup) or by a currently-open tab that
+/// already put it there, both of which `live_pane_ids` already covers.
+///
+/// Scoping to `--client-id` matters whenever more than one Som installation
+/// SSHes into the same remote host (e.g. a Windows machine AND a Mac both
+/// connect to `deb`) — a HOLDER the OTHER machine spawned is invisible to
+/// THIS machine's `db.json` and would look orphaned by pane_id alone, even
+/// though it's perfectly live from that other machine's point of view.
+/// Comparing `--client-id` against this very cleanup connection's own
+/// `$SSH_CLIENT` needs no coordination between installations at all — sshd
+/// independently reports the same source IP to every SSH connection from
+/// the same client machine.
+///
+/// Best-effort: a failure here (host unreachable, no processes to list,
+/// `ps`/`grep` missing) is logged and swallowed rather than propagated —
+/// this is housekeeping, not something that should block a tab from
+/// restoring.
+fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pane_ids: &[String]) {
+    // WSL has no long-lived cross-restart HOLDER of its own the way an SSH
+    // profile's remote host does (see `wrap_remote_command_args`'s `-tt`
+    // doc comment) — nothing to clean up there.
+    if !matches!(remote_kind, RemoteKind::Ssh) {
+        return;
+    }
+    // `ps -eo args` (not `ps aux`, which truncates the command line on
+    // some `ps` implementations, and not `pgrep -a`, which isn't installed
+    // everywhere) — one `pid\x1fargs` pair per line, `\x1f` (unit
+    // separator, never a legal byte in a pid or an ordinary command line)
+    // rather than whitespace so a `--program` argument containing spaces
+    // doesn't shift the split. The leading `echo "$SSH_CLIENT"` line (read
+    // separately below) piggybacks THIS SAME SSH connection's own
+    // `$SSH_CLIENT` — sshd sets it to this cleanup connection's actual
+    // source IP, which is by definition identical to what any OTHER
+    // invocation from this same client machine (i.e. a RELAY spawning a
+    // HOLDER) already got and passed down as `--client-id`.
+    //
+    // Matches on `--holder` (built from two concatenated awk string
+    // literals, `"--hold" "er"`, rather than written as one) specifically
+    // so the match pattern itself never appears as a literal substring
+    // anywhere in THIS `sh -lc "..."` invocation's own command line — a
+    // plain `/--holder/` (or `/--pane-id/`, or `/som-tmux.*--holder/`)
+    // regex would find its own `awk` and the `sh -lc` wrapper that ran it
+    // too, since the script text necessarily contains whatever substring
+    // it's searching for. `index()` on the concatenation sidesteps that
+    // self-match without needing a second process to post-filter results.
+    let script = r#"echo "$SSH_CLIENT"; ps -eo pid,args | awk 'index($0, "--hold" "er") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", script]);
+    let output = match run_remote_command(remote_kind, &probe) {
+        Ok(output) => output,
+        Err(err) => {
+            log::warn!("failed to list remote som-tmux holders for orphan cleanup, skipping: {err:#}");
+            return;
+        }
+    };
+    let Some((ssh_client_line, ps_output)) = output.split_once('\n') else {
+        log::warn!("unexpected output from orphan-cleanup probe, skipping: {output:?}");
+        return;
+    };
+    let Some(this_client_ip) = ssh_client_line.split_whitespace().next() else {
+        // Not actually an SSH connection from sshd's point of view (no
+        // `$SSH_CLIENT`) — shouldn't happen for a real `tmux: true` SSH
+        // profile, but if it ever does there's no safe way to tell which
+        // HOLDERs belong to this client, so skip cleanup entirely rather
+        // than guess.
+        return;
+    };
+
+    let orphaned_pids = parse_orphaned_holder_pids(ps_output, this_client_ip, live_pane_ids);
+
+    if orphaned_pids.is_empty() {
+        return;
+    }
+    log::info!("killing {} orphaned som-tmux holder(s) not in db.json: {orphaned_pids:?}", orphaned_pids.len());
+    let kill_script = format!("kill {} 2>/dev/null || true", orphaned_pids.join(" "));
+    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &kill_script]);
+    if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
+        log::warn!("failed to kill orphaned som-tmux holders: {err:#}");
+    }
+}
+
+/// Parses `pid\x1fargs` lines (the format `kill_orphaned_holders`'s `awk`
+/// script emits) and returns the pids of every HOLDER that (a) was spawned
+/// for `this_client_ip` (its `--client-id` matches) and (b) whose
+/// `--pane-id` isn't in `live_pane_ids`. Pulled out of `kill_orphaned_
+/// holders` itself so this string-parsing logic can be unit-tested without
+/// an actual SSH round-trip.
+///
+/// A HOLDER with NO `--client-id` at all (an old binary from before that
+/// flag existed) is deliberately left alone rather than treated as a match
+/// — silently killing pre-upgrade HOLDERs the first time this code ships
+/// would be a surprising one-time mass-kill; they age out naturally once
+/// each pane is reattached (which redeploys/relaunches with the new
+/// binary, see `ensure_remote_binary_deployed`).
+fn parse_orphaned_holder_pids(ps_output: &str, this_client_ip: &str, live_pane_ids: &[String]) -> Vec<String> {
+    fn find_flag_value<'a>(args: &'a str, flag: &str) -> Option<&'a str> {
+        let pos = args.find(flag)?;
+        args[pos + flag.len()..].split_whitespace().next()
+    }
+
+    let mut orphaned_pids = Vec::new();
+    for line in ps_output.lines() {
+        let Some((pid, args)) = line.split_once('\u{1f}') else { continue };
+        let Some(client_id) = find_flag_value(args, "--client-id ") else { continue };
+        if client_id != this_client_ip {
+            continue;
+        }
+        let Some(pane_id) = find_flag_value(args, "--pane-id ") else { continue };
+        if !pane_id.is_empty() && !live_pane_ids.iter().any(|id| id == pane_id) {
+            orphaned_pids.push(pid.trim().to_string());
+        }
+    }
+    orphaned_pids
 }
 
 /// Ensures `~/.local/bin/som-tmux` on the far side of an `ssh`/`wsl`
@@ -2387,6 +2550,61 @@ mod tmux_shell_wrapping_tests {
             &["--version"],
         );
         assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/som-tmux", "--version"]);
+    }
+
+    #[test]
+    fn orphan_scan_flags_a_holder_whose_pane_id_is_not_in_db_json() {
+        let ps_output =
+            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id dead-pane --client-id 192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+        assert_eq!(orphaned, vec!["12345"]);
+    }
+
+    #[test]
+    fn orphan_scan_leaves_a_holder_whose_pane_id_is_in_db_json_alone() {
+        let ps_output =
+            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id 192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_handles_multiple_lines_and_ignores_malformed_ones() {
+        let ps_output = concat!(
+            "111\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-a --client-id 192.168.50.2\n",
+            "222\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id 192.168.50.2\n",
+            "not a valid line at all\n",
+            "333\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-b --client-id 192.168.50.2\n",
+        );
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+        assert_eq!(orphaned, vec!["111", "333"]);
+    }
+
+    #[test]
+    fn orphan_scan_ignores_lines_with_no_pane_id_argument() {
+        let ps_output = "999\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --client-id 192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_ignores_lines_with_no_client_id_argument() {
+        // An old pre-upgrade HOLDER binary, from before `--client-id`
+        // existed — must be left alone, not treated as an automatic match.
+        let ps_output = "888\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id dead-pane\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_ignores_a_holder_spawned_by_a_different_client_machine() {
+        // Simulates a second Som installation (e.g. a Mac) also SSHed into
+        // the same host — its HOLDER must never look orphaned just because
+        // this client's own db.json doesn't know its pane_id.
+        let ps_output =
+            "777\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id other-machines-pane --client-id 192.168.50.9\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+        assert!(orphaned.is_empty());
     }
 
     #[test]

@@ -71,6 +71,37 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
     dir.join(format!("{truncated_profile}-{short_id}.sock")).to_string_lossy().into_owned()
 }
 
+/// The IP address of the machine that's SSHed into THIS host, as sshd
+/// itself reports it via `$SSH_CLIENT` — passed down through `--client-id`
+/// on every RELAY-spawned HOLDER (see `main.rs`'s `Args`) so a HOLDER's
+/// `ps` command line records which client created it. Exists purely for
+/// orphan cleanup: `kill_orphaned_holders` (`terminal_panel.rs`) runs once
+/// per host at handshake time (itself a fresh `ssh host ...` invocation,
+/// so it sees its OWN `$SSH_CLIENT`, naturally equal to the same value any
+/// other RELAY invocation from that same client machine would see) and
+/// must only ever kill HOLDERs it can actually judge "orphaned or not" — a
+/// HOLDER created by a DIFFERENT client machine (e.g. a Mac also SSHed
+/// into this same remote host) is invisible to this client's own
+/// `db.json` and would look orphaned by pane_id alone, even though it's
+/// perfectly live from that other machine's point of view. Scoping the
+/// cleanup to `--client-id == $SSH_CLIENT of the cleanup's own SSH
+/// connection` avoids that cross-client collateral damage entirely,
+/// without needing any coordination between clients or any persisted
+/// state at all — sshd already independently tells every SSH connection
+/// from the same client machine the same source IP.
+///
+/// Only ever meaningful for an SSH `tmux: true` profile's RELAY (which
+/// really does run ON the remote host, spawned via `ssh host
+/// ~/.local/bin/som-tmux ...` — see `wrap_remote_command_args`) — `None`
+/// for a local or WSL RELAY, neither of which goes through sshd and so has
+/// no `$SSH_CLIENT` to read; `kill_orphaned_holders` only ever runs for
+/// `RemoteKind::Ssh` anyway, so those callers simply never pass `--client-
+/// id` at all.
+pub fn ssh_client_ip() -> Option<String> {
+    let raw = std::env::var("SSH_CLIENT").ok()?;
+    raw.split_whitespace().next().map(str::to_string)
+}
+
 /// Which OS a HOLDER is running on — part of the handshake (see
 /// `HandshakeInfo`) so a RELAY (potentially a newer build than the HOLDER
 /// it's reattaching to, e.g. after Som updated but a remote HOLDER survived

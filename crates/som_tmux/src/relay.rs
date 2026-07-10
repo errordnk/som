@@ -262,6 +262,16 @@ pub fn run(
                 // written through unmodified, exactly like a plain
                 // (non-tmux) Som terminal's own PTY output already is.
                 HolderOutput::Bytes(bytes) => {
+                    if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/som-diag-forwarded.log")
+                        {
+                            let _ = writeln!(f, "FWD {bytes:?}");
+                        }
+                    }
                     std::io::stdout().write_all(&bytes)?;
                     std::io::stdout().flush()?;
                 }

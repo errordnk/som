@@ -1496,8 +1496,8 @@ fn tmux_wrapped_shell(
             let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback);
             Ok((server_path.to_string_lossy().to_string(), wrapped_args))
         }
-        RemoteKind::Ssh | RemoteKind::Wsl => {
-            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback);
+        kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
+            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback, kind);
             Ok((program, wrapped_args))
         }
     }
@@ -1553,8 +1553,27 @@ fn wrap_remote_command_args(
     args: Vec<String>,
     cursor_shape: CursorShape,
     scrollback: Option<usize>,
+    remote_kind: RemoteKind,
 ) -> Vec<String> {
     let mut wrapped_args = args;
+    // `-tt` (force pseudo-terminal allocation, doubled so it applies even
+    // though this process's own stdin isn't a tty from ssh's point of
+    // view) for SSH profiles specifically. Without a remote pty, `ssh host
+    // <explicit command>` gives the remote `som-tmux` RELAY plain pipes
+    // for stdin/stdout — no `TIOCGWINSZ` to read the real size from and no
+    // SSH window-change channel — so the remote shell was permanently
+    // stuck at the RELAY's 80x24 fallback regardless of the real pane
+    // size, which mismatched what Som's own `TerminalElement` renders at
+    // and showed up as systematic blank lines between prompts (the remote
+    // shell wrapping/scrolling against a 24-row terminal while Som draws
+    // ~40). Forcing a remote pty makes sshd allocate one, so the size
+    // negotiated at connect AND every later window-change both propagate
+    // natively over the SSH protocol — no custom in-band size channel
+    // needed. WSL profiles don't go through sshd and have their own pty
+    // handling, so this is SSH-only.
+    if let RemoteKind::Ssh = remote_kind {
+        wrapped_args.insert(0, "-tt".to_string());
+    }
     wrapped_args.push("~/.local/bin/som-tmux".to_string());
     wrapped_args.push(profile_name.to_string());
     wrapped_args.push(pane_id.to_string());
@@ -2327,12 +2346,13 @@ mod tmux_shell_wrapping_tests {
         // som-tmux invocation goes on the REMOTE side, appended
         // after ssh's own arguments, since ssh hands everything past its
         // own flags/host to a shell on the far end.
-        let args = wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()], CursorShape::Block, None);
+        let args =
+            wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()], CursorShape::Block, None, RemoteKind::Ssh);
         assert_eq!(
             args,
             vec![
-                "192.168.50.5", "~/.local/bin/som-tmux", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block", "--",
-                "-l"
+                "-tt", "192.168.50.5", "~/.local/bin/som-tmux", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
+                "--", "-l"
             ]
         );
     }
@@ -2346,7 +2366,10 @@ mod tmux_shell_wrapping_tests {
             vec!["--cd".to_string(), "~".to_string()],
             CursorShape::Bar,
             Some(5000),
+            RemoteKind::Wsl,
         );
+        // No `-tt` for WSL — that's SSH-only (WSL has its own pty handling
+        // and doesn't go through sshd).
         assert_eq!(
             args,
             vec![
@@ -2397,16 +2420,18 @@ mod tmux_shell_wrapping_tests {
             vec!["192.168.50.5".to_string()],
             CursorShape::Block,
             None,
+            RemoteKind::Ssh,
         );
         let shell = Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
         let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a remote tmux-wrapped shell");
         let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
         assert_eq!(program, "ssh");
-        assert_eq!(args[0], "192.168.50.5");
-        assert_eq!(args[1], "~/.local/bin/som-tmux");
-        assert_eq!(args[2], "pi5"); // profile unchanged
-        assert_ne!(args[3], "original-pane-id"); // pane_id replaced
-        assert_eq!(&args[4..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
+        assert_eq!(args[0], "-tt");
+        assert_eq!(args[1], "192.168.50.5");
+        assert_eq!(args[2], "~/.local/bin/som-tmux");
+        assert_eq!(args[3], "pi5"); // profile unchanged
+        assert_ne!(args[4], "original-pane-id"); // pane_id replaced
+        assert_eq!(&args[5..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
     }
 
     #[test]

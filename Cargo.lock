@@ -7068,7 +7068,7 @@ dependencies = [
 
 [[package]]
 name = "som_tmux"
-version = "0.1.0"
+version = "1.6.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

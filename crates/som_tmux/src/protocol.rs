@@ -71,24 +71,34 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
     dir.join(format!("{truncated_profile}-{short_id}.sock")).to_string_lossy().into_owned()
 }
 
-/// The IP address of the machine that's SSHed into THIS host, as sshd
-/// itself reports it via `$SSH_CLIENT` — passed down through `--client-id`
+/// `<remote-username>@<client-ip>` identifying BOTH the OS account that
+/// SSHed into THIS host AND which machine it came from — the IP half comes
+/// from sshd's own `$SSH_CLIENT`, the username half from THIS process's own
+/// effective user (`whoami`-equivalent). Passed down through `--client-id`
 /// on every RELAY-spawned HOLDER (see `main.rs`'s `Args`) so a HOLDER's
-/// `ps` command line records which client created it. Exists purely for
-/// orphan cleanup: `kill_orphaned_holders` (`terminal_panel.rs`) runs once
-/// per host at handshake time (itself a fresh `ssh host ...` invocation,
-/// so it sees its OWN `$SSH_CLIENT`, naturally equal to the same value any
-/// other RELAY invocation from that same client machine would see) and
-/// must only ever kill HOLDERs it can actually judge "orphaned or not" — a
-/// HOLDER created by a DIFFERENT client machine (e.g. a Mac also SSHed
-/// into this same remote host) is invisible to this client's own
-/// `db.json` and would look orphaned by pane_id alone, even though it's
-/// perfectly live from that other machine's point of view. Scoping the
-/// cleanup to `--client-id == $SSH_CLIENT of the cleanup's own SSH
-/// connection` avoids that cross-client collateral damage entirely,
-/// without needing any coordination between clients or any persisted
-/// state at all — sshd already independently tells every SSH connection
-/// from the same client machine the same source IP.
+/// `ps` command line records who/what created it. Exists purely for orphan
+/// cleanup and version-mismatch teardown: `kill_orphaned_holders`/
+/// `kill_all_holders_for_redeploy` (`terminal_panel.rs`) run once per host
+/// at handshake time (themselves a fresh `ssh host ...` invocation, so they
+/// see their OWN `$SSH_CLIENT`/user, naturally equal to what any other
+/// invocation from this same account on this same machine already got) and
+/// must only ever touch HOLDERs they can actually judge "belongs to me or
+/// not" — a HOLDER created by a DIFFERENT client machine, or a different
+/// OS account on the SAME remote host (e.g. a shared build server with
+/// several users each running their own Som), is invisible to this
+/// account's own `db.json` and must never be treated as this account's to
+/// kill, even though the raw `ps` listing sees it just fine. Comparing
+/// `--client-id` against this very connection's own `<user>@$SSH_CLIENT`
+/// needs no coordination between clients or accounts at all — sshd/the
+/// remote OS already independently reports the same identity to every SSH
+/// connection from the same account on the same machine.
+///
+/// Belt-and-suspenders on top of what Unix file/process permissions
+/// already enforce (a non-privileged user's `kill` on another user's
+/// process fails regardless) — this filter exists so a buggy cleanup query
+/// simply never CONSIDERS another account's HOLDER a candidate in the
+/// first place, rather than relying on the kill syscall to silently reject
+/// it.
 ///
 /// Only ever meaningful for an SSH `tmux: true` profile's RELAY (which
 /// really does run ON the remote host, spawned via `ssh host
@@ -97,9 +107,33 @@ pub fn pipe_name(profile_name: &str, pane_id: &str) -> String {
 /// no `$SSH_CLIENT` to read; `kill_orphaned_holders` only ever runs for
 /// `RemoteKind::Ssh` anyway, so those callers simply never pass `--client-
 /// id` at all.
-pub fn ssh_client_ip() -> Option<String> {
+pub fn ssh_client_id() -> Option<String> {
     let raw = std::env::var("SSH_CLIENT").ok()?;
-    raw.split_whitespace().next().map(str::to_string)
+    let ip = raw.split_whitespace().next()?;
+    let user = whoami_unix()?;
+    Some(format!("{user}@{ip}"))
+}
+
+#[cfg(unix)]
+fn whoami_unix() -> Option<String> {
+    // SAFETY: `geteuid()` has no failure mode (always returns the calling
+    // process's real effective uid) and `getpwuid` on a valid uid returns
+    // either a valid pointer into thread-local/static storage libc owns
+    // (never freed by us, never mutated after return) or null — both
+    // branches handled below.
+    unsafe {
+        let passwd = libc::getpwuid(libc::geteuid());
+        if passwd.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*passwd).pw_name);
+        Some(name.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(unix))]
+fn whoami_unix() -> Option<String> {
+    None
 }
 
 /// Which OS a HOLDER is running on — part of the handshake (see
@@ -140,6 +174,51 @@ pub fn current_platform() -> (Os, Arch) {
     };
     let arch = if cfg!(target_arch = "x86_64") { Arch::Amd64 } else { Arch::Arm64 };
     (os, arch)
+}
+
+/// Directory name (under `platform_binaries_dir()`) holding the
+/// pre-built `som-tmux` for a given `(Os, Arch)` pair — the four names the
+/// user chose for `~/.config/som/tmux/{name}/som-tmux`. Used on BOTH ends
+/// of a deploy decision: locally, to find which pre-built binary to `scp`
+/// up for a remote host reporting this `(os, arch)` in its handshake; and
+/// (implicitly, by a human/release-packaging script, not this codebase) to
+/// know where to drop each cross-compiled build's output in the first
+/// place.
+pub fn platform_dir_name(os: Os, arch: Arch) -> &'static str {
+    match (os, arch) {
+        (Os::Windows, _) => "windows",
+        (Os::Darwin, _) => "macos",
+        (Os::Linux, Arch::Amd64) => "linux-amd",
+        (Os::Linux, Arch::Arm64) => "linux-arm",
+    }
+}
+
+/// `~/.config/som/tmux/` — where Som keeps a pre-built `som-tmux` for
+/// every supported remote platform (see `platform_dir_name`), so an SSH
+/// `tmux: true` profile's deploy step is a plain `scp` of an
+/// already-built file rather than a `git pull && cargo build` on the
+/// remote machine itself (see `project_som_tmux` memory for why that
+/// changed: a build on every real target machine was the ORIGINAL
+/// approach, explicitly chosen over cross-compilation at the time — this
+/// supersedes that decision now that shipping pre-built binaries inside
+/// Som's own installer for each platform is possible). Lives under Som's
+/// own `paths::config_dir()`, same as `db.json` and everything else Som
+/// persists locally — NOT a per-remote-host location; this directory is
+/// read locally on the machine actually running Som, one entry per remote
+/// platform Som might ever need to talk to, not per host.
+pub fn platform_binaries_dir() -> std::path::PathBuf {
+    paths::config_dir().join("tmux")
+}
+
+/// Full local path to the pre-built `som-tmux` for a given remote
+/// `(Os, Arch)` — `None` if Som has never been told about (or hasn't yet
+/// downloaded/copied in) a binary for that platform. Callers (`terminal_
+/// view`'s `ensure_remote_binary_deployed`) treat a missing file the same
+/// way as an unreachable host: log and skip, rather than failing the tab.
+pub fn local_binary_path_for(os: Os, arch: Arch) -> Option<std::path::PathBuf> {
+    let file_name = if let Os::Windows = os { "som-tmux.exe" } else { "som-tmux" };
+    let path = platform_binaries_dir().join(platform_dir_name(os, arch)).join(file_name);
+    path.is_file().then_some(path)
 }
 
 /// Exchanged first thing on every new connection, before any actual

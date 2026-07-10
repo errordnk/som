@@ -1,6 +1,13 @@
+# NOTE: keep this in lockstep with crates/zed/Cargo.toml's own `version` —
+# HandshakeInfo::current() (protocol.rs) reads THIS crate's own
+# CARGO_PKG_VERSION and treats it as Som's version for the whole
+# deploy-vs-not-deploy decision (see project_som_tmux memory): som-tmux
+# always gets redeployed whenever Som's version changes, even if nothing in
+# this crate itself changed, specifically so this number always means "Som
+# build X" rather than "som_tmux crate revision Y".
 [package]
 name = "som_tmux"
-version = "0.1.0"
+version = "1.6.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"

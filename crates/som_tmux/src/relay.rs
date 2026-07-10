@@ -527,10 +527,10 @@ fn spawn_detached_holder(
     // `tmux: true` profile, the RELAY itself is what `ssh host
     // ~/.local/bin/som-tmux ...` spawned, so sshd has already set
     // `$SSH_CLIENT` on it to the real connecting client's IP. See
-    // `protocol::ssh_client_ip`'s doc comment for why this is what
+    // `protocol::ssh_client_id`'s doc comment for why this is what
     // `kill_orphaned_holders` scopes cleanup to.
-    if let Some(client_ip) = som_tmux::protocol::ssh_client_ip() {
-        command.arg("--client-id").arg(client_ip);
+    if let Some(client_id) = som_tmux::protocol::ssh_client_id() {
+        command.arg("--client-id").arg(client_id);
     }
     if let Some(cursor_shape) = cursor_shape {
         command.arg("--cursor-shape").arg(cursor_shape);

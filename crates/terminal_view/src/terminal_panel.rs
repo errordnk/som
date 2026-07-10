@@ -1834,63 +1834,190 @@ fn parse_orphaned_holder_pids(ps_output: &str, this_client_ip: &str, live_pane_i
 
 /// Ensures `~/.local/bin/som-tmux` on the far side of an `ssh`/`wsl`
 /// tmux profile is present and matches THIS Som build's version — see
-/// `project_som_tmux` memory ("Обновление 19"/23) for the full policy this
-/// implements. Runs entirely on a background thread (blocking `ssh`/`wsl`
-/// child processes) — callers must not call this from GPUI's main thread.
+/// `project_som_tmux` memory for the full policy this implements. Runs
+/// entirely on a background thread (blocking `ssh`/`wsl`/`scp` child
+/// processes) — callers must not call this from GPUI's main thread.
 ///
-/// Deliberately does NOT decide whether to restart an already-running
-/// HOLDER process for this pane — that would need per-pane "is it busy"
-/// state (live child processes under the shell, see `project_som_tmux`
-/// memory) this function has no access to, and isn't needed for the
-/// deploy-vs-not-deploy decision anyway: overwriting the on-disk binary
-/// file is safe even while an old HOLDER process still has it open/running
-/// with the old version loaded in memory (ordinary Unix file semantics) —
-/// a NEW `--holder`/relay invocation picks up the new file next time one is
-/// spawned; an already-running HOLDER just keeps serving with the version
-/// it started with until something else causes it to restart.
+/// Deploy mechanism is `scp` of a PRE-BUILT binary from `~/.config/som/
+/// tmux/{platform}/som-tmux` (see `som_tmux::protocol::platform_binaries_
+/// dir`) — NOT `git pull && cargo build` on the remote machine, which is
+/// what this used to do. That approach needed a full clone of this
+/// repository AND a working Rust toolchain already present on every single
+/// remote host, and cost a real (sometimes multi-minute) compile on every
+/// version bump; `scp` of an already-built file costs a few hundred
+/// milliseconds regardless of host. The pre-built binaries themselves come
+/// from Som's own installer for each platform (packaged once at release
+/// time, not built here) — WSL keeps the OLD git-pull-and-build path since
+/// it isn't really a separate "remote platform" needing its own packaged
+/// binary (same machine, same architecture Som itself just built for).
 ///
-/// Deploy mechanism is `git pull && cargo build` ON the remote machine, NOT
-/// scp of a locally cross-compiled binary — Som's own Windows build has no
-/// cross-compiled artifact for the remote's actual platform (see
-/// `project_som_tmux` memory, "Обновление 21": cross-compilation was
-/// deliberately rejected in favor of building natively on each real target
-/// machine), and every profile's remote host already has its own clone of
-/// this same repository (that's how the binaries got there in the first
-/// place) — `git pull` is a no-op if the remote is already current, so this
-/// is safe to run unconditionally once a version mismatch (or missing
-/// binary) is detected, not just on first deploy.
+/// UNLIKE the old approach, this one is NOT safe to run while an old
+/// HOLDER is still alive on the remote host: overwriting a running Linux
+/// binary in place via `cp`/`scp`'s destination-truncate semantics fails
+/// outright (`ETXTBSY`, confirmed by direct reproduction — ordinary Unix
+/// "safe to replace a running executable" semantics only hold for an
+/// atomic rename onto a NEW inode, not an in-place truncate-and-rewrite).
+/// So a version mismatch now means: kill every `som-tmux` process this
+/// account owns on that host FIRST (`kill_all_holders_for_redeploy`),
+/// THEN `scp` the new binary in. Every live pane on every client currently
+/// attached to that host (this account's own tabs AND, if sharing an
+/// account across machines, any other client's) loses its connection and
+/// reconnects to a brand new HOLDER on next use — an accepted, explicit
+/// tradeoff (long-running remote sessions are exactly what tmux:true
+/// exists to preserve across a LOCAL Som restart, but a version bump is
+/// disruptive by nature here; the alternative, a remote compile, was both
+/// slower AND already had its own ETXTBSY-shaped failure mode against a
+/// live HOLDER — see `project_bugs` memory).
 fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<()> {
     let local_version = som_tmux::protocol::HandshakeInfo::current().version;
 
     let version_probe = wrap_remote_probe_args(host_args, "~/.local/bin/som-tmux", &["--version"]);
-    let remote_version = run_remote_command(remote_kind, &version_probe)
+    let remote_info = run_remote_command(remote_kind, &version_probe)
         .ok()
-        .and_then(|output| serde_json::from_str::<som_tmux::protocol::HandshakeInfo>(output.trim()).ok())
-        .map(|info| info.version);
+        .and_then(|output| serde_json::from_str::<som_tmux::protocol::HandshakeInfo>(output.trim()).ok());
 
-    if remote_version.as_deref() == Some(local_version.as_str()) {
+    if remote_info.as_ref().map(|info| info.version.as_str()) == Some(local_version.as_str()) {
         return Ok(()); // already up to date, nothing to do
     }
 
     log::info!(
-        "som-tmux on remote host is {:?} (local build is {local_version:?}) — rebuilding remotely",
-        remote_version
+        "som-tmux on remote host is {:?} (local build is {local_version:?}) — redeploying",
+        remote_info.as_ref().map(|info| &info.version)
     );
 
-    // The trailing `codesign -s - ... || true` re-signs the copy on macOS —
-    // confirmed by direct reproduction that plain `cp` on APFS leaves the
-    // freshly-built binary's ad-hoc code signature invalid at its NEW path
-    // (`codesign -dv` still shows `adhoc,linker-signed`, but launching it
-    // fails with "load code signature error 2" / killed, confirmed via
-    // `log show`'s `AppleSystemPolicy` denial), even though the exact same
-    // binary at its original build path (`target/release/som-tmux`) runs
-    // fine — re-signing after the copy (not before) fixes it. `codesign`
-    // doesn't exist on Linux, so `|| true` makes this a no-op there instead
-    // of failing the whole deploy script over a command that was never
-    // going to matter on that platform.
-    let deploy_script = "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux) && mkdir -p ~/.local/bin && cp target/release/som-tmux ~/.local/bin/som-tmux && (codesign -s - ~/.local/bin/som-tmux 2>/dev/null || true)";
-    let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", deploy_script]);
-    run_remote_command(remote_kind, &deploy_probe)?;
+    // WSL is the same machine/architecture Som itself was just built for —
+    // no separate pre-built platform binary to `scp` in, so it keeps the
+    // original remote-build path (still cheap: WSL's own repo clone,
+    // usually already warm from Som's own dev use, and no network hop).
+    if let RemoteKind::Wsl = remote_kind {
+        let deploy_script =
+            "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux) && mkdir -p ~/.local/bin && cp target/release/som-tmux ~/.local/bin/som-tmux";
+        let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", deploy_script]);
+        run_remote_command(remote_kind, &deploy_probe)?;
+        return Ok(());
+    }
+
+    // The remote's own handshake tells us exactly which pre-built binary
+    // to send — no guessing/probing needed. A HOLDER left over from before
+    // `HandshakeInfo` existed (or an entirely fresh host with nothing at
+    // `~/.local/bin/som-tmux` yet) has no `remote_info` at all; ASSUME the
+    // remote is the same platform family as whatever Som already thinks
+    // this profile is (there's no other signal available at this point) —
+    // in practice this only matters for genuinely first-ever deploys,
+    // where the user picked this profile's platform when setting it up.
+    let (os, arch) = remote_info
+        .map(|info| (info.os, info.arch))
+        .unwrap_or_else(som_tmux::protocol::current_platform);
+    let Some(local_binary) = som_tmux::protocol::local_binary_path_for(os, arch) else {
+        anyhow::bail!(
+            "no pre-built som-tmux binary for {os:?}/{arch:?} under {:?} — nothing to deploy",
+            som_tmux::protocol::platform_binaries_dir()
+        );
+    };
+
+    // Kill every som-tmux process (RELAY and HOLDER alike) this account
+    // owns on this host BEFORE overwriting the binary file in place — see
+    // this function's own doc comment for why (`ETXTBSY` against a live
+    // HOLDER). Every live pane on this host reconnects to a fresh HOLDER
+    // on next use; an accepted, explicit tradeoff for a version bump.
+    kill_all_holders_for_redeploy(host_args, remote_kind);
+
+    scp_to_remote(host_args, &local_binary, "~/.local/bin/som-tmux")?;
+    let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-tmux"]);
+    run_remote_command(remote_kind, &chmod_probe)?;
+    Ok(())
+}
+
+/// Kills every `som-tmux` process (RELAY and HOLDER alike — a version bump
+/// invalidates the RELAY side too, not just the detached HOLDER) on the far
+/// end of an SSH `tmux: true` profile — called right before `ensure_remote_
+/// binary_deployed` overwrites the binary file in place, since that fails
+/// outright against any process still executing it (`ETXTBSY`, see that
+/// function's doc comment).
+///
+/// Deliberately does NOT filter by `--client-id` the way `kill_orphaned_
+/// holders` does — a version mismatch means the file on disk is about to
+/// change out from under EVERY process executing it, this account's own
+/// panes AND (if multiple client machines share this same SSH account,
+/// see `som_tmux::protocol::ssh_client_id`'s doc comment) any other
+/// client's too, so there's no "belongs to someone else, leave it" case to
+/// preserve here the way there is for orphan cleanup. What `kill` alone
+/// already can't reach — another OS account's processes — stays untouched
+/// purely because Unix permissions forbid it regardless of any filtering
+/// this function could add; see `ssh_client_id`'s doc comment for why this
+/// is belt-and-suspenders there but not meaningful here.
+///
+/// UNLIKE `kill_orphaned_holders` (which only ever touches a HOLDER whose
+/// pane_id is missing from `db.json`), this kills EVERY matching process
+/// regardless of whether its pane is still live — a version mismatch means
+/// every pane on this host needs a fresh HOLDER anyway, live or not, so
+/// there's nothing to preserve by being selective here.
+///
+/// Best-effort, same as `kill_orphaned_holders`: a failure here is logged
+/// and swallowed, and the caller proceeds to `scp` regardless — if the old
+/// process really is still alive and blocking the overwrite, THAT step's
+/// own error will surface and get logged there instead.
+fn kill_all_holders_for_redeploy(host_args: &[String], remote_kind: RemoteKind) {
+    if !matches!(remote_kind, RemoteKind::Ssh) {
+        return;
+    }
+    // Same self-match-avoidance trick as `kill_orphaned_holders` — see that
+    // function's doc comment for why `"--hold" "er"` is split like this.
+    // Matches BOTH `--holder` (the HOLDER itself) and the bare RELAY
+    // invocation, which never has `--holder` in its own args but always
+    // has `som-tmux` in argv[0]'s path — `"som-tmu" "x"` splits THAT
+    // pattern the same way, so the contiguous substring "som-tmux" never
+    // appears verbatim in this probe's OWN `sh -lc` script text (which
+    // `ps -eo args` would otherwise also match, since a process's command
+    // line IS this script's literal source text).
+    let script = r#"ps -eo pid,args | awk 'index($0, "som-tmu" "x") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", script]);
+    let output = match run_remote_command(remote_kind, &probe) {
+        Ok(output) => output,
+        Err(err) => {
+            log::warn!("failed to list remote som-tmux processes for redeploy cleanup, skipping: {err:#}");
+            return;
+        }
+    };
+
+    let pids: Vec<String> = output
+        .lines()
+        .filter_map(|line| line.split_once('\u{1f}'))
+        .map(|(pid, _args)| pid.trim().to_string())
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    log::info!("killing {} som-tmux process(es) on remote host ahead of a version-mismatch redeploy: {pids:?}", pids.len());
+    let kill_script = format!("kill {} 2>/dev/null || true", pids.join(" "));
+    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &kill_script]);
+    if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
+        log::warn!("failed to kill remote som-tmux processes ahead of redeploy: {err:#}");
+    }
+}
+
+/// Copies `local_path` to `host_args`' host at `remote_path` via `scp` —
+/// separate from `run_remote_command` (which only ever runs `ssh`/`wsl`)
+/// since `scp` has a completely different argv shape (`scp src host:dst`,
+/// no shell command to hand off). Assumes `host_args` is exactly a single
+/// hostname with no extra flags, same assumption `wrap_remote_probe_args`
+/// already makes for the `ssh`-based probes — real profiles are always
+/// `ssh <host>` with per-host quirks (ports, keys, users) living in `~/.
+/// ssh/config`, never inline flags (see `terminal_panel.rs`'s test
+/// fixtures / real `settings.json` profiles, all of this shape).
+fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path: &str) -> anyhow::Result<()> {
+    let Some(host) = host_args.last() else {
+        anyhow::bail!("scp_to_remote called with empty host_args");
+    };
+    let destination = format!("{host}:{remote_path}");
+    let output = util::command::new_std_command("scp")
+        .arg(local_path)
+        .arg(&destination)
+        .output()
+        .with_context(|| format!("failed to spawn scp to copy {local_path:?} to {destination:?}"))?;
+    if !output.status.success() {
+        anyhow::bail!("scp exited with {:?}: {}", output.status.code(), String::from_utf8_lossy(&output.stderr));
+    }
     Ok(())
 }
 

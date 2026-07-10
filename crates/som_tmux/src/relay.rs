@@ -253,6 +253,16 @@ pub fn run(
                     let mut redrawer = crate::redraw::Redrawer::new();
                     let mut bytes = Vec::new();
                     redrawer.redraw(&term, &mut bytes)?;
+                    if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/som-diag-forwarded.log")
+                        {
+                            let _ = writeln!(f, "SNAPSHOT grid_size=({},{}) bytes={bytes:?}", term.columns(), term.screen_lines());
+                        }
+                    }
                     std::io::stdout().write_all(&bytes)?;
                     std::io::stdout().flush()?;
                 }

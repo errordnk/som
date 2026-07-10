@@ -260,7 +260,7 @@ pub fn run(
                             .append(true)
                             .open("/tmp/som-diag-forwarded.log")
                         {
-                            let _ = writeln!(f, "SNAPSHOT grid_size=({},{}) bytes={bytes:?}", term.columns(), term.screen_lines());
+                            let _ = writeln!(f, "SNAPSHOT bytes={bytes:?}");
                         }
                     }
                     std::io::stdout().write_all(&bytes)?;

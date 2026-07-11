@@ -595,18 +595,47 @@ impl TerminalPanel {
             cx.spawn_in(window, async move |workspace, cx| {
                 if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
                     let host_args = host_args.clone();
-                    cx.background_spawn(async move {
-                        if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
-                            log::warn!("remote som-tmux deploy check failed, proceeding with whatever is already there: {err:#}");
-                        }
-                    })
-                    .await;
+                    let deploy_result = cx
+                        .background_spawn(async move { ensure_remote_binary_deployed(&host_args, remote_kind) })
+                        .await;
+                    if let Err(err) = deploy_result {
+                        log::warn!("remote som-tmux deploy check failed, proceeding with whatever is already there: {err:#}");
+                        // Best-effort: this profile's tab still gets
+                        // created below with whatever binary is already on
+                        // the remote host (which might work fine, or might
+                        // not — but silently trying anyway beats refusing
+                        // to open the tab at all). The banner is purely
+                        // informational — a real deploy failure (e.g. the
+                        // scp/kill retries in `ensure_remote_binary_
+                        // deployed` both failing) is exactly the kind of
+                        // "housekeeping went wrong, but you should know"
+                        // case a banner exists for, rather than a silent
+                        // log line the user has no way to notice.
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                show_som_tmux_error(
+                                    workspace,
+                                    format!("som-tmux deploy check failed for this profile\n{err:#}"),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }
                 }
 
                 let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback) {
                     Ok(pair) => pair,
                     Err(err) => {
                         log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                show_som_tmux_error(
+                                    workspace,
+                                    format!("Failed to set up tmux profile {:?}\n{err:#}", profile.name),
+                                    cx,
+                                );
+                            })
+                            .ok();
                         return anyhow::Ok(());
                     }
                 };
@@ -865,23 +894,45 @@ impl TerminalPanel {
                             // though each already had its own `cx.spawn`).
                             // `cx.background_spawn` moves the blocking work
                             // onto a real background thread pool instead.
-                            cx.background_spawn({
-                                let host_args = host_args.clone();
-                                let live_pane_ids = live_pane_ids.clone();
-                                async move {
-                                    if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
-                                        log::warn!(
-                                            "remote som-tmux deploy check failed on restore, proceeding with whatever is already there: {err:#}"
-                                        );
+                            let deploy_result = cx
+                                .background_spawn({
+                                    let host_args = host_args.clone();
+                                    let live_pane_ids = live_pane_ids.clone();
+                                    async move {
+                                        let deploy_result = ensure_remote_binary_deployed(&host_args, remote_kind);
+                                        // Piggybacks on the SSH round-trip
+                                        // the deploy check above already
+                                        // pays for — see `kill_orphaned_
+                                        // holders`'s doc comment.
+                                        kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
+                                        deploy_result
                                     }
-                                    // Piggybacks on the SSH round-trip the
-                                    // deploy check above already pays for —
-                                    // see `kill_orphaned_holders`'s doc
-                                    // comment.
-                                    kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
-                                }
-                            })
-                            .await;
+                                })
+                                .await;
+                            if let Err(err) = deploy_result {
+                                log::warn!(
+                                    "remote som-tmux deploy check failed on restore, proceeding with whatever is already there: {err:#}"
+                                );
+                                // See the identical banner in `new_terminal`
+                                // for why this is worth surfacing, not just
+                                // logging — a restore-time deploy failure
+                                // is just as invisible to the user
+                                // otherwise.
+                                window_handle
+                                    .update(cx, |_, _, cx| {
+                                        workspace.update(cx, |workspace, cx| {
+                                            show_som_tmux_error(
+                                                workspace,
+                                                format!(
+                                                    "som-tmux deploy check failed for profile {:?}\n{err:#}",
+                                                    profile.name
+                                                ),
+                                                cx,
+                                            );
+                                        })
+                                    })
+                                    .ok();
+                            }
                         }
 
                         let (cursor_shape, scrollback) = window_handle
@@ -1859,6 +1910,33 @@ fn parse_orphaned_holder_pids(ps_output: &str, this_client_ip: &str, live_pane_i
     orphaned_pids
 }
 
+/// Shows a dismissible banner for a som-tmux deploy/setup failure — same
+/// notification shape as `som_config.rs`'s `SomConfig::show_parse_error`
+/// (a plain `MessageNotification` with a "Copy" button for the full error
+/// text), reused here so ALL of Som's own user-facing error banners look
+/// and behave the same way, not just settings.json parse errors. Unlike
+/// `show_parse_error`, this doesn't need to search `cx.windows()` for a
+/// `Workspace` — every caller already has a `WeakEntity<Workspace>` in
+/// hand (the tab/restore context the failure happened in), so it takes
+/// one directly instead.
+fn show_som_tmux_error(workspace: &mut Workspace, message: String, cx: &mut Context<Workspace>) {
+    use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
+
+    let id = NotificationId::Named("som-tmux-deploy-error".into());
+    workspace.show_notification(id, cx, move |cx| {
+        let message2 = message.clone();
+        let message3 = message.clone();
+        cx.new(|cx| {
+            MessageNotification::new(message2, cx)
+                .primary_message("Copy")
+                .primary_on_click(move |_window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(message3.clone()));
+                })
+                .show_suppress_button(false)
+        })
+    });
+}
+
 /// Ensures `~/.local/bin/som-tmux` on the far side of an `ssh`/`wsl`
 /// tmux profile is present and matches THIS Som build's version — see
 /// `project_som_tmux` memory for the full policy this implements. Runs
@@ -1953,9 +2031,39 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     // this function's own doc comment for why (`ETXTBSY` against a live
     // HOLDER). Every live pane on this host reconnects to a fresh HOLDER
     // on next use; an accepted, explicit tradeoff for a version bump.
-    kill_all_holders_for_redeploy(host_args, remote_kind);
+    //
+    // Retried up to `KILL_AND_SCP_ATTEMPTS` times as a whole (kill THEN
+    // scp, not scp alone) — `kill_all_holders_for_redeploy` already kills
+    // with SIGKILL and waits for every pid to actually disappear from `ps`
+    // in the SAME ssh session, but that wait is itself best-effort/bounded
+    // (2s) and best-effort on the LISTING step too (a failed `ps` probe
+    // just skips cleanup rather than blocking), so a single kill+scp pass
+    // can still occasionally lose the race against a slow-to-exit or
+    // freshly-respawned process. Re-running the whole pair (not just scp)
+    // means a second attempt also re-lists and re-kills anything still
+    // alive, rather than retrying scp against a binary the first attempt
+    // never actually got out of the way.
+    const KILL_AND_SCP_ATTEMPTS: u32 = 2;
+    let mut last_scp_err = None;
+    for attempt in 1..=KILL_AND_SCP_ATTEMPTS {
+        kill_all_holders_for_redeploy(host_args, remote_kind);
+        match scp_to_remote(host_args, &local_binary, "~/.local/bin/som-tmux") {
+            Ok(()) => {
+                last_scp_err = None;
+                break;
+            }
+            Err(err) => {
+                log::warn!("scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} failed for {host_args:?}: {err:#}");
+                last_scp_err = Some(err);
+            }
+        }
+    }
+    if let Some(err) = last_scp_err {
+        return Err(err.context(format!(
+            "failed to deploy som-tmux to {host_args:?} after {KILL_AND_SCP_ATTEMPTS} kill+scp attempts"
+        )));
+    }
 
-    scp_to_remote(host_args, &local_binary, "~/.local/bin/som-tmux")?;
     let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-tmux"]);
     run_remote_command(remote_kind, &chmod_probe)?;
     Ok(())

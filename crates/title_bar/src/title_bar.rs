@@ -28,7 +28,7 @@ use settings::Settings as _;
 
 use title_bar_settings::TitleBarSettings;
 use ui::{
-    TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    SpinnerLabel, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use util::ResultExt;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
@@ -349,6 +349,11 @@ impl TitleBar {
                 cx.notify();
             }));
         }
+        // Drives the drag-zone spinner in `render_tab_controls` — `App::
+        // set_global` doesn't itself trigger a re-render, so without this
+        // subscription the spinner would only ever appear/disappear on
+        // whatever NEXT unrelated re-render happened to occur.
+        subscriptions.push(cx.observe_global::<workspace::SomRestoreActivity>(|_, cx| cx.notify()));
 
         let platform_titlebar = cx.new(|cx| {
             let mut titlebar = PlatformTitleBar::new(id, cx);
@@ -395,13 +400,24 @@ impl TitleBar {
             .when_some(tabs_element, |this, tabs| {
                 this.child(tabs)
             })
-            // Drag zone: fills remaining space, min width = 2 buttons (72px)
+            // Drag zone: fills remaining space, min width = 2 buttons (72px).
+            // Shows a single spinner (see `workspace::SomRestoreActivity`'s
+            // doc comment) for as long as ANY background tab restore/
+            // deploy-check is still running — deliberately the ONLY
+            // loading indicator for that work (no per-tab spinner, no
+            // placeholder-tab content spinner): one indicator, one place.
             .child(
                 div()
                     .id("titlebar-drag-zone")
                     .flex_1()
                     .min_w(px(72.))
                     .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(workspace::SomRestoreActivity::is_active(cx), |this| {
+                        this.child(SpinnerLabel::new())
+                    })
                     .on_click(|ev: &ClickEvent, window, _cx| {
                         if ev.click_count() == 2 {
                             window.zoom_window();

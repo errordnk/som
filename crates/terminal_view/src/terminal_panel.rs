@@ -577,6 +577,20 @@ impl TerminalPanel {
             let profile = profile.unwrap();
             let cwd = working_directory.clone().map(|p| p.to_string_lossy().to_string());
             let pane_id = uuid::Uuid::new_v4().to_string();
+            // Same placeholder-tab approach as `restore_som_tabs`'s Phase
+            // 0 (see that function's doc comment) — a new SSH `tmux: true`
+            // tab used to sit on nothing at all (not even a tab in the tab
+            // bar) for however long its deploy check + terminal creation
+            // took, a real, reported pause on plain "new tab" clicks/
+            // shortcuts, not just restore-on-launch. Inserting a
+            // `PendingTerminalTab` synchronously, right now, means the tab
+            // (name/icon already known) appears immediately, is activated
+            // immediately (`add_item_to_main_pane` always focuses/
+            // activates its new item), and the real terminal replaces it
+            // in place once ready via `replace_center_terminal_named`.
+            let placeholder = cx.new(|cx| PendingTerminalTab::new(tab_name.clone(), tab_icon.clone(), cx));
+            let placeholder_item_id = placeholder.entity_id();
+            workspace.add_item_to_main_pane(Box::new(placeholder), profile_index, window, cx);
             // Remote (ssh/wsl) profiles need a blocking deploy check (git
             // pull + rebuild on the far side if the version there doesn't
             // match this Som build — see `ensure_remote_binary_deployed`'s
@@ -629,12 +643,21 @@ impl TerminalPanel {
                     Err(err) => {
                         log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
                         workspace
-                            .update(cx, |workspace, cx| {
+                            .update_in(cx, |workspace, window, cx| {
                                 show_som_tmux_error(
                                     workspace,
                                     format!("Failed to set up tmux profile {:?}\n{err:#}", profile.name),
                                     cx,
                                 );
+                                // The placeholder tab inserted synchronously
+                                // above never gets a real terminal now — close
+                                // it rather than leaving an empty, permanently
+                                // stuck tab behind.
+                                if let Some(main_pane) = workspace.panes().first().cloned() {
+                                    main_pane.update(cx, |pane, cx| {
+                                        pane.remove_item(placeholder_item_id, true, true, window, cx);
+                                    });
+                                }
                             })
                             .ok();
                         return anyhow::Ok(());
@@ -642,9 +665,16 @@ impl TerminalPanel {
                 };
 
                 let task = workspace.update_in(cx, |workspace, window, cx| {
-                    Self::add_center_terminal_named(workspace, tab_name, tab_icon, profile_index, window, cx, move |project, cx| {
-                        project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx)
-                    })
+                    Self::replace_center_terminal_named(
+                        workspace,
+                        placeholder_item_id,
+                        tab_name,
+                        tab_icon,
+                        profile_index,
+                        window,
+                        cx,
+                        move |project, cx| project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx),
+                    )
                 })?;
                 let (item_id, _terminal) = task.await?;
                 workspace.update(cx, |workspace, _cx| {

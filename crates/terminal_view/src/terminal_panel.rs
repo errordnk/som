@@ -759,6 +759,12 @@ impl TerminalPanel {
         cx: &mut App,
     ) -> Task<()> {
         let window_handle = window.window_handle();
+        // Drives the titlebar's drag-zone spinner (see `workspace::
+        // SomRestoreActivity`'s doc comment) — `begin` here, `end` right
+        // before this whole task resolves, so the spinner covers this
+        // ENTIRE restore (tab creation, splits, deploy checks, orphan
+        // cleanup), not just some inner slice of it.
+        workspace::SomRestoreActivity::begin(cx);
         cx.spawn(async move |cx| {
             let db_state = workspace::som_db::load_som_db();
 
@@ -822,99 +828,118 @@ impl TerminalPanel {
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                    // Same remote deploy check as `new_terminal` — see
-                    // `ensure_remote_binary_deployed`'s doc comment. Already
-                    // inside this function's own `cx.spawn`, so this just
-                    // awaits inline rather than needing a nested `spawn_in`.
+                    // The ENTIRE rest of this tab's setup — deploy check,
+                    // orphan cleanup, terminal creation, tmux_sessions
+                    // bookkeeping — runs inside ONE `cx.spawn`, pushed into
+                    // `tab_creations` immediately, so THIS tab's (possibly
+                    // slow, real SSH round-trip) deploy check can never
+                    // block the `for` loop from moving on to the NEXT
+                    // tab's restore. Before this, the deploy check/orphan
+                    // cleanup below were awaited directly in the loop body
+                    // — with N SSH `tmux: true` tabs, total restore time
+                    // was the SUM of every host's round-trip, not the
+                    // slowest one, exactly the concurrency Phase 1's own
+                    // doc comment already promised but this one branch
+                    // didn't actually deliver.
                     let (remote_program, host_args) =
                         project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
-                    if let RemoteKind::Ssh | RemoteKind::Wsl = classify_remote(&remote_program) {
-                        let remote_kind = classify_remote(&remote_program);
-                        let live_pane_ids = live_pane_ids.clone();
-                        cx.background_spawn(async move {
-                            if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
-                                log::warn!(
-                                    "remote som-tmux deploy check failed on restore, proceeding with whatever is already there: {err:#}"
-                                );
-                            }
-                            // Piggybacks on the SSH round-trip the deploy
-                            // check above already pays for — see
-                            // `kill_orphaned_holders`'s doc comment.
-                            kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
-                        })
-                        .await;
-                    }
-
-                    let (cursor_shape, scrollback) = window_handle
-                        .update(cx, |_, _, cx| {
-                            let settings = TerminalSettings::get_global(cx);
-                            (settings.cursor_shape, settings.max_scroll_history_lines)
-                        })
-                        .unwrap_or((CursorShape::default(), None));
-                    let wrapped = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback);
-                    let created = match wrapped {
-                        Ok((program, args)) => window_handle
-                            .update(cx, |_, window, cx| {
-                                workspace.update(cx, |workspace, cx| {
-                                    let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
-                                    Self::add_center_terminal_named(
-                                        workspace,
-                                        Some(profile.name.clone()),
-                                        profile.icon.clone(),
-                                        Some(tab.profile_index),
-                                        window,
-                                        cx,
-                                        move |project, cx| {
-                                            project.create_terminal_with_program_and_args(cwd, program, args, cx)
-                                        },
-                                    )
-                                })
+                    let remote_kind = classify_remote(&remote_program);
+                    let live_pane_ids = live_pane_ids.clone();
+                    let workspace = workspace.clone();
+                    let profile = profile.clone();
+                    let cwd = cwd.clone();
+                    let tab_profile_index = tab.profile_index;
+                    let created = cx.spawn(async move |cx| {
+                        if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+                            // `ensure_remote_binary_deployed`/`kill_orphaned_
+                            // holders` are SYNCHRONOUS, blocking functions
+                            // (real `ssh`/`scp` child processes via
+                            // `std::process::Command::output()`) — running
+                            // them directly on THIS `cx.spawn`'s foreground
+                            // executor would block that executor's thread
+                            // for the whole SSH round-trip, starving every
+                            // OTHER tab's `cx.spawn` task of a chance to
+                            // progress too (confirmed: without `background_
+                            // spawn` here, two tabs' deploy-checks ran
+                            // fully back-to-back, not concurrently, even
+                            // though each already had its own `cx.spawn`).
+                            // `cx.background_spawn` moves the blocking work
+                            // onto a real background thread pool instead.
+                            cx.background_spawn({
+                                let host_args = host_args.clone();
+                                let live_pane_ids = live_pane_ids.clone();
+                                async move {
+                                    if let Err(err) = ensure_remote_binary_deployed(&host_args, remote_kind) {
+                                        log::warn!(
+                                            "remote som-tmux deploy check failed on restore, proceeding with whatever is already there: {err:#}"
+                                        );
+                                    }
+                                    // Piggybacks on the SSH round-trip the
+                                    // deploy check above already pays for —
+                                    // see `kill_orphaned_holders`'s doc
+                                    // comment.
+                                    kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
+                                }
                             })
-                            .ok()
-                            .and_then(|r| r.ok()),
-                        Err(err) => {
-                            log::error!("failed to set up tmux profile {:?} on restore: {err:#}", profile.name);
-                            None
+                            .await;
                         }
-                    };
-                    if let Some(created) = created {
-                        let workspace = workspace.clone();
-                        let pane_id = pane_id.clone();
-                        let created = cx.spawn(async move |cx| {
-                            let (item_id, _terminal) = created.await?;
-                            // Restored tabs never otherwise call
-                            // `set_tmux_sessions_for_item` — without this,
-                            // `pane_id` above (correctly reused from
-                            // `db.json`, or freshly generated when this tab
-                            // never had one) never makes it back into
-                            // `Workspace::som_tab_tmux_sessions`, so the
-                            // NEXT `som_persist_db_json` call writes `None`
-                            // for this tab's `tmux_sessions` regardless of
-                            // what pane it's actually backed by — silently
-                            // forgetting the association on every restore.
-                            // Confirmed root cause of a reported bug: a
-                            // `htop`/`micro` process running in a
-                            // `som-tmux` HOLDER survives Som closing
-                            // (the whole point of the HOLDER/RELAY design —
-                            // see `project_som_tmux` memory), but the tab
-                            // that opens on the NEXT launch gets a
-                            // brand-new `pane_id` instead of reattaching to
-                            // that same still-alive HOLDER, since db.json
-                            // never remembered which pane_id this tab was
-                            // actually using. Uses `window_handle.update`
-                            // (not `workspace.update` directly) since
-                            // `Workspace::set_tmux_sessions_for_item` needs
-                            // a `Context<Workspace>`, only obtainable
-                            // through the window.
-                            window_handle.update(cx, |_, _, cx| {
-                                workspace.update(cx, |workspace, _cx| {
-                                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
-                                })
-                            })??;
-                            anyhow::Ok(item_id)
-                        });
-                        tab_creations.push((db_index, tab.extra_splits, created));
-                    }
+
+                        let (cursor_shape, scrollback) = window_handle
+                            .update(cx, |_, _, cx| {
+                                let settings = TerminalSettings::get_global(cx);
+                                (settings.cursor_shape, settings.max_scroll_history_lines)
+                            })
+                            .unwrap_or((CursorShape::default(), None));
+                        let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback)?;
+                        let created = window_handle.update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
+                                Self::add_center_terminal_named(
+                                    workspace,
+                                    Some(profile.name.clone()),
+                                    profile.icon.clone(),
+                                    Some(tab_profile_index),
+                                    window,
+                                    cx,
+                                    move |project, cx| {
+                                        project.create_terminal_with_program_and_args(cwd, program, args, cx)
+                                    },
+                                )
+                            })
+                        })??;
+                        let (item_id, _terminal) = created.await?;
+                        // Restored tabs never otherwise call
+                        // `set_tmux_sessions_for_item` — without this,
+                        // `pane_id` above (correctly reused from
+                        // `db.json`, or freshly generated when this tab
+                        // never had one) never makes it back into
+                        // `Workspace::som_tab_tmux_sessions`, so the
+                        // NEXT `som_persist_db_json` call writes `None`
+                        // for this tab's `tmux_sessions` regardless of
+                        // what pane it's actually backed by — silently
+                        // forgetting the association on every restore.
+                        // Confirmed root cause of a reported bug: a
+                        // `htop`/`micro` process running in a
+                        // `som-tmux` HOLDER survives Som closing
+                        // (the whole point of the HOLDER/RELAY design —
+                        // see `project_som_tmux` memory), but the tab
+                        // that opens on the NEXT launch gets a
+                        // brand-new `pane_id` instead of reattaching to
+                        // that same still-alive HOLDER, since db.json
+                        // never remembered which pane_id this tab was
+                        // actually using. Uses `window_handle.update`
+                        // (not `workspace.update` directly) since
+                        // `Workspace::set_tmux_sessions_for_item` needs
+                        // a `Context<Workspace>`, only obtainable
+                        // through the window.
+                        window_handle.update(cx, |_, _, cx| {
+                            workspace.update(cx, |workspace, _cx| {
+                                workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                            })
+                        })??;
+                        anyhow::Ok(item_id)
+                    });
+                    tab_creations.push((db_index, tab.extra_splits, created));
                     continue;
                 }
 
@@ -1165,6 +1190,8 @@ impl TerminalPanel {
                     })
                 })
                 .ok();
+
+            window_handle.update(cx, |_, _, cx| workspace::SomRestoreActivity::end(cx)).ok();
         })
     }
 

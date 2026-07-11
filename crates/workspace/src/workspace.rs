@@ -507,6 +507,119 @@ pub struct SomTabsRestorer(
 
 impl gpui::Global for SomTabsRestorer {}
 
+/// A plain reference count of "how many background restore/deploy jobs are
+/// running right now" — driven by `terminal_view::TerminalPanel::
+/// restore_som_tabs` (`begin`/`end` bracket each tab's SSH deploy-check/
+/// creation), read by `title_bar::TitleBar` (via `cx.observe_global`) to
+/// show a single spinner in the titlebar's drag zone for as long as this
+/// is above zero. Deliberately a bare counter, not a bool: several tabs'
+/// restores run concurrently (see `restore_som_tabs`'s own Phase 1 doc
+/// comment), so the spinner must stay on until the LAST one finishes, not
+/// disappear the moment any single one does.
+///
+/// `App::set_global` (what `begin`/`end` call under the hood) does NOT
+/// itself notify anything — GPUI only re-renders observers when an
+/// explicit event fires. `cx.observe_global::<SomRestoreActivity>()`
+/// relies on `notify_global_observers` firing on ANY global mutation via
+/// `App::set_global`/`App::update_global`, no matter how small — see
+/// `App::set_global`'s own implementation, which always calls this
+/// regardless of whether the new value differs from the old one.
+#[derive(Clone, Copy, Default)]
+pub struct SomRestoreActivity(pub usize);
+
+impl gpui::Global for SomRestoreActivity {}
+
+impl SomRestoreActivity {
+    /// Marks the start of one background restore/deploy job — pair with a
+    /// matching `end` once it finishes (a `Drop` guard would be more
+    /// foolproof, but every real call site already has an unambiguous
+    /// single exit point via `.await`, so the extra type wasn't worth it).
+    pub fn begin(cx: &mut App) {
+        let current = cx.try_global::<SomRestoreActivity>().copied().unwrap_or_default();
+        cx.set_global(SomRestoreActivity(Self::next_on_begin(current.0)));
+    }
+
+    /// Marks the end of one background restore/deploy job started by
+    /// `begin`. Saturating (never panics/underflows) so a stray extra
+    /// `end` call — e.g. from a bug elsewhere — degrades to "spinner turns
+    /// off slightly early" rather than a crash.
+    pub fn end(cx: &mut App) {
+        let current = cx.try_global::<SomRestoreActivity>().copied().unwrap_or_default();
+        cx.set_global(SomRestoreActivity(Self::next_on_end(current.0)));
+    }
+
+    /// Whether the titlebar's drag-zone spinner should currently be shown.
+    pub fn is_active(cx: &App) -> bool {
+        cx.try_global::<SomRestoreActivity>().is_some_and(|activity| Self::should_show(activity.0))
+    }
+
+    /// Pure counter-increment logic, pulled out of `begin` so it can be
+    /// unit-tested without a real `App` context (GPUI globals need one).
+    fn next_on_begin(current: usize) -> usize {
+        current + 1
+    }
+
+    /// Pure counter-decrement logic, pulled out of `end` — see `next_on_
+    /// begin`'s doc comment. Saturating: a stray extra `end` (a bug
+    /// elsewhere pairing `begin`/`end` wrong) must never underflow/panic,
+    /// it should just clamp at zero (spinner already off, stays off).
+    fn next_on_end(current: usize) -> usize {
+        current.saturating_sub(1)
+    }
+
+    /// Pure "should the spinner be visible" logic, pulled out of
+    /// `is_active` — see `next_on_begin`'s doc comment.
+    fn should_show(count: usize) -> bool {
+        count > 0
+    }
+}
+
+#[cfg(test)]
+mod som_restore_activity_tests {
+    use super::SomRestoreActivity;
+
+    #[test]
+    fn spinner_is_off_when_no_jobs_have_started() {
+        assert!(!SomRestoreActivity::should_show(0));
+    }
+
+    #[test]
+    fn spinner_turns_on_after_the_first_begin() {
+        let count = SomRestoreActivity::next_on_begin(0);
+        assert!(SomRestoreActivity::should_show(count));
+    }
+
+    #[test]
+    fn spinner_stays_on_while_any_of_several_concurrent_jobs_is_still_running() {
+        // Three tabs restoring concurrently (a real restore_som_tabs
+        // scenario) — the spinner must stay on until the LAST one ends,
+        // not turn off after the first `end` call.
+        let mut count = 0;
+        count = SomRestoreActivity::next_on_begin(count);
+        count = SomRestoreActivity::next_on_begin(count);
+        count = SomRestoreActivity::next_on_begin(count);
+        assert!(SomRestoreActivity::should_show(count));
+
+        count = SomRestoreActivity::next_on_end(count);
+        assert!(SomRestoreActivity::should_show(count), "two of three jobs still running");
+
+        count = SomRestoreActivity::next_on_end(count);
+        assert!(SomRestoreActivity::should_show(count), "one of three jobs still running");
+
+        count = SomRestoreActivity::next_on_end(count);
+        assert!(!SomRestoreActivity::should_show(count), "all jobs finished");
+    }
+
+    #[test]
+    fn an_extra_end_call_saturates_at_zero_instead_of_underflowing() {
+        // Regression coverage for a mismatched begin/end pair (a bug
+        // elsewhere) — must degrade to "spinner off", never panic.
+        let count = SomRestoreActivity::next_on_end(0);
+        assert_eq!(count, 0);
+        assert!(!SomRestoreActivity::should_show(count));
+    }
+}
+
 /// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
 #[action(namespace = workspace)]

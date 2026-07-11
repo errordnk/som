@@ -607,80 +607,94 @@ impl TerminalPanel {
             let terminal_settings = TerminalSettings::get_global(cx);
             let cursor_shape = terminal_settings.cursor_shape;
             let scrollback = terminal_settings.max_scroll_history_lines;
+            // Drives the titlebar's drag-zone spinner (see `workspace::
+            // SomRestoreActivity`'s doc comment) for a new tab's deploy
+            // check + terminal creation, same as `restore_som_tabs` already
+            // does for restore-on-launch — `begin` here, `end` once the
+            // whole inner future below resolves (success, deploy failure,
+            // or tmux_wrapped_shell failure alike), via the wrapping
+            // `async move` rather than duplicating `end()` at every one of
+            // that future's several early-return points.
+            workspace::SomRestoreActivity::begin(cx);
             cx.spawn_in(window, async move |workspace, cx| {
-                if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
-                    let host_args = host_args.clone();
-                    let deploy_result = cx
-                        .background_spawn(async move { ensure_remote_binary_deployed(&host_args, remote_kind) })
-                        .await;
-                    if let Err(err) = deploy_result {
-                        log::warn!("remote som-tmux deploy check failed, proceeding with whatever is already there: {err:#}");
-                        // Best-effort: this profile's tab still gets
-                        // created below with whatever binary is already on
-                        // the remote host (which might work fine, or might
-                        // not — but silently trying anyway beats refusing
-                        // to open the tab at all). The banner is purely
-                        // informational — a real deploy failure (e.g. the
-                        // scp/kill retries in `ensure_remote_binary_
-                        // deployed` both failing) is exactly the kind of
-                        // "housekeeping went wrong, but you should know"
-                        // case a banner exists for, rather than a silent
-                        // log line the user has no way to notice.
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                show_som_tmux_error(
-                                    workspace,
-                                    format!("som-tmux deploy check failed for this profile\n{err:#}"),
-                                    cx,
-                                );
-                            })
-                            .ok();
+                let result: anyhow::Result<()> = async {
+                    if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+                        let host_args = host_args.clone();
+                        let deploy_result = cx
+                            .background_spawn(async move { ensure_remote_binary_deployed(&host_args, remote_kind) })
+                            .await;
+                        if let Err(err) = deploy_result {
+                            log::warn!("remote som-tmux deploy check failed, proceeding with whatever is already there: {err:#}");
+                            // Best-effort: this profile's tab still gets
+                            // created below with whatever binary is already on
+                            // the remote host (which might work fine, or might
+                            // not — but silently trying anyway beats refusing
+                            // to open the tab at all). The banner is purely
+                            // informational — a real deploy failure (e.g. the
+                            // scp/kill retries in `ensure_remote_binary_
+                            // deployed` both failing) is exactly the kind of
+                            // "housekeeping went wrong, but you should know"
+                            // case a banner exists for, rather than a silent
+                            // log line the user has no way to notice.
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    show_som_tmux_error(
+                                        workspace,
+                                        format!("som-tmux deploy check failed for this profile\n{err:#}"),
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }
                     }
+
+                    let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback) {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
+                            workspace
+                                .update_in(cx, |workspace, window, cx| {
+                                    show_som_tmux_error(
+                                        workspace,
+                                        format!("Failed to set up tmux profile {:?}\n{err:#}", profile.name),
+                                        cx,
+                                    );
+                                    // The placeholder tab inserted synchronously
+                                    // above never gets a real terminal now — close
+                                    // it rather than leaving an empty, permanently
+                                    // stuck tab behind.
+                                    if let Some(main_pane) = workspace.panes().first().cloned() {
+                                        main_pane.update(cx, |pane, cx| {
+                                            pane.remove_item(placeholder_item_id, true, true, window, cx);
+                                        });
+                                    }
+                                })
+                                .ok();
+                            return anyhow::Ok(());
+                        }
+                    };
+
+                    let task = workspace.update_in(cx, |workspace, window, cx| {
+                        Self::replace_center_terminal_named(
+                            workspace,
+                            placeholder_item_id,
+                            tab_name,
+                            tab_icon,
+                            profile_index,
+                            window,
+                            cx,
+                            move |project, cx| project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx),
+                        )
+                    })?;
+                    let (item_id, _terminal) = task.await?;
+                    workspace.update(cx, |workspace, _cx| {
+                        workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                    })?;
+                    anyhow::Ok(())
                 }
-
-                let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback) {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
-                        workspace
-                            .update_in(cx, |workspace, window, cx| {
-                                show_som_tmux_error(
-                                    workspace,
-                                    format!("Failed to set up tmux profile {:?}\n{err:#}", profile.name),
-                                    cx,
-                                );
-                                // The placeholder tab inserted synchronously
-                                // above never gets a real terminal now — close
-                                // it rather than leaving an empty, permanently
-                                // stuck tab behind.
-                                if let Some(main_pane) = workspace.panes().first().cloned() {
-                                    main_pane.update(cx, |pane, cx| {
-                                        pane.remove_item(placeholder_item_id, true, true, window, cx);
-                                    });
-                                }
-                            })
-                            .ok();
-                        return anyhow::Ok(());
-                    }
-                };
-
-                let task = workspace.update_in(cx, |workspace, window, cx| {
-                    Self::replace_center_terminal_named(
-                        workspace,
-                        placeholder_item_id,
-                        tab_name,
-                        tab_icon,
-                        profile_index,
-                        window,
-                        cx,
-                        move |project, cx| project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx),
-                    )
-                })?;
-                let (item_id, _terminal) = task.await?;
-                workspace.update(cx, |workspace, _cx| {
-                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
-                })?;
-                anyhow::Ok(())
+                .await;
+                cx.update(|_, cx| workspace::SomRestoreActivity::end(cx)).ok();
+                result
             })
             .detach_and_log_err(cx);
             return;

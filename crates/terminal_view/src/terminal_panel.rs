@@ -2059,7 +2059,38 @@ fn kill_all_holders_for_redeploy(host_args: &[String], remote_kind: RemoteKind) 
         return;
     }
     log::info!("killing {} som-tmux process(es) on remote host ahead of a version-mismatch redeploy: {pids:?}", pids.len());
-    let kill_script = format!("kill {} 2>/dev/null || true", pids.join(" "));
+    // Plain `kill` sends SIGTERM, which a process can catch/delay/ignore —
+    // and even a default handler's teardown isn't instantaneous. A `kill`
+    // over one SSH connection followed by a SEPARATE `scp` connection
+    // right after (as `ensure_remote_binary_deployed` does) is a real
+    // race: the kernel hasn't necessarily finished tearing the process
+    // down (and releasing its exec image) by the time the next
+    // connection's `scp` tries to overwrite the same file, and `scp`/`cp`
+    // fail outright against a still-executing binary (`ETXTBSY`,
+    // confirmed live against `usa` — see `project_bugs` memory). `kill
+    // -9` (SIGKILL) instead — uncatchable, unblockable, the kernel tears
+    // the process down immediately with no user-space cleanup step to
+    // wait out. Still followed by a short bounded `kill -0` poll (20 *
+    // 100ms = 2s) IN THE SAME SSH session/script (not a second round-trip
+    // from the Windows side, which would just move the same race to "did
+    // THIS connection's kill finish before THAT connection's scp
+    // started") as defense in depth — SIGKILL removes the process
+    // immediately but the exec image's busy flag is still cleared by the
+    // kernel's own (near-instant, but not appearing "before returning
+    // from kill(2)") teardown, not synchronously with the signal call
+    // itself.
+    let pid_list = pids.join(" ");
+    let kill_script = format!(
+        r#"kill -9 {pid_list} 2>/dev/null || true
+for _ in $(seq 1 20); do
+  still_alive=0
+  for pid in {pid_list}; do
+    kill -0 "$pid" 2>/dev/null && still_alive=1
+  done
+  [ "$still_alive" = 0 ] && break
+  sleep 0.1
+done"#
+    );
     let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &kill_script]);
     if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
         log::warn!("failed to kill remote som-tmux processes ahead of redeploy: {err:#}");

@@ -1893,8 +1893,21 @@ impl Workspace {
                 })
                 .ok()
                 .flatten();
+            // Deliberately NOT awaited here — this whole function runs
+            // before `window.activate_window()` below (what actually makes
+            // the window visible, since `build_window_options` sets `show:
+            // false`), so awaiting `restore_task` here means the window
+            // stays completely invisible for however long EVERY tab takes
+            // to restore, including slow real SSH `tmux: true` connections
+            // — confirmed as a real, reported symptom ("не вижу
+            // моментального запуска окна сома"). Detaching it into its own
+            // task lets the window show immediately while tabs/splits/
+            // deploy-checks keep populating in the background — the
+            // titlebar's drag-zone spinner (`SomRestoreActivity`, driven by
+            // `restore_som_tabs` itself) is what actually communicates
+            // "still working" once the window IS visible.
             if let Some(restore_task) = restore_task {
-                restore_task.await;
+                restore_task.detach();
             }
 
             // Restore default dock state for empty workspaces
@@ -8175,8 +8188,10 @@ pub fn open_workspace_by_id(
             })
             .ok()
             .flatten();
+        // Deliberately NOT awaited — see `new_local`'s identical restore-task
+        // handling for why (window visibility must never block on this).
         if let Some(restore_task) = restore_task {
-            restore_task.await;
+            restore_task.detach();
         }
 
         window.update(cx, |_, window, cx| {

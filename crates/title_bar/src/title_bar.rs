@@ -414,7 +414,8 @@ impl TitleBar {
                     .h_full()
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .justify_end()
+                    .pr_2()
                     .when(workspace::SomRestoreActivity::is_active(cx), |this| {
                         this.child(SpinnerLabel::new())
                     })

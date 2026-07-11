@@ -1,6 +1,7 @@
 mod blink_manager;
 pub mod cursor;
 mod persistence;
+pub mod pending_terminal_tab;
 pub mod terminal_element;
 pub mod terminal_panel;
 pub mod terminal_scrollbar;

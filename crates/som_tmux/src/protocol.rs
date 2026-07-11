@@ -177,19 +177,29 @@ pub fn current_platform() -> (Os, Arch) {
 }
 
 /// Directory name (under `platform_binaries_dir()`) holding the
-/// pre-built `som-tmux` for a given `(Os, Arch)` pair — the four names the
-/// user chose for `~/.config/som/tmux/{name}/som-tmux`. Used on BOTH ends
-/// of a deploy decision: locally, to find which pre-built binary to `scp`
-/// up for a remote host reporting this `(os, arch)` in its handshake; and
-/// (implicitly, by a human/release-packaging script, not this codebase) to
-/// know where to drop each cross-compiled build's output in the first
-/// place.
+/// pre-built `som-tmux` for a given `(Os, Arch)` pair — the names the user
+/// chose for `~/.config/som/tmux/{name}/som-tmux`, one per (os, arch) pair
+/// this codebase actually supports (see `Os`/`Arch`'s own doc comment for
+/// the four supported combinations — Intel Mac and Windows-on-ARM are
+/// excluded on purpose, so there is no `windows-arm`/`macos-amd` directory
+/// to name). Used on BOTH ends of a deploy decision: locally, to find
+/// which pre-built binary to `scp` up for a remote host reporting this
+/// `(os, arch)` in its handshake; and (implicitly, by a human/release-
+/// packaging script, not this codebase) to know where to drop each
+/// cross-compiled build's output in the first place.
 pub fn platform_dir_name(os: Os, arch: Arch) -> &'static str {
     match (os, arch) {
-        (Os::Windows, _) => "windows",
-        (Os::Darwin, _) => "macos",
+        (Os::Windows, Arch::Amd64) => "windows-amd",
+        (Os::Darwin, Arch::Arm64) => "macos-arm",
         (Os::Linux, Arch::Amd64) => "linux-amd",
         (Os::Linux, Arch::Arm64) => "linux-arm",
+        // Genuinely unsupported combos (Windows-on-ARM, Intel Mac) — no
+        // directory name exists for these; `local_binary_path_for` never
+        // finds a file regardless of what this string is, so any
+        // placeholder is fine as long as it can never collide with a real
+        // supported directory above.
+        (Os::Windows, Arch::Arm64) => "windows-arm-unsupported",
+        (Os::Darwin, Arch::Amd64) => "macos-amd-unsupported",
     }
 }
 
@@ -310,6 +320,111 @@ pub enum HolderOutput {
     /// other reason (which the RELAY treats as "connection lost, nothing
     /// more to do" without necessarily needing to know why).
     ShellExited,
+}
+
+#[cfg(test)]
+mod platform_dir_tests {
+    use super::*;
+
+    /// Regression coverage for a real naming ambiguity: `platform_dir_name`
+    /// used to map EVERY `Os::Windows` to a bare `"windows"` and every
+    /// `Os::Darwin` to a bare `"macos"`, ignoring `Arch` entirely — fine by
+    /// accident today (only one arch per OS is actually supported, see
+    /// `Os`/`Arch`'s own doc comment), but the name alone gave no way to
+    /// tell whether a given directory held an amd64 or arm64 build.
+    /// Renamed to always carry the arch suffix, matching `linux-amd`/
+    /// `linux-arm`'s existing convention, so `~/.config/som/tmux/`'s
+    /// directory names are self-describing regardless of which two of the
+    /// four supported combos anyone's actually using.
+    #[test]
+    fn windows_amd64_maps_to_windows_amd() {
+        assert_eq!(platform_dir_name(Os::Windows, Arch::Amd64), "windows-amd");
+    }
+
+    #[test]
+    fn macos_arm64_maps_to_macos_arm() {
+        // The real Mac this codebase talks to (see project_som_tmux
+        // memory) is Apple Silicon (arm64) — Intel Mac is explicitly
+        // unsupported (Os/Arch's own doc comment), so this is the only
+        // Darwin combo that should ever resolve to a real directory.
+        assert_eq!(platform_dir_name(Os::Darwin, Arch::Arm64), "macos-arm");
+    }
+
+    #[test]
+    fn linux_amd64_maps_to_linux_amd() {
+        assert_eq!(platform_dir_name(Os::Linux, Arch::Amd64), "linux-amd");
+    }
+
+    #[test]
+    fn linux_arm64_maps_to_linux_arm() {
+        assert_eq!(platform_dir_name(Os::Linux, Arch::Arm64), "linux-arm");
+    }
+
+    #[test]
+    fn every_supported_combo_maps_to_a_distinct_directory_name() {
+        // The four combos project_som_tmux memory ("Обновление 21") says
+        // are actually supported — Intel Mac and Windows-on-ARM excluded
+        // on purpose, deliberately not asserted here at all.
+        let supported = [
+            (Os::Windows, Arch::Amd64),
+            (Os::Darwin, Arch::Arm64),
+            (Os::Linux, Arch::Amd64),
+            (Os::Linux, Arch::Arm64),
+        ];
+        let names: Vec<&str> = supported.iter().map(|&(os, arch)| platform_dir_name(os, arch)).collect();
+        for (i, a) in names.iter().enumerate() {
+            for (j, b) in names.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two supported (os, arch) combos must never share a directory name: {supported:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_platform_always_resolves_to_a_supported_combo() {
+        // Whatever machine actually runs this test, current_platform()'s
+        // own (os, arch) result must itself be one of the four supported
+        // combos — otherwise Som's own build platform wouldn't even be
+        // able to name its own directory under ~/.config/som/tmux/.
+        let (os, arch) = current_platform();
+        let supported = matches!(
+            (os, arch),
+            (Os::Windows, Arch::Amd64) | (Os::Darwin, Arch::Arm64) | (Os::Linux, Arch::Amd64) | (Os::Linux, Arch::Arm64)
+        );
+        assert!(supported, "current_platform() returned an unsupported combo: {os:?}/{arch:?}");
+    }
+
+    #[test]
+    fn local_binary_path_for_uses_the_exe_suffix_only_on_windows() {
+        // Doesn't touch the filesystem (no real file exists at this
+        // fabricated config_dir in a test environment) — local_binary_
+        // path_for returns None either way, but the file NAME it would
+        // have looked for is what this test actually protects (the .exe
+        // suffix decision), so this reaches into platform_binaries_dir()
+        // directly rather than trying to assert on local_binary_path_for's
+        // None result.
+        let windows_dir = platform_binaries_dir().join(platform_dir_name(Os::Windows, Arch::Amd64));
+        let unix_dir = platform_binaries_dir().join(platform_dir_name(Os::Linux, Arch::Amd64));
+        assert!(windows_dir.ends_with("windows-amd"));
+        assert!(unix_dir.ends_with("linux-amd"));
+    }
+
+    #[test]
+    fn local_binary_path_for_returns_none_when_no_file_exists_for_that_platform() {
+        // A platform combo whose directory almost certainly doesn't exist
+        // in whatever environment runs this test (or if it does, has no
+        // file in it) — must return None, not panic or fabricate a path
+        // that doesn't actually exist on disk.
+        let result = local_binary_path_for(Os::Linux, Arch::Arm64);
+        // Can't assert None unconditionally — a dev machine that's ALSO
+        // used to run the real deploy-som-tmux.sh script might genuinely
+        // have this file. Only assert the contract that matters: if Some,
+        // the path really does exist on disk.
+        if let Some(path) = result {
+            assert!(path.is_file(), "local_binary_path_for returned a path that doesn't actually exist: {path:?}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

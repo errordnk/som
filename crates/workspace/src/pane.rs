@@ -1401,6 +1401,40 @@ impl Pane {
         };
     }
 
+    /// Swaps the item currently at `item_id`'s position for `new_item`,
+    /// IN PLACE — the new item lands at the exact same array index the old
+    /// one occupied, `active_item_index`/pinned-tab-count/activation
+    /// history are all left untouched (unlike `remove_item`/`add_item`,
+    /// which each independently adjust those). Built for `restore_som_
+    /// tabs`'s placeholder-tab flow: a `PendingTerminalTab` is inserted at
+    /// its final `db.json` position immediately so the tab bar draws every
+    /// tab up front, then gets swapped for the real `TerminalView` once
+    /// its `Terminal` finishes connecting — from the tab bar's point of
+    /// view this must be invisible (same position, same active/focus
+    /// state), not a close-then-reopen.
+    ///
+    /// If `item_id` isn't found (already closed by the user before its
+    /// real content was ready — a real possibility during restore), this
+    /// is a no-op: the caller's new item is simply never inserted, since
+    /// there's no meaningful position left to put it at.
+    pub fn replace_item_at(
+        &mut self,
+        item_id: EntityId,
+        new_item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.index_for_item_id(item_id) else {
+            return;
+        };
+        let was_active = self.active_item_index == index;
+        self.items[index] = new_item;
+        if was_active && self.focus_handle.contains_focused(window, cx) {
+            self.items[index].item_focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
     pub fn toggle_zoom(&mut self, _: &ToggleZoom, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_toggle_zoom {
             cx.propagate();

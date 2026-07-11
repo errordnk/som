@@ -2,6 +2,7 @@ use std::{cmp, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{
     TerminalView, default_working_directory,
+    pending_terminal_tab::PendingTerminalTab,
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
@@ -766,6 +767,65 @@ impl TerminalPanel {
         })
     }
 
+    /// Like `add_center_terminal_named_at`, but SWAPS the finished
+    /// `TerminalView` into `placeholder_item_id`'s existing position
+    /// (`Pane::replace_item_at`) instead of inserting a new item — used by
+    /// `restore_som_tabs`'s placeholder-tab flow, where a `PendingTerminalTab`
+    /// already occupies this tab's final position in the tab bar (see that
+    /// function's own doc comment for why) and just needs its content
+    /// filled in once the real terminal is ready, not a brand new tab
+    /// inserted alongside it.
+    pub fn replace_center_terminal_named(
+        workspace: &mut Workspace,
+        placeholder_item_id: gpui::EntityId,
+        tab_name: Option<String>,
+        tab_icon: Option<String>,
+        profile_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<(gpui::EntityId, WeakEntity<Terminal>)>> {
+        if !is_enabled_in_workspace(workspace, cx) {
+            return Task::ready(Err(anyhow!(
+                "terminal not yet supported for remote projects"
+            )));
+        }
+        let project = workspace.project().downgrade();
+        cx.spawn_in(window, async move |workspace, cx| {
+            let terminal = project.update(cx, create_terminal)?.await?;
+
+            let item_id = workspace.update_in(cx, |workspace, window, cx| {
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new_with_title_and_icon(
+                        terminal.clone(),
+                        workspace.weak_handle(),
+                        workspace.database_id(),
+                        workspace.project().downgrade(),
+                        tab_name.clone(),
+                        tab_icon.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                let item_id = terminal_view.entity_id();
+                if let Some(profile_index) = profile_index {
+                    workspace.set_profile_index_for_item(item_id, profile_index);
+                }
+                if let Some(main_pane) = workspace.panes().first().cloned() {
+                    main_pane.update(cx, |pane, cx| {
+                        pane.replace_item_at(placeholder_item_id, Box::new(terminal_view), window, cx);
+                    });
+                }
+                item_id
+            })?;
+            Ok((item_id, terminal.downgrade()))
+        })
+    }
+
     /// Restores tabs and their split panes from `~/.config/som/db.json` at
     /// launch. Registered as the `workspace::SomTabsRestorer` global hook (see
     /// `init` below) since `workspace` can't call into `terminal_view`
@@ -813,16 +873,74 @@ impl TerminalPanel {
                 .cloned()
                 .collect();
 
-            // Phase 1: create every tab's terminal concurrently — each tab is
-            // an independent item in the main pane, so there's no shared
-            // state to race on here. Where each tab actually lands in the
-            // main pane depends on connection speed (fast local shells vs.
-            // slow ssh logins), not `db.json`'s order, so `db_index` is kept
-            // alongside each creation and used to fix up ordering explicitly
-            // once every tab exists (see the reorder step at the start of
-            // Phase 2) rather than trying to pin positions during insertion.
-            let mut tab_creations = Vec::with_capacity(db_state.tabs.len());
-            for (db_index, tab) in db_state.tabs.iter().enumerate() {
+            // Phase 0: insert a `PendingTerminalTab` placeholder for EVERY
+            // tab up front, synchronously, all in one `window_handle.
+            // update` call before any `.await` gets in the way — this is
+            // what makes the whole tab bar draw immediately, in db.json's
+            // exact order, instead of tabs popping in one at a time as
+            // each one's (possibly slow, real SSH) terminal connection
+            // finishes. Only name/icon (from settings.json, via
+            // `TabProfiles::profile_at`) are needed for this — no need to
+            // wait for anything remote. A tab whose `profile_index` no
+            // longer exists in settings.json is skipped here exactly like
+            // Phase 1 already skipped it (same fallible lookup, same
+            // "don't guess" reasoning) — no placeholder, no later fill-in.
+            let placeholders: Vec<(usize, workspace::som_db::SomDbTab, gpui::EntityId)> = window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        db_state
+                            .tabs
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(db_index, tab)| {
+                                let profile = workspace::TabProfiles::profile_at(tab.profile_index, cx)?;
+                                let placeholder = cx.new(|cx| {
+                                    PendingTerminalTab::new(Some(profile.name.clone()), profile.icon.clone(), cx)
+                                });
+                                let item_id = placeholder.entity_id();
+                                workspace.add_item_to_main_pane_at(
+                                    Box::new(placeholder),
+                                    Some(tab.profile_index),
+                                    Some(db_index),
+                                    window,
+                                    cx,
+                                );
+                                Some((db_index, tab.clone(), item_id))
+                            })
+                            .collect()
+                    })
+                })
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+
+            // Give the tab db.json marked active a head start over the
+            // rest — every tab's REAL content still gets created
+            // concurrently below regardless of order, but `cx.spawn`/
+            // `cx.background_spawn` ultimately schedule onto a shared
+            // executor/thread pool, so which one gets dispatched FIRST can
+            // still matter for which one visibly fills in first. `db_index
+            // == db_state.active_tab` finds it directly (Phase 0 built
+            // `placeholders` in that same db.json order) rather than
+            // needing a separate lookup.
+            let mut placeholders = placeholders;
+            if let Some(active_position) = placeholders
+                .iter()
+                .position(|(db_index, ..)| *db_index == db_state.active_tab)
+            {
+                let active = placeholders.remove(active_position);
+                placeholders.insert(0, active);
+            }
+
+            // Phase 1: create every tab's REAL terminal concurrently — each
+            // tab already has a stable position and `EntityId` from Phase 0
+            // above, so unlike before, there's no reordering needed once
+            // these finish: each one just replaces its own placeholder in
+            // place (`Pane::replace_item_at`, via `replace_center_terminal_
+            // named`) whenever it happens to be ready, regardless of
+            // whether a slower tab elsewhere is still connecting.
+            let mut tab_creations = Vec::with_capacity(placeholders.len());
+            for (db_index, tab, placeholder_item_id) in placeholders {
                 let Some(profile) = window_handle
                     .update(cx, |_, _, cx| {
                         workspace::TabProfiles::profile_at(tab.profile_index, cx)
@@ -945,8 +1063,9 @@ impl TerminalPanel {
                         let created = window_handle.update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
                                 let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
-                                Self::add_center_terminal_named(
+                                Self::replace_center_terminal_named(
                                     workspace,
+                                    placeholder_item_id,
                                     Some(profile.name.clone()),
                                     profile.icon.clone(),
                                     Some(tab_profile_index),
@@ -999,8 +1118,9 @@ impl TerminalPanel {
                         workspace.update(cx, |workspace, cx| {
                             let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
                             let shell = profile.shell.clone();
-                            Self::add_center_terminal_named(
+                            Self::replace_center_terminal_named(
                                 workspace,
+                                placeholder_item_id,
                                 Some(profile.name.clone()),
                                 profile.icon.clone(),
                                 Some(tab.profile_index),
@@ -1026,15 +1146,14 @@ impl TerminalPanel {
                 }
             }
 
-            // Await every tab's creation before doing anything else. Tabs
-            // were created concurrently in Phase 1, so they can land in the
-            // main pane in a different order than `db_state.tabs` (a local
-            // shell resolves faster than an ssh connection) — fix that up
-            // explicitly now, in one pass, rather than trying to pin
-            // positions during insertion (which doesn't work: `add_item`'s
-            // destination index gets clamped to however many items exist
-            // *at that moment*, so an early-finishing tab meant for index 2
-            // would just get inserted at 0).
+            // Await every tab's REAL content to land. Unlike before this
+            // whole placeholder-tab flow existed, no reordering is needed
+            // here at all: Phase 0 already put every tab at its final
+            // `db.json` position UP FRONT, and `replace_center_terminal_
+            // named`'s `Pane::replace_item_at` swaps each placeholder for
+            // its real `TerminalView` IN PLACE — the tab bar's order was
+            // already correct the whole time, regardless of which tab's
+            // (possibly slow, real SSH) connection happens to finish last.
             let mut tabs_in_db_order = Vec::with_capacity(tab_creations.len());
             for (db_index, extra_splits, created) in tab_creations.into_iter() {
                 if let Some(item_id) = created.await.log_err() {
@@ -1045,20 +1164,11 @@ impl TerminalPanel {
             window_handle
                 .update(cx, |_, _, cx| {
                     workspace.update(cx, |workspace, cx| {
-                        if let Some(main_pane) = workspace.panes().first().cloned() {
-                            main_pane.update(cx, |pane, cx| {
-                                for (position, (_, _, item_id)) in
-                                    tabs_in_db_order.iter().enumerate()
-                                {
-                                    pane.reorder_item_to(*item_id, position);
-                                }
-                                cx.notify();
-                            });
-                        }
-                        // The reorder above can silently move which array
-                        // position the active tab sits at, without emitting
-                        // `ActivateItem` — resync so the next real tab switch
-                        // parks the correct tab instead of a stale one.
+                        // Nothing moved position, but `active_item_index`
+                        // is still worth resyncing defensively here (e.g. a
+                        // placeholder whose tab the user closed mid-restore
+                        // before its real content ever arrived) — same
+                        // safety net the old reorder-based flow already had.
                         workspace.som_resync_active_tab_index(cx);
                     })
                 })
@@ -1074,10 +1184,10 @@ impl TerminalPanel {
             //
             // Each tab must be made the active tab before splitting it —
             // `som_split_active_pane_awaited` always splits whatever tab is
-            // currently active. The reorder above already fixed up the main
-            // pane's ordering, but locate each tab's index by `EntityId`
-            // again anyway rather than assuming `position` still holds,
-            // since reordering shifts indices around as each item moves.
+            // currently active. Every tab's position has been stable since
+            // Phase 0, but this still looks each one up by `EntityId`
+            // rather than assuming `position` holds, since splitting an
+            // EARLIER tab in this same loop shifts later ones' indices.
             for (_db_index, extra_splits, item_id) in tabs_in_db_order.into_iter() {
                 if extra_splits == 0 {
                     continue;

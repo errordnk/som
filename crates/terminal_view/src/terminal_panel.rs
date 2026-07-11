@@ -1898,16 +1898,22 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     }
 
     // The remote's own handshake tells us exactly which pre-built binary
-    // to send — no guessing/probing needed. A HOLDER left over from before
-    // `HandshakeInfo` existed (or an entirely fresh host with nothing at
-    // `~/.local/bin/som-tmux` yet) has no `remote_info` at all; ASSUME the
-    // remote is the same platform family as whatever Som already thinks
-    // this profile is (there's no other signal available at this point) —
-    // in practice this only matters for genuinely first-ever deploys,
-    // where the user picked this profile's platform when setting it up.
-    let (os, arch) = remote_info
-        .map(|info| (info.os, info.arch))
-        .unwrap_or_else(som_tmux::protocol::current_platform);
+    // to send when `~/.local/bin/som-tmux` already exists there (even an
+    // old/incompatible one, since `HandshakeInfo` has been part of the
+    // wire format since before this deploy mechanism existed). A genuinely
+    // FIRST-ever deploy (nothing at that path yet — the actual `usa`
+    // real-world case this fixes) has no `remote_info` at all: falling
+    // back to THIS (Windows) machine's own `current_platform()` here was a
+    // real, confirmed bug — it deployed a Windows .exe to a real Debian
+    // `usa` host ("cannot execute binary file: Exec format error"), since
+    // there's no reason at all a remote SSH server shares Som's own local
+    // platform. `uname_platform` below asks the remote directly instead —
+    // `uname` exists on every Unix `ssh` could plausibly be reaching (WSL
+    // is handled separately, above, before this point is ever reached).
+    let (os, arch) = match remote_info {
+        Some(info) => (info.os, info.arch),
+        None => uname_platform(host_args, remote_kind)?,
+    };
     let Some(local_binary) = som_tmux::protocol::local_binary_path_for(os, arch) else {
         anyhow::bail!(
             "no pre-built som-tmux binary for {os:?}/{arch:?} under {:?} — nothing to deploy",
@@ -1926,6 +1932,43 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-tmux"]);
     run_remote_command(remote_kind, &chmod_probe)?;
     Ok(())
+}
+
+/// Asks the remote host directly what platform it is via `uname -s`/`uname
+/// -m`, for the one case `HandshakeInfo` can't help with: a host that has
+/// NO `som-tmux` at `~/.local/bin/` yet at all (a genuinely first-ever
+/// deploy). Every real SSH `tmux: true` profile target is some Unix (this
+/// codebase's four supported platforms are Windows/macOS/Linux-amd64/
+/// Linux-arm64, but a Windows SSH SERVER is exotic enough not to special-
+/// case here — `uname` simply isn't present there, and that failure
+/// surfaces as an ordinary `Err`, same as any other unreachable-probe
+/// case).
+fn uname_platform(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<(som_tmux::protocol::Os, som_tmux::protocol::Arch)> {
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", "uname -s; uname -m"]);
+    let output = run_remote_command(remote_kind, &probe)?;
+    parse_uname_platform(&output)
+}
+
+/// Parses `uname -s`/`uname -m`'s combined two-line output (what
+/// `uname_platform`'s probe script prints) into `(Os, Arch)`. Pulled out
+/// of `uname_platform` itself so this parsing logic can be unit-tested
+/// without an actual SSH round-trip.
+fn parse_uname_platform(output: &str) -> anyhow::Result<(som_tmux::protocol::Os, som_tmux::protocol::Arch)> {
+    let mut lines = output.lines();
+    let kernel = lines.next().unwrap_or("").trim();
+    let machine = lines.next().unwrap_or("").trim();
+
+    let os = match kernel {
+        "Linux" => som_tmux::protocol::Os::Linux,
+        "Darwin" => som_tmux::protocol::Os::Darwin,
+        other => anyhow::bail!("unsupported remote kernel {other:?} reported by uname -s"),
+    };
+    let arch = match machine {
+        "x86_64" => som_tmux::protocol::Arch::Amd64,
+        "aarch64" | "arm64" => som_tmux::protocol::Arch::Arm64,
+        other => anyhow::bail!("unsupported remote machine architecture {other:?} reported by uname -m"),
+    };
+    Ok((os, arch))
 }
 
 /// Kills every `som-tmux` process (RELAY and HOLDER alike — a version bump
@@ -2732,6 +2775,46 @@ mod tmux_shell_wrapping_tests {
             "777\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id other-machines-pane --client-id 192.168.50.9\n";
         let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
         assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn parses_a_real_debian_x86_64_uname_report() {
+        let (os, arch) = parse_uname_platform("Linux\nx86_64\n").unwrap();
+        assert_eq!(os, som_tmux::protocol::Os::Linux);
+        assert_eq!(arch, som_tmux::protocol::Arch::Amd64);
+    }
+
+    #[test]
+    fn parses_a_real_macos_arm64_uname_report() {
+        let (os, arch) = parse_uname_platform("Darwin\narm64\n").unwrap();
+        assert_eq!(os, som_tmux::protocol::Os::Darwin);
+        assert_eq!(arch, som_tmux::protocol::Arch::Arm64);
+    }
+
+    #[test]
+    fn parses_a_linux_aarch64_uname_report() {
+        // `uname -m` on Linux reports "aarch64", NOT "arm64" (that's
+        // macOS's spelling) — regression coverage for accepting both.
+        let (os, arch) = parse_uname_platform("Linux\naarch64\n").unwrap();
+        assert_eq!(os, som_tmux::protocol::Os::Linux);
+        assert_eq!(arch, som_tmux::protocol::Arch::Arm64);
+    }
+
+    #[test]
+    fn rejects_an_unrecognized_kernel_rather_than_guessing() {
+        // Regression test for the real bug this whole function fixes: a
+        // brand-new host with no som-tmux yet used to silently fall back
+        // to THIS (Windows) machine's own platform instead of asking the
+        // remote — confirmed live against a real Debian `usa` host, which
+        // got a Windows .exe deployed to it ("Exec format error"). An
+        // unparseable/unexpected uname report must be a hard error, never
+        // a silent guess.
+        assert!(parse_uname_platform("SomeExoticKernel\nx86_64\n").is_err());
+    }
+
+    #[test]
+    fn rejects_an_unrecognized_architecture_rather_than_guessing() {
+        assert!(parse_uname_platform("Linux\nriscv64\n").is_err());
     }
 
     #[test]

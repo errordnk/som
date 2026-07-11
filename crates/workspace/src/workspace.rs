@@ -4160,6 +4160,18 @@ impl Workspace {
         self.som_tab_tmux_sessions.insert(item_id, pane_ids);
     }
 
+    /// Records `profile_index` (settings.json's `tabs[]` array index) as
+    /// the profile backing `item_id`'s tab — same bookkeeping `add_item_
+    /// to_main_pane_at` already does inline for a brand new tab, exposed
+    /// separately for `terminal_view`'s placeholder-tab restore flow
+    /// (`TerminalPanel::replace_center_terminal_named`), which swaps a
+    /// `PendingTerminalTab` for a real `TerminalView` under a DIFFERENT
+    /// `EntityId` than the one that would've been passed to `add_item_to_
+    /// main_pane_at` normally.
+    pub fn set_profile_index_for_item(&mut self, item_id: gpui::EntityId, profile_index: usize) {
+        self.som_tab_profile_index.insert(item_id, profile_index);
+    }
+
     /// Like `add_item_to_main_pane`, but lets the caller pin the tab to a
     /// specific position instead of always appending at the end. Needed by
     /// `restore_som_tabs`: tabs there are created concurrently, so the order

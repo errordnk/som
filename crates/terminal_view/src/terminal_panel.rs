@@ -888,7 +888,7 @@ impl TerminalPanel {
             let placeholders: Vec<(usize, workspace::som_db::SomDbTab, gpui::EntityId)> = window_handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
-                        db_state
+                        let placeholders: Vec<_> = db_state
                             .tabs
                             .iter()
                             .enumerate()
@@ -907,7 +907,30 @@ impl TerminalPanel {
                                 );
                                 Some((db_index, tab.clone(), item_id))
                             })
-                            .collect()
+                            .collect();
+
+                        // Switch to the tab db.json marked active RIGHT
+                        // NOW, before any real terminal content exists at
+                        // all — otherwise the user would see whatever tab
+                        // happened to be at index 0 (or wherever the main
+                        // pane's default active index lands) for as long as
+                        // Phase 1/2 below take to finish, even though every
+                        // tab's PLACEHOLDER already exists and could be
+                        // switched to immediately. The real activation this
+                        // shadows (`db_state.active_tab`, near the end of
+                        // this function, after splits are restored) still
+                        // needs to run too — it's what actually unparks
+                        // this tab's split panes, which don't exist yet at
+                        // this point in Phase 0.
+                        if let Some(main_pane) = workspace.panes().first().cloned() {
+                            main_pane.update(cx, |pane, cx| {
+                                if db_state.active_tab < pane.items_len() {
+                                    pane.activate_item(db_state.active_tab, true, true, window, cx);
+                                }
+                            });
+                        }
+
+                        placeholders
                     })
                 })
                 .ok()

@@ -3482,6 +3482,30 @@ mod tmux_shell_wrapping_tests {
     /// `~/.local/bin/som-tmux` (this test spawns real HOLDER processes with
     /// it, it doesn't deploy). Run explicitly with:
     /// `cargo test -p terminal_view test_kill_orphaned_holders_only_kills_the_orphan -- --ignored --nocapture`
+
+    /// Counts processes with `--holder` in argv AND `pane_id` — NOT a
+    /// plain `grep -c '<pane_id>'`/`grep -- --holder`, either of which
+    /// would count its OWN `grep`/`sh -lc` process too (their command line
+    /// literally contains whatever plain substring they're searching
+    /// for). Same awk self-match-avoidance trick production code already
+    /// uses (`kill_orphaned_holders`'s own doc comment) — splitting
+    /// `--holder` across two concatenated awk string literals so the
+    /// contiguous substring never appears in this script's own source
+    /// text, which `ps -eo args` would otherwise also match. Shared by
+    /// every integration test below that needs to count real HOLDER/RELAY
+    /// processes by pane_id.
+    fn count_holders_with_pane_id(host_args: &[String], pane_id: &str) -> u32 {
+        let script = format!(r#"ps -eo args | awk 'index($0, "--hold" "er") && index($0, "{pane_id}")' | wc -l"#);
+        let quoted_script = shell_quote(&script);
+        let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
+        let output = run_remote_command(RemoteKind::Ssh, &probe).expect("ps probe should succeed");
+        // Last non-empty line, not the whole trimmed output — a login
+        // shell can print unrelated profile-script noise ahead of
+        // `wc -l`'s own result (same real `ssh localhost` behavior
+        // `kill_orphaned_holders`'s own doc comment describes).
+        output.lines().rev().find(|line| !line.trim().is_empty()).and_then(|line| line.trim().parse().ok()).unwrap_or(999)
+    }
+
     #[test]
     #[ignore]
     fn test_kill_orphaned_holders_only_kills_the_orphan() {
@@ -3535,28 +3559,6 @@ mod tmux_shell_wrapping_tests {
         // searching for), double-counting every real match. The pane_id
         // itself is unique enough (embeds this test's own process id) to
         // not need that extra filter anyway.
-        // Counts processes with `--holder` in argv AND this exact pane_id
-        // — NOT a plain `grep -c '<pane_id>'`/`grep -- --holder`, either of
-        // which would count its OWN `grep`/`sh -lc` process too (their
-        // command line literally contains whatever plain substring they're
-        // searching for). Same awk self-match-avoidance trick production
-        // code already uses (`kill_orphaned_holders`'s own doc comment) —
-        // splitting `--holder` across two concatenated awk string literals
-        // so the contiguous substring never appears in this script's own
-        // source text, which `ps -eo args` would otherwise also match.
-        fn count_holders_with_pane_id(host_args: &[String], pane_id: &str) -> u32 {
-            let script =
-                format!(r#"ps -eo args | awk 'index($0, "--hold" "er") && index($0, "{pane_id}")' | wc -l"#);
-            let quoted_script = shell_quote(&script);
-            let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
-            let output = run_remote_command(RemoteKind::Ssh, &probe).expect("ps probe should succeed");
-            // Last non-empty line, not the whole trimmed output — a login
-            // shell can print unrelated profile-script noise ahead of
-            // `wc -l`'s own result (same real `ssh localhost` behavior
-            // `kill_orphaned_holders`'s own doc comment describes).
-            output.lines().rev().find(|line| !line.trim().is_empty()).and_then(|line| line.trim().parse().ok()).unwrap_or(999)
-        }
-
         let orphan_count = count_holders_with_pane_id(&host_args, &orphan_pane_id);
         assert_eq!(orphan_count, 0, "the orphaned HOLDER (not in live_pane_ids) should have been killed");
 
@@ -3569,5 +3571,55 @@ mod tmux_shell_wrapping_tests {
         let quoted_cleanup_script = shell_quote(&cleanup_script);
         let cleanup_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_cleanup_script]);
         run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
+    }
+
+    /// Real SSH round-trip: confirms `kill_all_holders_for_redeploy` kills
+    /// EVERY matching HOLDER regardless of `--client-id`/live-pane-id
+    /// status — unlike `kill_orphaned_holders`, this function is
+    /// deliberately indiscriminate (see its own doc comment for why: a
+    /// version mismatch means the binary file is about to change out from
+    /// under every process executing it, live or not, this account's own
+    /// or a different client machine sharing the same account). Spawns
+    /// two HOLDERs with DIFFERENT `--client-id`s (simulating two client
+    /// machines sharing one SSH account) to confirm neither survives.
+    ///
+    /// `#[ignore]`d by default — same reachability requirement as the
+    /// other integration tests above. Run explicitly with:
+    /// `cargo test -p terminal_view test_kill_all_holders_for_redeploy_kills_everything -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_kill_all_holders_for_redeploy_kills_everything() {
+        let host_args = integration_test_ssh_host();
+        let pane_id_a = format!("test-redeploy-a-{}", std::process::id());
+        let pane_id_b = format!("test-redeploy-b-{}", std::process::id());
+
+        for (pane_id, client_id) in [(&pane_id_a, "dnk@192.168.50.2"), (&pane_id_b, "otheruser@192.168.50.9")] {
+            let spawn_script = format!(
+                "nohup ~/.local/bin/som-tmux --holder --profile test-redeploy-cleanup --pane-id {pane_id} --client-id {client_id} --program /bin/sh >/dev/null 2>&1 &"
+            );
+            let quoted_spawn_script = shell_quote(&spawn_script);
+            let spawn_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_spawn_script]);
+            run_remote_command(RemoteKind::Ssh, &spawn_probe).expect("failed to spawn a test HOLDER");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Sanity check: both really are alive before the kill, so a
+        // passing assertion afterward actually proves something.
+        assert_eq!(count_holders_with_pane_id(&host_args, &pane_id_a), 1, "test setup: HOLDER a should be alive");
+        assert_eq!(count_holders_with_pane_id(&host_args, &pane_id_b), 1, "test setup: HOLDER b should be alive");
+
+        kill_all_holders_for_redeploy(&host_args, RemoteKind::Ssh);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            count_holders_with_pane_id(&host_args, &pane_id_a),
+            0,
+            "HOLDER a must be killed even though its --client-id matches this connection"
+        );
+        assert_eq!(
+            count_holders_with_pane_id(&host_args, &pane_id_b),
+            0,
+            "HOLDER b must ALSO be killed despite a different --client-id — kill_all_holders_for_redeploy is deliberately indiscriminate"
+        );
     }
 }

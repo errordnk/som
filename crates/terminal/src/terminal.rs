@@ -3892,10 +3892,12 @@ mod tests {
         cx.executor().allow_parking();
 
         // Overridable via env var so this same test can be pointed at any
-        // reachable SSH host with `~/.local/bin/som-tmux` already
-        // built there (Mac, deb, pi5, ...) without editing this file each
-        // time — defaults to the Mac used when this test was first written.
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.6".to_string());
+        // reachable SSH host with `~/.local/bin/som-tmux` already built
+        // there (Mac, deb, pi5, ...) without editing this file each time —
+        // defaults to `localhost` (a local sshd, e.g. WSL2's own on this
+        // dev machine) so the test suite doesn't depend on a specific
+        // machine on a specific network being reachable.
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-mac-close-{}", std::process::id());
         let profile_name = "test-mac-close";
 
@@ -4031,7 +4033,7 @@ mod tests {
     async fn test_ssh_remote_tmux_forwards_special_keys_unmangled(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.6".to_string());
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-keys-{}", std::process::id());
         let profile_name = "test-keys";
 
@@ -4214,7 +4216,7 @@ mod tests {
     async fn test_ssh_tmux_backend_htop_f2_opens_setup_screen(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-ssh-tmuxv2-f2-{}", std::process::id());
         let profile_name = "test-ssh-tmuxv2-f2";
 
@@ -4299,7 +4301,7 @@ mod tests {
     async fn test_ssh_tmux_backend_basic_io_and_close(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-tmuxv2-basic-{}", std::process::id());
         let profile_name = "test-tmuxv2-basic";
 
@@ -4415,7 +4417,7 @@ mod tests {
     async fn test_ssh_tmux_backend_enter_does_not_double_crlf(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-tmuxv2-enter-{}", std::process::id());
         let profile_name = "test-tmuxv2-enter";
 
@@ -4507,7 +4509,7 @@ mod tests {
     async fn test_ssh_tmux_backend_enter_does_not_double_crlf_after_reattach(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "192.168.50.3".to_string());
+        let ssh_host = std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string());
         let pane_id = format!("test-tmuxv2-reattach-{}", std::process::id());
         let profile_name = "test-tmuxv2-reattach";
         // Exact `wrap_remote_command_args` shape (terminal_panel.rs), not

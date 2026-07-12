@@ -620,6 +620,113 @@ mod som_restore_activity_tests {
     }
 }
 
+#[cfg(test)]
+mod som_tmux_sessions_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Real `Workspace`, `Project`, and window — not a plain HashMap unit
+    /// test — exercising `set_tmux_sessions_for_item`/`tmux_sessions_for_
+    /// item` through GPUI's own entity update path. Regression coverage
+    /// for a real bug: a tmux tab with split panes only ever persisted
+    /// its MAIN pane's pane_id to db.json (e.g. `"6.2:<one-uuid>"` despite
+    /// `extra_splits == 2`), silently losing every split's pane_id on each
+    /// restore and leaking an orphaned HOLDER process per split, per
+    /// restart, on the remote host — confirmed live against a real deb
+    /// host (24 accumulated orphaned HOLDER processes from repeated
+    /// testing before this fix). `TerminalView::clone_on_split` now reads
+    /// back whatever's already recorded for the tab's item_id and APPENDS
+    /// the new split's fresh pane_id, rather than overwriting — this test
+    /// exercises exactly that read-modify-write sequence against a real
+    /// `Workspace` entity, standing in for what `clone_on_split` actually
+    /// does once a split's terminal finishes connecting.
+    #[gpui::test]
+    async fn appending_a_splits_pane_id_keeps_the_mains_pane_id_too(cx: &mut TestAppContext) {
+        let app_state = cx.update(AppState::test);
+        let project = cx.update(|cx| {
+            Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
+        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        let main_item_id = window
+            .update(cx, |workspace, _window, cx| {
+                let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
+                let item_id = item.entity_id();
+                workspace.set_tmux_sessions_for_item(item_id, vec!["main-pane-id".to_string()]);
+                item_id
+            })
+            .unwrap();
+
+        // Simulates `clone_on_split`'s own read-modify-write: read back
+        // whatever's already recorded for this tab, append the new
+        // split's freshly-generated pane_id, write the combined list back.
+        window
+            .update(cx, |workspace, _window, cx| {
+                let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
+                pane_ids.push("first-split-pane-id".to_string());
+                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids);
+                let _ = cx;
+            })
+            .unwrap();
+
+        // A second split (level 1, cascading off the first) does the same.
+        window
+            .update(cx, |workspace, _window, cx| {
+                let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
+                pane_ids.push("second-split-pane-id".to_string());
+                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids);
+                let _ = cx;
+            })
+            .unwrap();
+
+        let final_sessions = window
+            .update(cx, |workspace, _window, _cx| workspace.tmux_sessions_for_item(main_item_id))
+            .unwrap();
+        assert_eq!(
+            final_sessions,
+            Some(vec![
+                "main-pane-id".to_string(),
+                "first-split-pane-id".to_string(),
+                "second-split-pane-id".to_string(),
+            ]),
+            "all three pane_ids (main + both splits) must survive, in creation order"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_item_with_no_recorded_sessions_yet_starts_from_an_empty_list(cx: &mut TestAppContext) {
+        // A plain (non-tmux) tab, or a tmux tab's very FIRST pane_id being
+        // recorded — `tmux_sessions_for_item` must return `None`/an empty
+        // starting point rather than panicking, so `clone_on_split`'s
+        // `.unwrap_or_default()` fallback is exercised for real here too.
+        let app_state = cx.update(AppState::test);
+        let project = cx.update(|cx| {
+            Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
+        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        let item_id = window
+            .update(cx, |workspace, _window, cx| {
+                let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
+                let item_id = item.entity_id();
+                assert_eq!(workspace.tmux_sessions_for_item(item_id), None);
+
+                let mut pane_ids = workspace.tmux_sessions_for_item(item_id).unwrap_or_default();
+                pane_ids.push("only-pane-id".to_string());
+                workspace.set_tmux_sessions_for_item(item_id, pane_ids);
+                item_id
+            })
+            .unwrap();
+
+        let sessions = window
+            .update(cx, |workspace, _window, _cx| workspace.tmux_sessions_for_item(item_id))
+            .unwrap();
+        assert_eq!(sessions, Some(vec!["only-pane-id".to_string()]));
+    }
+}
+
 /// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -4158,6 +4265,15 @@ impl Workspace {
     /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
     pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, pane_ids: Vec<String>) {
         self.som_tab_tmux_sessions.insert(item_id, pane_ids);
+    }
+
+    /// Reads back whatever `set_tmux_sessions_for_item` has recorded for
+    /// `item_id` so far — used by `TerminalView::clone_on_split` to APPEND
+    /// a new split's freshly-generated pane_id to the tab's existing list
+    /// (main pane's pane_id, plus any earlier splits') rather than
+    /// clobbering it with a single-element list.
+    pub fn tmux_sessions_for_item(&self, item_id: gpui::EntityId) -> Option<Vec<String>> {
+        self.som_tab_tmux_sessions.get(&item_id).cloned()
     }
 
     /// Records `profile_index` (settings.json's `tabs[]` array index) as

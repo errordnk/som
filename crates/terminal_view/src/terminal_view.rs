@@ -1279,6 +1279,7 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
+        let mut fresh_pane_id: Option<String> = None;
         let Ok(terminal) = self.project.update(cx, |project, cx| {
             // Prefer the terminal's own CWD; fall back to home dir so split panes
             // don't inherit Som's process directory.
@@ -1294,15 +1295,19 @@ impl Item for TerminalView {
             // the normal exact-copy clone.
             let source_shell = self.terminal().read(cx).shell();
             match crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(source_shell) {
-                Some(fresh_shell) => project.clone_terminal_with_shell(self.terminal(), Some(fresh_shell), cx, cwd),
+                Some((fresh_shell, pane_id)) => {
+                    fresh_pane_id = Some(pane_id);
+                    project.clone_terminal_with_shell(self.terminal(), Some(fresh_shell), cx, cwd)
+                }
                 None => project.clone_terminal(self.terminal(), cx, cwd),
             }
         }) else {
             return Task::ready(None);
         };
+        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             let terminal = terminal.await.log_err()?;
-            this.update_in(cx, |this, window, cx| {
+            let new_view = this.update_in(cx, |this, window, cx| {
                 cx.new(|cx| {
                     TerminalView::new(
                         terminal,
@@ -1314,7 +1319,32 @@ impl Item for TerminalView {
                     )
                 })
             })
-            .ok()
+            .ok()?;
+            // If this WAS a tmux-wrapped shell, the new split just got its
+            // OWN fresh pane_id above — record it under the TAB's item_id
+            // (not this split pane's own, brand new one) in `Workspace::
+            // som_tab_tmux_sessions`, alongside whatever pane_ids that tab
+            // already has, so a later restore reattaches this split to its
+            // own still-alive HOLDER instead of losing track of it and
+            // starting a fresh session. Without this, `som_persist_db_json`
+            // only ever wrote the tab's FIRST (main pane) pane_id, silently
+            // dropping every split's — confirmed as a real bug: a tab's
+            // `db.json` entry like `"6.2:<one-uuid>"` (extra_splits=2 but
+            // only one pane_id) meant both splits reconnected to brand-new
+            // HOLDERs on every restore, leaking the old ones.
+            if let Some(pane_id) = fresh_pane_id {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        let Some(main_pane) = workspace.panes().first().cloned() else { return };
+                        let Some(tab_item) = main_pane.read(cx).active_item() else { return };
+                        let tab_item_id = tab_item.item_id();
+                        let mut pane_ids = workspace.tmux_sessions_for_item(tab_item_id).unwrap_or_default();
+                        pane_ids.push(pane_id);
+                        workspace.set_tmux_sessions_for_item(tab_item_id, pane_ids);
+                    })
+                    .ok();
+            }
+            Some(new_view)
         })
     }
 

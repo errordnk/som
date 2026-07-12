@@ -1889,8 +1889,14 @@ fn wrap_remote_command_args(
 /// `wrap_command_args`/`wrap_remote_command_args`) and, if so, returns an
 /// equivalent `Shell` with a FRESH `pane_id` substituted in place of the
 /// original — everything else (profile, program/args, cursor-shape/
-/// scrollback flags) copied through unchanged. Returns `None` for any other
-/// shell, which callers treat as "not tmux-wrapped, clone normally".
+/// scrollback flags) copied through unchanged — ALONGSIDE that same fresh
+/// pane_id as a plain `String`, so callers that need to record it (see
+/// `TerminalView::clone_on_split`, which persists it into `Workspace::
+/// som_tab_tmux_sessions` so a later restore can reattach to this split's
+/// own HOLDER instead of losing track of it) don't have to re-parse the
+/// rebuilt `Shell` a second time just to recover the value this function
+/// already generated. Returns `None` for any other shell, which callers
+/// treat as "not tmux-wrapped, clone normally".
 ///
 /// Why this exists at all: `TerminalView::clone_on_split` (used for
 /// Ctrl+\-style pane splitting) would otherwise copy this terminal's exact
@@ -1898,12 +1904,8 @@ fn wrap_remote_command_args(
 /// shell that means the SAME `pane_id`, which connects the new split to the
 /// SAME HOLDER/session as the pane it was split from (confirmed bug report:
 /// starting `htop` in one split pane made it appear in every pane of the
-/// tab, because they were all just RELAYs onto one shared session). Splits
-/// for tmux tabs aren't a fully designed feature yet (see the comment on
-/// `restore_som_tabs`'s tmux branch — restore only ever recreates the main
-/// pane, never extra splits), but a split CAN still be created interactively
-/// via Ctrl+\ today, so this at minimum stops it from silently aliasing
-/// sessions — the split gets its OWN independent HOLDER/session instead.
+/// tab, because they were all just RELAYs onto one shared session). This
+/// gives the split its OWN independent HOLDER/session instead.
 ///
 /// Deliberately re-parses the argv shape rather than threading a `pane_id`
 /// through some parallel piece of state — `wrap_command_args`/
@@ -1911,7 +1913,7 @@ fn wrap_remote_command_args(
 /// shape, so detecting/rewriting it here means any future change to that
 /// shape only needs updating in one place to keep this in sync (the reverse
 /// of maintaining a second, parallel encoding of the same information).
-pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<Shell> {
+pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<(Shell, String)> {
     let Shell::WithArguments { program, args, title_override } = shell else { return None };
     let fresh_pane_id = uuid::Uuid::new_v4().to_string();
 
@@ -1922,8 +1924,11 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<Shell> {
                 return None;
             }
             let mut new_args = args.clone();
-            new_args[1] = fresh_pane_id;
-            Some(Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() })
+            new_args[1] = fresh_pane_id.clone();
+            Some((
+                Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() },
+                fresh_pane_id,
+            ))
         }
         RemoteKind::Ssh | RemoteKind::Wsl => {
             // wrap_remote_command_args: [...host_args, "~/.local/bin/som-tmux", profile, pane_id, "$SHELL", ...]
@@ -1933,8 +1938,11 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<Shell> {
                 return None;
             }
             let mut new_args = args.clone();
-            new_args[pane_id_pos] = fresh_pane_id;
-            Some(Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() })
+            new_args[pane_id_pos] = fresh_pane_id.clone();
+            Some((
+                Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() },
+                fresh_pane_id,
+            ))
         }
     }
 }
@@ -1946,11 +1954,41 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<Shell> {
 /// invocation does (`wrap_remote_command_args`). Shared by the deploy-check
 /// path so it builds the SAME kind of command line, not a parallel one that
 /// could drift out of sync with what actually gets run for real.
+///
+/// CRITICAL: any element of `extra` containing spaces (a real `sh -lc
+/// "<script>"` invocation, not a single-word flag like `--version`) MUST
+/// be single-quoted here — OpenSSH's client concatenates every argv
+/// element after the host into ONE space-joined command line and re-parses
+/// THAT as a shell command on the remote side (see `ssh(1)`: "If command
+/// is specified... arguments are concatenated together, separated by
+/// spaces, to form a single command"), WITHOUT re-quoting each original
+/// argv element. A bare multi-word `sh -lc echo hello world` (four
+/// separate Rust `String`s at this level) reaches the remote shell as
+/// `-c`'s argument being just `echo` (the first word after `-c`), with
+/// `hello`/`world` becoming positional params instead of part of the
+/// script — confirmed live with a plain Rust `Command::args(...)` test
+/// (no wrapping shell involved at all) against BOTH a real deb host and
+/// `ssh localhost`: `sh -lc "echo hi"` printed nothing. Every call site
+/// passing a multi-word script through `extra` already wraps it in single
+/// quotes for exactly this reason — this function does NOT do that
+/// wrapping itself (it has no way to tell "a flag" from "a script" apart),
+/// so it's each caller's responsibility.
 fn wrap_remote_probe_args(host_args: &[String], remote_program: &str, extra: &[&str]) -> Vec<String> {
     let mut wrapped_args = host_args.to_vec();
     wrapped_args.push(remote_program.to_string());
     wrapped_args.extend(extra.iter().map(|s| s.to_string()));
     wrapped_args
+}
+
+/// Wraps `script` in single quotes so it survives OpenSSH's own argv-to-
+/// one-command-line concatenation as ONE shell word instead of being
+/// re-split on whitespace — see `wrap_remote_probe_args`'s doc comment for
+/// why this matters. Escapes any single quote already in `script` using
+/// the standard POSIX-shell trick (`'\''`: close the quote, an escaped
+/// literal quote, reopen the quote) since a bare embedded `'` would
+/// otherwise end the quoting early.
+fn shell_quote(script: &str) -> String {
+    format!("'{}'", script.replace('\'', r#"'\''"#))
 }
 
 /// Kills every `som-tmux --holder` process on the far end of an SSH `tmux:
@@ -2018,8 +2056,27 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
     // too, since the script text necessarily contains whatever substring
     // it's searching for. `index()` on the concatenation sidesteps that
     // self-match without needing a second process to post-filter results.
-    let script = r#"echo "$SSH_CLIENT"; ps -eo pid,args | awk 'index($0, "--hold" "er") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
-    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", script]);
+    // `whoami` + `$SSH_CLIENT` together reproduce the EXACT `<user>@<ip>`
+    // shape `som_tmux::protocol::ssh_client_id` builds on the RELAY side
+    // (see that function's doc comment) — comparing against a bare IP
+    // here used to never match at all (a real regression: `--client-id`
+    // is always `user@ip`, so `client_id != this_client_ip` was `true`
+    // unconditionally once `--client-id` stopped being a bare IP,
+    // silently disabling orphan cleanup entirely — confirmed live: 24
+    // orphaned HOLDER processes had accumulated on a real deb host with
+    // this bug in place, none of them ever cleaned up).
+    // Prefixed with a marker (`SOM_CLIENT_ID:`) rather than trusting this
+    // to be the FIRST line of output — a login shell (`sh -lc`, i.e. `-l`)
+    // can run profile scripts (`.bashrc`/`.profile`/version-manager init
+    // like `fnm`/`nvm`) that print their OWN unrelated lines to stdout
+    // before this script's own `echo` ever runs (confirmed live against a
+    // real `ssh localhost` WSL2 setup: `/usr/local/bin/fnm` appeared as
+    // literal stdout noise ahead of everything else). Searching for the
+    // marker instead of blindly taking the first line makes this immune to
+    // that ordering, on any host, not just ones without such scripts.
+    let script = r#"echo "SOM_CLIENT_ID:$(whoami)@$SSH_CLIENT"; ps -eo pid,args | awk 'index($0, "--hold" "er") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
+    let quoted_script = shell_quote(script);
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
     let output = match run_remote_command(remote_kind, &probe) {
         Ok(output) => output,
         Err(err) => {
@@ -2027,11 +2084,15 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
             return;
         }
     };
-    let Some((ssh_client_line, ps_output)) = output.split_once('\n') else {
+    let Some(marker_line) = output.lines().find(|line| line.starts_with("SOM_CLIENT_ID:")) else {
         log::warn!("unexpected output from orphan-cleanup probe, skipping: {output:?}");
         return;
     };
-    let Some(this_client_ip) = ssh_client_line.split_whitespace().next() else {
+    // `marker_line` (after the marker prefix) is `<user>@<ip> <port>
+    // <server-port>` (whoami's output concatenated directly onto
+    // $SSH_CLIENT's first field) — taking just the first whitespace-
+    // separated token gives `<user>@<ip>`.
+    let Some(this_client_id) = marker_line["SOM_CLIENT_ID:".len()..].split_whitespace().next() else {
         // Not actually an SSH connection from sshd's point of view (no
         // `$SSH_CLIENT`) — shouldn't happen for a real `tmux: true` SSH
         // profile, but if it ever does there's no safe way to tell which
@@ -2039,15 +2100,34 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
         // than guess.
         return;
     };
+    // Every OTHER line is either the awk script's own `pid\x1fargs` output
+    // or unrelated shell-profile noise — the `\u{1f}` unit separator only
+    // ever appears in the former (see the awk script's own comment above
+    // for why), so filtering on its presence discards the noise
+    // regardless of whether it landed before or after the marker line.
+    let ps_output: String = output
+        .lines()
+        .filter(|line| line.contains('\u{1f}'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // An empty `$SSH_CLIENT` collapses to a bare `user@` (whoami succeeded,
+    // sshd didn't set the var) — just as unable to safely identify this
+    // client's HOLDERs as the "no $SSH_CLIENT at all" case above, so treat
+    // it the same way rather than matching a `--client-id` that also
+    // happens to end in a bare `@`.
+    if this_client_id.ends_with('@') {
+        return;
+    }
 
-    let orphaned_pids = parse_orphaned_holder_pids(ps_output, this_client_ip, live_pane_ids);
+    let orphaned_pids = parse_orphaned_holder_pids(&ps_output, this_client_id, live_pane_ids);
 
     if orphaned_pids.is_empty() {
         return;
     }
     log::info!("killing {} orphaned som-tmux holder(s) not in db.json: {orphaned_pids:?}", orphaned_pids.len());
     let kill_script = format!("kill {} 2>/dev/null || true", orphaned_pids.join(" "));
-    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &kill_script]);
+    let quoted_kill_script = shell_quote(&kill_script);
+    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
     if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
         log::warn!("failed to kill orphaned som-tmux holders: {err:#}");
     }
@@ -2055,10 +2135,11 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
 
 /// Parses `pid\x1fargs` lines (the format `kill_orphaned_holders`'s `awk`
 /// script emits) and returns the pids of every HOLDER that (a) was spawned
-/// for `this_client_ip` (its `--client-id` matches) and (b) whose
-/// `--pane-id` isn't in `live_pane_ids`. Pulled out of `kill_orphaned_
-/// holders` itself so this string-parsing logic can be unit-tested without
-/// an actual SSH round-trip.
+/// for `this_client_id` (its `--client-id` matches — the FULL `<user>@<ip>`
+/// value, not just the ip half) and (b) whose `--pane-id` isn't in
+/// `live_pane_ids`. Pulled out of `kill_orphaned_holders` itself so this
+/// string-parsing logic can be unit-tested without an actual SSH
+/// round-trip.
 ///
 /// A HOLDER with NO `--client-id` at all (an old binary from before that
 /// flag existed) is deliberately left alone rather than treated as a match
@@ -2066,7 +2147,7 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
 /// would be a surprising one-time mass-kill; they age out naturally once
 /// each pane is reattached (which redeploys/relaunches with the new
 /// binary, see `ensure_remote_binary_deployed`).
-fn parse_orphaned_holder_pids(ps_output: &str, this_client_ip: &str, live_pane_ids: &[String]) -> Vec<String> {
+fn parse_orphaned_holder_pids(ps_output: &str, this_client_id: &str, live_pane_ids: &[String]) -> Vec<String> {
     fn find_flag_value<'a>(args: &'a str, flag: &str) -> Option<&'a str> {
         let pos = args.find(flag)?;
         args[pos + flag.len()..].split_whitespace().next()
@@ -2076,7 +2157,7 @@ fn parse_orphaned_holder_pids(ps_output: &str, this_client_ip: &str, live_pane_i
     for line in ps_output.lines() {
         let Some((pid, args)) = line.split_once('\u{1f}') else { continue };
         let Some(client_id) = find_flag_value(args, "--client-id ") else { continue };
-        if client_id != this_client_ip {
+        if client_id != this_client_id {
             continue;
         }
         let Some(pane_id) = find_flag_value(args, "--pane-id ") else { continue };
@@ -2174,7 +2255,8 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     if let RemoteKind::Wsl = remote_kind {
         let deploy_script =
             "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_tmux) && mkdir -p ~/.local/bin && cp target/release/som-tmux ~/.local/bin/som-tmux";
-        let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", deploy_script]);
+        let quoted_deploy_script = shell_quote(deploy_script);
+        let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_deploy_script]);
         run_remote_command(remote_kind, &deploy_probe)?;
         return Ok(());
     }
@@ -2256,19 +2338,31 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
 /// surfaces as an ordinary `Err`, same as any other unreachable-probe
 /// case).
 fn uname_platform(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<(som_tmux::protocol::Os, som_tmux::protocol::Arch)> {
-    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", "uname -s; uname -m"]);
+    // Prefixed with a marker (same technique `kill_orphaned_holders` uses
+    // — see that function's doc comment) rather than trusting `uname -s`/
+    // `uname -m` to be the first two lines of output: a login shell (`-l`)
+    // can run profile scripts that print their OWN unrelated lines to
+    // stdout first (confirmed live: `/usr/local/bin/fnm` on a real `ssh
+    // localhost` WSL2 setup), which would otherwise be silently
+    // misinterpreted as the kernel name itself.
+    let quoted_script = shell_quote(r#"echo "SOM_UNAME:$(uname -s) $(uname -m)""#);
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
     let output = run_remote_command(remote_kind, &probe)?;
     parse_uname_platform(&output)
 }
 
-/// Parses `uname -s`/`uname -m`'s combined two-line output (what
-/// `uname_platform`'s probe script prints) into `(Os, Arch)`. Pulled out
-/// of `uname_platform` itself so this parsing logic can be unit-tested
-/// without an actual SSH round-trip.
+/// Parses `uname_platform`'s marker-prefixed probe output (`SOM_UNAME:
+/// <kernel> <machine>`, possibly preceded by unrelated shell-profile
+/// noise) into `(Os, Arch)`. Pulled out of `uname_platform` itself so this
+/// parsing logic can be unit-tested without an actual SSH round-trip.
 fn parse_uname_platform(output: &str) -> anyhow::Result<(som_tmux::protocol::Os, som_tmux::protocol::Arch)> {
-    let mut lines = output.lines();
-    let kernel = lines.next().unwrap_or("").trim();
-    let machine = lines.next().unwrap_or("").trim();
+    let marker_line = output
+        .lines()
+        .find_map(|line| line.strip_prefix("SOM_UNAME:"))
+        .ok_or_else(|| anyhow::anyhow!("uname probe output had no SOM_UNAME: marker line: {output:?}"))?;
+    let mut fields = marker_line.split_whitespace();
+    let kernel = fields.next().unwrap_or("").trim();
+    let machine = fields.next().unwrap_or("").trim();
 
     let os = match kernel {
         "Linux" => som_tmux::protocol::Os::Linux,
@@ -2326,7 +2420,8 @@ fn kill_all_holders_for_redeploy(host_args: &[String], remote_kind: RemoteKind) 
     // `ps -eo args` would otherwise also match, since a process's command
     // line IS this script's literal source text).
     let script = r#"ps -eo pid,args | awk 'index($0, "som-tmu" "x") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
-    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", script]);
+    let quoted_script = shell_quote(script);
+    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
     let output = match run_remote_command(remote_kind, &probe) {
         Ok(output) => output,
         Err(err) => {
@@ -2376,7 +2471,8 @@ for _ in $(seq 1 20); do
   sleep 0.1
 done"#
     );
-    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &kill_script]);
+    let quoted_kill_script = shell_quote(&kill_script);
+    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
     if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
         log::warn!("failed to kill remote som-tmux processes ahead of redeploy: {err:#}");
     }
@@ -3067,36 +3163,45 @@ mod tmux_shell_wrapping_tests {
 
     #[test]
     fn orphan_scan_flags_a_holder_whose_pane_id_is_not_in_db_json() {
+        // Regression coverage: `--client-id` is a FULL `<user>@<ip>` value
+        // (see `som_tmux::protocol::ssh_client_id`), not a bare IP — every
+        // one of these tests used to compare a bare IP against a bare IP
+        // and pass, while the real `kill_orphaned_holders` compared a bare
+        // IP against a real `user@ip` `--client-id` and NEVER matched,
+        // silently disabling orphan cleanup entirely in production (see
+        // `kill_orphaned_holders`'s doc comment for how this was confirmed
+        // live). These fixtures use the realistic `user@ip` shape so this
+        // test suite actually would have caught that.
         let ps_output =
-            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id dead-pane --client-id 192.168.50.2\n";
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id dead-pane --client-id dnk@192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &["live-pane".to_string()]);
         assert_eq!(orphaned, vec!["12345"]);
     }
 
     #[test]
     fn orphan_scan_leaves_a_holder_whose_pane_id_is_in_db_json_alone() {
         let ps_output =
-            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id 192.168.50.2\n";
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+            "12345\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id dnk@192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &["live-pane".to_string()]);
         assert!(orphaned.is_empty());
     }
 
     #[test]
     fn orphan_scan_handles_multiple_lines_and_ignores_malformed_ones() {
         let ps_output = concat!(
-            "111\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-a --client-id 192.168.50.2\n",
-            "222\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id 192.168.50.2\n",
+            "111\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-a --client-id dnk@192.168.50.2\n",
+            "222\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id live-pane --client-id dnk@192.168.50.2\n",
             "not a valid line at all\n",
-            "333\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-b --client-id 192.168.50.2\n",
+            "333\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id orphan-b --client-id dnk@192.168.50.2\n",
         );
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &["live-pane".to_string()]);
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &["live-pane".to_string()]);
         assert_eq!(orphaned, vec!["111", "333"]);
     }
 
     #[test]
     fn orphan_scan_ignores_lines_with_no_pane_id_argument() {
-        let ps_output = "999\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --client-id 192.168.50.2\n";
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+        let ps_output = "999\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --client-id dnk@192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &[]);
         assert!(orphaned.is_empty());
     }
 
@@ -3105,7 +3210,7 @@ mod tmux_shell_wrapping_tests {
         // An old pre-upgrade HOLDER binary, from before `--client-id`
         // existed — must be left alone, not treated as an automatic match.
         let ps_output = "888\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id dead-pane\n";
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &[]);
         assert!(orphaned.is_empty());
     }
 
@@ -3115,21 +3220,31 @@ mod tmux_shell_wrapping_tests {
         // the same host — its HOLDER must never look orphaned just because
         // this client's own db.json doesn't know its pane_id.
         let ps_output =
-            "777\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id other-machines-pane --client-id 192.168.50.9\n";
-        let orphaned = parse_orphaned_holder_pids(ps_output, "192.168.50.2", &[]);
+            "777\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id other-machines-pane --client-id dnk@192.168.50.9\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &[]);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_ignores_a_holder_spawned_by_a_different_user_on_the_same_machine() {
+        // A shared build server: two different OS accounts, same client
+        // machine IP — the ip half matching alone must NOT be enough.
+        let ps_output =
+            "555\u{1f} /home/dnk/.local/bin/som-tmux --holder --profile deb --pane-id other-users-pane --client-id otheruser@192.168.50.2\n";
+        let orphaned = parse_orphaned_holder_pids(ps_output, "dnk@192.168.50.2", &[]);
         assert!(orphaned.is_empty());
     }
 
     #[test]
     fn parses_a_real_debian_x86_64_uname_report() {
-        let (os, arch) = parse_uname_platform("Linux\nx86_64\n").unwrap();
+        let (os, arch) = parse_uname_platform("SOM_UNAME:Linux x86_64\n").unwrap();
         assert_eq!(os, som_tmux::protocol::Os::Linux);
         assert_eq!(arch, som_tmux::protocol::Arch::Amd64);
     }
 
     #[test]
     fn parses_a_real_macos_arm64_uname_report() {
-        let (os, arch) = parse_uname_platform("Darwin\narm64\n").unwrap();
+        let (os, arch) = parse_uname_platform("SOM_UNAME:Darwin arm64\n").unwrap();
         assert_eq!(os, som_tmux::protocol::Os::Darwin);
         assert_eq!(arch, som_tmux::protocol::Arch::Arm64);
     }
@@ -3138,9 +3253,28 @@ mod tmux_shell_wrapping_tests {
     fn parses_a_linux_aarch64_uname_report() {
         // `uname -m` on Linux reports "aarch64", NOT "arm64" (that's
         // macOS's spelling) — regression coverage for accepting both.
-        let (os, arch) = parse_uname_platform("Linux\naarch64\n").unwrap();
+        let (os, arch) = parse_uname_platform("SOM_UNAME:Linux aarch64\n").unwrap();
         assert_eq!(os, som_tmux::protocol::Os::Linux);
         assert_eq!(arch, som_tmux::protocol::Arch::Arm64);
+    }
+
+    #[test]
+    fn ignores_shell_profile_noise_ahead_of_the_marker_line() {
+        // Regression coverage: a login shell (`sh -lc`) can run profile
+        // scripts (version-manager init banners, etc.) that print
+        // unrelated lines to stdout BEFORE this probe's own marker line —
+        // confirmed live against a real `ssh localhost` WSL2 setup
+        // (`/usr/local/bin/fnm` appeared as literal noise ahead of the
+        // real uname output). The marker line must be found regardless of
+        // what precedes it.
+        let (os, arch) = parse_uname_platform("/usr/local/bin/fnm\nSOM_UNAME:Linux x86_64\n").unwrap();
+        assert_eq!(os, som_tmux::protocol::Os::Linux);
+        assert_eq!(arch, som_tmux::protocol::Arch::Amd64);
+    }
+
+    #[test]
+    fn rejects_output_with_no_marker_line_at_all() {
+        assert!(parse_uname_platform("Linux\nx86_64\n").is_err());
     }
 
     #[test]
@@ -3152,12 +3286,12 @@ mod tmux_shell_wrapping_tests {
         // got a Windows .exe deployed to it ("Exec format error"). An
         // unparseable/unexpected uname report must be a hard error, never
         // a silent guess.
-        assert!(parse_uname_platform("SomeExoticKernel\nx86_64\n").is_err());
+        assert!(parse_uname_platform("SOM_UNAME:SomeExoticKernel x86_64\n").is_err());
     }
 
     #[test]
     fn rejects_an_unrecognized_architecture_rather_than_guessing() {
-        assert!(parse_uname_platform("Linux\nriscv64\n").is_err());
+        assert!(parse_uname_platform("SOM_UNAME:Linux riscv64\n").is_err());
     }
 
     #[test]
@@ -3175,11 +3309,13 @@ mod tmux_shell_wrapping_tests {
             args,
             title_override: None,
         };
-        let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a local tmux-wrapped shell");
+        let (rebuilt, fresh_pane_id) =
+            rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a local tmux-wrapped shell");
         let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
         assert_eq!(program, "C:\\som\\som-tmux.exe");
         assert_eq!(args[0], "dnk"); // profile unchanged
         assert_ne!(args[1], "original-pane-id"); // pane_id replaced
+        assert_eq!(args[1], fresh_pane_id); // and matches the returned pane_id
         assert_eq!(&args[2..], &["pwsh.exe", "--cursor-shape", "underline", "--scrollback", "10000"]);
     }
 
@@ -3194,7 +3330,8 @@ mod tmux_shell_wrapping_tests {
             RemoteKind::Ssh,
         );
         let shell = Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
-        let rebuilt = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a remote tmux-wrapped shell");
+        let (rebuilt, fresh_pane_id) =
+            rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a remote tmux-wrapped shell");
         let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
         assert_eq!(program, "ssh");
         assert_eq!(args[0], "-tt");
@@ -3202,6 +3339,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(args[2], "~/.local/bin/som-tmux");
         assert_eq!(args[3], "pi5"); // profile unchanged
         assert_ne!(args[4], "original-pane-id"); // pane_id replaced
+        assert_eq!(args[4], fresh_pane_id); // and matches the returned pane_id
         assert_eq!(&args[5..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
     }
 
@@ -3215,5 +3353,221 @@ mod tmux_shell_wrapping_tests {
         assert!(rebuild_tmux_shell_with_fresh_pane_id(&shell).is_none());
         assert!(rebuild_tmux_shell_with_fresh_pane_id(&Shell::System).is_none());
         assert!(rebuild_tmux_shell_with_fresh_pane_id(&Shell::Program("bash".to_string())).is_none());
+    }
+
+    /// Overridable via env var, same convention `terminal`'s own SSH
+    /// integration tests use — defaults to `localhost` (a local sshd, e.g.
+    /// WSL2's own on this dev machine) so the test suite doesn't depend on
+    /// a specific machine on a specific network being reachable.
+    fn integration_test_ssh_host() -> Vec<String> {
+        vec![std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string())]
+    }
+
+    /// Real SSH round-trip against `integration_test_ssh_host()` — confirms
+    /// `ensure_remote_binary_deployed` correctly detects a version mismatch
+    /// and successfully redeploys, end to end (version probe → kill any
+    /// live som-tmux processes this account owns → scp the right pre-built
+    /// binary in → chmod +x → re-probe confirms the new version). Doesn't
+    /// assert anything about WHICH processes get killed (see `kill_all_
+    /// holders_for_redeploy`'s own doc comment) — this is specifically
+    /// about the deploy mechanism itself succeeding against a real host.
+    ///
+    /// KNOWN LIMITATION on a real dev machine: this manufactures a version
+    /// mismatch by deleting the remote binary, which forces `ensure_remote_
+    /// binary_deployed` down its `local_binary_path_for` lookup — under
+    /// `cfg!(test)`, `paths::config_dir()` resolves against a FAKE home
+    /// directory (`C:\Users\zed\...`/`/home/zed\...`, see `util::paths::
+    /// home_dir`'s own `cfg!(test)` branch) this process typically has no
+    /// permission to create on a real Windows machine (confirmed:
+    /// `New-Item -Path C:\Users\zed` → access denied, even from an
+    /// otherwise fully-privileged dev account — creating an arbitrary
+    /// top-level `C:\Users\<name>` directory needs real admin rights this
+    /// test deliberately does NOT attempt to acquire). Skip this one (`test_
+    /// deploy_is_a_no_op_when_already_current` below covers the OTHER,
+    /// reachable branch) unless `C:\Users\zed\.config\som\tmux\linux-amd\
+    /// som-tmux` (or the Unix equivalent) has been populated out of band.
+    ///
+    /// `#[ignore]`d by default: needs a real reachable SSH host with a
+    /// clone of this repo at `~/som` (so `git pull` succeeds) — the
+    /// version mismatch itself is manufactured by this test (deleting
+    /// whatever's currently there), not a precondition. Run explicitly
+    /// with: `cargo test -p terminal_view test_deploy_redeploys_a_version_mismatch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_deploy_redeploys_a_version_mismatch() {
+        let host_args = integration_test_ssh_host();
+
+        // Manufacture a version mismatch: remove whatever's currently
+        // deployed (if anything) so ensure_remote_binary_deployed sees
+        // `remote_info == None` and takes the real first-deploy path.
+        let cleanup_probe = wrap_remote_probe_args(&host_args, "rm", &["-f", "~/.local/bin/som-tmux"]);
+        run_remote_command(RemoteKind::Ssh, &cleanup_probe).expect("failed to clear out the remote binary for this test");
+
+        ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh).expect("deploy should succeed against a real reachable host");
+
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/som-tmux", &["--version"]);
+        let output = run_remote_command(RemoteKind::Ssh, &version_probe).expect("the freshly-deployed binary should run");
+        let info: som_tmux::protocol::HandshakeInfo =
+            serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
+        assert_eq!(info.version, som_tmux::protocol::HandshakeInfo::current().version);
+    }
+
+    /// Real SSH round-trip: confirms `ensure_remote_binary_deployed` is a
+    /// true no-op (no kill, no scp) when the remote is already at the
+    /// current version — the common case on every tab open/restore once a
+    /// host has been deployed to once already. Verified by checking the
+    /// binary's mtime is unchanged after the call, rather than asserting
+    /// on internal call counts (this function has no test-seam for that
+    /// and adding one purely for this would be over-engineering for a
+    /// single assertion).
+    ///
+    /// Requires the remote to ALREADY be at the current version before
+    /// this test runs (deliberately does NOT call `ensure_remote_binary_
+    /// deployed` itself to set that up first, unlike `test_deploy_
+    /// redeploys_a_version_mismatch` — a version MISMATCH path needs
+    /// `local_binary_path_for`, which resolves relative to `paths::
+    /// config_dir()`, which under `cfg!(test)` resolves to a fake `C:\
+    /// Users\zed\...`/`/home/zed/...` home directory this process has no
+    /// permission to create on a real dev machine — see `util::paths::
+    /// home_dir`'s own `cfg!(test)` branch. The ALREADY-current path
+    /// returns early, before ever touching `local_binary_path_for`, so
+    /// it's the one case this integration test CAN safely exercise without
+    /// hitting that same wall; deploy the current build to the test host
+    /// manually first — e.g. `scp ~/.config/som/tmux/linux-amd/som-tmux
+    /// <host>:~/.local/bin/som-tmux` — to set up the precondition.
+    ///
+    /// `#[ignore]`d by default — same reachability requirement as `test_
+    /// deploy_redeploys_a_version_mismatch`. Run explicitly with:
+    /// `cargo test -p terminal_view test_deploy_is_a_no_op_when_already_current -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_deploy_is_a_no_op_when_already_current() {
+        let host_args = integration_test_ssh_host();
+
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/som-tmux", &["--version"]);
+        let output = run_remote_command(RemoteKind::Ssh, &version_probe)
+            .expect("remote must already have SOME som-tmux at ~/.local/bin/som-tmux for this test's precondition");
+        let info: som_tmux::protocol::HandshakeInfo =
+            serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
+        assert_eq!(
+            info.version,
+            som_tmux::protocol::HandshakeInfo::current().version,
+            "test precondition not met: deploy the current build to the test host manually first (see doc comment)"
+        );
+
+        let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "~/.local/bin/som-tmux"]);
+        let mtime_before = run_remote_command(RemoteKind::Ssh, &mtime_probe).expect("stat should succeed");
+
+        ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh).expect("no-op deploy should still report success");
+
+        let mtime_after = run_remote_command(RemoteKind::Ssh, &mtime_probe).expect("stat should succeed");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "binary's mtime must be unchanged — a matching version must never re-kill/re-scp"
+        );
+    }
+
+    /// Real SSH round-trip: creates a `som-tmux --holder` with a pane_id
+    /// NOT in `live_pane_ids`, confirms `kill_orphaned_holders` kills it,
+    /// and confirms a SEPARATE holder whose pane_id IS in `live_pane_ids`
+    /// survives — the two behaviors this function exists to balance (see
+    /// its own doc comment). Uses the real `--client-id` this account/host
+    /// pair would actually get (read back via `$SSH_CLIENT` + `whoami`, the
+    /// same way `som_tmux::protocol::ssh_client_id` does on the remote
+    /// side), not a fabricated one, so this exercises the SAME client-id
+    /// matching path production code goes through, not a shortcut around it.
+    ///
+    /// `#[ignore]`d by default — same reachability requirement as the
+    /// deploy tests above, plus a working `som-tmux` binary already at
+    /// `~/.local/bin/som-tmux` (this test spawns real HOLDER processes with
+    /// it, it doesn't deploy). Run explicitly with:
+    /// `cargo test -p terminal_view test_kill_orphaned_holders_only_kills_the_orphan -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_kill_orphaned_holders_only_kills_the_orphan() {
+        let host_args = integration_test_ssh_host();
+        let orphan_pane_id = format!("test-orphan-{}", std::process::id());
+        let live_pane_id = format!("test-live-{}", std::process::id());
+
+        // `$(whoami)@$SSH_CLIENT`'s ip half — the EXACT `<user>@<ip>` shape
+        // `kill_orphaned_holders` itself computes for THIS connection —
+        // must be baked into each spawned HOLDER's own `--client-id` for
+        // this test to mean anything: a HOLDER spawned with a mismatched
+        // (or absent) `--client-id` is invisible to orphan cleanup by
+        // design (see `parse_orphaned_holder_pids`'s doc comment), so
+        // using anything else here would silently test nothing. Same
+        // marker-prefix technique `kill_orphaned_holders` itself uses (see
+        // its own doc comment) — a login shell can print unrelated profile-
+        // script noise (e.g. a version manager's init banner) to stdout
+        // BEFORE this echo ever runs, so blindly taking the first line/word
+        // of output is unreliable on a real host (confirmed live against
+        // `ssh localhost`'s WSL2 setup).
+        let quoted_client_id_script = shell_quote(r#"echo "SOM_TEST_CLIENT_ID:$(whoami)@$SSH_CLIENT""#);
+        let client_id_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_client_id_script]);
+        let client_id_output =
+            run_remote_command(RemoteKind::Ssh, &client_id_probe).expect("failed to read back this connection's client-id");
+        let client_id = client_id_output
+            .lines()
+            .find_map(|line| line.strip_prefix("SOM_TEST_CLIENT_ID:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("client-id probe should print the marker line")
+            .to_string();
+
+        for pane_id in [&orphan_pane_id, &live_pane_id] {
+            let spawn_script = format!(
+                "nohup ~/.local/bin/som-tmux --holder --profile test-orphan-cleanup --pane-id {pane_id} --client-id {client_id} --program /bin/sh >/dev/null 2>&1 &"
+            );
+            let quoted_spawn_script = shell_quote(&spawn_script);
+            let spawn_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_spawn_script]);
+            run_remote_command(RemoteKind::Ssh, &spawn_probe).expect("failed to spawn a test HOLDER");
+        }
+        // Give each HOLDER a moment to actually start listening before the
+        // orphan-scan probe below greps for it.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        kill_orphaned_holders(&host_args, RemoteKind::Ssh, std::slice::from_ref(&live_pane_id));
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // A single `grep -c '<unique pane_id>'` (no intermediate `--pane-
+        // id` filter) — an extra `grep -- --pane-id` stage would match ITS
+        // OWN command line too (`ps -eo args` sees the `grep` process's
+        // own argv, which literally contains the string `--pane-id` it's
+        // searching for), double-counting every real match. The pane_id
+        // itself is unique enough (embeds this test's own process id) to
+        // not need that extra filter anyway.
+        // Counts processes with `--holder` in argv AND this exact pane_id
+        // — NOT a plain `grep -c '<pane_id>'`/`grep -- --holder`, either of
+        // which would count its OWN `grep`/`sh -lc` process too (their
+        // command line literally contains whatever plain substring they're
+        // searching for). Same awk self-match-avoidance trick production
+        // code already uses (`kill_orphaned_holders`'s own doc comment) —
+        // splitting `--holder` across two concatenated awk string literals
+        // so the contiguous substring never appears in this script's own
+        // source text, which `ps -eo args` would otherwise also match.
+        fn count_holders_with_pane_id(host_args: &[String], pane_id: &str) -> u32 {
+            let script =
+                format!(r#"ps -eo args | awk 'index($0, "--hold" "er") && index($0, "{pane_id}")' | wc -l"#);
+            let quoted_script = shell_quote(&script);
+            let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
+            let output = run_remote_command(RemoteKind::Ssh, &probe).expect("ps probe should succeed");
+            // Last non-empty line, not the whole trimmed output — a login
+            // shell can print unrelated profile-script noise ahead of
+            // `wc -l`'s own result (same real `ssh localhost` behavior
+            // `kill_orphaned_holders`'s own doc comment describes).
+            output.lines().rev().find(|line| !line.trim().is_empty()).and_then(|line| line.trim().parse().ok()).unwrap_or(999)
+        }
+
+        let orphan_count = count_holders_with_pane_id(&host_args, &orphan_pane_id);
+        assert_eq!(orphan_count, 0, "the orphaned HOLDER (not in live_pane_ids) should have been killed");
+
+        let live_count = count_holders_with_pane_id(&host_args, &live_pane_id);
+        assert_eq!(live_count, 1, "the live HOLDER (pane_id IS in live_pane_ids) must survive");
+
+        // Cleanup: the live one was deliberately spared above, so kill it
+        // now that the test is done with it.
+        let cleanup_script = format!("pkill -9 -f 'pane-id {live_pane_id}' 2>/dev/null || true");
+        let quoted_cleanup_script = shell_quote(&cleanup_script);
+        let cleanup_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_cleanup_script]);
+        run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
     }
 }

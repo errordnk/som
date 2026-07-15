@@ -45,9 +45,10 @@ use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
     Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    PathPromptOptions, Pixels, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, actions, canvas, point, px, relative, size,
+    transparent_black,
 };
 pub use history_manager::*;
 
@@ -456,6 +457,80 @@ pub struct TabProfile {
 pub struct TabProfiles(pub Vec<TabProfile>);
 
 impl gpui::Global for TabProfiles {}
+
+/// Window-level config translated from `settings.json`'s `window.*` block
+/// (see `som_config::WindowConfig`). Set once at startup by the `zed` crate
+/// (which owns `SomConfig`; `workspace` can't depend on it directly) via
+/// `SomWindowSettings::set`, and consulted whenever a new OS window is
+/// created. Window *placement* (`window.mode`) is handled separately in
+/// `zed::build_window_options` via `som_db::SomWindowBounds` — this global
+/// only carries padding, which is a per-frame render concern.
+#[derive(Clone, Copy, Default)]
+pub struct SomWindowSettings {
+    /// Padding, in pixels, between the OS window edge and Som's content.
+    pub padding_top: u32,
+    pub padding_bottom: u32,
+    pub padding_left: u32,
+    pub padding_right: u32,
+}
+
+impl gpui::Global for SomWindowSettings {}
+
+impl SomWindowSettings {
+    pub fn set(settings: SomWindowSettings, cx: &mut gpui::App) {
+        cx.set_global(settings);
+    }
+
+    fn get(cx: &gpui::App) -> SomWindowSettings {
+        cx.try_global::<SomWindowSettings>().copied().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod som_window_settings_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Before `zed`'s startup code ever calls `SomWindowSettings::set`
+    /// (e.g. in an isolated GPUI test), reads must default to zero padding
+    /// rather than panicking on a missing global.
+    #[gpui::test]
+    async fn defaults_to_zero_padding_when_never_set(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SomWindowSettings::get(cx);
+            assert_eq!(settings.padding_top, 0);
+            assert_eq!(settings.padding_bottom, 0);
+            assert_eq!(settings.padding_left, 0);
+            assert_eq!(settings.padding_right, 0);
+        });
+    }
+
+    /// `SomWindowSettings::set` must round-trip through a real GPUI global
+    /// (not a bare struct comparison) — this is what `Workspace::render`
+    /// actually reads at paint time to compute padding.
+    #[gpui::test]
+    async fn set_padding_is_visible_to_a_later_get(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SomWindowSettings::set(
+                SomWindowSettings {
+                    padding_top: 4,
+                    padding_bottom: 8,
+                    padding_left: 12,
+                    padding_right: 16,
+                },
+                cx,
+            );
+        });
+
+        cx.update(|cx| {
+            let settings = SomWindowSettings::get(cx);
+            assert_eq!(settings.padding_top, 4);
+            assert_eq!(settings.padding_bottom, 8);
+            assert_eq!(settings.padding_left, 12);
+            assert_eq!(settings.padding_right, 16);
+        });
+    }
+}
 
 impl TabProfiles {
     pub fn set(profiles: Vec<TabProfile>, cx: &mut gpui::App) {
@@ -1920,29 +1995,22 @@ impl Workspace {
                     })?;
                     (window, workspace)
                 } else {
-                    let window_bounds_override = window_bounds_env_override();
+                    // Window geometry is entirely Som's own concern now —
+                    // `build_window_options` derives it from `window.mode` /
+                    // `db.json` (see `som_db::SomWindowBounds`), not Zed's
+                    // inherited SQLite workspace/window persistence. The env
+                    // var override is the one exception, kept for local
+                    // debugging (`ZED_WINDOW_POSITION`/`ZED_WINDOW_SIZE`).
+                    let window_bounds_override =
+                        window_bounds_env_override().map(WindowBounds::Windowed);
 
-                    let (window_bounds, display) = if let Some(bounds) = window_bounds_override {
-                        (Some(WindowBounds::Windowed(bounds)), None)
-                    } else if let Some(workspace) = serialized_workspace.as_ref()
-                        && let Some(display) = workspace.display
-                        && let Some(bounds) = workspace.window_bounds.as_ref()
-                    {
-                        // Reopening an existing workspace - restore its saved bounds
-                        (Some(bounds.0), Some(display))
-                    } else if let Some((display, bounds)) =
-                        persistence::read_default_window_bounds(&kvp)
-                    {
-                        // New or empty workspace - use the last known window bounds
-                        (Some(bounds), Some(display))
-                    } else {
-                        // New window - let GPUI's default_bounds() handle cascading
-                        (None, None)
-                    };
-
-                    // Use the serialized workspace to construct the new window
-                    let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx));
-                    options.window_bounds = window_bounds;
+                    let options = cx.update(|cx| {
+                        let mut options = (app_state.build_window_options)(None, cx);
+                        if let Some(bounds) = window_bounds_override {
+                            options.window_bounds = Some(bounds);
+                        }
+                        options
+                    });
                     let centered_layout = serialized_workspace
                         .as_ref()
                         .map(|w| w.centered_layout)
@@ -5893,10 +5961,17 @@ impl Workspace {
             .copied()
             .unwrap_or(0)
             .min(tabs[active_tab].extra_splits);
+        // Preserve whatever windowed-mode bounds are already on disk — this
+        // function only knows about tabs/panes, not window geometry (that's
+        // tracked separately via `save_window_bounds_to_som_db`), so
+        // overwriting with `None` here would silently forget the user's
+        // last window size/position on every tab/split change.
+        let window_bounds = som_db::load_som_db().window_bounds;
         som_db::save_som_db(&som_db::SomDbState {
             tabs,
             active_tab,
             active_pane,
+            window_bounds,
         });
     }
 
@@ -6189,40 +6264,27 @@ impl Workspace {
         self.session_id.clone()
     }
 
+    /// Persists the window's current geometry to `~/.config/som/db.json`
+    /// (see `som_db::SomWindowBounds`) so `window.mode: "windowed"` restores
+    /// to the same position/size next launch. Only the plain windowed
+    /// rect is meaningful to remember this way — maximized/fullscreen just
+    /// fill the display and don't need a remembered geometry of their own,
+    /// so this deliberately no-ops for those (`inner_window_bounds()`
+    /// returns the *current* bounds, which would otherwise overwrite the
+    /// user's last windowed size with a maximized-sized rect the moment
+    /// they maximize).
     fn save_window_bounds(&self, window: &mut Window, cx: &mut App) -> Task<()> {
-        let Some(display) = window.display(cx) else {
+        let gpui::WindowBounds::Windowed(bounds) = window.inner_window_bounds() else {
             return Task::ready(());
         };
-        let Ok(display_uuid) = display.uuid() else {
-            return Task::ready(());
-        };
-
-        let window_bounds = window.inner_window_bounds();
-        let database_id = self.database_id;
-        let has_paths = !self.root_paths(cx).is_empty();
-        let db = WorkspaceDb::global(cx);
-        let kvp = db::kvp::KeyValueStore::global(cx);
-
-        cx.background_executor().spawn(async move {
-            if !has_paths {
-                persistence::write_default_window_bounds(&kvp, window_bounds, display_uuid)
-                    .await
-                    .log_err();
-            }
-            if let Some(database_id) = database_id {
-                db.set_window_open_status(
-                    database_id,
-                    SerializedWindowBounds(window_bounds),
-                    display_uuid,
-                )
-                .await
-                .log_err();
-            } else {
-                persistence::write_default_window_bounds(&kvp, window_bounds, display_uuid)
-                    .await
-                    .log_err();
-            }
-        })
+        let _ = cx;
+        som_db::save_window_bounds_to_som_db(som_db::SomWindowBounds {
+            x: f32::from(bounds.origin.x) as i32,
+            y: f32::from(bounds.origin.y) as i32,
+            width: f32::from(bounds.size.width) as u32,
+            height: f32::from(bounds.size.height) as u32,
+        });
+        Task::ready(())
     }
 
     /// Bypass the 200ms serialization throttle and write workspace state to
@@ -7383,6 +7445,10 @@ impl Render for Workspace {
             workspace: &self.weak_self,
         };
 
+        // `window.padding` in settings.json — inset between the OS window
+        // edge and Som's content (title bar included), in pixels.
+        let som_window_padding = SomWindowSettings::get(cx);
+
         div()
             .relative()
             .size_full()
@@ -7394,6 +7460,11 @@ impl Render for Workspace {
             .items_start()
             .text_color(colors.text)
             .overflow_hidden()
+            .pt(px(som_window_padding.padding_top as f32))
+            .pb(px(som_window_padding.padding_bottom as f32))
+            .pl(px(som_window_padding.padding_left as f32))
+            .pr(px(som_window_padding.padding_right as f32))
+            .bg(colors.background)
             .children(self.titlebar_item.clone())
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {
@@ -8230,7 +8301,6 @@ pub fn open_workspace_by_id(
     );
 
     let db = WorkspaceDb::global(cx);
-    let kvp = db::kvp::KeyValueStore::global(cx);
     cx.spawn(async move |cx| {
         let serialized_workspace = db
             .workspace_for_id(workspace_id)
@@ -8256,23 +8326,17 @@ pub fn open_workspace_by_id(
             })?;
             (window, workspace)
         } else {
-            let window_bounds_override = window_bounds_env_override();
-
-            let (window_bounds, display) = if let Some(bounds) = window_bounds_override {
-                (Some(WindowBounds::Windowed(bounds)), None)
-            } else if let Some(display) = serialized_workspace.display
-                && let Some(bounds) = serialized_workspace.window_bounds.as_ref()
-            {
-                (Some(bounds.0), Some(display))
-            } else if let Some((display, bounds)) = persistence::read_default_window_bounds(&kvp) {
-                (Some(bounds), Some(display))
-            } else {
-                (None, None)
-            };
+            // See the equivalent block in `open_paths` — window geometry is
+            // entirely Som's own concern (`window.mode` / `db.json`), not
+            // Zed's inherited SQLite persistence.
+            let window_bounds_override =
+                window_bounds_env_override().map(WindowBounds::Windowed);
 
             let options = cx.update(|cx| {
-                let mut options = (app_state.build_window_options)(display, cx);
-                options.window_bounds = window_bounds;
+                let mut options = (app_state.build_window_options)(None, cx);
+                if let Some(bounds) = window_bounds_override {
+                    options.window_bounds = Some(bounds);
+                }
                 options
             });
 

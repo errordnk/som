@@ -238,13 +238,64 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
 
     let use_system_window_tabs = WorkspaceSettings::get_global(cx).use_system_window_tabs;
 
+    // `window.mode` in settings.json (see `som_config::WindowMode`) governs
+    // the window's placement on every launch — this is deliberately
+    // authoritative (not just a first-run default), driven by Som's own
+    // `db.json` for the `windowed` restore rect rather than Zed's inherited
+    // SQLite window-bounds persistence, matching how tabs/splits already
+    // work. See `som_db::SomWindowBounds`.
+    let window_mode = crate::som_config::SomConfig::load_embedded().window.mode();
+    let restore_bounds = || {
+        display
+            .as_ref()
+            .map(|d| d.default_bounds())
+            .unwrap_or_else(|| {
+                gpui::Bounds::new(point(px(0.), px(0.)), gpui::Size { width: px(1024.), height: px(768.) })
+            })
+    };
+    let windowed_bounds = || -> gpui::Bounds<gpui::Pixels> {
+        if let Some(b) = workspace::som_db::load_som_db().window_bounds {
+            return gpui::Bounds::new(
+                point(px(b.x as f32), px(b.y as f32)),
+                gpui::Size { width: px(b.width as f32), height: px(b.height as f32) },
+            );
+        }
+        // No remembered geometry yet — 100px smaller than the display in
+        // each dimension, inset 50px from the top-left.
+        let screen = display
+            .as_ref()
+            .map(|d| d.bounds())
+            .unwrap_or_else(|| gpui::Bounds::new(point(px(0.), px(0.)), gpui::Size { width: px(1920.), height: px(1080.) }));
+        gpui::Bounds::new(
+            point(px(50.), px(50.)),
+            gpui::Size {
+                width: px((f32::from(screen.size.width) - 100.).max(360.)),
+                height: px((f32::from(screen.size.height) - 100.).max(240.)),
+            },
+        )
+    };
+    let window_bounds = match window_mode {
+        crate::som_config::WindowMode::Maximized => {
+            Some(gpui::WindowBounds::Maximized(restore_bounds()))
+        }
+        crate::som_config::WindowMode::Fullscreen => {
+            Some(gpui::WindowBounds::Fullscreen(restore_bounds()))
+        }
+        crate::som_config::WindowMode::Windowed => {
+            Some(gpui::WindowBounds::Windowed(windowed_bounds()))
+        }
+        crate::som_config::WindowMode::Minimized => None,
+    };
+    let start_minimized = window_mode == crate::som_config::WindowMode::Minimized
+        || crate::START_MINIMIZED.load(std::sync::atomic::Ordering::Relaxed);
+
     WindowOptions {
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("Som".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(9.0), px(9.0))),
         }),
-        window_bounds: None,
+        window_bounds,
         focus: false,
         show: false,
         kind: WindowKind::Normal,
@@ -262,7 +313,7 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
             None
         },
         app_id: Some("dev.som.Som".to_owned()),
-        start_minimized: crate::START_MINIMIZED.load(std::sync::atomic::Ordering::Relaxed),
+        start_minimized,
         ..Default::default()
     }
 }

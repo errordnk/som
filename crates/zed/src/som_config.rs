@@ -58,6 +58,29 @@ pub struct WindowConfig {
     pub padding: Option<PaddingConfig>,
 }
 
+/// How the window should be placed when it's first created. Parsed from
+/// `window.mode` (`"windowed"` / `"maximized"` / `"minimized"` / `"fullscreen"`);
+/// unrecognized or absent values fall back to `Windowed`.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowMode {
+    #[default]
+    Windowed,
+    Maximized,
+    Minimized,
+    Fullscreen,
+}
+
+impl WindowConfig {
+    pub fn mode(&self) -> WindowMode {
+        match self.mode.as_deref() {
+            Some("maximized") => WindowMode::Maximized,
+            Some("minimized") => WindowMode::Minimized,
+            Some("fullscreen") => WindowMode::Fullscreen,
+            _ => WindowMode::Windowed,
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PaddingConfig {
@@ -405,6 +428,18 @@ impl SomConfig {
                         cx.update(|cx| {
                             config.apply_settings(cx);
                             config.apply_keys(cx);
+
+                            let padding = config.window.padding.clone().unwrap_or_default();
+                            workspace::SomWindowSettings::set(
+                                workspace::SomWindowSettings {
+                                    padding_top: padding.top,
+                                    padding_bottom: padding.bottom,
+                                    padding_left: padding.left,
+                                    padding_right: padding.right,
+                                },
+                                cx,
+                            );
+                            cx.refresh_windows();
                         });
                     }
                     Err(err) => {

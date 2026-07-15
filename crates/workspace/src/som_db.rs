@@ -45,11 +45,25 @@ pub struct SomDbTab {
     pub tmux_sessions: Option<Vec<String>>,
 }
 
+/// Windowed-mode OS window position/size, in physical pixels. Only ever
+/// populated/consulted when `window.mode` in settings.json is `"windowed"`
+/// (see `som_config::WindowMode`) — maximized/minimized/fullscreen don't
+/// have a meaningful restore rect of their own here, they just use
+/// whatever the display reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SomWindowBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SomDbState {
     pub tabs: Vec<SomDbTab>,
     pub active_tab: usize,
     pub active_pane: usize,
+    pub window_bounds: Option<SomWindowBounds>,
 }
 
 impl Default for SomDbState {
@@ -62,6 +76,7 @@ impl Default for SomDbState {
             }],
             active_tab: 0,
             active_pane: 0,
+            window_bounds: None,
         }
     }
 }
@@ -73,6 +88,26 @@ impl Default for SomDbState {
 struct SomDbFile {
     tabs: Vec<String>,
     active: String,
+    /// `"x,y,width,height"`, physical pixels. Absent (old file, or windowed
+    /// mode never used) means "no remembered windowed-mode geometry yet".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_bounds: Option<String>,
+}
+
+fn format_window_bounds(b: &SomWindowBounds) -> String {
+    format!("{},{},{},{}", b.x, b.y, b.width, b.height)
+}
+
+fn parse_window_bounds(s: &str) -> Option<SomWindowBounds> {
+    let mut parts = s.split(',');
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    let width = parts.next()?.parse().ok()?;
+    let height = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SomWindowBounds { x, y, width, height })
 }
 
 fn parse_pair(s: &str) -> Option<(usize, usize)> {
@@ -137,10 +172,13 @@ pub fn load_som_db() -> SomDbState {
     let max_pane = tabs[active_tab].extra_splits;
     let active_pane = active_pane.min(max_pane);
 
+    let window_bounds = file.window_bounds.as_deref().and_then(parse_window_bounds);
+
     SomDbState {
         tabs,
         active_tab,
         active_pane,
+        window_bounds,
     }
 }
 
@@ -165,6 +203,7 @@ pub fn save_som_db(state: &SomDbState) {
             })
             .collect(),
         active: format!("{}.{}", state.active_tab, state.active_pane),
+        window_bounds: state.window_bounds.as_ref().map(format_window_bounds),
     };
     let Ok(json) = serde_json::to_string_pretty(&file) else {
         return;
@@ -174,6 +213,16 @@ pub fn save_som_db(state: &SomDbState) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, json);
+}
+
+/// Read-modify-write just the window bounds, leaving tabs/active untouched.
+/// Window resize/move events are independent of tab state changes, so this
+/// avoids clobbering concurrent tab/split writes (or vice versa) the way
+/// blindly calling `save_som_db` with a stale in-memory `SomDbState` would.
+pub fn save_window_bounds_to_som_db(bounds: SomWindowBounds) {
+    let mut state = load_som_db();
+    state.window_bounds = Some(bounds);
+    save_som_db(&state);
 }
 
 #[cfg(test)]

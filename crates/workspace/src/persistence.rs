@@ -169,31 +169,6 @@ impl Column for SerializedWindowBounds {
     }
 }
 
-const DEFAULT_WINDOW_BOUNDS_KEY: &str = "default_window_bounds";
-
-pub fn read_default_window_bounds(kvp: &KeyValueStore) -> Option<(Uuid, WindowBounds)> {
-    let json_str = kvp
-        .read_kvp(DEFAULT_WINDOW_BOUNDS_KEY)
-        .log_err()
-        .flatten()?;
-
-    let (display_uuid, persisted) =
-        serde_json::from_str::<(Uuid, WindowBoundsJson)>(&json_str).ok()?;
-    Some((display_uuid, persisted.into()))
-}
-
-pub async fn write_default_window_bounds(
-    kvp: &KeyValueStore,
-    bounds: WindowBounds,
-    display_uuid: Uuid,
-) -> anyhow::Result<()> {
-    let persisted = WindowBoundsJson::from(bounds);
-    let json_str = serde_json::to_string(&(display_uuid, persisted))?;
-    kvp.write_kvp(DEFAULT_WINDOW_BOUNDS_KEY.to_string(), json_str)
-        .await?;
-    Ok(())
-}
-
 #[derive(Serialize, Deserialize)]
 pub enum WindowBoundsJson {
     Windowed {

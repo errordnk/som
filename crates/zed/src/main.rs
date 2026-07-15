@@ -425,6 +425,17 @@ fn main() {
         som_config.apply_settings(cx);
         som_config.load_nord_theme(cx);
 
+        let padding = som_config.window.padding.clone().unwrap_or_default();
+        workspace::SomWindowSettings::set(
+            workspace::SomWindowSettings {
+                padding_top: padding.top,
+                padding_bottom: padding.bottom,
+                padding_left: padding.left,
+                padding_right: padding.right,
+            },
+            cx,
+        );
+
         let profiles: Vec<workspace::TabProfile> = som_config
             .tabs
             .iter()

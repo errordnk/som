@@ -7192,7 +7192,11 @@ impl Render for Workspace {
         };
 
         // `window.padding` in settings.json — inset between the OS window
-        // edge and Som's content (title bar included), in pixels.
+        // edge and Som's terminal content, in pixels. Deliberately applied
+        // only to the content area below, NOT the outermost div — the
+        // title bar/tab strip must stay flush against the window edge
+        // (0,0) regardless of padding, only the terminal/split area should
+        // be inset from it.
         let som_window_padding = SomWindowSettings::get(cx);
 
         div()
@@ -7206,10 +7210,6 @@ impl Render for Workspace {
             .items_start()
             .text_color(colors.text)
             .overflow_hidden()
-            .pt(px(som_window_padding.padding_top as f32))
-            .pb(px(som_window_padding.padding_bottom as f32))
-            .pl(px(som_window_padding.padding_left as f32))
-            .pr(px(som_window_padding.padding_right as f32))
             .bg(colors.background)
             .children(self.titlebar_item.clone())
             .on_modifiers_changed(move |_, _, cx| {
@@ -7224,6 +7224,10 @@ impl Render for Workspace {
                     .flex_1()
                     .flex()
                     .flex_col()
+                    .pt(px(som_window_padding.padding_top as f32))
+                    .pb(px(som_window_padding.padding_bottom as f32))
+                    .pl(px(som_window_padding.padding_left as f32))
+                    .pr(px(som_window_padding.padding_right as f32))
                     .child(
                         div()
                             .id("workspace")
@@ -7234,9 +7238,6 @@ impl Render for Workspace {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .border_t_1()
-                            .border_b_1()
-                            .border_color(colors.border)
                             .child({
                                 let this = cx.entity();
                                 canvas(

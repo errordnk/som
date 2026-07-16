@@ -20,7 +20,6 @@ anyhow.workspace = true
 async-channel.workspace = true
 async-recursion.workspace = true
 collections.workspace = true
-db.workspace = true
 dirs.workspace = true
 futures.workspace = true
 gpui.workspace = true

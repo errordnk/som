@@ -1,5 +1,4 @@
 use gpui::{App, Menu, MenuItem};
-use terminal_view::terminal_panel;
 
 pub fn app_menus(_cx: &mut App) -> Vec<Menu> {
     use zed_actions::Quit;
@@ -22,8 +21,6 @@ pub fn app_menus(_cx: &mut App) -> Vec<Menu> {
         MenuItem::action("Toggle Right Dock", workspace::ToggleRightDock),
         MenuItem::action("Toggle Bottom Dock", workspace::ToggleBottomDock),
         MenuItem::action("Toggle All Docks", workspace::ToggleAllDocks),
-        MenuItem::separator(),
-        MenuItem::action("Terminal Panel", terminal_panel::ToggleFocus),
     ];
 
     vec![

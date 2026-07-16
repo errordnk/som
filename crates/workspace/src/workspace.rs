@@ -1,5 +1,4 @@
 pub mod dock;
-pub mod history_manager;
 pub mod invalid_item_view;
 pub mod item;
 mod modal_layer;
@@ -47,10 +46,9 @@ use gpui::{
     Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
     PathPromptOptions, Pixels, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
     Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
-    WindowHandle, WindowId, WindowOptions, actions, canvas, point, px, relative, size,
+    WindowHandle, WindowOptions, actions, canvas, point, px, relative, size,
     transparent_black,
 };
-pub use history_manager::*;
 
 pub mod project_types {
     pub use project::{
@@ -78,12 +76,8 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
-    model::{
-        DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
-        SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
-    },
-    read_serialized_multi_workspaces,
+    WorkspaceDb, delete_unloaded_items,
+    model::{DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedProjectGroup, SerializedWorkspaceLocation},
 };
 use persistence::{SerializedWindowBounds, model::SerializedWorkspace};
 use project::{
@@ -1126,10 +1120,9 @@ pub fn prompt_for_open_path_and_open(
     .detach();
 }
 
-pub fn init(app_state: Arc<AppState>, cx: &mut App) {
+pub fn init(_app_state: Arc<AppState>, cx: &mut App) {
     component::init();
     toast_layer::init(cx);
-    history_manager::init(app_state.fs.clone(), cx);
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))
@@ -1598,7 +1591,6 @@ pub struct Workspace {
     removing: bool,
     open_in_dev_container: bool,
     _dev_container_task: Option<Task<Result<()>>>,
-    _panels_task: Option<Task<Result<()>>>,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     active_worktree_creation: ActiveWorktreeCreation,
@@ -1670,7 +1662,6 @@ impl Workspace {
                 &project::Event::WorktreeRemoved(_) => {
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
-                    this.update_history(cx);
                 }
 
                 &project::Event::WorktreeAdded(id) => {
@@ -1682,7 +1673,6 @@ impl Workspace {
                         .is_some_and(|wt| wt.read(cx).is_visible())
                     {
                         this.serialize_workspace(window, cx);
-                        this.update_history(cx);
                     }
                 }
                 project::Event::WorktreeUpdatedEntries(..) => {
@@ -1857,7 +1847,6 @@ impl Workspace {
             left_dock,
             bottom_dock,
             right_dock,
-            _panels_task: None,
             project: project.clone(),
             dispatching_keystrokes: Default::default(),
             window_edited: false,
@@ -2110,14 +2099,6 @@ impl Workspace {
                         .log_err();
                 }
             }
-
-            window
-                .update(cx, |_, _window, cx| {
-                    workspace.update(cx, |this: &mut Workspace, cx| {
-                        this.update_history(cx);
-                    });
-                })
-                .log_err();
 
             if open_mode == OpenMode::NewWindow || open_mode == OpenMode::Activate {
                 window
@@ -2587,14 +2568,6 @@ impl Workspace {
 
     pub fn app_state(&self) -> &Arc<AppState> {
         &self.app_state
-    }
-
-    pub fn set_panels_task(&mut self, task: Task<Result<()>>) {
-        self._panels_task = Some(task);
-    }
-
-    pub fn take_panels_task(&mut self) -> Option<Task<Result<()>>> {
-        self._panels_task.take()
     }
 
     pub fn project(&self) -> &Entity<Project> {
@@ -6503,21 +6476,6 @@ impl Workspace {
         }
     }
 
-    fn update_history(&self, cx: &mut App) {
-        let Some(id) = self.database_id() else {
-            return;
-        };
-        if !self.project.read(cx).is_local() {
-            return;
-        }
-        if let Some(manager) = HistoryManager::global(cx) {
-            let paths = PathList::new(&self.root_paths(cx));
-            manager.update(cx, |this, cx| {
-                this.update_history(id, HistoryManagerEntry::new(id, &paths), cx);
-            });
-        }
-    }
-
     async fn serialize_items(
         this: &WeakEntity<Self>,
         items_rx: UnboundedReceiver<Box<dyn SerializableItemHandle>>,
@@ -7880,159 +7838,6 @@ impl WorkspaceHandle for Entity<Workspace> {
     }
 }
 
-pub async fn last_opened_workspace_location(
-    db: &WorkspaceDb,
-    fs: &dyn fs::Fs,
-) -> Option<(WorkspaceId, SerializedWorkspaceLocation, PathList)> {
-    db.last_workspace(fs)
-        .await
-        .log_err()
-        .flatten()
-        .map(|workspace| (workspace.workspace_id, workspace.location, workspace.paths))
-}
-
-pub async fn last_session_workspace_locations(
-    db: &WorkspaceDb,
-    last_session_id: &str,
-    last_session_window_stack: Option<Vec<WindowId>>,
-    fs: &dyn fs::Fs,
-) -> Option<Vec<SessionWorkspace>> {
-    db.last_session_workspace_locations(last_session_id, last_session_window_stack, fs)
-        .await
-        .log_err()
-}
-
-pub async fn restore_multiworkspace(
-    multi_workspace: SerializedMultiWorkspace,
-    app_state: Arc<AppState>,
-    cx: &mut AsyncApp,
-) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
-    let SerializedMultiWorkspace {
-        active_workspace,
-        state,
-    } = multi_workspace;
-
-    let workspace_result = if active_workspace.paths.is_empty() {
-        cx.update(|cx| {
-            open_workspace_by_id(active_workspace.workspace_id, app_state.clone(), None, cx)
-        })
-        .await
-    } else {
-        cx.update(|cx| {
-            Workspace::new_local(
-                active_workspace.paths.paths().to_vec(),
-                app_state.clone(),
-                None,
-                None,
-                None,
-                OpenMode::Activate,
-                cx,
-            )
-        })
-        .await
-        .map(|result| result.window)
-    };
-
-    let window_handle = match workspace_result {
-        Ok(handle) => handle,
-        Err(err) => {
-            log::error!("Failed to restore active workspace: {err:#}");
-
-            let mut fallback_handle = None;
-            for key in &state.project_groups {
-                let key: ProjectGroupKey = key.clone().into();
-                let paths = key.path_list().paths().to_vec();
-                match cx
-                    .update(|cx| {
-                        Workspace::new_local(
-                            paths,
-                            app_state.clone(),
-                            None,
-                            None,
-                            None,
-                            OpenMode::Activate,
-                            cx,
-                        )
-                    })
-                    .await
-                {
-                    Ok(OpenResult { window, .. }) => {
-                        fallback_handle = Some(window);
-                        break;
-                    }
-                    Err(fallback_err) => {
-                        log::error!("Fallback project group also failed: {fallback_err:#}");
-                    }
-                }
-            }
-
-            fallback_handle.ok_or(err)?
-        }
-    };
-
-    apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
-
-    window_handle
-        .update(cx, |_, window, _cx| {
-            window.activate_window();
-        })
-        .ok();
-
-    Ok(window_handle)
-}
-
-pub async fn apply_restored_multiworkspace_state(
-    window_handle: WindowHandle<MultiWorkspace>,
-    state: &MultiWorkspaceState,
-    _fs: Arc<dyn fs::Fs>,
-    cx: &mut AsyncApp,
-) {
-    let MultiWorkspaceState {
-        sidebar_open,
-        project_groups,
-        sidebar_state,
-        ..
-    } = state;
-
-    if !project_groups.is_empty() {
-        let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
-        for serialized in project_groups.iter().cloned() {
-            let SerializedProjectGroupState { key, expanded } = serialized.into_restored_state();
-            if key.path_list().paths().is_empty() {
-                continue;
-            }
-            if !resolved_groups.iter().any(|g| g.key == key) {
-                resolved_groups.push(SerializedProjectGroupState { key, expanded });
-            }
-        }
-
-        window_handle
-            .update(cx, |multi_workspace, _window, cx| {
-                multi_workspace.restore_project_groups(resolved_groups, cx);
-            })
-            .ok();
-    }
-
-    if *sidebar_open {
-        window_handle
-            .update(cx, |multi_workspace, _, cx| {
-                multi_workspace.restore_open_sidebar(cx);
-            })
-            .ok();
-    }
-
-    if let Some(sidebar_state) = sidebar_state {
-        window_handle
-            .update(cx, |multi_workspace, window, cx| {
-                if let Some(sidebar) = multi_workspace.sidebar() {
-                    sidebar.restore_serialized_state(sidebar_state, window, cx);
-                }
-                multi_workspace.serialize(cx);
-            })
-            .ok();
-    }
-}
-
 actions!(
     collab,
     [
@@ -8281,119 +8086,6 @@ pub struct OpenResult {
     pub window: WindowHandle<MultiWorkspace>,
     pub workspace: Entity<Workspace>,
     pub opened_items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-}
-
-/// Opens a workspace by its database ID, used for restoring empty workspaces with unsaved content.
-pub fn open_workspace_by_id(
-    workspace_id: WorkspaceId,
-    app_state: Arc<AppState>,
-    requesting_window: Option<WindowHandle<MultiWorkspace>>,
-    cx: &mut App,
-) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
-    let project_handle = Project::local(
-        app_state.fs.clone(),
-        None,
-        project::LocalProjectFlags {
-            init_worktree_trust: true,
-            ..project::LocalProjectFlags::default()
-        },
-        cx,
-    );
-
-    let db = WorkspaceDb::global(cx);
-    cx.spawn(async move |cx| {
-        let serialized_workspace = db
-            .workspace_for_id(workspace_id)
-            .with_context(|| format!("Workspace {workspace_id:?} not found"))?;
-
-        let centered_layout = serialized_workspace.centered_layout;
-
-        let (window, workspace) = if let Some(window) = requesting_window {
-            let workspace = window.update(cx, |multi_workspace, window, cx| {
-                let workspace = cx.new(|cx| {
-                    let mut workspace = Workspace::new(
-                        Some(workspace_id),
-                        project_handle.clone(),
-                        app_state.clone(),
-                        window,
-                        cx,
-                    );
-                    workspace.centered_layout = centered_layout;
-                    workspace
-                });
-                multi_workspace.add(workspace.clone(), &*window, cx);
-                workspace
-            })?;
-            (window, workspace)
-        } else {
-            // See the equivalent block in `open_paths` — window geometry is
-            // entirely Som's own concern (`window.mode` / `db.json`), not
-            // Zed's inherited SQLite persistence.
-            let window_bounds_override =
-                window_bounds_env_override().map(WindowBounds::Windowed);
-
-            let options = cx.update(|cx| {
-                let mut options = (app_state.build_window_options)(None, cx);
-                if let Some(bounds) = window_bounds_override {
-                    options.window_bounds = Some(bounds);
-                }
-                options
-            });
-
-            let window = cx.open_window(options, {
-                let app_state = app_state.clone();
-                let project_handle = project_handle.clone();
-                move |window, cx| {
-                    let workspace = cx.new(|cx| {
-                        let mut workspace = Workspace::new(
-                            Some(workspace_id),
-                            project_handle,
-                            app_state,
-                            window,
-                            cx,
-                        );
-                        workspace.centered_layout = centered_layout;
-                        workspace
-                    });
-                    cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-                }
-            })?;
-
-            let workspace = window.update(cx, |multi_workspace: &mut MultiWorkspace, _, _cx| {
-                multi_workspace.workspace().clone()
-            })?;
-
-            (window, workspace)
-        };
-
-        notify_if_database_failed(window, cx);
-
-        // Tabs/splits are restored from ~/.config/som/db.json (see
-        // `som_db.rs`) — same as `new_local`'s restore path, see the comment
-        // there. `serialized_workspace` (Zed's file/folder SQLite state) is
-        // not used for Som's tabs.
-        let _ = serialized_workspace;
-        let restore_task = window
-            .update(cx, |_, window, cx| {
-                let restorer = cx.try_global::<SomTabsRestorer>().cloned();
-                restorer.map(|restorer| (restorer.0)(workspace.downgrade(), window, cx))
-            })
-            .ok()
-            .flatten();
-        // Deliberately NOT awaited — see `new_local`'s identical restore-task
-        // handling for why (window visibility must never block on this).
-        if let Some(restore_task) = restore_task {
-            restore_task.detach();
-        }
-
-        window.update(cx, |_, window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                workspace.serialize_workspace(window, cx);
-            });
-        })?;
-
-        Ok(window)
-    })
 }
 
 #[allow(clippy::type_complexity)]

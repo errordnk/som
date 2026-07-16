@@ -45,7 +45,6 @@ pub struct SomConfig {
 pub struct WindowConfig {
     pub theme: Option<String>,
     pub mode: Option<String>,
-    pub opacity: Option<f32>,
     pub padding: Option<PaddingConfig>,
     pub selection: Option<String>,
 }

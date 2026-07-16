@@ -415,6 +415,14 @@ pub struct NewTerminal {
     /// Optional shell command override (e.g. "wsl --cd ~").
     #[serde(default)]
     pub shell: Option<String>,
+    /// Set instead of `tab_name`/`shell` when this binding is `Ctrl+Shift+N`
+    /// for a profile slot `N` that settings.json's `tabs[]` doesn't actually
+    /// have (e.g. `Ctrl+Shift+9` with only 3 profiles configured) — see
+    /// `som_config.rs`'s `apply_keys`. `new_terminal` shows an error
+    /// notification and opens nothing when this is set, rather than
+    /// silently falling back to the default profile.
+    #[serde(default)]
+    pub missing_profile_index: Option<usize>,
 }
 
 /// A single tab profile loaded from som config's settings.json `tabs[]`

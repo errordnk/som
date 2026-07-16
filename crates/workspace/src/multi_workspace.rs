@@ -13,14 +13,13 @@ use std::future::Future;
 
 use std::path::PathBuf;
 use ui::prelude::*;
-use util::ResultExt;
 use util::path_list::PathList;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
-    persistence::model::MultiWorkspaceState,
+    serialized_state::MultiWorkspaceState,
 };
 
 actions!(
@@ -1349,17 +1348,6 @@ impl MultiWorkspace {
             workspace._schedule_serialize_workspace.take();
             workspace._serialize_workspace_task.take();
         });
-
-        if let Some(workspace_id) = workspace.read(cx).database_id() {
-            let db = crate::persistence::WorkspaceDb::global(cx);
-            self.pending_removal_tasks.retain(|task| !task.is_ready());
-            self.pending_removal_tasks
-                .push(cx.background_spawn(async move {
-                    db.set_session_binding(workspace_id, None, None)
-                        .await
-                        .log_err();
-                }));
-        }
     }
 
     fn sync_sidebar_to_workspace(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
@@ -1381,7 +1369,7 @@ impl MultiWorkspace {
                             .project_groups
                             .iter()
                             .map(|group| {
-                                crate::persistence::model::SerializedProjectGroup::from_group(
+                                crate::serialized_state::SerializedProjectGroup::from_group(
                                     &group.key,
                                     group.expanded,
                                 )
@@ -1397,7 +1385,7 @@ impl MultiWorkspace {
                 return;
             };
             let _ = window_id;
-            crate::persistence::write_multi_workspace_state(state).await;
+            crate::som_db::save_multi_workspace_state(&state);
         }));
     }
 
@@ -1594,84 +1582,6 @@ impl MultiWorkspace {
             expanded: group.expanded,
             last_active_workspace: None,
         });
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn create_test_workspace(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        let app_state = self.workspace().read(cx).app_state().clone();
-        let project = Project::local(
-            app_state.fs.clone(),
-            None,
-            project::LocalProjectFlags::default(),
-            cx,
-        );
-        let new_workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
-        self.activate(new_workspace.clone(), None, window, cx);
-
-        let weak_workspace = new_workspace.downgrade();
-        let db = crate::persistence::WorkspaceDb::global(cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let workspace_id = db.next_id().await.unwrap();
-            let workspace = weak_workspace.upgrade().unwrap();
-            let task: Task<()> = this
-                .update_in(cx, |this, window, cx| {
-                    let session_id = workspace.read(cx).session_id();
-                    let window_id = window.window_handle().window_id().as_u64();
-                    workspace.update(cx, |workspace, _cx| {
-                        workspace.set_database_id(workspace_id);
-                    });
-                    this.serialize(cx);
-                    let db = db.clone();
-                    cx.background_spawn(async move {
-                        db.set_session_binding(workspace_id, session_id, Some(window_id))
-                            .await
-                            .log_err();
-                    })
-                })
-                .unwrap();
-            task.await
-        })
-    }
-
-    /// Assigns random database IDs to all retained workspaces, flushes
-    /// workspace serialization (SQLite) and multi-workspace state (KVP),
-    /// and writes session bindings.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn flush_all_serialization(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<Task<()>> {
-        for workspace in self.workspaces() {
-            workspace.update(cx, |ws, _cx| {
-                if ws.database_id().is_none() {
-                    ws.set_random_database_id();
-                }
-            });
-        }
-
-        let session_id = self.workspace().read(cx).session_id();
-        let window_id_u64 = window.window_handle().window_id().as_u64();
-
-        let mut tasks: Vec<Task<()>> = Vec::new();
-        for workspace in self.workspaces() {
-            tasks.push(workspace.update(cx, |ws, cx| ws.flush_serialization(window, cx)));
-            if let Some(db_id) = workspace.read(cx).database_id() {
-                let db = crate::persistence::WorkspaceDb::global(cx);
-                let session_id = session_id.clone();
-                tasks.push(cx.background_spawn(async move {
-                    db.set_session_binding(db_id, session_id, Some(window_id_u64))
-                        .await
-                        .log_err();
-                }));
-            }
-        }
-        self.serialize(cx);
-        tasks
     }
 
     /// Removes one or more workspaces from this multi-workspace.

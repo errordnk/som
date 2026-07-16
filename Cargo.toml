@@ -4,7 +4,6 @@ members = [
     "crates/assets",
     "crates/clock",
     "crates/collections",
-    "crates/db",
     "crates/fs",
     "crates/gpui",
     "crates/gpui_shared_string",
@@ -34,8 +33,6 @@ members = [
     "crates/settings_json",
     "crates/settings_macros",
     "crates/som_tmux",
-    "crates/sqlez",
-    "crates/sqlez_macros",
     "crates/sum_tree",
     "crates/syntax_theme",
     "crates/terminal",
@@ -77,7 +74,6 @@ clock = { path = "crates/clock" }
 collections = { path = "crates/collections", version = "0.1.0" }
 component = { path = "crates/component" }
 console = "0.16"
-db = { path = "crates/db" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dialoguer = { version = "0.12", default-features = false }
 env_var = { path = "crates/env_var" }
@@ -116,8 +112,6 @@ settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
 som_tmux = { path = "crates/som_tmux" }
-sqlez = { path = "crates/sqlez" }
-sqlez_macros = { path = "crates/sqlez_macros" }
 sum_tree = { path = "crates/sum_tree" }
 syntax_theme = { path = "crates/syntax_theme" }
 task = { path = "crates/task" }
@@ -562,7 +556,6 @@ debug = "full"
 gpui_macros = { opt-level = 3 }
 derive_refineable = { opt-level = 3 }
 settings_macros = { opt-level = 3 }
-sqlez_macros = { opt-level = 3, codegen-units = 1 }
 ui_macros = { opt-level = 3 }
 util_macros = { opt-level = 3 }
 quote = { opt-level = 3 }

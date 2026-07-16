@@ -343,6 +343,46 @@ pub struct SomTrustedHost {
     pub host_identifier: String,
 }
 
+impl SomTrustedHost {
+    pub fn from_remote_host_location(host: &project::trusted_worktrees::RemoteHostLocation) -> Self {
+        Self {
+            user_name: host.user_name.as_ref().map(|s| s.to_string()),
+            host_identifier: host.host_identifier.to_string(),
+        }
+    }
+
+    pub fn into_remote_host_location(self) -> project::trusted_worktrees::RemoteHostLocation {
+        project::trusted_worktrees::RemoteHostLocation {
+            user_name: self.user_name.map(gpui::SharedString::new),
+            host_identifier: gpui::SharedString::new(self.host_identifier),
+        }
+    }
+}
+
+/// Converts trusted-worktree data keyed by [`project::trusted_worktrees::RemoteHostLocation`]
+/// (used in-memory by `TrustedWorktrees`) to/from the JSON-serializable
+/// [`SomTrustedHost`] key used on disk.
+pub fn save_trusted_worktrees_by_host(
+    trusted: collections::HashMap<
+        Option<project::trusted_worktrees::RemoteHostLocation>,
+        collections::HashSet<PathBuf>,
+    >,
+) {
+    let converted = trusted
+        .into_iter()
+        .map(|(host, paths)| (host.map(|h| SomTrustedHost::from_remote_host_location(&h)), paths))
+        .collect();
+    save_trusted_worktrees(converted);
+}
+
+pub fn load_trusted_worktrees_by_host()
+-> collections::HashMap<Option<project::trusted_worktrees::RemoteHostLocation>, collections::HashSet<PathBuf>> {
+    load_trusted_worktrees()
+        .into_iter()
+        .map(|(host, paths)| (host.map(SomTrustedHost::into_remote_host_location), paths))
+        .collect()
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TrustedWorktreesFile {
     /// `None` host = paths trusted on the local machine (not over SSH/WSL).

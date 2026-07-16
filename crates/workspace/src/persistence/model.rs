@@ -7,7 +7,6 @@ use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
-use gpui::WindowId;
 
 use project::{
     ProjectGroupKey,
@@ -31,16 +30,6 @@ impl SerializedWorkspaceLocation {
     pub fn sorted_paths(&self) -> Arc<Vec<PathBuf>> {
         unimplemented!()
     }
-}
-
-/// A workspace entry from a previous session, containing all the info needed
-/// to restore it including which window it belonged to (for MultiWorkspace grouping).
-#[derive(Debug, PartialEq, Clone)]
-pub struct SessionWorkspace {
-    pub workspace_id: WorkspaceId,
-    pub location: SerializedWorkspaceLocation,
-    pub paths: PathList,
-    pub window_id: Option<WindowId>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,15 +77,6 @@ pub struct MultiWorkspaceState {
     pub project_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]
     pub sidebar_state: Option<String>,
-}
-
-/// The serialized state of a single MultiWorkspace window from a previous session:
-/// the active workspace to restore plus window-level state (project group keys,
-/// sidebar).
-#[derive(Debug, Clone)]
-pub struct SerializedMultiWorkspace {
-    pub active_workspace: SessionWorkspace,
-    pub state: MultiWorkspaceState,
 }
 
 #[derive(Debug, PartialEq, Clone)]

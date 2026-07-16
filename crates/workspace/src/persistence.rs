@@ -2,9 +2,6 @@ pub mod model;
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
-use fs::Fs;
-
 use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet};
 use db::{
@@ -14,10 +11,7 @@ use db::{
     sqlez_macros::sql,
 };
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
-use project::{
-    ProjectGroupKey,
-    trusted_worktrees::{DbTrustedPaths, RemoteHostLocation},
-};
+use project::trusted_worktrees::{DbTrustedPaths, RemoteHostLocation};
 
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -40,26 +34,12 @@ use model::{
     SerializedPaneGroup, SerializedWorkspace,
 };
 
-use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
+use self::model::{DockStructure, SerializedWorkspaceLocation};
 
 // https://www.sqlite.org/limits.html
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
-
-fn parse_timestamp(text: &str) -> DateTime<Utc> {
-    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-        .map(|naive| naive.and_utc())
-        .unwrap_or_else(|_| Utc::now())
-}
-
-fn contains_wsl_path(paths: &PathList) -> bool {
-    cfg!(windows)
-        && paths
-            .paths()
-            .iter()
-            .any(|path| util::paths::WslPath::from_path(path).is_some())
-}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct SerializedAxis(pub(crate) gpui::Axis);
@@ -262,16 +242,6 @@ impl From<WindowBoundsJson> for WindowBounds {
     }
 }
 
-fn read_multi_workspace_state(window_id: WindowId, cx: &App) -> model::MultiWorkspaceState {
-    let kvp = KeyValueStore::global(cx);
-    kvp.scoped("multi_workspace_state")
-        .read(&window_id.as_u64().to_string())
-        .log_err()
-        .flatten()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
-}
-
 pub async fn write_multi_workspace_state(
     kvp: &KeyValueStore,
     window_id: WindowId,
@@ -283,48 +253,6 @@ pub async fn write_multi_workspace_state(
             .await
             .log_err();
     }
-}
-
-pub fn read_serialized_multi_workspaces(
-    session_workspaces: Vec<model::SessionWorkspace>,
-    cx: &App,
-) -> Vec<model::SerializedMultiWorkspace> {
-    let mut window_groups: Vec<Vec<model::SessionWorkspace>> = Vec::new();
-    let mut window_id_to_group: HashMap<WindowId, usize> = HashMap::default();
-
-    for session_workspace in session_workspaces {
-        match session_workspace.window_id {
-            Some(window_id) => {
-                let group_index = *window_id_to_group.entry(window_id).or_insert_with(|| {
-                    window_groups.push(Vec::new());
-                    window_groups.len() - 1
-                });
-                window_groups[group_index].push(session_workspace);
-            }
-            None => {
-                window_groups.push(vec![session_workspace]);
-            }
-        }
-    }
-
-    window_groups
-        .into_iter()
-        .filter_map(|group| {
-            let window_id = group.first().and_then(|sw| sw.window_id);
-            let state = window_id
-                .map(|wid| read_multi_workspace_state(wid, cx))
-                .unwrap_or_default();
-            let active_workspace = state
-                .active_workspace_id
-                .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
-                .or(Some(0))
-                .and_then(|index| group.into_iter().nth(index))?;
-            Some(model::SerializedMultiWorkspace {
-                active_workspace,
-                state,
-            })
-        })
-        .collect()
 }
 
 const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
@@ -1010,92 +938,6 @@ impl WorkspaceDb {
         })
     }
 
-    /// Returns the workspace with the given ID, loading all associated data.
-    pub(crate) fn workspace_for_id(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> Option<SerializedWorkspace> {
-        let (
-            paths,
-            paths_order,
-            identity_paths,
-            identity_paths_order,
-            window_bounds,
-            display,
-            centered_layout,
-            docks,
-            window_id,
-        ): (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<SerializedWindowBounds>,
-            Option<Uuid>,
-            Option<bool>,
-            DockStructure,
-            Option<u64>,
-        ) = self
-            .select_row_bound(sql! {
-                SELECT
-                    paths,
-                    paths_order,
-                    identity_paths,
-                    identity_paths_order,
-                    window_state,
-                    window_x,
-                    window_y,
-                    window_width,
-                    window_height,
-                    display,
-                    centered_layout,
-                    left_dock_visible,
-                    left_dock_active_panel,
-                    left_dock_zoom,
-                    right_dock_visible,
-                    right_dock_active_panel,
-                    right_dock_zoom,
-                    bottom_dock_visible,
-                    bottom_dock_active_panel,
-                    bottom_dock_zoom,
-                    window_id
-                FROM workspaces
-                WHERE workspace_id = ?
-            })
-            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))
-            .context("No workspace found for id")
-            .warn_on_err()
-            .flatten()?;
-
-        let paths = PathList::deserialize(&SerializedPathList {
-            paths,
-            order: paths_order,
-        });
-        let identity_paths = identity_paths.map(|paths| {
-            PathList::deserialize(&SerializedPathList {
-                paths,
-                order: identity_paths_order.unwrap_or_default(),
-            })
-        });
-
-        Some(SerializedWorkspace {
-            id: workspace_id,
-            location: SerializedWorkspaceLocation::Local,
-            paths,
-            identity_paths,
-            center_group: self
-                .get_center_pane_group(workspace_id)
-                .context("Getting center group")
-                .log_err()?,
-            window_bounds,
-            centered_layout: centered_layout.unwrap_or(false),
-            display,
-            docks,
-            session_id: None,
-            window_id,
-        })
-    }
-
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
@@ -1196,257 +1038,6 @@ impl WorkspaceDb {
         pub async fn next_id() -> Result<WorkspaceId> {
             INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id
         }
-    }
-
-    fn recent_workspaces(
-        &self,
-    ) -> Result<
-        Vec<(
-            WorkspaceId,
-            PathList,
-            Option<PathList>,
-            Option<String>,
-            DateTime<Utc>,
-        )>,
-    > {
-        Ok(self
-            .recent_workspaces_query()?
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    paths,
-                    order,
-                    identity_paths,
-                    identity_paths_order,
-                    session_id,
-                    timestamp,
-                )| {
-                    (
-                        id,
-                        PathList::deserialize(&SerializedPathList { paths, order }),
-                        identity_paths.map(|paths| {
-                            PathList::deserialize(&SerializedPathList {
-                                paths,
-                                order: identity_paths_order.unwrap_or_default(),
-                            })
-                        }),
-                        session_id,
-                        parse_timestamp(&timestamp),
-                    )
-                },
-            )
-            .collect())
-    }
-
-    query! {
-        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<String>, String)>> {
-            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, session_id, timestamp
-            FROM workspaces
-            WHERE
-                paths IS NOT NULL AND
-                remote_connection_id IS NULL
-            ORDER BY timestamp DESC
-        }
-    }
-
-    fn session_workspaces(
-        &self,
-        session_id: String,
-    ) -> Result<Vec<(WorkspaceId, PathList, Option<u64>)>>
-    {
-        Ok(self
-            .session_workspaces_query(session_id)?
-            .into_iter()
-            .map(
-                |(workspace_id, paths, order, window_id)| {
-                    (
-                        WorkspaceId(workspace_id),
-                        PathList::deserialize(&SerializedPathList { paths, order }),
-                        window_id,
-                    )
-                },
-            )
-            .collect())
-    }
-
-    query! {
-        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<u64>)>> {
-            SELECT workspace_id, paths, paths_order, window_id
-            FROM workspaces
-            WHERE session_id = ?1 AND remote_connection_id IS NULL
-            ORDER BY timestamp DESC
-        }
-    }
-
-    query! {
-        pub async fn delete_workspace_by_id(id: WorkspaceId) -> Result<()> {
-            DELETE FROM workspaces
-            WHERE workspace_id IS ?
-        }
-    }
-
-    async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
-        let mut any_dir = false;
-        for path in paths {
-            match fs.metadata(path).await.ok().flatten() {
-                None => return false,
-                Some(meta) => {
-                    if meta.is_dir {
-                        any_dir = true;
-                    }
-                }
-            }
-        }
-        any_dir
-    }
-
-    // Returns the raw recent workspace history. Scratch workspaces (no paths) are filtered
-    // out because they are restored separately by `last_session_workspace_locations`.
-    pub async fn recent_project_workspaces_ungrouped(
-        &self,
-        fs: &dyn Fs,
-    ) -> Result<Vec<RecentWorkspace>> {
-        let mut result = Vec::new();
-        for (id, paths, identity_paths_hint, _session_id, timestamp) in
-            self.recent_workspaces()?
-        {
-            if paths.paths().is_empty() || contains_wsl_path(&paths) {
-                continue;
-            }
-
-            if Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
-                let identity_paths = resolve_local_workspace_identity(fs, &paths)
-                    .await
-                    .or(identity_paths_hint)
-                    .unwrap_or_else(|| paths.clone());
-                result.push(RecentWorkspace {
-                    workspace_id: id,
-                    location: SerializedWorkspaceLocation::Local,
-                    paths,
-                    identity_paths,
-                    timestamp,
-                });
-            }
-        }
-
-        Ok(result)
-    }
-
-    // Returns the recent project workspaces suitable for recent-project UIs.
-    // Entries are deduplicated by git worktree identity, but preserve the original
-    // serialized paths for reopening.
-    pub async fn recent_project_workspaces(&self, fs: &dyn Fs) -> Result<Vec<RecentWorkspace>> {
-        Ok(dedupe_recent_workspaces(
-            self.recent_project_workspaces_ungrouped(fs).await?,
-        ))
-    }
-
-    pub async fn delete_recent_workspace_group(
-        &self,
-        target: &RecentWorkspace,
-    ) -> Result<Vec<WorkspaceId>> {
-        let target_paths = &target.identity_paths;
-
-        let mut workspace_ids = Vec::new();
-        for (workspace_id, paths, identity_paths, _, _) in
-            self.recent_workspaces()?
-        {
-            if &identity_paths.unwrap_or(paths) == target_paths {
-                workspace_ids.push(workspace_id);
-            }
-        }
-
-        futures::future::join_all(
-            workspace_ids
-                .iter()
-                .copied()
-                .map(|workspace_id| self.delete_workspace_by_id(workspace_id)),
-        )
-        .await;
-
-        Ok(workspace_ids)
-    }
-
-    pub async fn garbage_collect_workspaces(
-        &self,
-        fs: &dyn Fs,
-        current_session_id: &str,
-        last_session_id: Option<&str>,
-    ) -> Result<()> {
-        let now = Utc::now();
-        let mut workspaces_to_delete = Vec::new();
-        for (id, paths, _identity_paths_hint, session_id, timestamp) in
-            self.recent_workspaces()?
-        {
-            if let Some(session_id) = session_id.as_deref() {
-                if session_id == current_session_id || Some(session_id) == last_session_id {
-                    continue;
-                }
-            }
-
-            if contains_wsl_path(&paths) {
-                workspaces_to_delete.push(id);
-                continue;
-            }
-
-            if !Self::all_paths_exist_with_a_directory(paths.paths(), fs).await
-                && now - timestamp >= chrono::Duration::days(7)
-            {
-                workspaces_to_delete.push(id);
-            }
-        }
-
-        futures::future::join_all(
-            workspaces_to_delete
-                .into_iter()
-                .map(|id| self.delete_workspace_by_id(id)),
-        )
-        .await;
-        Ok(())
-    }
-
-    pub async fn last_workspace(&self, fs: &dyn Fs) -> Result<Option<RecentWorkspace>> {
-        Ok(self.recent_project_workspaces(fs).await?.into_iter().next())
-    }
-
-    // Returns the locations of the workspaces that were still opened when the last
-    // session was closed (i.e. when Zed was quit).
-    // If `last_session_window_order` is provided, the returned locations are ordered
-    // according to that.
-    pub async fn last_session_workspace_locations(
-        &self,
-        last_session_id: &str,
-        last_session_window_stack: Option<Vec<WindowId>>,
-        fs: &dyn Fs,
-    ) -> Result<Vec<SessionWorkspace>> {
-        let mut workspaces = Vec::new();
-
-        for (workspace_id, paths, window_id) in
-            self.session_workspaces(last_session_id.to_owned())?
-        {
-            let window_id = window_id.map(WindowId::from);
-
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
-                workspaces.push(SessionWorkspace {
-                    workspace_id,
-                    location: SerializedWorkspaceLocation::Local,
-                    paths,
-                    window_id,
-                });
-            }
-        }
-
-        if let Some(stack) = last_session_window_stack {
-            workspaces.sort_by_key(|workspace| {
-                workspace
-                    .window_id
-                    .and_then(|id| stack.iter().position(|&order_id| order_id == id))
-                    .unwrap_or(usize::MAX)
-            });
-        }
-
-        Ok(workspaces)
     }
 
     fn get_center_pane_group(&self, workspace_id: WorkspaceId) -> Result<SerializedPaneGroup> {
@@ -1807,45 +1398,6 @@ VALUES {placeholders};"#
         }
     }
 
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecentWorkspace {
-    pub workspace_id: WorkspaceId,
-    pub location: SerializedWorkspaceLocation,
-    pub paths: PathList,
-    pub identity_paths: PathList,
-    pub timestamp: DateTime<Utc>,
-}
-
-impl RecentWorkspace {
-    pub fn project_group_key(&self) -> ProjectGroupKey {
-        ProjectGroupKey::new(None, self.identity_paths.clone())
-    }
-}
-
-async fn resolve_local_workspace_identity(_fs: &dyn Fs, _paths: &PathList) -> Option<PathList> {
-    None
-}
-
-fn dedupe_recent_workspaces(
-    workspaces: impl IntoIterator<Item = RecentWorkspace>,
-) -> Vec<RecentWorkspace> {
-    let mut indices_by_key: HashMap<Vec<PathBuf>, usize> = HashMap::default();
-    let mut result: Vec<RecentWorkspace> = Vec::new();
-    for workspace in workspaces {
-        let key = workspace.identity_paths.paths().to_vec();
-        if let Some(&existing_index) = indices_by_key.get(&key) {
-            if workspace.timestamp > result[existing_index].timestamp {
-                result[existing_index] = workspace;
-            }
-        } else {
-            indices_by_key.insert(key, result.len());
-            result.push(workspace);
-        }
-    }
-
-    result
 }
 
 pub fn delete_unloaded_items(

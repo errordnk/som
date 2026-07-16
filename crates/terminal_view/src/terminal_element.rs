@@ -763,6 +763,20 @@ impl TerminalElement {
             self.interactivity.on_scroll_wheel({
                 let terminal_view = self.terminal_view.downgrade();
                 move |e, window, cx| {
+                    // Ctrl+wheel (Cmd+wheel on macOS) zooms the terminal font,
+                    // matching the standard convention used by browsers and
+                    // most terminal emulators — same session-only font-size
+                    // adjustment as Ctrl+=/Ctrl+-.
+                    if e.modifiers.secondary() {
+                        let line_height = px(1.0);
+                        let y_delta = e.delta.pixel_delta(line_height).y;
+                        if y_delta > Pixels::ZERO {
+                            theme_settings::increase_buffer_font_size(cx);
+                        } else if y_delta < Pixels::ZERO {
+                            theme_settings::decrease_buffer_font_size(cx);
+                        }
+                        return;
+                    }
                     terminal_view
                         .update(cx, |terminal_view, cx| {
                             if matches!(terminal_view.mode, TerminalMode::Standalone)

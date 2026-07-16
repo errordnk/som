@@ -1,6 +1,5 @@
 mod application_menu;
 pub mod collab;
-mod onboarding_banner;
 mod title_bar_settings;
 
 use crate::application_menu::ApplicationMenu;
@@ -32,9 +31,6 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{MultiWorkspace, ToggleWorktreeSecurity, Workspace};
-
-
-pub use onboarding_banner::restore_banner;
 
 /// A plain div-based button for use as PopoverMenu trigger, matching window control hover style.
 struct TitleBarButton {

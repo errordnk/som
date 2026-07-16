@@ -99,7 +99,10 @@ impl Default for LogConfig {
 pub struct FontConfig {
     pub face: Option<String>,
     pub size: Option<f32>,
-    pub weight: Option<String>,
+    /// Integer 100-900 (same scale as Zed's own `buffer_font_weight`/
+    /// `terminal.font_weight` — 400 = normal, 700 = bold). Values outside
+    /// that range are clamped by Zed's own settings pipeline, not here.
+    pub weight: Option<f32>,
     pub line_height: Option<f32>,
     /// OpenType feature tag -> value. Accepts `true`/`false` (e.g. `{"calt":
     /// false}` to disable ligatures) as well as integers (e.g. `{"cv01": 7}`
@@ -346,6 +349,10 @@ impl SomConfig {
         }
         if let Some(size) = self.font.size {
             terminal_parts.push(format!("\"font_size\": {}", size));
+        }
+        if let Some(weight) = self.font.weight {
+            terminal_parts.push(format!("\"font_weight\": {}", weight));
+            parts.push(format!("\"buffer_font_weight\": {}", weight));
         }
         if let Some(lh) = self.font.line_height {
             terminal_parts.push(format!("\"line_height\": {{ \"custom\": {} }}", lh));

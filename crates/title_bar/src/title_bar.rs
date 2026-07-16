@@ -461,6 +461,7 @@ impl TitleBar {
                                 local: false,
                                 tab_name: Some(tab_name.clone()),
                                 shell: tab_shell.clone(),
+                                missing_profile_index: None,
                             }), cx);
                         })),
                 )
@@ -534,6 +535,7 @@ impl TitleBar {
                                                         local: false,
                                                         tab_name: Some(name_for_action.clone()),
                                                         shell: shell.clone(),
+                                                        missing_profile_index: None,
                                                     }),
                                                     cx,
                                                 );

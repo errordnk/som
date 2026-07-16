@@ -32,19 +32,7 @@ This document describes every user-facing feature of Som and every option in `~/
 
 All fields are optional; anything you omit falls back to the shipped default for your platform. Unknown keys are silently ignored (no error), so a typo in a key name will not warn you — double-check spelling against this table.
 
-### `env`
-
-```json
-"env": {}
-```
-Declared but **currently not applied anywhere** — setting environment variables here has no effect. (See [Known gaps](#known-gaps-between-docs-and-behavior).)
-
-### `general`
-
-| Key | Type | Effect |
-|---|---|---|
-| `general.bell` | string (`"system"` / `"off"`) | **Currently not applied** despite being present in the shipped defaults — has no effect regardless of value. |
-| `general.copyOnSelect` | bool | Auto-copies your selection to the clipboard. Applied correctly. |
+Two behaviors are fixed and not configurable: the terminal bell is always silent (no setting to turn on a system alert sound), and copy-on-select (auto-copying your selection to the clipboard) is always on.
 
 ### `window`
 
@@ -54,6 +42,7 @@ Declared but **currently not applied anywhere** — setting environment variable
 | `window.mode` | `"windowed"` (default) / `"maximized"` / `"minimized"` / `"fullscreen"` | Initial window placement, applied on every launch (not just first run). `"windowed"` remembers its position/size in `db.json` (see [Session persistence](#session-persistence-dbjson)) — moving or resizing the window updates that automatically. If no geometry has been remembered yet, it defaults to the display size minus 100px in each dimension, positioned 50px from the top-left. |
 | `window.opacity` | number | **Currently not applied.** |
 | `window.padding.{top,bottom,left,right}` | number, pixels | Inset between the OS window edge and Som's content (title bar included), on that side. `0` (default) means no inset. |
+| `window.selection` | hex string, e.g. `"#88c0d0"` | Terminal selection-highlight color (the background behind text you've selected with the mouse). Also recolors a few other accent-colored UI bits as a side effect (e.g. search-match highlighting), since it shares the theme's single `text.accent` color rather than being terminal-specific. |
 
 ### `log`
 
@@ -241,8 +230,5 @@ Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` defaul
 
 These are documented here deliberately rather than silently ignored, so you don't spend time debugging a setting that simply doesn't do anything yet:
 
-- **`general.bell` is parsed but never applied.** Setting it to `"off"` or `"system"` has no effect either way.
 - **`window.opacity` and `font.weight` are parsed but never applied.** They're present in the shipped default files but currently do nothing.
-- **`env` (top-level environment variables) is parsed but never applied.**
-- **macOS and Linux default templates have a shape mismatch:** their `bell`, `copyOnSelect`, `selection`, and `theme` keys are at the top level of the JSON, but Som's config loader expects them nested under `general.*`/`window.*`. As shipped, this means on macOS/Linux those four values are silently ignored no matter what the template file says — only Windows' template is nested correctly. If you're on macOS/Linux and want `copyOnSelect`/`theme`/`bell` to actually apply, nest them explicitly: `{"general": {"bell": "off", "copyOnSelect": true}, "window": {"theme": "Nord Dark"}}`.
 - **Only the Windows default template wires up `Ctrl+Shift+2`..`9` for additional tab profiles.** The macOS/Linux templates only bind profile 1 (bound twice, redundantly) — if you add more profiles on those platforms, you'll need to add your own `keys` entries (e.g. `"cmd-shift-2": "New2"`) to reach them.

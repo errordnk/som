@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static START_MINIMIZED: AtomicBool = AtomicBool::new(false);
 use http_client::read_proxy_from_env;
 use collections::HashMap;
-use db::kvp::KeyValueStore;
 use fs::RealFs;
 use futures::StreamExt;
 use gpui::{
@@ -317,10 +316,7 @@ fn main() {
 
     let app_db = db::AppDatabase::new();
     let session_id = Uuid::new_v4().to_string();
-    let session = app.background_executor().spawn(Session::new(
-        session_id.clone(),
-        KeyValueStore::from_app_db(&app_db),
-    ));
+    let session = Session::new(session_id.clone());
     let _background_executor = app.background_executor();
 
     let (open_listener, mut open_rx) = OpenListener::new();
@@ -404,9 +400,7 @@ fn main() {
         zed::init(cx);
         project::Project::init(cx);
 
-        let session = cx.foreground_executor().block_on(session);
-
-        let app_session = cx.new(|cx| AppSession::new(session, cx));
+        let app_session = cx.new(|_cx| AppSession::new(session));
 
         let app_state = Arc::new(AppState {
             fs: fs.clone(),

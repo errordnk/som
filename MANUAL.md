@@ -51,9 +51,9 @@ Declared but **currently not applied anywhere** — setting environment variable
 | Key | Type | Effect |
 |---|---|---|
 | `window.theme` | string | Active theme name (e.g. `"Nord Dark"`). Applied correctly. |
-| `window.mode` | string | **Currently not applied** — declared and shipped (`"Maximized"` on Windows) but has no effect. |
+| `window.mode` | `"windowed"` (default) / `"maximized"` / `"minimized"` / `"fullscreen"` | Initial window placement, applied on every launch (not just first run). `"windowed"` remembers its position/size in `db.json` (see [Session persistence](#session-persistence-dbjson)) — moving or resizing the window updates that automatically. If no geometry has been remembered yet, it defaults to the display size minus 100px in each dimension, positioned 50px from the top-left. |
 | `window.opacity` | number | **Currently not applied.** |
-| `window.padding.{top,bottom,left,right}` | number | **Currently not applied.** |
+| `window.padding.{top,bottom,left,right}` | number, pixels | Inset between the OS window edge and Som's content (title bar included), on that side. `0` (default) means no inset. |
 
 ### `log`
 
@@ -70,9 +70,24 @@ Declared but **currently not applied anywhere** — setting environment variable
 | `font.size` | number | Terminal font size (px). |
 | `font.weight` | string | **Currently not applied** — declared and shipped but has no effect. |
 | `font.lineHeight` | number | Terminal line height multiplier. |
-| `font.features` | object (OpenType tag → bool), e.g. `{"calt": true}` | **Currently not applied — see the ligatures note below.** |
+| `font.features` | object (OpenType feature tag → `true`/`false` or a non-negative integer) | OpenType font features — see [Ligatures and font features](#ligatures-and-font-features) below. |
 
-**Ligatures:** Som's tagline mentions ligatures, but as shipped, ligatures are **off by default** and `font.features` (the field that looks like it should control this) is parsed and then silently dropped — it never reaches the terminal renderer. There is currently no supported way to turn ligatures on from `settings.json`. If you need them, you'd have to hand-edit the file to include a raw Zed-schema `terminal.font_features` block (`{"terminal": {"font_features": {"calt": true}}}`) merged at the top level — untested, and may be overwritten by Som's own settings writer on the next change.
+#### Ligatures and font features
+
+`font.features` maps a 4-character OpenType feature tag to either a boolean (`true`/`false`, enable/disable) or an integer (for features with multiple variants, like stylistic sets). This mirrors Zed's own `terminal.font_features`/`buffer_font_features` format exactly:
+
+```json
+"font": {
+  "face": "FiraCode Nerd Font",
+  "features": {
+    "calt": true,
+    "cv02": 1,
+    "cv01": 7
+  }
+}
+```
+
+`calt` is the standard OpenType tag for contextual alternates, which is what most fonts (including FiraCode, Cascadia Code, JetBrains Mono) use to draw ligatures like `->`, `=>`, `!=`, `>=`, `&&` as single joined glyphs. **Ligatures are off by default** — set `"calt": true` to turn them on (the font itself must support ligatures; Som doesn't synthesize them). Invalid tags (not exactly 4 alphanumeric characters) or invalid values (anything other than a boolean or non-negative integer) are logged and skipped rather than breaking the rest of your settings.
 
 ### `cursor`
 
@@ -191,9 +206,9 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 
 ## Session persistence (db.json)
 
-Som remembers your open tabs, their split layout, and (for `tmux: true` tabs) their remote session IDs in `~/.config/som/db.json`, so relaunching Som puts you back where you left off — including reattaching to still-running remote shells rather than starting fresh ones.
+Som remembers your open tabs, their split layout, (for `tmux: true` tabs) their remote session IDs, and — when `window.mode` is `"windowed"` — the window's last position and size, all in `~/.config/som/db.json`. Relaunching Som puts you back where you left off, including reattaching to still-running remote shells rather than starting fresh ones.
 
-This file is rewritten automatically whenever you open/close a tab or split, switch tabs, or quit — you shouldn't need to touch it directly. If it's ever missing or corrupted, Som just falls back to a single empty tab rather than failing to start.
+This file is rewritten automatically whenever you open/close a tab or split, switch tabs, resize/move the window, or quit — you shouldn't need to touch it directly. If it's ever missing or corrupted, Som just falls back to a single empty tab (and default window placement) rather than failing to start.
 
 ## Restore on launch
 
@@ -226,9 +241,8 @@ Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` defaul
 
 These are documented here deliberately rather than silently ignored, so you don't spend time debugging a setting that simply doesn't do anything yet:
 
-- **`font.features` (ligatures) is parsed but never applied.** There's currently no working way to enable ligatures from `settings.json`, despite it being a headline feature of the project. See the [font](#font) section above.
 - **`general.bell` is parsed but never applied.** Setting it to `"off"` or `"system"` has no effect either way.
-- **`window.mode`, `window.opacity`, `window.padding`, and `font.weight` are parsed but never applied.** They're present in the shipped default files but currently do nothing.
+- **`window.opacity` and `font.weight` are parsed but never applied.** They're present in the shipped default files but currently do nothing.
 - **`env` (top-level environment variables) is parsed but never applied.**
 - **macOS and Linux default templates have a shape mismatch:** their `bell`, `copyOnSelect`, `selection`, and `theme` keys are at the top level of the JSON, but Som's config loader expects them nested under `general.*`/`window.*`. As shipped, this means on macOS/Linux those four values are silently ignored no matter what the template file says — only Windows' template is nested correctly. If you're on macOS/Linux and want `copyOnSelect`/`theme`/`bell` to actually apply, nest them explicitly: `{"general": {"bell": "off", "copyOnSelect": true}, "window": {"theme": "Nord Dark"}}`.
 - **Only the Windows default template wires up `Ctrl+Shift+2`..`9` for additional tab profiles.** The macOS/Linux templates only bind profile 1 (bound twice, redundantly) — if you add more profiles on those platforms, you'll need to add your own `keys` entries (e.g. `"cmd-shift-2": "New2"`) to reach them.

@@ -1279,6 +1279,11 @@ impl Window {
         } = options;
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let restore_state = match window_bounds {
+            WindowBounds::Maximized(_) => crate::WindowOpenState::Maximized,
+            WindowBounds::Fullscreen(_) => crate::WindowOpenState::Fullscreen,
+            WindowBounds::Windowed(_) => crate::WindowOpenState::Windowed,
+        };
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1296,6 +1301,7 @@ impl Window {
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
                 start_minimized,
+                restore_state,
             },
         )?;
 
@@ -1326,10 +1332,20 @@ impl Window {
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
         platform_window.set_background_appearance(window_background);
 
-        match window_bounds {
-            WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
-            WindowBounds::Maximized(_) => platform_window.zoom(),
-            WindowBounds::Windowed(_) => {}
+        // A minimized window's platform backend already received `restore_
+        // state` (see `WindowParams` above) and is responsible for restoring
+        // into the right state itself once un-minimized — calling `zoom`/
+        // `toggle_fullscreen` here as well would fight that: on Windows,
+        // `zoom`'s not-yet-visible fallback overwrites the pending
+        // `Minimized` placement with a plain `Maximized` one, discarding the
+        // "stay minimized" request entirely (the window opens instead of
+        // minimizing to the taskbar).
+        if !start_minimized {
+            match window_bounds {
+                WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
+                WindowBounds::Maximized(_) => platform_window.zoom(),
+                WindowBounds::Windowed(_) => {}
+            }
         }
 
         let accessibility_force_disabled = cx.accessibility_force_disabled;

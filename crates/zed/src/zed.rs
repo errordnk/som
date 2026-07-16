@@ -36,7 +36,7 @@ use workspace::notifications::simple_message_notification::MessageNotification;
 use workspace::{
     AppState, CloseWindow, MultiWorkspace, NewWindow, Workspace, WorkspaceSettings,
     open_new, with_active_or_new_workspace,
-    CloseIntent, OpenLog, RestoreBanner,
+    CloseIntent, OpenLog,
 };
 use zed_actions::{About, OpenBrowser, OpenSettingsFile, OpenZedUrl, Quit};
 
@@ -68,8 +68,6 @@ pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(quit);
-
-    cx.on_action(|_: &RestoreBanner, cx| title_bar::restore_banner(cx));
 
     cx.on_action(|_: &OpenLog, cx| {
         with_active_or_new_workspace(cx, |workspace, window, cx| {

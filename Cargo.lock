@@ -7883,8 +7883,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrayvec",
- "chrono",
- "db",
  "fs",
  "gpui",
  "platform_title_bar",

@@ -277,8 +277,6 @@ actions!(
         ClearTrustedWorktrees,
         /// Stops following a collaborator.
         Unfollow,
-        /// Restores the banner.
-        RestoreBanner,
         /// Toggles expansion of the selected item.
         ToggleExpandItem,
     ]
@@ -1375,7 +1373,7 @@ impl AppState {
 
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         <dyn Fs>::set_global(fs.clone(), cx);
-        let session = cx.new(|cx| AppSession::new(Session::test()));
+        let session = cx.new(|_cx| AppSession::new(Session::test()));
 
         theme_settings::init(theme::LoadThemes::JustBase, cx);
 
@@ -2317,40 +2315,34 @@ impl Workspace {
         })
     }
 
+    /// Reads a panel's remembered size from `~/.config/som/db.json` (see
+    /// `som_db::load_dock_panel_size`). No panel is ever actually docked in
+    /// Som (there's no `add_panel` call site anymore — see the docked
+    /// Terminal Panel removal), so in practice `panel_key` never matches
+    /// anything on disk; this exists so the (currently unreachable through
+    /// any real UI) generic dock-resize code paths below don't need special
+    /// casing.
     pub fn persisted_panel_size_state(
         &self,
         panel_key: &'static str,
         cx: &App,
     ) -> Option<dock::PanelSizeState> {
-        dock::Dock::load_persisted_size_state(self, panel_key, cx)
+        let _ = cx;
+        som_db::load_dock_panel_size(panel_key)
     }
 
+    /// Writes a panel's size to `~/.config/som/db.json`. See the doc comment
+    /// on `persisted_panel_size_state` — this is dead in practice for Som
+    /// today (no panel is ever docked) but kept working so the generic dock
+    /// code doesn't silently drop state if a panel is added back later.
     pub fn persist_panel_size_state(
         &self,
         panel_key: &str,
         size_state: dock::PanelSizeState,
         cx: &mut App,
     ) {
-        let Some(workspace_id) = self
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(self.session_id())
-        else {
-            return;
-        };
-
-        let kvp = db::kvp::KeyValueStore::global(cx);
-        let panel_key = panel_key.to_string();
-        cx.background_spawn(async move {
-            let scope = kvp.scoped(dock::PANEL_SIZE_STATE_KEY);
-            scope
-                .write(
-                    format!("{workspace_id}:{panel_key}"),
-                    serde_json::to_string(&size_state)?,
-                )
-                .await
-        })
-        .detach_and_log_err(cx);
+        let _ = cx;
+        som_db::save_dock_panel_size(panel_key.to_string(), size_state.size.map(f32::from), size_state.flex);
     }
 
     pub fn set_panel_size_state<T: Panel>(
@@ -6919,7 +6911,7 @@ impl Workspace {
     pub fn test_new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         use session::Session;
 
-        let session = cx.new(|cx| AppSession::new(Session::test()));
+        let session = cx.new(|_cx| AppSession::new(Session::test()));
         window.activate_window();
         let app_state = Arc::new(AppState {
             fs: project.read(cx).fs().clone(),

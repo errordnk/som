@@ -52,10 +52,7 @@ use theme::{ActiveTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
 use util::ResultExt;
 use uuid::Uuid;
-use workspace::{
-    AppState, MultiWorkspace, SessionWorkspace, Toast,
-    WorkspaceSettings, WorkspaceStore, notifications::NotificationId, restore_multiworkspace,
-};
+use workspace::{AppState, WorkspaceSettings, WorkspaceStore};
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
     derive_paths_with_position, handle_keymap_file_changes, initialize_workspace,
@@ -520,14 +517,6 @@ fn main() {
             })
         }
 
-        let (current_session_id, last_session_id) = {
-            let session = app_state.session.read(cx);
-            (
-                session.id().to_owned(),
-                session.last_session_id().map(|id| id.to_owned()),
-            )
-        };
-
         let restore_task = match open_rx
             .try_recv()
             .ok()
@@ -555,20 +544,10 @@ fn main() {
             }),
         };
 
-        cx.spawn({
-            let db = workspace::WorkspaceDb::global(cx);
-            let fs = app_state.fs.clone();
-            async move |_cx| {
-                restore_task.await;
-                db.garbage_collect_workspaces(
-                    fs.as_ref(),
-                    &current_session_id,
-                    last_session_id.as_deref(),
-                )
-                .await
-            }
+        cx.spawn(async move |_cx| {
+            restore_task.await;
         })
-        .detach_and_log_err(cx);
+        .detach();
 
         let app_state = app_state.clone();
 
@@ -667,185 +646,30 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     }
 }
 
+/// Som always opens exactly one window on launch — there is no "recent
+/// projects"/multi-window session restore (Zed inheritance, deliberately
+/// dropped: Som has no file/project concept for those to apply to, and
+/// there's only ever one window). Whatever tabs/splits/panes existed
+/// previously are restored independently via `SomTabsRestorer`/`db.json`
+/// (see `restore_som_tabs` in `terminal_view::terminal_panel`), regardless
+/// of which window-open path creates the window.
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
-        let mut error_count = 0;
-        for multi_workspace in multi_workspaces {
-            let result = restore_multiworkspace(multi_workspace, app_state.clone(), cx)
-                .await
-                .map(|_| ());
-
-            if let Err(error) = result {
-                log::error!("Failed to restore workspace: {error:#}");
-                error_count += 1;
-            }
-        }
-
-        if error_count > 0 {
-            let message = if error_count == 1 {
-                "Failed to restore 1 workspace. Check logs for details.".to_string()
-            } else {
-                format!(
-                    "Failed to restore {} workspaces. Check logs for details.",
-                    error_count
-                )
-            };
-
-            // Try to find an active workspace to show the toast
-            let toast_shown = cx.update(|cx| {
-                if let Some(window) = cx.active_window()
-                    && let Some(multi_workspace) = window.downcast::<MultiWorkspace>()
-                {
-                    multi_workspace
-                        .update(cx, |multi_workspace, _, cx| {
-                            multi_workspace.workspace().update(cx, |workspace, cx| {
-                                workspace.show_toast(
-                                    Toast::new(NotificationId::unique::<()>(), message.clone()),
-                                    cx,
-                                )
-                            });
-                        })
-                        .ok();
-                    return true;
-                }
-                false
-            });
-
-            // If we couldn't show a toast (no windows opened successfully),
-            // open a fallback empty workspace and show the error there
-            if !toast_shown {
-                log::error!("All workspace restorations failed. Opening fallback empty workspace.");
-                cx.update(|cx| {
-                    workspace::open_new(
-                        Default::default(),
-                        app_state.clone(),
-                        cx,
-                        |workspace, _window, cx| {
-                            workspace.show_toast(
-                                Toast::new(NotificationId::unique::<()>(), message),
-                                cx,
-                            );
-                        },
-                    )
-                })
-                .await?;
-            }
-        }
-
-        // If the user cancelled a failed remote connection at startup,
-        // open_remote_project returns Ok but removes the window, so error_count
-        // stays 0 and the toast fallback above does not trigger. Without this
-        // check, Zed would exit silently.
-        if cx.update(|cx| cx.windows().is_empty()) {
-            cx.update(|cx| {
-                workspace::open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        open_terminal_in_workspace(workspace, window, cx);
-                    },
-                )
-            })
-            .await?;
-        }
-    } else {
-        cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    open_terminal_in_workspace(workspace, window, cx);
-                },
-            )
-        })
-        .await?;
-    }
+    cx.update(|cx| {
+        workspace::open_new(
+            Default::default(),
+            app_state,
+            cx,
+            |workspace, window, cx| {
+                open_terminal_in_workspace(workspace, window, cx);
+            },
+        )
+    })
+    .await?;
 
     Ok(())
-}
-
-async fn restorable_workspaces(
-    cx: &mut AsyncApp,
-    app_state: &Arc<AppState>,
-) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
-    let locations = restorable_workspace_locations(cx, app_state).await?;
-    Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
-}
-
-pub(crate) async fn restorable_workspace_locations(
-    cx: &mut AsyncApp,
-    app_state: &Arc<AppState>,
-) -> Option<Vec<SessionWorkspace>> {
-    let (mut restore_behavior, db) = cx.update(|cx| {
-        (
-            WorkspaceSettings::get(None, cx).restore_on_startup,
-            workspace::WorkspaceDb::global(cx),
-        )
-    });
-
-    let session_handle = app_state.session.clone();
-    let (last_session_id, last_session_window_stack) = cx.update(|cx| {
-        let session = session_handle.read(cx);
-
-        (
-            session.last_session_id().map(|id| id.to_string()),
-            session.last_session_window_stack(),
-        )
-    });
-
-    if last_session_id.is_none()
-        && matches!(
-            restore_behavior,
-            workspace::RestoreOnStartupBehavior::LastSession
-        )
-    {
-        restore_behavior = workspace::RestoreOnStartupBehavior::LastWorkspace;
-    }
-
-    match restore_behavior {
-        workspace::RestoreOnStartupBehavior::LastWorkspace => {
-            workspace::last_opened_workspace_location(&db, app_state.fs.as_ref())
-                .await
-                .map(|(workspace_id, location, paths)| {
-                    vec![SessionWorkspace {
-                        workspace_id,
-                        location,
-                        paths,
-                        window_id: None,
-                    }]
-                })
-        }
-        workspace::RestoreOnStartupBehavior::LastSession => {
-            if let Some(last_session_id) = last_session_id {
-                let ordered = last_session_window_stack.is_some();
-
-                let mut locations = workspace::last_session_workspace_locations(
-                    &db,
-                    &last_session_id,
-                    last_session_window_stack,
-                    app_state.fs.as_ref(),
-                )
-                .await
-                .filter(|locations| !locations.is_empty());
-
-                // Since last_session_window_order returns the windows ordered front-to-back
-                // we need to open the window that was frontmost last.
-                if ordered && let Some(locations) = locations.as_mut() {
-                    locations.reverse();
-                }
-
-                locations
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
 }
 
 fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {

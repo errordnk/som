@@ -7626,7 +7626,6 @@ dependencies = [
  "async-channel 2.5.0",
  "async-recursion",
  "collections",
- "db",
  "dirs",
  "futures",
  "gpui",

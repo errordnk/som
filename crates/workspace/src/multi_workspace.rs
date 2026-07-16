@@ -413,12 +413,6 @@ impl MultiWorkspace {
         self.apply_open_sidebar(cx);
     }
 
-    /// Restores the sidebar to open state from persisted session data without
-    /// firing a telemetry event, since this is not a user-initiated action.
-    pub(crate) fn restore_open_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.apply_open_sidebar(cx);
-    }
-
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = true;
         self.retain_active_workspace(cx);
@@ -1645,9 +1639,7 @@ impl MultiWorkspace {
 
     /// Assigns random database IDs to all retained workspaces, flushes
     /// workspace serialization (SQLite) and multi-workspace state (KVP),
-    /// and writes session bindings so the serialized data can be read
-    /// back by `last_session_workspace_locations` +
-    /// `read_serialized_multi_workspaces`.
+    /// and writes session bindings.
     #[cfg(any(test, feature = "test-support"))]
     pub fn flush_all_serialization(
         &mut self,

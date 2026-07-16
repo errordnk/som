@@ -3,7 +3,6 @@ use crate::persistence::model::DockData;
 use crate::{DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceSettings};
 use crate::Workspace;
 use anyhow::Context as _;
-use db::kvp::KeyValueStore;
 
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
@@ -334,8 +333,6 @@ pub struct PanelButtons {
     dock: Entity<Dock>,
     _settings_subscription: Subscription,
 }
-
-pub(crate) const PANEL_SIZE_STATE_KEY: &str = "dock_panel_size";
 
 fn panel_uses_flexible_width(
     position: DockPosition,
@@ -1039,23 +1036,6 @@ impl Dock {
         }
     }
 
-    pub(crate) fn load_persisted_size_state(
-        workspace: &Workspace,
-        panel_key: &'static str,
-        cx: &App,
-    ) -> Option<PanelSizeState> {
-        let workspace_id = workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())?;
-        let kvp = KeyValueStore::global(cx);
-        let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
-        scope
-            .read(&format!("{workspace_id}:{panel_key}"))
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<PanelSizeState>(&json).log_err())
-    }
 }
 
 impl Render for Dock {

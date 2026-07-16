@@ -225,6 +225,62 @@ pub fn save_window_bounds_to_som_db(bounds: SomWindowBounds) {
     save_som_db(&state);
 }
 
+/// Dock panel size persistence — kept in its own small file
+/// (`~/.config/som/dock_panel_sizes.json`), separate from the main
+/// `db.json`, since it's unrelated to tabs/window geometry and (as of this
+/// writing) no panel is ever actually docked in Som — there's no
+/// `add_panel` call site since the docked Terminal Panel was removed. This
+/// exists purely so `Workspace::persist_panel_size_state`'s generic dock
+/// code has somewhere to write without depending on SQLite; in practice
+/// the file is never created because nothing ever calls
+/// `save_dock_panel_size` in Som today.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DockPanelSizesFile {
+    #[serde(default)]
+    panels: std::collections::HashMap<String, DockPanelSizeEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct DockPanelSizeEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flex: Option<f32>,
+}
+
+fn dock_panel_sizes_path() -> PathBuf {
+    paths::config_dir().join("dock_panel_sizes.json")
+}
+
+fn load_dock_panel_sizes_file() -> DockPanelSizesFile {
+    let Ok(contents) = std::fs::read_to_string(dock_panel_sizes_path()) else {
+        return DockPanelSizesFile::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+pub fn load_dock_panel_size(panel_key: &str) -> Option<crate::dock::PanelSizeState> {
+    let file = load_dock_panel_sizes_file();
+    let entry = file.panels.get(panel_key)?;
+    Some(crate::dock::PanelSizeState {
+        size: entry.size.map(gpui::px),
+        flex: entry.flex,
+    })
+}
+
+pub fn save_dock_panel_size(panel_key: String, size: Option<f32>, flex: Option<f32>) {
+    let mut file = load_dock_panel_sizes_file();
+    file.panels.insert(panel_key, DockPanelSizeEntry { size, flex });
+    let Ok(json) = serde_json::to_string_pretty(&file) else {
+        return;
+    };
+    let path = dock_panel_sizes_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

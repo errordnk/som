@@ -325,6 +325,80 @@ pub fn save_multi_workspace_state<T: Serialize>(state: &T) {
     let _ = std::fs::write(path, json);
 }
 
+/// Trusted-worktree paths (which directories the user has explicitly
+/// approved for language-server/extension execution when opened over
+/// SSH/WSL/locally) — security-relevant state, previously a proper
+/// relational SQLite table (`trusted_worktrees`, with `absolute_path`/
+/// `user_name`/`host_name` columns). Preserved as a flat JSON file with the
+/// exact same semantics (a set of trusted absolute paths per remote host,
+/// or per "local machine" when there's no host) rather than simplified or
+/// dropped, since this gates a real security prompt.
+///
+/// `RemoteHostLocation` (from the `project` crate) doesn't derive
+/// `Serialize`/`Deserialize`, so hosts are represented here as their two
+/// plain fields instead of reusing that type directly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SomTrustedHost {
+    pub user_name: Option<String>,
+    pub host_identifier: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TrustedWorktreesFile {
+    /// `None` host = paths trusted on the local machine (not over SSH/WSL).
+    #[serde(default)]
+    entries: Vec<TrustedWorktreesEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TrustedWorktreesEntry {
+    #[serde(default)]
+    host: Option<SomTrustedHost>,
+    paths: Vec<PathBuf>,
+}
+
+fn trusted_worktrees_path() -> PathBuf {
+    paths::config_dir().join("trusted_worktrees.json")
+}
+
+pub fn load_trusted_worktrees()
+-> collections::HashMap<Option<SomTrustedHost>, collections::HashSet<PathBuf>> {
+    let Ok(contents) = std::fs::read_to_string(trusted_worktrees_path()) else {
+        return Default::default();
+    };
+    let file: TrustedWorktreesFile = serde_json::from_str(&contents).unwrap_or_default();
+    file.entries
+        .into_iter()
+        .map(|entry| (entry.host, entry.paths.into_iter().collect()))
+        .collect()
+}
+
+pub fn save_trusted_worktrees(
+    trusted: collections::HashMap<Option<SomTrustedHost>, collections::HashSet<PathBuf>>,
+) {
+    let file = TrustedWorktreesFile {
+        entries: trusted
+            .into_iter()
+            .map(|(host, paths)| TrustedWorktreesEntry {
+                host,
+                paths: paths.into_iter().collect(),
+            })
+            .collect(),
+    };
+    let Ok(json) = serde_json::to_string_pretty(&file) else {
+        return;
+    };
+    let path = trusted_worktrees_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
+pub fn clear_trusted_worktrees() {
+    let _ = std::fs::remove_file(trusted_worktrees_path());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

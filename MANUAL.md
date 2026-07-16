@@ -126,6 +126,8 @@ A flat map of keystroke → action name. User entries are merged on top of the p
 
 Recognized action names: `Copy`, `Paste`, `CloseTab`, `NewPane`, `UnSplitTab`, `ClosePane`, `NextPane`, `PrevPane`, `NextTab`, `PrevTab`, `Quit`, `IncreaseFont`, `DecreaseFont`, `ResetFont`, `NewTab`, `NewTab1`..`NewTab10`. Any other string is silently ignored — no binding is created and no error is shown, so check spelling carefully against this list.
 
+`NewTab1`..`NewTab10` open `tabs[0]`..`tabs[9]` by position — if settings.json has fewer profiles than that (e.g. `NewTab9` with only 5 `tabs[]` entries), pressing that key shows a "No profile #9…" notification instead of silently opening a different profile. Bare `NewTab` can't hit this: it always resolves to the default profile (see `tabs`' `default` field above), which is guaranteed to exist.
+
 Naming convention: Som-specific tab/pane actions (`NewTab*`, `CloseTab`, `NewPane`, `ClosePane`, `PrevPane`/`NextPane`, `PrevTab`/`NextTab`) are meant to live on `Ctrl+Shift+*` combinations in the shipped defaults, keeping them clear of `Copy`/`Paste`/`Quit`/font-size shortcuts, which follow standard, non-Shift system conventions instead.
 
 Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers, e.g. `ctrl-shift-c`, `cmd-v`, `alt-f4`.

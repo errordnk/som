@@ -31,8 +31,8 @@
   "keys": {
     "cmd-c": "Copy",
     "cmd-v": "Paste",
-    "cmd-n": "New",
-    "cmd-shift-1": "New",
+    "cmd-n": "NewTab",
+    "cmd-shift-1": "NewTab1",
     "cmd-q": "Quit"
   }
 }

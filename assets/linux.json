@@ -33,8 +33,8 @@
     "ctrl-shift-c": "Copy",
     "shift-insert": "Paste",
     "ctrl-v": "Paste",
-    "ctrl-n": "New",
-    "ctrl-shift-1": "New",
+    "ctrl-n": "NewTab",
+    "ctrl-shift-1": "NewTab1",
     "alt-f4": "Quit"
   }
 }

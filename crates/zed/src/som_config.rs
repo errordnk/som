@@ -13,7 +13,7 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
         "Copy"         => Some(("terminal::Copy",                   Some("Terminal"), false)),
         "Paste"        => Some(("terminal::Paste",                  Some("Terminal"), false)),
         "CloseTab"     => Some(("workspace::SomCloseTab",            None,            false)),
-        "SplitTab"     => Some(("workspace::SomSplitPane",          None,            false)),
+        "NewPane"      => Some(("workspace::SomSplitPane",          None,            false)),
         "UnSplitTab"   => Some(("workspace::SomUnsplitPane",        None,            false)),
         "ClosePane"    => Some(("workspace::SomClosePane",          None,            false)),
         "NextPane"     => Some(("workspace::SomActivateNextPane",   Some("Terminal"), false)),
@@ -21,9 +21,9 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
         "NextTab"      => Some(("workspace::SomActivateNextTab",    Some("Terminal"), false)),
         "PrevTab"      => Some(("workspace::SomActivatePrevTab",    Some("Terminal"), false)),
         "Quit"         => Some(("zed::Quit",                        None,            false)),
-        "FontIncrease" => Some(("zed::IncreaseBufferFontSize",      None,            true)),
-        "FontDecrease" => Some(("zed::DecreaseBufferFontSize",      None,            true)),
-        "FontReset"    => Some(("zed::ResetBufferFontSize",         None,            true)),
+        "IncreaseFont" => Some(("zed::IncreaseBufferFontSize",      None,            true)),
+        "DecreaseFont" => Some(("zed::DecreaseBufferFontSize",      None,            true)),
+        "ResetFont"    => Some(("zed::ResetBufferFontSize",         None,            true)),
         _ => None,
     }
 }
@@ -223,14 +223,14 @@ impl SomConfig {
         // User-defined bindings from windows.json "keys"
         for (keystroke_raw, action_name) in &self.keys {
             let keystroke = keystroke_raw.replace('\\', "\\\\");
-            // New / New1..New9 → open tabs[0]..tabs[8] by name
-            if action_name == "New" || action_name.strip_prefix("New").map_or(false, |s| s.parse::<usize>().is_ok()) {
-                let idx = if action_name == "New" {
+            // NewTab / NewTab1..NewTab10 → open tabs[0]..tabs[9] by name
+            if action_name == "NewTab" || action_name.strip_prefix("NewTab").map_or(false, |s| s.parse::<usize>().is_ok()) {
+                let idx = if action_name == "NewTab" {
                     1
                 } else {
-                    action_name["New".len()..].parse::<usize>().unwrap_or(1)
+                    action_name["NewTab".len()..].parse::<usize>().unwrap_or(1)
                 };
-                if idx >= 1 && idx <= 9 {
+                if idx >= 1 && idx <= 10 {
                     if let Some(tab) = self.tabs.get(idx - 1) {
                         let name = tab.name.replace('"', "\\\"");
                         if let Some(shell) = &tab.shell {

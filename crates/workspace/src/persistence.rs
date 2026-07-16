@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet};
 use db::{
-    kvp::KeyValueStore,
     query,
     sqlez::{connection::Connection, domain::Domain},
     sqlez_macros::sql,
 };
-use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
+use gpui::{Axis, Bounds, Task, WindowBounds, point, size};
 use project::trusted_worktrees::{DbTrustedPaths, RemoteHostLocation};
 
 use serde::{Deserialize, Serialize};
@@ -237,22 +236,15 @@ impl From<WindowBoundsJson> for WindowBounds {
     }
 }
 
-pub async fn write_multi_workspace_state(
-    _kvp: &KeyValueStore,
-    _window_id: WindowId,
-    state: model::MultiWorkspaceState,
-) {
+pub async fn write_multi_workspace_state(state: model::MultiWorkspaceState) {
     crate::som_db::save_multi_workspace_state(&state);
 }
 
-pub fn read_default_dock_state(_kvp: &KeyValueStore) -> Option<DockStructure> {
+pub fn read_default_dock_state() -> Option<DockStructure> {
     crate::som_db::load_default_dock_state()
 }
 
-pub async fn write_default_dock_state(
-    _kvp: &KeyValueStore,
-    docks: DockStructure,
-) -> anyhow::Result<()> {
+pub async fn write_default_dock_state(docks: DockStructure) -> anyhow::Result<()> {
     crate::som_db::save_default_dock_state(&docks);
     Ok(())
 }

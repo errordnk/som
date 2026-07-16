@@ -110,7 +110,11 @@ pub struct FontConfig {
     pub size: Option<f32>,
     pub weight: Option<String>,
     pub line_height: Option<f32>,
-    pub features: HashMap<String, bool>,
+    /// OpenType feature tag -> value. Accepts `true`/`false` (e.g. `{"calt":
+    /// false}` to disable ligatures) as well as integers (e.g. `{"cv01": 7}`
+    /// to pick a stylistic-set variant) — same shape as Zed's own
+    /// `terminal.font_features`/`buffer_font_features`.
+    pub features: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -333,6 +337,35 @@ impl SomConfig {
         }
         if let Some(lh) = self.font.line_height {
             terminal_parts.push(format!("\"line_height\": {{ \"custom\": {} }}", lh));
+        }
+        if !self.font.features.is_empty() {
+            let mut feature_parts: Vec<String> = Vec::new();
+            for (tag, value) in &self.font.features {
+                let is_valid_tag = tag.len() == 4 && tag.chars().all(|c| c.is_ascii_alphanumeric());
+                if !is_valid_tag {
+                    log::warn!("Ignoring invalid font feature tag: {tag}");
+                    continue;
+                }
+                match value {
+                    serde_json::Value::Bool(enabled) => {
+                        feature_parts.push(format!("\"{tag}\": {}", if *enabled { 1 } else { 0 }));
+                    }
+                    serde_json::Value::Number(n) if n.is_u64() => {
+                        feature_parts.push(format!("\"{tag}\": {n}"));
+                    }
+                    _ => {
+                        log::warn!(
+                            "Ignoring font feature \"{tag}\": value must be true/false or a non-negative integer"
+                        );
+                    }
+                }
+            }
+            if !feature_parts.is_empty() {
+                terminal_parts.push(format!(
+                    "\"font_features\": {{ {} }}",
+                    feature_parts.join(", ")
+                ));
+            }
         }
         if let Some(shape) = &self.cursor.shape {
             terminal_parts.push(format!("\"cursor_shape\": \"{}\"", shape));

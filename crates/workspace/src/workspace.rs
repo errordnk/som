@@ -1375,7 +1375,7 @@ impl AppState {
 
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         <dyn Fs>::set_global(fs.clone(), cx);
-        let session = cx.new(|cx| AppSession::new(Session::test(), cx));
+        let session = cx.new(|cx| AppSession::new(Session::test()));
 
         theme_settings::init(theme::LoadThemes::JustBase, cx);
 
@@ -6919,7 +6919,7 @@ impl Workspace {
     pub fn test_new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         use session::Session;
 
-        let session = cx.new(|cx| AppSession::new(Session::test(), cx));
+        let session = cx.new(|cx| AppSession::new(Session::test()));
         window.activate_window();
         let app_state = Arc::new(AppState {
             fs: project.read(cx).fs().clone(),

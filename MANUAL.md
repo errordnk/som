@@ -56,7 +56,7 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 |---|---|---|
 | `font.face` | string | Terminal AND UI buffer font family. |
 | `font.size` | number | Terminal font size (px). |
-| `font.weight` | string | **Currently not applied** — declared and shipped but has no effect. |
+| `font.weight` | integer, 100-900 | Terminal AND UI buffer font weight (same scale as Zed's own `buffer_font_weight`/`terminal.font_weight` — 400 = normal, 700 = bold). Out-of-range values are clamped. |
 | `font.lineHeight` | number | Terminal line height multiplier. |
 | `font.features` | object (OpenType feature tag → `true`/`false` or a non-negative integer) | OpenType font features — see [Ligatures and font features](#ligatures-and-font-features) below. |
 
@@ -229,5 +229,4 @@ Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` defaul
 
 These are documented here deliberately rather than silently ignored, so you don't spend time debugging a setting that simply doesn't do anything yet:
 
-- **`font.weight` is parsed but never applied.** Present in the shipped default files but currently does nothing.
 - **Only the Windows default template wires up `Ctrl+Shift+2`..`9` for additional tab profiles.** The macOS/Linux templates only bind profile 1 (bound twice, redundantly) — if you add more profiles on those platforms, you'll need to add your own `keys` entries (e.g. `"cmd-shift-2": "New2"`) to reach them.

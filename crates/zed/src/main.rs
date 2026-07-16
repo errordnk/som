@@ -314,7 +314,6 @@ fn main() {
 
     let app = build_application().with_assets(Assets);
 
-    let app_db = db::AppDatabase::new();
     let session_id = Uuid::new_v4().to_string();
     let session = Session::new(session_id.clone());
     let _background_executor = app.background_executor();
@@ -354,14 +353,7 @@ fn main() {
     });
 
     app.run(move |cx| {
-        cx.set_global(app_db);
-        let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
-            Ok(trusted_paths) => trusted_paths,
-            Err(e) => {
-                log::error!("Failed to do initial trusted worktrees fetch: {e:#}");
-                HashMap::default()
-            }
-        };
+        let db_trusted_paths = workspace::som_db::load_trusted_worktrees_by_host();
         trusted_worktrees::init(db_trusted_paths, cx);
         menu::init();
         zed_actions::init();

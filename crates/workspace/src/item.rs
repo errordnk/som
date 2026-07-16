@@ -3,7 +3,7 @@ use crate::{
     SerializableItemRegistry, ToolbarItemLocation, Workspace, WorkspaceId,
     invalid_item_view::InvalidItemView,
     pane::{self, Pane},
-    persistence::model::ItemId,
+    serialized_state::ItemId,
     searchable::SearchableItemHandle,
     workspace_settings::{AutosaveSetting, WorkspaceSettings},
 };

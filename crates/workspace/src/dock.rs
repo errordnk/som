@@ -1,5 +1,5 @@
 use crate::focus_follows_mouse::FocusFollowsMouse as _;
-use crate::persistence::model::DockData;
+use crate::serialized_state::DockData;
 use crate::{DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceSettings};
 use crate::Workspace;
 use anyhow::Context as _;

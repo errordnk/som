@@ -36,7 +36,6 @@ serde_json.workspace = true
 clap.workspace = true
 collections.workspace = true
 http_client.workspace = true
-db.workspace = true
 fs.workspace = true
 indoc.workspace = true
 futures.workspace = true

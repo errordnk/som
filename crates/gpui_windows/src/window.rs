@@ -342,27 +342,41 @@ impl WindowsWindowInner {
             return Ok(());
         };
         match open_status.state {
-            WindowOpenState::Maximized => unsafe {
+            PendingWindowState::Maximized => unsafe {
                 SetWindowPlacement(self.hwnd, &open_status.placement)
                     .context("failed to set window placement")?;
                 ShowWindowAsync(self.hwnd, SW_MAXIMIZE).ok()?;
             },
-            WindowOpenState::Fullscreen => {
+            PendingWindowState::Fullscreen => {
                 unsafe {
                     SetWindowPlacement(self.hwnd, &open_status.placement)
                         .context("failed to set window placement")?
                 };
                 self.toggle_fullscreen();
             }
-            WindowOpenState::Windowed => unsafe {
+            PendingWindowState::Windowed => unsafe {
                 SetWindowPlacement(self.hwnd, &open_status.placement)
                     .context("failed to set window placement")?;
             },
-            WindowOpenState::Minimized => unsafe {
+            PendingWindowState::Minimized(restore_state) => unsafe {
                 self.state.start_minimized.set(true);
-                SetWindowPlacement(self.hwnd, &open_status.placement)
+                // `rcNormalPosition`/`showCmd` describe where/how the window
+                // ends up once un-minimized — `WPF_RESTORETOMAXIMIZED` is
+                // what makes a minimized-then-restored window come back
+                // maximized instead of snapping to `rcNormalPosition`'s
+                // (windowed-restore-sized) rect. Fullscreen has no such
+                // native flag to restore into: fall back to a plain
+                // minimized-to-windowed placement, matching the softer
+                // failure `toggle_fullscreen`'s callers already tolerate
+                // when the window isn't visible yet (see `zoom`/`toggle_
+                // fullscreen`'s own not-yet-visible branches above).
+                let mut placement = open_status.placement;
+                placement.showCmd = SW_SHOWMINIMIZED.0 as u32;
+                if restore_state == gpui::WindowOpenState::Maximized {
+                    placement.flags |= WPF_RESTORETOMAXIMIZED;
+                }
+                SetWindowPlacement(self.hwnd, &placement)
                     .context("failed to set window placement")?;
-                ShowWindowAsync(self.hwnd, SW_SHOWMINNOACTIVE).ok()?;
             },
         }
         Ok(())
@@ -550,14 +564,14 @@ impl WindowsWindow {
         if params.start_minimized {
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,
-                state: WindowOpenState::Minimized,
+                state: PendingWindowState::Minimized(params.restore_state),
             }));
         } else if params.show {
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,
-                state: WindowOpenState::Windowed,
+                state: PendingWindowState::Windowed,
             }));
         }
 
@@ -885,7 +899,7 @@ impl PlatformWindow for WindowsWindow {
             if IsWindowVisible(self.0.hwnd).as_bool() {
                 ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
             } else if let Some(mut status) = self.state.initial_placement.take() {
-                status.state = WindowOpenState::Maximized;
+                status.state = PendingWindowState::Maximized;
                 self.state.initial_placement.set(Some(status));
             }
         }
@@ -895,7 +909,7 @@ impl PlatformWindow for WindowsWindow {
         if unsafe { IsWindowVisible(self.0.hwnd).as_bool() } {
             self.0.toggle_fullscreen();
         } else if let Some(mut status) = self.state.initial_placement.take() {
-            status.state = WindowOpenState::Fullscreen;
+            status.state = PendingWindowState::Fullscreen;
             self.state.initial_placement.set(Some(status));
         }
     }
@@ -1330,15 +1344,20 @@ impl WindowBorderOffset {
 #[derive(Clone)]
 struct WindowOpenStatus {
     placement: WINDOWPLACEMENT,
-    state: WindowOpenState,
+    state: PendingWindowState,
 }
 
+/// Windows-only: a pending state change to apply the first time this window
+/// actually shows itself (see `set_window_placement`). `Minimized` carries
+/// its own `gpui::WindowOpenState` (`restore_state`) rather than being
+/// mutually exclusive with `Maximized`/`Fullscreen`/`Windowed` — a window can
+/// start minimized AND restore to any one of those three.
 #[derive(Clone, Copy)]
-enum WindowOpenState {
+enum PendingWindowState {
     Maximized,
     Fullscreen,
     Windowed,
-    Minimized,
+    Minimized(gpui::WindowOpenState),
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");

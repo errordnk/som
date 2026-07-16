@@ -1521,6 +1521,29 @@ pub struct WindowParams {
 
     /// Whether to start the window minimized (taskbar only, no focus)
     pub start_minimized: bool,
+
+    /// When `start_minimized` is set, which state the window should restore
+    /// to when the user un-minimizes it — otherwise it's ambiguous whether
+    /// `bounds` (the maximized/fullscreen *restore* rect, not full-display
+    /// bounds) should be applied as a plain windowed rect or as the
+    /// maximized/fullscreen state it actually represents.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub restore_state: WindowOpenState,
+}
+
+/// Which visual state a window should be in — used both for `WindowParams::
+/// restore_state` (what a minimized window restores to) and, on Windows,
+/// internally by the platform window to remember pending state changes
+/// requested before the window is actually shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowOpenState {
+    /// A normal, resizable window at its own bounds.
+    #[default]
+    Windowed,
+    /// The window fills the display, leaving the taskbar visible.
+    Maximized,
+    /// The window fills the display, hiding the taskbar/title bar.
+    Fullscreen,
 }
 
 /// Represents the status of how a window should be opened.

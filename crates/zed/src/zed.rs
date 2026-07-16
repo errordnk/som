@@ -34,8 +34,8 @@ use uuid::Uuid;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 use workspace::notifications::simple_message_notification::MessageNotification;
 use workspace::{
-    AppState, CloseWindow, MultiWorkspace, NewWindow, Workspace, WorkspaceSettings,
-    open_new, with_active_or_new_workspace,
+    AppState, CloseWindow, MultiWorkspace, Workspace, WorkspaceSettings,
+    with_active_or_new_workspace,
     CloseIntent, OpenLog,
 };
 use zed_actions::{About, OpenBrowser, OpenSettingsFile, OpenZedUrl, Quit};
@@ -553,13 +553,13 @@ fn register_actions(
                 theme_settings::reset_buffer_font_size(cx);
             },
         )
-        .register_action({
-            let app_state = app_state.clone();
-            move |_, _: &NewWindow, _, cx| {
-                open_new(Default::default(), app_state.clone(), cx, |_, _, _| {})
-                    .detach();
-            }
-        });
+        // NewWindow is deliberately not registered — Som only ever has one
+        // window, and the action fires from inside that window anyway, so
+        // there is nothing to do (see `Workspace::new_local`'s
+        // `window_to_replace` logic, which every other window-opening path
+        // already routes through the existing window rather than creating
+        // a second one).
+        ;
 }
 
 fn open_log_file(

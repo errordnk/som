@@ -1,7 +1,6 @@
 mod app_menus;
 pub(crate) mod open_listener;
 
-use anyhow::Context as _;
 pub use app_menus::*;
 pub use open_listener::{
     OpenListener, OpenRequest, OpenRequestKind, RawOpenRequest,
@@ -13,7 +12,7 @@ pub use open_listener::listen_for_cli_connections;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use gpui::{
     Action, App, Context, DismissEvent, Focusable, KeyBinding,
-    PathPromptOptions, PromptLevel, ReadGlobal as _, SharedString, Task,
+    PathPromptOptions, PromptLevel, ReadGlobal as _, SharedString,
     Window, WindowHandle, WindowKind, WindowOptions,
     actions, point, px,
 };
@@ -27,7 +26,6 @@ use std::{
     sync::Arc,
     sync::atomic::{self, AtomicBool},
 };
-use terminal_view::terminal_panel::{self, TerminalPanel};
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
 use ui::prelude::*;
@@ -354,8 +352,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             show_software_emulation_warning_if_needed(specs.clone(), window, cx);
         }
 
-        let panels_task = initialize_panels(window, cx);
-        workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
 
         if !workspace.has_active_modal(window, cx) {
@@ -461,23 +457,6 @@ fn show_software_emulation_warning_if_needed(
     }
 }
 
-fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
-    cx.spawn_in(window, async move |workspace_handle, cx| {
-        if let Some(panel) = TerminalPanel::load(workspace_handle.clone(), cx.clone())
-            .await
-            .context("failed to load terminal panel")
-            .log_err()
-        {
-            workspace_handle
-                .update_in(&mut cx.clone(), |workspace, window, cx| {
-                    workspace.add_panel(panel, window, cx);
-                })
-                .log_err();
-        }
-        anyhow::Ok(())
-    })
-}
-
 fn register_actions(
     app_state: Arc<AppState>,
     workspace: &mut Workspace,
@@ -574,14 +553,6 @@ fn register_actions(
         .register_action(
             |_, _: &zed_actions::ResetBufferFontSize, _window, cx| {
                 theme_settings::reset_buffer_font_size(cx);
-            },
-        )
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &terminal_panel::ToggleFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
             },
         )
         .register_action({

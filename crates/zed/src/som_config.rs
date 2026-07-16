@@ -31,8 +31,6 @@ fn som_action_to_gpui(action: &str) -> Option<(&'static str, Option<&'static str
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SomConfig {
-    pub env: HashMap<String, String>,
-    pub general: GeneralConfig,
     pub window: WindowConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
@@ -44,18 +42,12 @@ pub struct SomConfig {
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct GeneralConfig {
-    pub bell: Option<String>,
-    pub copy_on_select: Option<bool>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
 pub struct WindowConfig {
     pub theme: Option<String>,
     pub mode: Option<String>,
     pub opacity: Option<f32>,
     pub padding: Option<PaddingConfig>,
+    pub selection: Option<String>,
 }
 
 /// How the window should be placed when it's first created. Parsed from
@@ -319,12 +311,33 @@ impl SomConfig {
             parts.push(format!("\"theme\": \"{}\"", theme));
         }
 
-        // Build experimental.theme_overrides.players[0] from cursor.color
-        let cursor_color = self.cursor.color.as_deref().unwrap_or("");
-        if !cursor_color.is_empty() {
+        // Build experimental.theme_overrides.players[0] from cursor.color / window.selection
+        let mut player_parts: Vec<String> = Vec::new();
+        if let Some(cursor_color) = self.cursor.color.as_deref().filter(|s| !s.is_empty()) {
+            player_parts.push(format!("\"cursor\": \"{}\"", cursor_color));
+        }
+        let mut theme_override_parts: Vec<String> = Vec::new();
+        if !player_parts.is_empty() {
+            theme_override_parts.push(format!(
+                "\"players\": [{{ {} }}]",
+                player_parts.join(", ")
+            ));
+        }
+        // `window.selection` drives the terminal's selection-highlight color,
+        // which is hardcoded in the renderer to `theme.colors().text_accent`
+        // (see `terminal_element.rs::layout_grid`'s `sel_bg_color`) — not the
+        // `players[].selection` field despite the similar name, which only
+        // affects unrelated UI elements. Overriding `text.accent` also
+        // recolors a few other accent-colored UI bits (e.g. search-match
+        // highlighting) as a side effect, since it's a single shared theme
+        // color, not a terminal-specific one.
+        if let Some(selection_color) = self.window.selection.as_deref().filter(|s| !s.is_empty()) {
+            theme_override_parts.push(format!("\"text.accent\": \"{}\"", selection_color));
+        }
+        if !theme_override_parts.is_empty() {
             parts.push(format!(
-                "\"experimental.theme_overrides\": {{ \"players\": [{{ \"cursor\": \"{}\" }}] }}",
-                cursor_color
+                "\"experimental.theme_overrides\": {{ {} }}",
+                theme_override_parts.join(", ")
             ));
         }
 
@@ -387,9 +400,9 @@ impl SomConfig {
         if let Some(alt) = &self.scroll.alternate_scroll {
             terminal_parts.push(format!("\"alternate_scroll\": \"{}\"", alt));
         }
-        if let Some(copy) = self.general.copy_on_select {
-            terminal_parts.push(format!("\"copy_on_select\": {}", copy));
-        }
+        // Always on / always off — not user-configurable.
+        terminal_parts.push("\"copy_on_select\": true".to_string());
+        terminal_parts.push("\"bell\": \"off\"".to_string());
 
         if !terminal_parts.is_empty() {
             parts.push(format!("\"terminal\": {{ {} }}", terminal_parts.join(", ")));

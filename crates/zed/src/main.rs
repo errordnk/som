@@ -183,9 +183,10 @@ fn open_terminal_in_workspace(
     window: &mut gpui::Window,
     cx: &mut gpui::Context<workspace::Workspace>,
 ) {
+    let default_index = workspace::TabProfiles::default_index(cx);
     let profile = cx
         .try_global::<workspace::TabProfiles>()
-        .and_then(|p| p.0.first().cloned());
+        .and_then(|p| p.0.get(default_index).cloned());
     let tab_name = profile
         .as_ref()
         .map(|profile| profile.name.clone())
@@ -196,7 +197,7 @@ fn open_terminal_in_workspace(
         workspace,
         tab_name,
         tab_icon,
-        Some(0),
+        Some(default_index),
         window,
         cx,
         |project, cx| project.create_local_terminal(cx),
@@ -425,7 +426,7 @@ fn main() {
             .enumerate()
             .map(|(i, t)| {
                 let idx = i + 1;
-                let key_name = format!("New{}", idx);
+                let key_name = format!("NewTab{}", idx);
                 let keystroke = som_config.keys.iter()
                     .find(|(_, v)| *v == &key_name)
                     .map(|(k, _)| k.clone());
@@ -436,6 +437,7 @@ fn main() {
                     icon: t.icon.clone(),
                     home: t.home.clone(),
                     tmux: t.tmux,
+                    default: t.default,
                 }
             })
             .collect();

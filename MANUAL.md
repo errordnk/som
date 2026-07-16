@@ -95,12 +95,12 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 
 ### `tabs`
 
-An ordered array of tab profiles. The first entry (`tabs[0]`) is what `Ctrl+N`/`Cmd+N` opens; entries 2-9 are reachable via `Ctrl+Shift+2`..`Ctrl+Shift+9` on the Windows template (see [Default keybindings](#default-keybindings) — macOS/Linux templates currently only wire up profile 1).
+An ordered array of tab profiles. `Ctrl+N`/`Cmd+N` and the bare `NewTab` action (`Ctrl+Shift+=` in the shipped defaults) open the *default* profile: the one entry with `"default": true`, or `tabs[0]` if none is marked. Entries 2-9 are reachable via `Ctrl+Shift+2`..`Ctrl+Shift+9` on the Windows template regardless of which one is default (see [Default keybindings](#default-keybindings) — macOS/Linux templates currently only wire up profile 1).
 
 ```json
 "tabs": [
   { "name": "shell", "icon": "", "shell": "$SHELL", "home": "~" },
-  { "name": "server", "shell": "ssh myhost", "home": "~", "tmux": true }
+  { "name": "server", "shell": "ssh myhost", "home": "~", "tmux": true, "default": true }
 ]
 ```
 
@@ -111,6 +111,7 @@ An ordered array of tab profiles. The first entry (`tabs[0]`) is what `Ctrl+N`/`
 | `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. |
 | `home` | string | none | Working directory; `~` is expanded. Must resolve to an existing directory or is ignored. |
 | `tmux` | bool | `false` | Opt-in to the `som-tmux` backend for this profile — keeps the session alive across Som restarts. See [som-tmux](#som-tmux-keeping-remote-sessions-alive). Splits are not yet supported on `tmux: true` tabs. |
+| `default` | bool | `false` | Marks this profile as the one `Ctrl+N`/the `+` button/bare `NewTab` opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
 
 ### `keys`
 
@@ -118,12 +119,14 @@ A flat map of keystroke → action name. User entries are merged on top of the p
 
 ```json
 "keys": {
-  "ctrl-shift-t": "New",
+  "ctrl-shift-t": "NewTab",
   "ctrl-alt-left": "PrevTab"
 }
 ```
 
-Recognized action names: `Copy`, `Paste`, `CloseTab`, `SplitTab`, `UnSplitTab`, `ClosePane`, `NextPane`, `PrevPane`, `NextTab`, `PrevTab`, `Quit`, `FontIncrease`, `FontDecrease`, `FontReset`, `New`, `New1`..`New9`. Any other string is silently ignored — no binding is created and no error is shown, so check spelling carefully against this list.
+Recognized action names: `Copy`, `Paste`, `CloseTab`, `NewPane`, `UnSplitTab`, `ClosePane`, `NextPane`, `PrevPane`, `NextTab`, `PrevTab`, `Quit`, `IncreaseFont`, `DecreaseFont`, `ResetFont`, `NewTab`, `NewTab1`..`NewTab10`. Any other string is silently ignored — no binding is created and no error is shown, so check spelling carefully against this list.
+
+Naming convention: Som-specific tab/pane actions (`NewTab*`, `CloseTab`, `NewPane`, `ClosePane`, `PrevPane`/`NextPane`, `PrevTab`/`NextTab`) are meant to live on `Ctrl+Shift+*` combinations in the shipped defaults, keeping them clear of `Copy`/`Paste`/`Quit`/font-size shortcuts, which follow standard, non-Shift system conventions instead.
 
 Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers, e.g. `ctrl-shift-c`, `cmd-v`, `alt-f4`.
 
@@ -137,13 +140,14 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 |---|---|
 | `Ctrl+Insert` / `Ctrl+Shift+C` | Copy |
 | `Shift+Insert` / `Ctrl+V` | Paste |
-| `Ctrl+N` | New tab (profile 1) |
-| `Ctrl+Shift+1`..`Ctrl+Shift+9` | New tab from profile 1-9 |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset font size (session only, not saved) |
-| `Ctrl+F4` | Close active tab |
-| `Ctrl+\` | Split active pane |
-| `Ctrl+Shift+\` | Close active split pane |
-| `Ctrl+Left` / `Ctrl+Right` | Focus previous / next split pane |
+| `Ctrl+Scroll` (`Cmd+Scroll` on macOS) | Zoom font size in/out (session only, not saved) |
+| `Ctrl+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
+| `Ctrl+Shift+1`..`Ctrl+Shift+9` / `Ctrl+Shift+0` | New tab from profile 1-9 / profile 10 |
+| `Ctrl+Shift+-` | Close active tab |
+| `Ctrl+Shift+\` | Split active pane (new pane) |
+| `Ctrl+Shift+Backspace` | Close active split pane |
+| `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Focus previous / next split pane |
 | `Ctrl+Shift+Left` / `Ctrl+Shift+Right` | Activate previous / next tab |
 | `Alt+F4` | Quit |
 

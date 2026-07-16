@@ -281,6 +281,50 @@ pub fn save_dock_panel_size(panel_key: String, size: Option<f32>, flex: Option<f
     let _ = std::fs::write(path, json);
 }
 
+/// Default dock layout (left/right/bottom open/closed + size) for an empty
+/// workspace, and the live `MultiWorkspace` state (active workspace id,
+/// project groups, sidebar) — both were SQLite/KVP-backed in Zed. Neither
+/// is meaningfully exercised in Som today: no panel is ever docked (so
+/// dock state is always the same empty structure), and Som doesn't restore
+/// project groups/sidebar state on launch (that's all driven by
+/// `db.json`/`SomTabsRestorer` instead) — but the write/read call sites are
+/// still live code, so kept working via small standalone JSON files rather
+/// than deleted outright.
+fn default_dock_state_path() -> PathBuf {
+    paths::config_dir().join("default_dock_state.json")
+}
+
+pub fn load_default_dock_state<T: serde::de::DeserializeOwned>() -> Option<T> {
+    let contents = std::fs::read_to_string(default_dock_state_path()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+pub fn save_default_dock_state<T: Serialize>(docks: &T) {
+    let Ok(json) = serde_json::to_string_pretty(docks) else {
+        return;
+    };
+    let path = default_dock_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
+fn multi_workspace_state_path() -> PathBuf {
+    paths::config_dir().join("multi_workspace_state.json")
+}
+
+pub fn save_multi_workspace_state<T: Serialize>(state: &T) {
+    let Ok(json) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    let path = multi_workspace_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

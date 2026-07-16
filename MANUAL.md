@@ -40,7 +40,7 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 |---|---|---|
 | `window.theme` | string | Active theme name (e.g. `"Nord Dark"`). Applied correctly. |
 | `window.mode` | `"windowed"` (default) / `"maximized"` / `"minimized"` / `"fullscreen"` | Initial window placement, applied on every launch (not just first run). `"windowed"` remembers its position/size in `db.json` (see [Session persistence](#session-persistence-dbjson)) — moving or resizing the window updates that automatically. If no geometry has been remembered yet, it defaults to the display size minus 100px in each dimension, positioned 50px from the top-left. |
-| `window.padding.{top,bottom,left,right}` | number, pixels | Inset between the OS window edge and Som's content (title bar included), on that side. `0` (default) means no inset. |
+| `window.padding.{top,bottom,left,right}` | number, pixels | Inset between the OS window edge and the terminal/split area, on that side. The title bar and tab strip always stay flush against the window edge regardless of this setting. `0` (default) means no inset. |
 | `window.selection` | hex string, e.g. `"#88c0d0"` | Terminal selection-highlight color (the background behind text you've selected with the mouse). Also recolors a few other accent-colored UI bits as a side effect (e.g. search-match highlighting), since it shares the theme's single `text.accent` color rather than being terminal-specific. |
 
 ### `log`

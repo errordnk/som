@@ -1396,8 +1396,8 @@ impl MultiWorkspace {
             else {
                 return;
             };
-            let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
-            crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
+            let _ = window_id;
+            crate::persistence::write_multi_workspace_state(state).await;
         }));
     }
 

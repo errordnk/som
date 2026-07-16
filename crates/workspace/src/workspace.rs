@@ -1895,7 +1895,6 @@ impl Workspace {
         );
 
         let db = WorkspaceDb::global(cx);
-        let kvp = db::kvp::KeyValueStore::global(cx);
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
@@ -2077,7 +2076,7 @@ impl Workspace {
             // 1. This is an empty workspace (no paths), AND
             // 2. The serialized workspace either doesn't exist or has no paths
             if is_empty_workspace && !serialized_workspace_has_paths {
-                if let Some(default_docks) = persistence::read_default_dock_state(&kvp) {
+                if let Some(default_docks) = persistence::read_default_dock_state() {
                     window
                         .update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
@@ -6427,7 +6426,6 @@ impl Workspace {
                 // Save dock state for empty local workspaces
                 let docks = build_serialized_docks(self, window, cx);
                 let db = WorkspaceDb::global(cx);
-                let kvp = db::kvp::KeyValueStore::global(cx);
                 window.spawn(cx, async move |_| {
                     db.set_window_open_status(
                         database_id,
@@ -6437,7 +6435,7 @@ impl Workspace {
                     .await
                     .log_err();
                     db.set_session_id(database_id, None).await.log_err();
-                    persistence::write_default_dock_state(&kvp, docks)
+                    persistence::write_default_dock_state(docks)
                         .await
                         .log_err();
                 })

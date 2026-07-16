@@ -71,7 +71,13 @@ impl TerminalPanel {
             .as_deref()
             .is_some_and(|shell| profile.as_ref().and_then(|p| p.shell.as_deref()) != Some(shell));
         let shell_override = action.shell.clone().or(profile_shell);
-        let working_directory = default_working_directory(workspace, cx);
+        let profile_home = profile
+            .as_ref()
+            .and_then(|p| p.home.as_deref())
+            .and_then(|dir| shellexpand::full(dir).ok())
+            .map(|dir| PathBuf::from(dir.to_string()))
+            .filter(|dir| dir.is_dir());
+        let working_directory = profile_home.or_else(|| default_working_directory(workspace, cx));
         let local = action.local;
 
         if !is_shell_override && profile.as_ref().is_some_and(|p| p.tmux) {

@@ -171,40 +171,6 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
-/// Opens the very first tab for a brand-new (never-before-persisted)
-/// workspace — i.e. the fallback used when there's no `db.json` state to
-/// restore yet. Goes through the same canonical
-/// `TerminalPanel::add_center_terminal_named` path as every other tab
-/// creation (`NewTerminal`, `restore_som_tabs`), so this tab is recorded in
-/// `som_tab_profile_index` like any other rather than silently defaulting to
-/// profile 0 when `db.json` is next written.
-fn open_terminal_in_workspace(
-    workspace: &mut workspace::Workspace,
-    window: &mut gpui::Window,
-    cx: &mut gpui::Context<workspace::Workspace>,
-) {
-    let default_index = workspace::TabProfiles::default_index(cx);
-    let profile = cx
-        .try_global::<workspace::TabProfiles>()
-        .and_then(|p| p.0.get(default_index).cloned());
-    let tab_name = profile
-        .as_ref()
-        .map(|profile| profile.name.clone())
-        .filter(|n| !n.trim().is_empty());
-    let tab_icon = profile.as_ref().and_then(|profile| profile.icon.clone());
-
-    terminal_view::terminal_panel::TerminalPanel::add_center_terminal_named(
-        workspace,
-        tab_name,
-        tab_icon,
-        Some(default_index),
-        window,
-        cx,
-        |project, cx| project.create_local_terminal(cx),
-    )
-    .detach_and_log_err(cx);
-}
-
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
@@ -639,23 +605,21 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
 /// dropped: Som has no file/project concept for those to apply to, and
 /// there's only ever one window). Whatever tabs/splits/panes existed
 /// previously are restored independently via `SomTabsRestorer`/`db.json`
-/// (see `restore_som_tabs` in `terminal_view::terminal_panel`), regardless
-/// of which window-open path creates the window.
+/// (see `restore_som_tabs` in `terminal_view::terminal_panel`), which
+/// `workspace::open_new`'s window-open path runs unconditionally right
+/// after this `init` callback — including the very first launch, since
+/// `load_som_db` itself falls back to a single-default-tab state when
+/// `db.json` doesn't exist yet. `init` used to ALSO create a tab here as
+/// a "no db.json yet" fallback, which duplicated `restore_som_tabs`'s own
+/// fallback: every launch ended up with one extra tab beyond whatever
+/// `db.json` recorded, and since that extra tab got persisted right back
+/// into `db.json`, the count grew by one on every single restart.
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    cx.update(|cx| {
-        workspace::open_new(
-            Default::default(),
-            app_state,
-            cx,
-            |workspace, window, cx| {
-                open_terminal_in_workspace(workspace, window, cx);
-            },
-        )
-    })
-    .await?;
+    cx.update(|cx| workspace::open_new(Default::default(), app_state, cx, |_, _, _| {}))
+        .await?;
 
     Ok(())
 }

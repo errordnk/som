@@ -364,7 +364,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
     if let Err(e) = fs::fs_watcher::global(|_| {}) {
         let message = format!(
-            db::indoc! {r#"
+            indoc::indoc! {r#"
             inotify_init returned {}
 
             This may be due to system-wide limits on inotify instances.
@@ -392,7 +392,7 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
 fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
     if let Err(e) = fs::fs_watcher::global(|_| {}) {
         let message = format!(
-            db::indoc! {r#"
+            indoc::indoc! {r#"
             ReadDirectoryChangesW initialization failed: {}
             "#},
             e
@@ -425,7 +425,7 @@ fn show_software_emulation_warning_if_needed(
             ("Vulkan", "https://zed.dev/docs/linux", "https://zed.dev/docs/linux#zed-fails-to-open-windows")
         };
         let message = format!(
-            db::indoc! {r#"
+            indoc::indoc! {r#"
             Som uses {} for rendering and requires a compatible GPU.
 
             Currently you are using a software emulated GPU ({}) which

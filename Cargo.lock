@@ -7027,6 +7027,7 @@ dependencies = [
  "http_client",
  "image",
  "indexmap",
+ "indoc",
  "log",
  "menu",
  "mimalloc",

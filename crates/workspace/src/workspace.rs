@@ -431,6 +431,9 @@ pub struct TabProfile {
     /// See `som_config::TabProfile::tmux` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub tmux: bool,
+    /// See `som_config::TabProfile::default` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub default: bool,
 }
 
 /// Global list of tab profiles loaded from som config (name, shell, etc).
@@ -438,6 +441,18 @@ pub struct TabProfile {
 pub struct TabProfiles(pub Vec<TabProfile>);
 
 impl gpui::Global for TabProfiles {}
+
+impl TabProfiles {
+    /// Index of the profile that `Ctrl+N`/the `+` button/a fresh install's
+    /// first tab should open: the profile with `default: true` if the user
+    /// set one (validated to be at most one — see `SomConfig::
+    /// parse_with_defaults`), otherwise `0` (`tabs[0]`).
+    pub fn default_index(cx: &gpui::App) -> usize {
+        cx.try_global::<TabProfiles>()
+            .and_then(|profiles| profiles.0.iter().position(|p| p.default))
+            .unwrap_or(0)
+    }
+}
 
 /// Window-level config translated from `settings.json`'s `window.*` block
 /// (see `som_config::WindowConfig`). Set once at startup by the `zed` crate

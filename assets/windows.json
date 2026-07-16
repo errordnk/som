@@ -1,9 +1,4 @@
 {
-  "env": {},
-  "general": {
-    "bell": "off",
-    "copyOnSelect": true
-  },
   "window": {
     "theme": "Nord Dark",
     "mode": "Maximized",
@@ -13,6 +8,7 @@
       "left": 0,
       "right": 0
     },
+    "selection": "#88c0d0",
     "opacity": 1.0
   },
   "log": {
@@ -27,7 +23,7 @@
     "lineHeight": 1.2
   },
   "cursor": {
-    "shape": "underline",
+    "shape": "Underline",
     "color": "#90ee90",
     "blinking": "on"
   },

@@ -1,9 +1,8 @@
 {
-  "env": {},
-  "bell": "off",
-  "copyOnSelect": true,
-  "selection": "#88c0d0",
-  "theme": "Nord Dark",
+  "window": {
+    "selection": "#88c0d0",
+    "theme": "Nord Dark"
+  },
   "font": {
     "face": "Lilex",
     "features": {},

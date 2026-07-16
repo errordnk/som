@@ -141,6 +141,12 @@ pub struct TabProfile {
     /// `true` everywhere it's supported, keeping the field only as an
     /// explicit opt-out.
     pub tmux: bool,
+    /// Marks this profile as the one opened by `Ctrl+N`/the `+` button/
+    /// the very first tab on a fresh install, instead of `tabs[0]`. At
+    /// most one profile may set this — `parse_with_defaults` rejects
+    /// settings.json as invalid if more than one does. If none do,
+    /// `tabs[0]` remains the default (see `TabProfiles::default_index`).
+    pub default: bool,
 }
 
 impl SomConfig {
@@ -223,10 +229,13 @@ impl SomConfig {
         // User-defined bindings from windows.json "keys"
         for (keystroke_raw, action_name) in &self.keys {
             let keystroke = keystroke_raw.replace('\\', "\\\\");
-            // NewTab / NewTab1..NewTab10 → open tabs[0]..tabs[9] by name
+            // NewTab / NewTab1..NewTab10 → open tabs[0]..tabs[9] by name.
+            // Bare "NewTab" (no number) opens whichever profile has
+            // "default": true (validated to be at most one — see
+            // parse_with_defaults), or tabs[0] if none do.
             if action_name == "NewTab" || action_name.strip_prefix("NewTab").map_or(false, |s| s.parse::<usize>().is_ok()) {
                 let idx = if action_name == "NewTab" {
-                    1
+                    self.tabs.iter().position(|t| t.default).unwrap_or(0) + 1
                 } else {
                     action_name["NewTab".len()..].parse::<usize>().unwrap_or(1)
                 };
@@ -456,6 +465,12 @@ impl SomConfig {
                 "settings.json line {line}, column {col}: {e}\n  → {source_line}"
             )
         })?;
+        let default_count = user.tabs.iter().filter(|t| t.default).count();
+        if default_count > 1 {
+            return Err(format!(
+                "settings.json: only one tab profile may have \"default\": true, found {default_count}"
+            ));
+        }
         let mut merged_keys = defaults.keys;
         let mut config = user;
         for (k, v) in std::mem::take(&mut config.keys) {

@@ -51,7 +51,7 @@ impl TerminalPanel {
     ) {
         let default_tab_name = cx
             .try_global::<TabProfiles>()
-            .and_then(|p| p.0.first().map(|profile| profile.name.clone()));
+            .and_then(|p| p.0.get(TabProfiles::default_index(cx)).map(|profile| profile.name.clone()));
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
         let profile = tab_name.as_deref().and_then(|name| workspace::TabProfiles::find_by_name(name, cx));

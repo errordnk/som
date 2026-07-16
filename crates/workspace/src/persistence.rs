@@ -243,33 +243,22 @@ impl From<WindowBoundsJson> for WindowBounds {
 }
 
 pub async fn write_multi_workspace_state(
-    kvp: &KeyValueStore,
-    window_id: WindowId,
+    _kvp: &KeyValueStore,
+    _window_id: WindowId,
     state: model::MultiWorkspaceState,
 ) {
-    if let Ok(json_str) = serde_json::to_string(&state) {
-        kvp.scoped("multi_workspace_state")
-            .write(window_id.as_u64().to_string(), json_str)
-            .await
-            .log_err();
-    }
+    crate::som_db::save_multi_workspace_state(&state);
 }
 
-const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
-
-pub fn read_default_dock_state(kvp: &KeyValueStore) -> Option<DockStructure> {
-    let json_str = kvp.read_kvp(DEFAULT_DOCK_STATE_KEY).log_err().flatten()?;
-
-    serde_json::from_str::<DockStructure>(&json_str).ok()
+pub fn read_default_dock_state(_kvp: &KeyValueStore) -> Option<DockStructure> {
+    crate::som_db::load_default_dock_state()
 }
 
 pub async fn write_default_dock_state(
-    kvp: &KeyValueStore,
+    _kvp: &KeyValueStore,
     docks: DockStructure,
 ) -> anyhow::Result<()> {
-    let json_str = serde_json::to_string(&docks)?;
-    kvp.write_kvp(DEFAULT_DOCK_STATE_KEY.to_string(), json_str)
-        .await?;
+    crate::som_db::save_default_dock_state(&docks);
     Ok(())
 }
 

@@ -49,6 +49,11 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if let Some(idx) = action.missing_profile_index {
+            Self::show_missing_profile_error(workspace, idx, cx);
+            return;
+        }
+
         let default_tab_name = cx
             .try_global::<TabProfiles>()
             .and_then(|p| p.0.get(TabProfiles::default_index(cx)).map(|profile| profile.name.clone()));
@@ -217,6 +222,24 @@ impl TerminalPanel {
             }
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Shown when a `Ctrl+Shift+N` binding targets a `tabs[]` slot that
+    /// settings.json doesn't actually have (see `som_config.rs`'s
+    /// `apply_keys` and `workspace::NewTerminal::missing_profile_index`'s
+    /// doc comment) — opens no tab at all rather than silently falling back
+    /// to the default profile, which would be confusing (pressing "9" and
+    /// getting profile 1 with no indication why).
+    fn show_missing_profile_error(workspace: &mut Workspace, idx: usize, cx: &mut Context<Workspace>) {
+        use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
+        let tab_count = cx.try_global::<TabProfiles>().map(|p| p.0.len()).unwrap_or(0);
+        let msg = format!(
+            "No profile #{idx} in settings.json's \"tabs\" — only {tab_count} profile(s) configured."
+        );
+        let id = NotificationId::Named(format!("som-missing-profile-{idx}").into());
+        workspace.show_notification(id, cx, move |cx| {
+            cx.new(|cx| MessageNotification::new(msg.clone(), cx).show_suppress_button(false))
+        });
     }
 
     pub fn add_center_terminal(

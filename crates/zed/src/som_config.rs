@@ -234,7 +234,8 @@ impl SomConfig {
             // "default": true (validated to be at most one — see
             // parse_with_defaults), or tabs[0] if none do.
             if action_name == "NewTab" || action_name.strip_prefix("NewTab").map_or(false, |s| s.parse::<usize>().is_ok()) {
-                let idx = if action_name == "NewTab" {
+                let is_bare = action_name == "NewTab";
+                let idx = if is_bare {
                     self.tabs.iter().position(|t| t.default).unwrap_or(0) + 1
                 } else {
                     action_name["NewTab".len()..].parse::<usize>().unwrap_or(1)
@@ -252,6 +253,17 @@ impl SomConfig {
                                 "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\" }}] }} }}"
                             ));
                         }
+                        continue;
+                    }
+                    // Explicitly numbered (NewTab1..NewTab10) but settings.json's
+                    // tabs[] doesn't have that many profiles — surface an error
+                    // instead of silently opening tabs[0]/the default profile
+                    // (bare "NewTab" can't hit this: `idx` there always comes
+                    // from an existing tabs[] entry or the 0 fallback).
+                    if !is_bare {
+                        entries.push(format!(
+                            "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"missing_profile_index\": {idx} }}] }} }}"
+                        ));
                         continue;
                     }
                 }

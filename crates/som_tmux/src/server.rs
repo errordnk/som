@@ -1,11 +1,11 @@
-//! HOLDER side of the v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux
-//! v3" section): this is the long-lived process that actually owns the
-//! real shell's PTY and keeps a headless `alacritty_terminal::Term` (owned
-//! by `Session`) up to date, independent of whether any RELAY is
-//! currently connected. A RELAY (the process Som itself spawned into its
-//! own PTY — see `crate::relay`) connects here, gets a full state snapshot
-//! (`Session::snapshot()`) of the current screen, then a live stream of
-//! raw PTY bytes for as long as it stays connected.
+//! HOLDER side of som-tmux's HOLDER/RELAY architecture: this is the
+//! long-lived process that actually owns the real shell's PTY and keeps a
+//! headless `alacritty_terminal::Term` (owned by `Session`) up to date,
+//! independent of whether any RELAY is currently connected. A RELAY (the
+//! process Som itself spawned into its own PTY — see `crate::relay`)
+//! connects here, gets a full state snapshot (`Session::snapshot()`) of
+//! the current screen, then a live stream of raw PTY bytes for as long as
+//! it stays connected.
 //!
 //! One HOLDER = exactly one pane (see `protocol::pipe_name`'s doc comment
 //! for why this changed from the old per-profile multiplexed design) — so
@@ -142,8 +142,7 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     }
 
     // Snapshot immediately after the handshake+initial resize — see
-    // `protocol::HolderOutput::Snapshot`'s doc comment for why this
-    // replaces v1's "full ANSI redraw on connect" entirely: a
+    // `protocol::HolderOutput::Snapshot`'s doc comment: this way a
     // (re)attaching RELAY gets the ENTIRE terminal state (grid, cursor,
     // and the full `TermMode` bitflags) directly, correct from the first
     // frame, with nothing to replay. Subscribing to raw bytes BEFORE
@@ -195,11 +194,9 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
 /// as `HolderOutput::Bytes` messages, the other watches for the real shell
 /// exiting (`Session::subscribe`'s `AlacTermEvent::Exit`) to send a final
 /// `HolderOutput::ShellExited`. Two separate threads/channels rather than
-/// one, since they're fundamentally different event streams now (v1 had
-/// only `Wakeup`/`Exit` to work with, so one `next_change_blocking` loop
-/// covered both "something changed, redraw" and "it exited" — v3 gets a
-/// live byte stream directly, so there's no "redraw" step to trigger off
-/// `Wakeup` for anymore, only `Exit` still matters here).
+/// one, since they're fundamentally different event streams: a live byte
+/// stream is forwarded directly (no "redraw" step to trigger), while only
+/// `Exit` needs its own watcher here.
 fn spawn_forwarder(
     connection: Arc<PipeConnection>,
     writer: Arc<Mutex<()>>,

@@ -1,15 +1,13 @@
-// `bounds`/`session`/`server`/`relay` are the v3 architecture (see
-// `SOM_MUX_PLAN.md`'s "som-tmux v3" section) — a headless
-// `alacritty_terminal::Term` on the HOLDER side sends its full serialized
-// state (`Term::snapshot()`) to a (re)connecting RELAY, which restores it
-// onto a throwaway local `Term` and does ONE full ANSI repaint via
-// `redraw.rs` (which now only ever runs that one-shot, not continuously —
-// see that module's own doc comment) before switching to forwarding raw
-// PTY bytes unmodified. Cross-platform: `alacritty_terminal::tty::new()`
-// already works on both Windows and Unix, so this single implementation
-// covers the Windows-local profile AND every Unix (WSL/SSH) profile —
-// unlike v2 (`tmux_backend`, below), which needed Windows kept on a
-// permanently separate path since real tmux has no Windows PTY port.
+// `bounds`/`session`/`server`/`relay` implement som-tmux's HOLDER/RELAY
+// architecture — a headless `alacritty_terminal::Term` on the HOLDER side
+// sends its full serialized state (`Term::snapshot()`) to a (re)connecting
+// RELAY, which restores it onto a throwaway local `Term` and does ONE full
+// ANSI repaint via `redraw.rs` (which only ever runs that one-shot, not
+// continuously — see that module's own doc comment) before switching to
+// forwarding raw PTY bytes unmodified. Cross-platform:
+// `alacritty_terminal::tty::new()` already works on both Windows and Unix,
+// so this single implementation covers the Windows-local profile AND every
+// Unix (WSL/SSH) profile.
 mod bounds;
 mod redraw;
 mod relay;
@@ -135,8 +133,8 @@ fn main() {
     let args = parse_args();
     init_logging(&args.profile, &args.pane_id, args.holder);
 
-    // v3 architecture (see `SOM_MUX_PLAN.md`) is cross-platform — same
-    // HOLDER/RELAY split, same dispatch, on both Windows and Unix now.
+    // Cross-platform — same HOLDER/RELAY split, same dispatch, on both
+    // Windows and Unix.
     let result = if args.holder {
         server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     } else {

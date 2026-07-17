@@ -251,10 +251,7 @@ impl SvgRenderer {
 }
 
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
-    let font_paths = [
-        "fonts/IBMPlexSans-Regular.ttf",
-        "fonts/FiraCodeNerdFont-Regular.ttf",
-    ];
+    let font_paths = ["fonts/FiraCodeNerdFont-Regular.ttf"];
     for path in font_paths {
         match asset_source.load(path) {
             Ok(Some(data)) => db.load_font_data(data.into_owned()),
@@ -271,12 +268,12 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
     use usvg::fontdb::{Family, Query};
 
     let families_and_fallbacks: &[(Family<'_>, &str)] = &[
-        (Family::SansSerif, "IBM Plex Sans"),
-        // No serif font bundled; use sans-serif as best available fallback.
-        (Family::Serif, "IBM Plex Sans"),
+        (Family::SansSerif, "FiraCode Nerd Font"),
+        // No serif font bundled; use the same fallback as sans-serif.
+        (Family::Serif, "FiraCode Nerd Font"),
         (Family::Monospace, "FiraCode Nerd Font"),
-        (Family::Cursive, "IBM Plex Sans"),
-        (Family::Fantasy, "IBM Plex Sans"),
+        (Family::Cursive, "FiraCode Nerd Font"),
+        (Family::Fantasy, "FiraCode Nerd Font"),
     ];
 
     for (family, fallback_name) in families_and_fallbacks {
@@ -302,14 +299,11 @@ mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};
 
-    const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
     const FIRACODE_NERD_FONT_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
         db.load_font_data(FIRACODE_NERD_FONT_REGULAR.to_vec());
         db
     }
@@ -368,33 +362,6 @@ mod tests {
                 "Expected generic family {family:?} to resolve after fix_generic_font_families"
             );
         }
-    }
-
-    #[test]
-    fn test_select_emoji_font_skips_family_without_glyph() {
-        let mut db = db_with_bundled_fonts();
-
-        let ibm_plex_sans = db
-            .query(&usvg::fontdb::Query {
-                families: &[usvg::fontdb::Family::Name("IBM Plex Sans")],
-                weight: usvg::fontdb::Weight(400),
-                stretch: usvg::fontdb::Stretch::Normal,
-                style: usvg::fontdb::Style::Normal,
-            })
-            .unwrap();
-        let firacode = db
-            .query(&usvg::fontdb::Query {
-                families: &[usvg::fontdb::Family::Name("FiraCode Nerd Font")],
-                weight: usvg::fontdb::Weight(400),
-                stretch: usvg::fontdb::Stretch::Normal,
-                style: usvg::fontdb::Style::Normal,
-            })
-            .unwrap();
-        let selected = select_emoji_font('│', &[], &db, &["IBM Plex Sans", "FiraCode Nerd Font"]).unwrap();
-
-        assert_eq!(selected, firacode);
-        assert!(!font_has_char(&db, ibm_plex_sans, '│'));
-        assert!(font_has_char(&db, selected, '│'));
     }
 
     #[test]

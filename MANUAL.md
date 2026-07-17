@@ -244,3 +244,12 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 ## Theming
 
 Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` default), written to `~/.config/som/themes/nord.json` on first run. The underlying theme engine supports arbitrary theme files with about 150 individually addressable colors, but Som doesn't currently expose a way to install additional themes other than manually placing a compatible theme JSON file in the themes directory and setting `window.theme` to its name.
+
+Since Som's theme format is the same one Zed itself uses, any Zed theme JSON file works as-is. A few popular ones:
+
+- [Catppuccin](https://github.com/catppuccin/zed/blob/main/themes/catppuccin-mauve.json)
+- [Tokyo Night](https://github.com/ssaunderss/zed-tokyo-night/blob/main/themes/tokyo-night.json)
+- [One Dark Pro](https://github.com/MordFustang21/zed-one-dark-pro/blob/main/themes/one-dark.json)
+- [Dracula](https://github.com/dracula/zed/blob/main/themes/dracula.json)
+
+To install one: download the raw JSON file into `~/.config/som/themes/`, then set `window.theme` in settings.json to the theme's `"name"` field from inside that file (open the file and check — it isn't always the same as the filename, and some files define multiple named variants).

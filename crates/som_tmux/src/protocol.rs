@@ -281,14 +281,12 @@ pub enum RelayInput {
     Close,
 }
 
-/// HOLDER -> RELAY: v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux v3"
-/// section) — the HOLDER owns a headless `alacritty_terminal::Term` that
-/// mirrors the real shell's actual terminal state (fed by the real PTY's
-/// output through the normal ANSI parser), and sends that STATE to the
-/// RELAY rather than diffing/replaying ANSI bytes (what v1's `redraw.rs`
-/// did, and the specific design flaw this replaces: diffing visible grid
-/// content structurally cannot carry terminal MODES like DECCKM, since a
-/// mode flip has no visible content of its own).
+/// HOLDER -> RELAY: the HOLDER owns a headless `alacritty_terminal::Term`
+/// that mirrors the real shell's actual terminal state (fed by the real
+/// PTY's output through the normal ANSI parser), and sends that STATE to
+/// the RELAY rather than diffing/replaying ANSI bytes — diffing visible
+/// grid content structurally cannot carry terminal MODES like DECCKM, since
+/// a mode flip has no visible content of its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HolderOutput {
     /// Always the FIRST message a HOLDER sends back on a fresh connection,
@@ -310,10 +308,9 @@ pub enum HolderOutput {
     /// ordinary (non-tmux) Som terminal already uses on its own local
     /// `Term` — this is what keeps that `Term` (already correctly
     /// initialized by the `Snapshot` above) live and up to date afterward.
-    /// Unlike v1's `Bytes` variant, these are NOT already-diffed/
-    /// reconstructed ANSI from a `Redrawer` — they're literally what the
-    /// real shell wrote, same as `RelayInput::Bytes` already is for the
-    /// opposite direction.
+    /// These are NOT diffed/reconstructed ANSI from a `Redrawer` — they're
+    /// literally what the real shell wrote, same as `RelayInput::Bytes`
+    /// already is for the opposite direction.
     Bytes(Vec<u8>),
     /// The real shell process exited — the RELAY should exit too (nothing
     /// left to proxy). Distinct from a HOLDER-initiated disconnect for any

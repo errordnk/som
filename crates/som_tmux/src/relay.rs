@@ -222,22 +222,20 @@ pub fn run(
         loop {
             let message = read_holder_message(&reader_connection)?;
             match message {
-                // v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux v3"
-                // section): this RELAY is a separate OS process from Som,
-                // not part of the editor — the only way it can affect
-                // what Som's own `Terminal`/`ansi::Processor` actually
-                // renders is by writing plain ANSI bytes to its own
-                // stdout, same as v1/v2 always required. So a `Snapshot`
-                // still needs a one-time "state -> ANSI" step: restore
-                // the bincode-decoded `TermState` onto a throwaway local
-                // `Term` (used for nothing except this one conversion),
-                // then run a SINGLE full-redraw pass over it via a fresh
-                // `Redrawer` (whose very first `redraw()` call is
-                // documented to always be a full, from-scratch repaint —
-                // see `Redrawer::new`'s doc comment) and write those
-                // bytes to stdout once. Unlike v1, no further redraw
-                // calls happen after this — subsequent `HolderOutput::
-                // Bytes` are forwarded completely unmodified below.
+                // This RELAY is a separate OS process from Som, not part
+                // of the editor — the only way it can affect what Som's
+                // own `Terminal`/`ansi::Processor` actually renders is by
+                // writing plain ANSI bytes to its own stdout. So a
+                // `Snapshot` still needs a one-time "state -> ANSI" step:
+                // restore the bincode-decoded `TermState` onto a throwaway
+                // local `Term` (used for nothing except this one
+                // conversion), then run a SINGLE full-redraw pass over it
+                // via a fresh `Redrawer` (whose very first `redraw()` call
+                // is documented to always be a full, from-scratch repaint
+                // — see `Redrawer::new`'s doc comment) and write those
+                // bytes to stdout once. No further redraw calls happen
+                // after this — subsequent `HolderOutput::Bytes` are
+                // forwarded completely unmodified below.
                 HolderOutput::Snapshot(encoded) => {
                     let (state, _): (alacritty_terminal::term::serialize::TermState, usize) =
                         bincode::serde::decode_from_slice(&encoded, bincode::config::standard())

@@ -1,7 +1,15 @@
 {
   "window": {
     "selection": "#88c0d0",
-    "theme": "Nord Dark"
+    "theme": "Nord Darker",
+    "mode": "Maximized",
+    "padding": {
+      "top": 0,
+      "bottom": 0,
+      "left": 0,
+      "right": 0
+    },
+    "selection": "#88c0d0"
   },
   "font": {
     "face": "FiraCode Nerd Font",

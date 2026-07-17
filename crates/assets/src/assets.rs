@@ -7,7 +7,7 @@ use rust_embed::RustEmbed;
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
 #[include = "windows.json"]
-#[include = "darwin.json"]
+#[include = "macos.json"]
 #[include = "linux.json"]
 #[include = "nord.json"]
 #[include = "fonts/Lilex-Regular.ttf"]

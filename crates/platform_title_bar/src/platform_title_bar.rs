@@ -318,8 +318,16 @@ impl Render for PlatformTitleBar {
                 }
             });
 
+        // Bottom border on the WHOLE title bar block (button row + tab
+        // strip), not on the terminal content further down in workspace.rs
+        // — that way it always sits flush against the title bar/tab strip
+        // regardless of `window.padding`, instead of floating in the
+        // padding gap whenever top padding > 0 (see git history for the
+        // stray-line bug this replaces).
         v_flex()
             .w_full()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(title_bar)
             .child(self.system_window_tabs.clone().into_any_element())
     }

@@ -113,16 +113,16 @@ fn main() {
     }
     println!("PASS: relay's stdout contained the real remote shell's echoed output over SSH");
 
-    // The actual v2-regression check: no double-terminal-emulation garbage
+    // The actual regression check: no double-terminal-emulation garbage
     // (stray escape-sequence fragments, corrupted control codes) anywhere
     // in the stream — not just that the marker text happened to survive.
-    // Checks for the exact kind of artifact previously confirmed with v2
+    // Checks for the exact kind of artifact a real prior bug produced
     // (garbled `1c0`/`☁`-style fragments) — a byte sequence that looks like
     // a botched/partially-consumed escape sequence rather than either a
     // real ANSI escape (starts with ESC, 0x1b) or plain printable text.
     let suspicious_fragment = text.contains("1c0") || text.contains("☁") || text.contains("[?1;2c") && !text.contains('\x1b');
     if suspicious_fragment {
-        eprintln!("FAIL: found a v2-style corruption artifact in the relay's output:\n{text}");
+        eprintln!("FAIL: found a corruption artifact in the relay's output:\n{text}");
         std::process::exit(1);
     }
     println!("PASS: no double-terminal-emulation corruption artifacts found in the output");

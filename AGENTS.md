@@ -249,7 +249,7 @@ assets/
 **Платформенные дефолты в `assets/settings/default-{platform}.json`:**
 
 `assets/windows.json` — фаллбек если нет пользовательского settings.json: один таб PowerShell.
-`assets/darwin.json` — фаллбек: один таб $SHELL.
+`assets/macos.json` — фаллбек: один таб $SHELL.
 `assets/linux.json` — фаллбек: один таб $SHELL.
 
 **Логика загрузки при старте:**

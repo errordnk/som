@@ -115,7 +115,7 @@ impl fmt::Display for WorktreeId {
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
 #[include = "windows.json"]
-#[include = "darwin.json"]
+#[include = "macos.json"]
 #[include = "linux.json"]
 #[include = "nord.json"]
 pub struct SettingsAssets;

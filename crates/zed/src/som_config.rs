@@ -154,7 +154,7 @@ impl SomConfig {
         #[cfg(target_os = "windows")]
         let asset_name = "windows.json";
         #[cfg(target_os = "macos")]
-        let asset_name = "darwin.json";
+        let asset_name = "macos.json";
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let asset_name = "linux.json";
 
@@ -456,7 +456,7 @@ impl SomConfig {
         #[cfg(target_os = "windows")]
         let asset_name = "windows.json";
         #[cfg(target_os = "macos")]
-        let asset_name = "darwin.json";
+        let asset_name = "macos.json";
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let asset_name = "linux.json";
         assets::Assets::get(asset_name)

@@ -119,8 +119,9 @@ A flat map of keystroke → action name. User entries are merged on top of the p
 
 ```json
 "keys": {
-  "ctrl-shift-t": "NewTab",
-  "ctrl-alt-left": "PrevTab"
+  "ctrl-shift-=": "NewTab",
+  "ctrl-shift--": "CloseTab",
+  "ctrl-shift-left": "PrevTab"
 }
 ```
 
@@ -159,7 +160,14 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 |---|---|
 | `Cmd+C` | Copy |
 | `Cmd+V` | Paste |
-| `Cmd+N` / `Cmd+Shift+1` | New tab (profile 1 — both open the same profile; there is no profile-2 binding shipped) |
+| `Cmd+=` / `Cmd+-` / `Cmd+0` | Increase / decrease / reset font size (session only, not saved) |
+| `Cmd+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
+| `Cmd+Shift+1`..`Cmd+Shift+9` / `Cmd+Shift+0` | New tab from profile 1-9 / profile 10 |
+| `Cmd+Shift+-` | Close active tab |
+| `Cmd+Shift+\` | Split active pane (new pane) |
+| `Cmd+Shift+Backspace` | Close active split pane |
+| `Cmd+Shift+Up` / `Cmd+Shift+Down` | Focus previous / next split pane |
+| `Cmd+Shift+Left` / `Cmd+Shift+Right` | Activate previous / next tab |
 | `Cmd+Q` | Quit |
 
 ### Linux
@@ -168,7 +176,14 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 |---|---|
 | `Ctrl+Insert` / `Ctrl+Shift+C` | Copy |
 | `Shift+Insert` / `Ctrl+V` | Paste |
-| `Ctrl+N` / `Ctrl+Shift+1` | New tab (profile 1 — same caveat as macOS) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset font size (session only, not saved) |
+| `Ctrl+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
+| `Ctrl+Shift+1`..`Ctrl+Shift+9` / `Ctrl+Shift+0` | New tab from profile 1-9 / profile 10 |
+| `Ctrl+Shift+-` | Close active tab |
+| `Ctrl+Shift+\` | Split active pane (new pane) |
+| `Ctrl+Shift+Backspace` | Close active split pane |
+| `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Focus previous / next split pane |
+| `Ctrl+Shift+Left` / `Ctrl+Shift+Right` | Activate previous / next tab |
 | `Alt+F4` | Quit |
 
 ### Always active, not configurable via settings.json

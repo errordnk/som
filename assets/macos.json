@@ -29,10 +29,29 @@
     }
   ],
   "keys": {
+    "cmd-q": "Quit",
     "cmd-c": "Copy",
     "cmd-v": "Paste",
-    "cmd-n": "NewTab",
+    "cmd-=": "IncreaseFont",
+    "cmd--": "DecreaseFont",
+    "cmd-0": "ResetFont",
+    "cmd-shift-=": "NewTab",
     "cmd-shift-1": "NewTab1",
-    "cmd-q": "Quit"
+    "cmd-shift-2": "NewTab2",
+    "cmd-shift-3": "NewTab3",
+    "cmd-shift-4": "NewTab4",
+    "cmd-shift-5": "NewTab5",
+    "cmd-shift-6": "NewTab6",
+    "cmd-shift-7": "NewTab7",
+    "cmd-shift-8": "NewTab8",
+    "cmd-shift-9": "NewTab9",
+    "cmd-shift-0": "NewTab10",
+    "cmd-shift--": "CloseTab",
+    "cmd-shift-\\": "NewPane",
+    "cmd-shift-backspace": "ClosePane",
+    "cmd-shift-up": "PrevPane",
+    "cmd-shift-down": "NextPane",
+    "cmd-shift-left": "PrevTab",
+    "cmd-shift-right": "NextTab"
   }
 }

@@ -10,7 +10,6 @@ use rust_embed::RustEmbed;
 #[include = "macos.json"]
 #[include = "linux.json"]
 #[include = "nord.json"]
-#[include = "fonts/Lilex-Regular.ttf"]
 #[include = "fonts/IBMPlexSans-Regular.ttf"]
 #[include = "fonts/FiraCodeNerdFont-Regular.ttf"]
 #[include = "icons/*.svg"]
@@ -56,7 +55,7 @@ impl Assets {
     pub fn load_test_fonts(&self, cx: &App) {
         cx.text_system()
             .add_fonts(vec![
-                self.load("fonts/Lilex-Regular.ttf").unwrap().unwrap(),
+                self.load("fonts/FiraCodeNerdFont-Regular.ttf").unwrap().unwrap(),
             ])
             .unwrap()
     }

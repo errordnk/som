@@ -253,7 +253,7 @@ impl SvgRenderer {
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
     let font_paths = [
         "fonts/IBMPlexSans-Regular.ttf",
-        "fonts/Lilex-Regular.ttf",
+        "fonts/FiraCodeNerdFont-Regular.ttf",
     ];
     for path in font_paths {
         match asset_source.load(path) {
@@ -274,7 +274,7 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
         (Family::SansSerif, "IBM Plex Sans"),
         // No serif font bundled; use sans-serif as best available fallback.
         (Family::Serif, "IBM Plex Sans"),
-        (Family::Monospace, "Lilex"),
+        (Family::Monospace, "FiraCode Nerd Font"),
         (Family::Cursive, "IBM Plex Sans"),
         (Family::Fantasy, "IBM Plex Sans"),
     ];
@@ -304,12 +304,13 @@ mod tests {
 
     const IBM_PLEX_REGULAR: &[u8] =
         include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Lilex-Regular.ttf");
+    const FIRACODE_NERD_FONT_REGULAR: &[u8] =
+        include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
         db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(LILEX_REGULAR.to_vec());
+        db.load_font_data(FIRACODE_NERD_FONT_REGULAR.to_vec());
         db
     }
 
@@ -381,23 +382,23 @@ mod tests {
                 style: usvg::fontdb::Style::Normal,
             })
             .unwrap();
-        let lilex = db
+        let firacode = db
             .query(&usvg::fontdb::Query {
-                families: &[usvg::fontdb::Family::Name("Lilex")],
+                families: &[usvg::fontdb::Family::Name("FiraCode Nerd Font")],
                 weight: usvg::fontdb::Weight(400),
                 stretch: usvg::fontdb::Stretch::Normal,
                 style: usvg::fontdb::Style::Normal,
             })
             .unwrap();
-        let selected = select_emoji_font('│', &[], &db, &["IBM Plex Sans", "Lilex"]).unwrap();
+        let selected = select_emoji_font('│', &[], &db, &["IBM Plex Sans", "FiraCode Nerd Font"]).unwrap();
 
-        assert_eq!(selected, lilex);
+        assert_eq!(selected, firacode);
         assert!(!font_has_char(&db, ibm_plex_sans, '│'));
         assert!(font_has_char(&db, selected, '│'));
     }
 
     #[test]
-    fn fix_generic_font_families_monospace_resolves_to_lilex() {
+    fn fix_generic_font_families_monospace_resolves_to_firacode() {
         let mut db = db_with_bundled_fonts();
         fix_generic_font_families(&mut db);
 
@@ -408,8 +409,8 @@ mod tests {
         let id = db.query(&query).expect("Monospace should resolve");
         let face = db.face(id).expect("Face should exist");
         assert!(
-            face.families.iter().any(|(name, _)| name.contains("Lilex")),
-            "Monospace should map to Lilex, got {:?}",
+            face.families.iter().any(|(name, _)| name.contains("FiraCode")),
+            "Monospace should map to FiraCode Nerd Font, got {:?}",
             face.families
         );
     }

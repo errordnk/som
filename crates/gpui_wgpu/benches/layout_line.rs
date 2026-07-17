@@ -3,7 +3,7 @@ use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
 use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
-const LILEX: &[u8] = include_bytes!("../../../assets/fonts/Lilex-Regular.ttf");
+const FIRACODE_NERD_FONT: &[u8] = include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
 const IBM_PLEX: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
 
 // ~4 000 chars of typical ASCII code text.
@@ -40,15 +40,15 @@ fn code_text() -> String {
 }
 
 fn bench_layout_line(c: &mut Criterion) {
-    let system = CosmicTextSystem::new_without_system_fonts("Lilex");
+    let system = CosmicTextSystem::new_without_system_fonts("FiraCode Nerd Font");
     system
-        .add_fonts(vec![Cow::Borrowed(LILEX), Cow::Borrowed(IBM_PLEX)])
+        .add_fonts(vec![Cow::Borrowed(FIRACODE_NERD_FONT), Cow::Borrowed(IBM_PLEX)])
         .unwrap();
 
-    let font_id_no_fallback = system.font_id(&font("Lilex")).unwrap();
+    let font_id_no_fallback = system.font_id(&font("FiraCode Nerd Font")).unwrap();
 
     let font_id_with_fallback = {
-        let mut f = font("Lilex");
+        let mut f = font("FiraCode Nerd Font");
         f.fallbacks = Some(FontFallbacks::from_fonts(vec!["IBM Plex Sans".to_string()]));
         system.font_id(&f).unwrap()
     };

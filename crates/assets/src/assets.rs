@@ -10,7 +10,6 @@ use rust_embed::RustEmbed;
 #[include = "macos.json"]
 #[include = "linux.json"]
 #[include = "nord.json"]
-#[include = "fonts/IBMPlexSans-Regular.ttf"]
 #[include = "fonts/FiraCodeNerdFont-Regular.ttf"]
 #[include = "icons/*.svg"]
 pub struct Assets;

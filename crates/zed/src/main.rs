@@ -742,10 +742,7 @@ fn parse_url_arg(arg: &str, _cx: &App) -> String {
 fn load_embedded_fonts(cx: &App) {
     let asset_source = cx.asset_source();
     let mut fonts = Vec::new();
-    for name in &[
-        "fonts/FiraCodeNerdFont-Regular.ttf",
-        "fonts/IBMPlexSans-Regular.ttf",
-    ] {
+    for name in &["fonts/FiraCodeNerdFont-Regular.ttf"] {
         if let Some(bytes) = asset_source.load(name).ok().flatten() {
             fonts.push(bytes);
         }

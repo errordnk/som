@@ -57,8 +57,7 @@ impl EventListener for ServerListener {
 /// RELAY directly. This is what lets a (re)connected RELAY get an initial
 /// `Session::snapshot()` (the full, already-parsed state) and then stay
 /// current via this raw byte stream afterward, without the HOLDER ever
-/// needing to diff/replay ANSI itself (v1's `redraw.rs`, which this
-/// architecture replaces) — the RELAY just feeds these same bytes through
+/// needing to diff/replay ANSI itself — the RELAY just feeds these same bytes through
 /// its OWN local `Term`'s ordinary ANSI parser, same as Som's regular
 /// (non-tmux) terminal already does for a directly-owned shell.
 struct RawByteBroadcaster {
@@ -402,19 +401,6 @@ impl Session {
         self.pty_tx.notify(bytes);
     }
 
-    /// Direct text dump of the underlying `Term`'s grid, bypassing
-    /// `crate::redraw` entirely — used by tests to distinguish "the real
-    /// shell/ConPTY produced this content" from "this crate's own diff/
-    /// redraw serialization corrupted it". Not used by production code
-    /// (the HOLDER always goes through `redraw()`), kept as a test-only
-    /// diagnostic tool since it was exactly what isolated a real bug (see
-    /// `redraw.rs`'s `pressing_enter_at_a_wide_pane_size_...` test) to
-    /// `relay.rs` instead of here.
-    pub fn diag_grid_text(&self) -> String {
-        let term = self.term.lock();
-        term.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect()
-    }
-
     /// Skips re-applying an identical size — mainly for the resize-poll
     /// thread's 250ms tick (`crate::relay`), which calls this constantly
     /// and would otherwise spam a `TIOCSWINSZ`/`SIGWINCH`-equivalent on
@@ -460,30 +446,16 @@ impl Session {
         self.pty_tx.0.send(Msg::Resize(window_size)).ok();
     }
 
-    /// Serializes the current grid into ANSI bytes via `redrawer`, writing
-    /// them to `out` — see `crate::redraw` module doc comment for why this
-    /// exists (transparent-PTY-proxy architecture: `som-tmux` must
-    /// emit plain ANSI on its own stdout, not a structured protocol, so
-    /// Som's own unmodified `TerminalElement` can parse it like any other
-    /// shell). `redrawer` carries the diff state; pass the SAME `Redrawer`
-    /// across repeated calls for incremental updates (only what changed
-    /// gets emitted), or a freshly-`Redrawer::new()` one for a full
-    /// redraw (a newly-(re)attached client needs to see the whole screen).
-    pub fn redraw(&self, redrawer: &mut crate::redraw::Redrawer, out: &mut impl std::io::Write) -> std::io::Result<()> {
-        let term = self.term.lock();
-        redrawer.redraw(&term, out)
-    }
-
-    /// v3 architecture (see `SOM_MUX_PLAN.md`'s "som-tmux v3" section):
-    /// captures this session's ENTIRE terminal state — both grid buffers,
+    /// Captures this session's ENTIRE terminal state — both grid buffers,
     /// cursor, and the full `TermMode` bitflags — bincode-encoded, ready to
-    /// send as a single `HolderOutput::Snapshot` message. Replaces
-    /// `redraw()`'s role for a freshly-(re)connected RELAY: instead of
-    /// replaying ANSI bytes to reproduce a screen (which cannot carry mode
-    /// flags like DECCKM, since a mode flip has no visible content of its
-    /// own — the actual design flaw v1's `Redrawer`-based approach had),
-    /// the RELAY calls `Term::restore()` with this directly, which is
-    /// correct-by-construction for every mode `TermMode` tracks.
+    /// send as a single `HolderOutput::Snapshot` message for a freshly-
+    /// (re)connected RELAY. Sending the state directly (rather than
+    /// replaying ANSI bytes to reproduce a screen) is what lets mode flags
+    /// like DECCKM come across correctly — a mode flip has no visible
+    /// content of its own, so diffing/replaying visible grid content alone
+    /// cannot carry it. The RELAY calls `Term::restore()` with this
+    /// directly, which is correct-by-construction for every mode
+    /// `TermMode` tracks.
     pub fn snapshot(&self) -> Vec<u8> {
         let term = self.term.lock();
         let state = term.snapshot();
@@ -567,12 +539,6 @@ fn process_pid(pty: &tty::Pty) -> Option<sysinfo::Pid> {
         .pid()
         .map(|pid| sysinfo::Pid::from_u32(u32::from(pid)))
 }
-
-// Color/attribute round-trip through a real PTY is covered by
-// `crate::redraw`'s tests (`redraw_round_trips_colored_text_through_a_real_
-// parser`), which exercises `Session::redraw` — the actual method used in
-// production now that `Session::snapshot`/the old `GridSnapshot` protocol
-// are gone. No separate test needed here for the same behavior.
 
 #[cfg(test)]
 mod tests {

@@ -4,7 +4,6 @@ use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
 const FIRACODE_NERD_FONT: &[u8] = include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
-const IBM_PLEX: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
 
 // ~4 000 chars of typical ASCII code text.
 fn code_text() -> String {
@@ -40,16 +39,18 @@ fn code_text() -> String {
 }
 
 fn bench_layout_line(c: &mut Criterion) {
-    let system = CosmicTextSystem::new_without_system_fonts("FiraCode Nerd Font");
-    system
-        .add_fonts(vec![Cow::Borrowed(FIRACODE_NERD_FONT), Cow::Borrowed(IBM_PLEX)])
-        .unwrap();
+    // Uses the system font database (unlike `new_without_system_fonts`) so
+    // "Segoe UI" — used below purely as a second, distinct fallback font to
+    // measure fallback-chain overhead against — resolves to a real font
+    // without needing its own bundled asset.
+    let system = CosmicTextSystem::new("FiraCode Nerd Font");
+    system.add_fonts(vec![Cow::Borrowed(FIRACODE_NERD_FONT)]).unwrap();
 
     let font_id_no_fallback = system.font_id(&font("FiraCode Nerd Font")).unwrap();
 
     let font_id_with_fallback = {
         let mut f = font("FiraCode Nerd Font");
-        f.fallbacks = Some(FontFallbacks::from_fonts(vec!["IBM Plex Sans".to_string()]));
+        f.fallbacks = Some(FontFallbacks::from_fonts(vec!["Segoe UI".to_string()]));
         system.font_id(&f).unwrap()
     };
 

@@ -20,13 +20,9 @@ use std::{
 };
 use wasm_bindgen::prelude::*;
 
-static BUNDLED_FONTS: &[&[u8]] = &[
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf"),
-    include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf"),
-];
+static BUNDLED_FONTS: &[&[u8]] = &[include_bytes!(
+    "../../../assets/fonts/FiraCodeNerdFont-Regular.ttf"
+)];
 
 pub struct WebPlatform {
     browser_window: web_sys::Window,
@@ -65,7 +61,7 @@ impl WebPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher);
         let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
-            "IBM Plex Sans",
+            "FiraCode Nerd Font",
         ));
         let fonts = BUNDLED_FONTS
             .iter()

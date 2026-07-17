@@ -649,6 +649,26 @@ pub fn clamp_font_size(size: Pixels) -> Pixels {
     size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
 }
 
+/// Native system UI font family per platform, used when the user hasn't set
+/// `ui_font_family` in settings.json — one hardcoded name per OS rather than
+/// a virtual name like `.SystemUIFont` so it's a real, always-installed font
+/// (Segoe UI/SF Pro/Noto Sans ship with the OS itself), not one that could
+/// be missing depending on what's installed.
+fn default_ui_font_family() -> SharedString {
+    #[cfg(target_os = "windows")]
+    {
+        "Segoe UI".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "SF Pro".into()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "Noto Sans".into()
+    }
+}
+
 fn font_fallbacks_from_settings(
     fallbacks: Option<Vec<settings::FontFamilyName>>,
 ) -> Option<FontFallbacks> {
@@ -685,7 +705,7 @@ impl settings::Settings for ThemeSettings {
                     .ui_font_family
                     .as_ref()
                     .map(|f| f.0.clone().into())
-                    .unwrap_or_else(|| "Segoe UI".into()),
+                    .unwrap_or_else(default_ui_font_family),
                 features: content
                     .ui_font_features
                     .clone()

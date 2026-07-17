@@ -744,7 +744,6 @@ fn load_embedded_fonts(cx: &App) {
     let mut fonts = Vec::new();
     for name in &[
         "fonts/FiraCodeNerdFont-Regular.ttf",
-        "fonts/Lilex-Regular.ttf",
         "fonts/IBMPlexSans-Regular.ttf",
     ] {
         if let Some(bytes) = asset_source.load(name).ok().flatten() {

@@ -1178,11 +1178,11 @@ impl FontMetrics {
 #[allow(unused)]
 pub fn font_name_with_fallbacks<'a>(name: &'a str, system: &'a str) -> &'a str {
     // Note: the "Zed Plex" fonts were deprecated as we are not allowed to use "Plex"
-    // in a derived font name. They are essentially indistinguishable from IBM Plex/
-    // FiraCode Nerd Font, and so retained here for backward compatibility.
+    // in a derived font name, and retained here (mapped to Som's own bundled
+    // font) for backward compatibility.
     match name {
         ".SystemUIFont" => system,
-        ".ZedSans" | "Zed Plex Sans" => "IBM Plex Sans",
+        ".ZedSans" | "Zed Plex Sans" => "FiraCode Nerd Font",
         ".ZedMono" | "Zed Plex Mono" => "FiraCode Nerd Font",
         _ => name,
     }
@@ -1195,11 +1195,11 @@ pub fn font_name_with_fallbacks_shared<'a>(
     system: &'a SharedString,
 ) -> &'a SharedString {
     // Note: the "Zed Plex" fonts were deprecated as we are not allowed to use "Plex"
-    // in a derived font name. They are essentially indistinguishable from IBM Plex/
-    // FiraCode Nerd Font, and so retained here for backward compatibility.
+    // in a derived font name, and retained here (mapped to Som's own bundled
+    // font) for backward compatibility.
     match name.as_str() {
         ".SystemUIFont" => system,
-        ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
+        ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("FiraCode Nerd Font") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("FiraCode Nerd Font") },
         _ => name,
     }

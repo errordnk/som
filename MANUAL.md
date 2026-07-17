@@ -1,6 +1,6 @@
 # Som Manual
 
-This document describes every user-facing feature of Som and every option in `~/.config/som/settings.json`. It reflects the actual behavior of the code as of this writing, including a few gaps between what's shipped and what's documented — those are called out explicitly rather than glossed over.
+This document describes every user-facing feature of Som and every option in `~/.config/som/settings.json`. It reflects the actual behavior of the code as of this writing.
 
 ## Table of contents
 
@@ -13,7 +13,6 @@ This document describes every user-facing feature of Som and every option in `~/
 7. [Restore on launch](#restore-on-launch)
 8. [som-tmux: keeping remote sessions alive](#som-tmux-keeping-remote-sessions-alive)
 9. [Theming](#theming)
-10. [Known gaps between docs and behavior](#known-gaps-between-docs-and-behavior)
 
 ---
 
@@ -56,13 +55,13 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 |---|---|---|
 | `font.face` | string | Terminal AND UI buffer font family. |
 | `font.size` | number | Terminal font size (px). |
-| `font.weight` | integer, 100-900 | Terminal AND UI buffer font weight (same scale as Zed's own `buffer_font_weight`/`terminal.font_weight` — 400 = normal, 700 = bold). Out-of-range values are clamped. |
+| `font.weight` | integer, 100-900 | Terminal AND UI buffer font weight (400 = normal, 700 = bold). Out-of-range values are clamped. |
 | `font.lineHeight` | number | Terminal line height multiplier. |
 | `font.features` | object (OpenType feature tag → `true`/`false` or a non-negative integer) | OpenType font features — see [Ligatures and font features](#ligatures-and-font-features) below. |
 
 #### Ligatures and font features
 
-`font.features` maps a 4-character OpenType feature tag to either a boolean (`true`/`false`, enable/disable) or an integer (for features with multiple variants, like stylistic sets). This mirrors Zed's own `terminal.font_features`/`buffer_font_features` format exactly:
+`font.features` maps a 4-character OpenType feature tag to either a boolean (`true`/`false`, enable/disable) or an integer (for features with multiple variants, like stylistic sets):
 
 ```json
 "font": {
@@ -125,7 +124,7 @@ A flat map of keystroke → action name. User entries are merged on top of the p
 }
 ```
 
-Recognized action names: `Copy`, `Paste`, `CloseTab`, `NewPane`, `UnSplitTab`, `ClosePane`, `NextPane`, `PrevPane`, `NextTab`, `PrevTab`, `Quit`, `IncreaseFont`, `DecreaseFont`, `ResetFont`, `NewTab`, `NewTab1`..`NewTab10`. Any other string is silently ignored — no binding is created and no error is shown, so check spelling carefully against this list.
+Recognized action names: `Copy`, `Paste`, `CloseTab`, `NewPane`, `ClosePane`, `NextPane`, `PrevPane`, `NextTab`, `PrevTab`, `Quit`, `IncreaseFont`, `DecreaseFont`, `ResetFont`, `NewTab`, `NewTab1`..`NewTab10`. Any other string is silently ignored — no binding is created and no error is shown, so check spelling carefully against this list.
 
 `NewTab1`..`NewTab10` open `tabs[0]`..`tabs[9]` by position — if settings.json has fewer profiles than that (e.g. `NewTab9` with only 5 `tabs[]` entries), pressing that key shows a "No profile #9…" notification instead of silently opening a different profile. Bare `NewTab` can't hit this: it always resolves to the default profile (see `tabs`' `default` field above), which is guaranteed to exist.
 
@@ -144,7 +143,7 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 | `Ctrl+Insert` / `Ctrl+Shift+C` | Copy |
 | `Shift+Insert` / `Ctrl+V` | Paste |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset font size (session only, not saved) |
-| `Ctrl+Scroll` (`Cmd+Scroll` on macOS) | Zoom font size in/out (session only, not saved) |
+| `Ctrl+Scroll` | Zoom font size in/out (session only, not saved) |
 | `Ctrl+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
 | `Ctrl+Shift+1`..`Ctrl+Shift+9` / `Ctrl+Shift+0` | New tab from profile 1-9 / profile 10 |
 | `Ctrl+Shift+-` | Close active tab |
@@ -161,6 +160,7 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 | `Cmd+C` | Copy |
 | `Cmd+V` | Paste |
 | `Cmd+=` / `Cmd+-` / `Cmd+0` | Increase / decrease / reset font size (session only, not saved) |
+| `Cmd+Scroll` | Zoom font size in/out (session only, not saved) |
 | `Cmd+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
 | `Cmd+Shift+1`..`Cmd+Shift+9` / `Cmd+Shift+0` | New tab from profile 1-9 / profile 10 |
 | `Cmd+Shift+-` | Close active tab |
@@ -177,6 +177,7 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 | `Ctrl+Insert` / `Ctrl+Shift+C` | Copy |
 | `Shift+Insert` / `Ctrl+V` | Paste |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset font size (session only, not saved) |
+| `Ctrl+Scroll` | Zoom font size in/out (session only, not saved) |
 | `Ctrl+Shift+=` | New tab from the default profile (`default: true`, or profile 1 if none is marked) |
 | `Ctrl+Shift+1`..`Ctrl+Shift+9` / `Ctrl+Shift+0` | New tab from profile 1-9 / profile 10 |
 | `Ctrl+Shift+-` | Close active tab |
@@ -242,12 +243,4 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 
 ## Theming
 
-Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` default), written to `~/.config/som/themes/nord.json` on first run. The full underlying theme engine (inherited from Zed) supports arbitrary theme files with about 150 individually addressable colors, but Som doesn't currently expose a way to install additional themes other than manually placing a compatible theme JSON file in the themes directory and setting `window.theme` to its name.
-
----
-
-## Known gaps between docs and behavior
-
-These are documented here deliberately rather than silently ignored, so you don't spend time debugging a setting that simply doesn't do anything yet:
-
-- **Only the Windows default template wires up `Ctrl+Shift+2`..`9` for additional tab profiles.** The macOS/Linux templates only bind profile 1 (bound twice, redundantly) — if you add more profiles on those platforms, you'll need to add your own `keys` entries (e.g. `"cmd-shift-2": "New2"`) to reach them.
+Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` default), written to `~/.config/som/themes/nord.json` on first run. The underlying theme engine supports arbitrary theme files with about 150 individually addressable colors, but Som doesn't currently expose a way to install additional themes other than manually placing a compatible theme JSON file in the themes directory and setting `window.theme` to its name.

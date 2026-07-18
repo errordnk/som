@@ -47,6 +47,27 @@ pub struct WindowConfig {
     pub mode: Option<String>,
     pub padding: Option<PaddingConfig>,
     pub selection: Option<String>,
+    /// Explicit windowed-mode startup position, physical pixels. Only takes
+    /// effect when `mode: "windowed"` AND both this and `size` have all
+    /// their fields present and non-zero — otherwise Som falls back to
+    /// `db.json`'s remembered geometry, same as when neither is set at all.
+    /// See `WindowConfig::explicit_windowed_bounds`.
+    pub position: Option<WindowPositionConfig>,
+    pub size: Option<WindowSizeConfig>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WindowPositionConfig {
+    pub top: u32,
+    pub left: u32,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WindowSizeConfig {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// How the window should be placed when it's first created. Parsed from
@@ -68,6 +89,24 @@ impl WindowConfig {
             Some("minimized") => WindowMode::Minimized,
             Some("fullscreen") => WindowMode::Fullscreen,
             _ => WindowMode::Windowed,
+        }
+    }
+
+    /// `(top, left, width, height)` if `position` and `size` are both set
+    /// and every one of their four fields is non-zero — the all-or-nothing
+    /// rule from `position`/`size`'s own doc comment above. `None` means
+    /// "fall back to db.json", exactly as if neither were set.
+    pub fn explicit_windowed_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        match (self.position, self.size) {
+            (Some(position), Some(size))
+                if position.top != 0
+                    && position.left != 0
+                    && size.width != 0
+                    && size.height != 0 =>
+            {
+                Some((position.top, position.left, size.width, size.height))
+            }
+            _ => None,
         }
     }
 }

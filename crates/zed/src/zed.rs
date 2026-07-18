@@ -240,7 +240,8 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
     // `db.json` for the `windowed` restore rect rather than Zed's inherited
     // SQLite window-bounds persistence, matching how tabs/splits already
     // work. See `som_db::SomWindowBounds`.
-    let window_mode = crate::som_config::SomConfig::load_embedded().window.mode();
+    let som_window_config = crate::som_config::SomConfig::load_embedded().window;
+    let window_mode = som_window_config.mode();
     let restore_bounds = || {
         display
             .as_ref()
@@ -250,6 +251,17 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
             })
     };
     let windowed_bounds = || -> gpui::Bounds<gpui::Pixels> {
+        // `window.top`/`left`/`width`/`height` in settings.json — takes
+        // priority over db.json's remembered geometry whenever all four are
+        // set and non-zero (see `WindowConfig::explicit_windowed_bounds`'s
+        // doc comment for the all-or-nothing rule). Otherwise, same as
+        // before: db.json's remembered rect, or the no-geometry-yet default.
+        if let Some((top, left, width, height)) = som_window_config.explicit_windowed_bounds() {
+            return gpui::Bounds::new(
+                point(px(left as f32), px(top as f32)),
+                gpui::Size { width: px(width as f32), height: px(height as f32) },
+            );
+        }
         if let Some(b) = workspace::som_db::load_som_db().window_bounds {
             return gpui::Bounds::new(
                 point(px(b.x as f32), px(b.y as f32)),

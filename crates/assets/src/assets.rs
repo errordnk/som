@@ -22,6 +22,16 @@ use rust_embed::RustEmbed;
 #[include = "tmux/windows-amd/som-tmux.exe"]
 #[include = "tmux/macos-arm/som-tmux"]
 #[include = "tmux/linux-amd/som-tmux"]
+// The Windows Terminal project's improved ConPTY backend — see `crates/zed/
+// build.rs`'s doc comment for where these are downloaded from (a pinned
+// nupkg version) and `crates/zed/src/main.rs`'s startup extraction, which
+// writes these bytes out to `~/.config/som/conpty/` (never next to som.exe
+// itself, so Som stays runnable from an arbitrary/read-only directory) and
+// points `SetDllDirectoryW` there before any terminal is created. Refreshed
+// manually by copying `target/release/{conpty.dll,OpenConsole.exe}` here
+// whenever build.rs's pinned `conpty_url` version bumps — not automated.
+#[include = "conpty/conpty.dll"]
+#[include = "conpty/OpenConsole.exe"]
 pub struct Assets;
 
 impl AssetSource for Assets {

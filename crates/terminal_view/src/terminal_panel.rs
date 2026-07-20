@@ -5,7 +5,7 @@ use crate::{
     pending_terminal_tab::PendingTerminalTab,
 };
 use gpui::{
-    App, AppContext as _, Context, Entity, Task, TaskExt, WeakEntity, Window,
+    App, AppContext as _, AssetSource, Context, Entity, Task, TaskExt, WeakEntity, Window,
 };
 use project::Project;
 
@@ -1554,10 +1554,9 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
         Some(info) => (info.os, info.arch),
         None => uname_platform(host_args, remote_kind)?,
     };
-    let Some(local_binary) = som_tmux::protocol::local_binary_path_for(os, arch) else {
+    let Some(local_binary) = ensure_embedded_binary_available(os, arch, &local_version) else {
         anyhow::bail!(
-            "no pre-built som-tmux binary for {os:?}/{arch:?} under {:?} — nothing to deploy",
-            som_tmux::protocol::platform_binaries_dir()
+            "no embedded som-tmux binary for {os:?}/{arch:?} — unsupported platform, falling back to plain (non-tmux) behavior"
         );
     };
 
@@ -1602,6 +1601,27 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-tmux"]);
     run_remote_command(remote_kind, &chmod_probe)?;
     Ok(())
+}
+
+/// Looks up Som's own embedded copy of `som-tmux` for a remote `(os, arch)`
+/// (see `crates/assets/src/assets.rs`'s `#[include = "tmux/..."]` entries —
+/// kept current by `scripts/update-tmux-binaries.sh`, a manually-run,
+/// pre-release step, NOT something that runs at build time) and extracts
+/// it to Som's local `~/.config/som/tmux/{platform}/` cache if missing or
+/// stale, returning that path. `None` for an unsupported platform (today:
+/// anything other than windows-amd/macos-arm/linux-amd — linux-arm in
+/// particular stays permanently unsupported) — callers treat this exactly
+/// like the old "no pre-built binary on disk" case: log and fall back to
+/// plain (non-tmux) behavior for that profile.
+fn ensure_embedded_binary_available(
+    os: som_tmux::protocol::Os,
+    arch: som_tmux::protocol::Arch,
+    local_version: &str,
+) -> Option<std::path::PathBuf> {
+    let exe_suffix = if let som_tmux::protocol::Os::Windows = os { ".exe" } else { "" };
+    let asset_path = format!("tmux/{}/som-tmux{exe_suffix}", som_tmux::protocol::platform_dir_name(os, arch));
+    let embedded_bytes = assets::Assets.load(&asset_path).ok().flatten();
+    som_tmux::protocol::ensure_embedded_binary_extracted(os, arch, embedded_bytes.as_deref(), local_version)
 }
 
 /// Asks the remote host directly what platform it is via `uname -s`/`uname
@@ -2179,18 +2199,19 @@ mod tmux_shell_wrapping_tests {
     ///
     /// KNOWN LIMITATION on a real dev machine: this manufactures a version
     /// mismatch by deleting the remote binary, which forces `ensure_remote_
-    /// binary_deployed` down its `local_binary_path_for` lookup — under
-    /// `cfg!(test)`, `paths::config_dir()` resolves against a FAKE home
-    /// directory (`C:\Users\zed\...`/`/home/zed\...`, see `util::paths::
-    /// home_dir`'s own `cfg!(test)` branch) this process typically has no
-    /// permission to create on a real Windows machine (confirmed:
+    /// binary_deployed` down its `ensure_embedded_binary_available` ->
+    /// `som_tmux::protocol::ensure_embedded_binary_extracted` lookup —
+    /// under `cfg!(test)`, `paths::config_dir()` resolves against a FAKE
+    /// home directory (`C:\Users\zed\...`/`/home/zed\...`, see `util::
+    /// paths::home_dir`'s own `cfg!(test)` branch) this process typically
+    /// has no permission to create on a real Windows machine (confirmed:
     /// `New-Item -Path C:\Users\zed` → access denied, even from an
     /// otherwise fully-privileged dev account — creating an arbitrary
     /// top-level `C:\Users\<name>` directory needs real admin rights this
     /// test deliberately does NOT attempt to acquire). Skip this one (`test_
     /// deploy_is_a_no_op_when_already_current` below covers the OTHER,
-    /// reachable branch) unless `C:\Users\zed\.config\som\tmux\linux-amd\
-    /// som-tmux` (or the Unix equivalent) has been populated out of band.
+    /// reachable branch) unless that fake config dir is writable in this
+    /// test environment.
     ///
     /// `#[ignore]`d by default: needs a real reachable SSH host with a
     /// clone of this repo at `~/som` (so `git pull` succeeds) — the
@@ -2230,16 +2251,16 @@ mod tmux_shell_wrapping_tests {
     /// this test runs (deliberately does NOT call `ensure_remote_binary_
     /// deployed` itself to set that up first, unlike `test_deploy_
     /// redeploys_a_version_mismatch` — a version MISMATCH path needs
-    /// `local_binary_path_for`, which resolves relative to `paths::
-    /// config_dir()`, which under `cfg!(test)` resolves to a fake `C:\
-    /// Users\zed\...`/`/home/zed/...` home directory this process has no
-    /// permission to create on a real dev machine — see `util::paths::
+    /// `ensure_embedded_binary_available`, which resolves relative to
+    /// `paths::config_dir()`, which under `cfg!(test)` resolves to a fake
+    /// `C:\Users\zed\...`/`/home/zed/...` home directory this process has
+    /// no permission to create on a real dev machine — see `util::paths::
     /// home_dir`'s own `cfg!(test)` branch. The ALREADY-current path
-    /// returns early, before ever touching `local_binary_path_for`, so
-    /// it's the one case this integration test CAN safely exercise without
-    /// hitting that same wall; deploy the current build to the test host
-    /// manually first — e.g. `scp ~/.config/som/tmux/linux-amd/som-tmux
-    /// <host>:~/.local/bin/som-tmux` — to set up the precondition.
+    /// returns early, before ever touching that lookup, so it's the one
+    /// case this integration test CAN safely exercise without hitting that
+    /// same wall; deploy the current build to the test host manually first
+    /// — e.g. `scp ~/.config/som/tmux/linux-amd/som-tmux <host>:~/.local/
+    /// bin/som-tmux` — to set up the precondition.
     ///
     /// `#[ignore]`d by default — same reachability requirement as `test_
     /// deploy_redeploys_a_version_mismatch`. Run explicitly with:

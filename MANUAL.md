@@ -23,7 +23,7 @@ This document describes every user-facing feature of Som and every option in `~/
 | `~/.config/som/settings.json` | Your configuration. Created from a platform-specific template on first launch. Watched and live-reloaded — edits apply immediately, with an in-app error banner if the JSON is invalid. |
 | `~/.config/som/themes/nord.json` | The bundled "Nord" theme, written out on first launch. |
 | `~/.config/som/db.json` | Tab/split/session layout, rewritten on every tab/split change and on quit. Not something you should hand-edit; described below for troubleshooting. |
-| `~/.config/som/tmux/{windows,macos,linux-amd}/som-tmux` | Pre-built `som-tmux` binaries used to deploy to remote hosts for SSH sessions with `"tmux": true`. |
+| `~/.config/som/tmux/{windows-amd,macos-arm,linux-amd}/som-tmux` | Pre-built `som-tmux` binaries used to deploy to remote hosts for SSH sessions with `"tmux": true` — auto-extracted from Som's own bundled copies on first use, not something you need to provide. |
 
 ---
 
@@ -110,7 +110,7 @@ An ordered array of tab profiles. `Ctrl+N`/`Cmd+N` and the bare `NewTab` action 
 | `icon` | string | none | Glyph shown on the tab (works best with a Nerd Font — see `font.face`). |
 | `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. |
 | `home` | string | none | Working directory; `~` is expanded. Must resolve to an existing directory or is ignored. |
-| `tmux` | bool | `false` | Opt-in to the `som-tmux` backend for this profile — keeps the session alive across Som restarts. See [som-tmux](#som-tmux-keeping-remote-sessions-alive). Splits are not yet supported on `tmux: true` tabs. |
+| `tmux` | bool | `false` | Opt-in to the `som-tmux` backend for this profile — keeps the session alive across Som restarts. See [som-tmux](#som-tmux-keeping-remote-sessions-alive). |
 | `default` | bool | `false` | Marks this profile as the one `Ctrl+N`/the `+` button/bare `NewTab` opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
 
 ### `keys`
@@ -213,7 +213,7 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 - `Ctrl+Shift+\` closes the most recently created split and refocuses a neighboring pane.
 - `Ctrl+Left`/`Ctrl+Right` cycle focus between the main pane and any live splits.
 - Switching away from a tab "parks" its splits (removes them from the visible layout but remembers their sizes); switching back restores them exactly as you left them — this works per-tab, so each tab keeps its own independent split layout.
-- **Splits are not yet supported on `tmux: true` tabs** — a tmux-backed tab only ever has one pane.
+- Works on `tmux: true` tabs too — each split pane gets its own independent persistent session.
 
 ## Session persistence (db.json)
 
@@ -235,10 +235,10 @@ When Som starts, it doesn't wait for slow connections before showing you the win
 Setting `"tmux": true` on a tab profile routes that tab's terminal through a small companion process (`som-tmux`) instead of a plain PTY:
 
 - **Local shells:** a detached process holds the real shell and PTY; it keeps running even if Som is closed, so reopening Som reconnects to the exact same session (scrollback, running programs, and all) instead of starting over.
-- **Remote shells (`ssh`/`wsl`):** the same mechanism runs on the far end — Som deploys a small pre-built `som-tmux` binary to `~/.local/bin/` on the remote host (only re-copying it when the version is out of date) and the remote shell runs inside it. This means a flaky connection or closing Som doesn't kill your remote session; reconnecting picks the same shell back up.
+- **Remote shells (`ssh`/`wsl`):** the same mechanism runs on the far end — Som deploys a small pre-built `som-tmux` binary to `~/.local/bin/` on the remote host (only re-copying it when the version is out of date) and the remote shell runs inside it. This means a flaky connection or closing Som doesn't kill your remote session; reconnecting picks the same shell back up. The pre-built binary itself comes bundled inside Som (Windows/macOS/Linux amd64 — Linux arm64 isn't built yet, and a `tmux: true` profile pointed at one falls back to a plain, non-persistent connection with a notification rather than failing to open).
 - Each tmux-backed pane gets its own persistent session, identified internally by a UUID — this is transparent to you, but it's what's saved in `db.json` to make reattachment possible.
 - Som periodically cleans up abandoned remote sessions (ones that no longer correspond to anything in your current tab list) on the same machine, so stale processes don't accumulate on hosts you connect to often. This is best-effort: if it fails for some reason, it's logged and ignored rather than blocking your tab from opening.
-- Splits are not currently supported on tmux-backed tabs (see [Splits](#splits)).
+- Splitting a tmux-backed tab works the same as any other tab — each new split pane gets its own independent persistent session (its own pane_id), not a shared one.
 
 This feature has no separate settings.json toggle beyond the per-profile `"tmux": true` — there's no global on/off switch.
 

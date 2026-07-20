@@ -220,15 +220,99 @@ pub fn platform_binaries_dir() -> std::path::PathBuf {
     paths::config_dir().join("tmux")
 }
 
+/// `som-tmux[.exe]` — the file name (not path) `local_binary_path_for`/
+/// `ensure_embedded_binary_extracted` both use under a platform's own
+/// `platform_dir_name` subdirectory.
+fn binary_file_name(os: Os) -> &'static str {
+    if let Os::Windows = os { "som-tmux.exe" } else { "som-tmux" }
+}
+
 /// Full local path to the pre-built `som-tmux` for a given remote
 /// `(Os, Arch)` — `None` if Som has never been told about (or hasn't yet
 /// downloaded/copied in) a binary for that platform. Callers (`terminal_
 /// view`'s `ensure_remote_binary_deployed`) treat a missing file the same
 /// way as an unreachable host: log and skip, rather than failing the tab.
 pub fn local_binary_path_for(os: Os, arch: Arch) -> Option<std::path::PathBuf> {
-    let file_name = if let Os::Windows = os { "som-tmux.exe" } else { "som-tmux" };
-    let path = platform_binaries_dir().join(platform_dir_name(os, arch)).join(file_name);
+    let path = platform_binaries_dir().join(platform_dir_name(os, arch)).join(binary_file_name(os));
     path.is_file().then_some(path)
+}
+
+/// Ensures the embedded `som-tmux` binary for a remote `(Os, Arch)` is
+/// present and current at `platform_binaries_dir()`'s own path for that
+/// platform, extracting `embedded_bytes` (Som's own RustEmbed'd copy — see
+/// `crates/assets/src/assets.rs`'s `#[include = "tmux/..."]` entries) there
+/// if the file is missing OR its own `--version` doesn't match
+/// `embedded_version` (`env!("CARGO_PKG_VERSION")` at Som's build time,
+/// same string `HandshakeInfo` already compares against a REMOTE host's
+/// binary — this is the identical check, just run locally as a plain child
+/// process instead of over SSH).
+///
+/// Returns the (now guaranteed-current, if `Some`) local path — the same
+/// path `local_binary_path_for` would return once this has run — or `None`
+/// if `embedded_bytes` is `None` (an unsupported platform: linux-arm,
+/// windows-arm, or macos-amd; Som was never built with a binary for that
+/// combination in the first place). Callers treat `None` exactly like
+/// `local_binary_path_for`'s `None` already was: log and fall back to
+/// plain (non-tmux) behavior for that profile, no crash.
+///
+/// This never touches a REMOTE host's binary — that overwrite-a-possibly-
+/// running-process concern (`ETXTBSY`, kill-before-scp) belongs entirely to
+/// `ensure_remote_binary_deployed` on the Som side. This function only
+/// ever writes to Som's own local cache directory, which nothing else runs
+/// out of directly.
+pub fn ensure_embedded_binary_extracted(
+    os: Os,
+    arch: Arch,
+    embedded_bytes: Option<&[u8]>,
+    embedded_version: &str,
+) -> Option<std::path::PathBuf> {
+    let path = platform_binaries_dir().join(platform_dir_name(os, arch)).join(binary_file_name(os));
+    ensure_embedded_binary_extracted_at(&path, embedded_bytes, embedded_version)
+}
+
+/// The actual extraction logic behind `ensure_embedded_binary_extracted`,
+/// taking the target path directly rather than deriving it from
+/// `platform_binaries_dir()` — split out so tests can point it at a
+/// throwaway temp path instead of Som's real `~/.config/som/tmux/`.
+fn ensure_embedded_binary_extracted_at(
+    path: &std::path::Path,
+    embedded_bytes: Option<&[u8]>,
+    embedded_version: &str,
+) -> Option<std::path::PathBuf> {
+    let embedded_bytes = embedded_bytes?;
+
+    if local_binary_version(path).as_deref() == Some(embedded_version) {
+        return Some(path.to_path_buf());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(path, embedded_bytes).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    Some(path.to_path_buf())
+}
+
+/// Runs `path --version` (the same handshake-JSON probe `ensure_remote_
+/// binary_deployed` already runs over SSH against a remote binary, here
+/// invoked as a local child process instead) and returns just its version
+/// string, or `None` if the file doesn't exist, isn't executable, or
+/// doesn't understand `--version` (e.g. a corrupted/truncated download —
+/// treated as "needs re-extracting", same as a missing file).
+fn local_binary_version(path: &std::path::Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let output = std::process::Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    serde_json::from_str::<HandshakeInfo>(stdout.trim()).ok().map(|info| info.version)
 }
 
 /// Exchanged first thing on every new connection, before any actual
@@ -421,6 +505,104 @@ mod platform_dir_tests {
         if let Some(path) = result {
             assert!(path.is_file(), "local_binary_path_for returned a path that doesn't actually exist: {path:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod embedded_binary_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "som_tmux_embedded_binary_test_{}_{name}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn missing_embedded_bytes_returns_none_without_touching_disk() {
+        let path = temp_path("missing_bytes");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(ensure_embedded_binary_extracted_at(&path, None, "1.0.0"), None);
+        assert!(!path.exists(), "must not create a file when embedded_bytes is None");
+    }
+
+    #[test]
+    fn missing_local_file_gets_written_from_embedded_bytes() {
+        let path = temp_path("missing_file");
+        let _ = std::fs::remove_file(&path);
+        let bytes = b"not a real binary, just test content";
+
+        let result = ensure_embedded_binary_extracted_at(&path, Some(bytes), "1.0.0");
+
+        assert_eq!(result.as_deref(), Some(path.as_path()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_that_fails_the_version_probe_gets_overwritten() {
+        // Simulates a stale/corrupted extraction: `local_binary_version`
+        // can't parse `--version` output from arbitrary garbage bytes (this
+        // isn't even a real executable, so running it fails outright) —
+        // same code path a genuinely OLDER som-tmux build would hit if its
+        // version string just didn't match, both treated identically as
+        // "needs re-extracting".
+        let path = temp_path("garbage_content");
+        std::fs::write(&path, b"garbage, not an executable").unwrap();
+        let new_bytes = b"replacement content";
+
+        let result = ensure_embedded_binary_extracted_at(&path, Some(new_bytes), "1.0.0");
+
+        assert_eq!(result.as_deref(), Some(path.as_path()));
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_binary_reporting_the_matching_version_is_left_untouched() {
+        // Uses the REAL locally-built som-tmux (this very test binary's own
+        // sibling artifact) so `--version` genuinely succeeds and reports a
+        // real, parseable HandshakeInfo — the one case that must NOT
+        // rewrite the file (mirrors ensure_remote_binary_deployed's own
+        // "already up to date, nothing to do" early return for a remote
+        // host).
+        let Ok(current_exe) = std::env::current_exe() else { return };
+        let Some(deps_dir) = current_exe.parent() else { return };
+        let Some(profile_dir) = deps_dir.parent() else { return };
+        let candidate = profile_dir.join(if cfg!(windows) { "som-tmux.exe" } else { "som-tmux" });
+        if !candidate.is_file() {
+            // Not every dev environment has built the som-tmux bin
+            // alongside the test artifacts — skip rather than fail.
+            return;
+        }
+
+        let real_version = HandshakeInfo::current().version;
+        let path = temp_path("matching_version");
+        std::fs::copy(&candidate, &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let original_bytes = std::fs::read(&path).unwrap();
+        let modified_time_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let result = ensure_embedded_binary_extracted_at(&path, Some(b"should never be written"), &real_version);
+
+        assert_eq!(result.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original_bytes,
+            "a binary already reporting the matching version must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified_time_before,
+            "must not touch the file at all when the version already matches"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 

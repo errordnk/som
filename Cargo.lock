@@ -7552,6 +7552,7 @@ name = "terminal_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "async-channel 2.5.0",
  "async-recursion",
  "collections",

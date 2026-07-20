@@ -254,6 +254,9 @@ fn main() {
     }
     ztracing::init();
 
+    #[cfg(target_os = "windows")]
+    ensure_conpty_extracted_and_wired();
+
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));
@@ -735,6 +738,55 @@ fn parse_url_arg(arg: &str, _cx: &App) -> String {
             } else {
                 format!("file://{arg}")
             }
+        }
+    }
+}
+
+/// Extracts Som's embedded, patched `conpty.dll`/`OpenConsole.exe` (the
+/// Windows Terminal project's improved ConPTY backend — see `crates/zed/
+/// build.rs`'s doc comment for where these come from) to `~/.config/som/
+/// conpty/` if not already there, then points `SetDllDirectoryW` at that
+/// directory so `alacritty_terminal`'s `LoadLibraryW(w!("conpty.dll"))`
+/// (no path — relies on the standard DLL search order) finds Som's own
+/// bundled copy before falling through to whatever baseline conpty.dll
+/// ships built into `System32` on Windows 10 1809+. Deliberately NOT
+/// written next to `som.exe` itself — the whole point is for Som to stay
+/// launchable from an arbitrary (possibly read-only) directory without
+/// assuming anything else sits beside it.
+///
+/// Must run before the first `Terminal`/PTY is created — called early in
+/// `main()`, right after logging is set up (so a failure here is at least
+/// visible) and long before any window/workspace exists.
+#[cfg(target_os = "windows")]
+fn ensure_conpty_extracted_and_wired() {
+    use gpui::AssetSource;
+
+    let conpty_dir = paths::config_dir().join("conpty");
+    for (asset_path, file_name) in
+        [("conpty/conpty.dll", "conpty.dll"), ("conpty/OpenConsole.exe", "OpenConsole.exe")]
+    {
+        let target = conpty_dir.join(file_name);
+        if target.is_file() {
+            continue;
+        }
+        let Some(bytes) = Assets.load(asset_path).ok().flatten() else {
+            log::error!("missing embedded asset {asset_path:?} — terminal will fall back to the system conpty");
+            continue;
+        };
+        if let Err(err) = std::fs::create_dir_all(&conpty_dir) {
+            log::error!("failed to create {conpty_dir:?}: {err:#}");
+            continue;
+        }
+        if let Err(err) = std::fs::write(&target, &bytes) {
+            log::error!("failed to write {target:?}: {err:#}");
+        }
+    }
+
+    unsafe {
+        use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+        use windows::core::HSTRING;
+        if let Err(err) = SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())) {
+            log::error!("SetDllDirectoryW({conpty_dir:?}) failed: {err:#} — terminal may fall back to the system conpty");
         }
     }
 }

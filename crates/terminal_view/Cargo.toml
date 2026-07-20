@@ -17,6 +17,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+assets.workspace = true
 async-channel.workspace = true
 async-recursion.workspace = true
 collections.workspace = true

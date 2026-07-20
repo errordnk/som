@@ -12,6 +12,16 @@ use rust_embed::RustEmbed;
 #[include = "nord.json"]
 #[include = "fonts/FiraCodeNerdFont-Regular.ttf"]
 #[include = "icons/*.svg"]
+// Pre-built som-tmux binaries for every remote platform Som's `tmux: true`
+// profiles support (Windows amd64, macOS arm64, Linux amd64 — NOT
+// linux-arm, which stays permanently unsupported) — see `som_tmux::
+// protocol::ensure_embedded_binary_extracted`, which writes these bytes out
+// to `~/.config/som/tmux/{platform}/` on demand. Kept up to date by
+// `scripts/update-tmux-binaries.sh` (dev-only, manually run before a
+// release), not built here or in CI.
+#[include = "tmux/windows-amd/som-tmux.exe"]
+#[include = "tmux/macos-arm/som-tmux"]
+#[include = "tmux/linux-amd/som-tmux"]
 pub struct Assets;
 
 impl AssetSource for Assets {

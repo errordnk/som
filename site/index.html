@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Som — быстрый терминал с сохранением сессий</title>
+<meta name="description" content="Som — минималистичный, быстрый терминал на GPUI с табами, сплитами и SSH-сессиями, которые переживают перезапуск. Портативный, один бинарник на платформу.">
+<link rel="icon" type="image/png" href="img/som-icon.png">
+<style>
+  :root {
+    --bg0: #2e3440;
+    --bg1: #3b4252;
+    --bg2: #434c5e;
+    --bg3: #4c566a;
+    --fg0: #eceff4;
+    --fg1: #e5e9f0;
+    --fg2: #d8dee9;
+    --muted: #8b96ac;
+    --accent: #88c0d0;
+    --accent2: #81a1c1;
+    --green: #a3be8c;
+    --yellow: #ebcb8b;
+    --red: #bf616a;
+    --purple: #b48ead;
+    --radius: 10px;
+    --maxw: 1080px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg0);
+    color: var(--fg1);
+    font-family: -apple-system, "Segoe UI", "SF Pro", "Noto Sans", system-ui, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, .mono {
+    font-family: "FiraCode Nerd Font", "Fira Code", "Cascadia Code", Consolas, monospace;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* ---------- nav ---------- */
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: rgba(46, 52, 64, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--bg2);
+  }
+  nav .wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 60px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 18px;
+    color: var(--fg0);
+  }
+  .brand-mark {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: flex; align-items: center; justify-content: center;
+    padding: 5px;
+  }
+  .brand-mark img { width: 100%; height: 100%; object-fit: contain; }
+  nav ul {
+    list-style: none;
+    display: flex;
+    gap: 28px;
+    margin: 0;
+    padding: 0;
+  }
+  nav ul a {
+    color: var(--fg2);
+    font-size: 14px;
+    font-weight: 500;
+  }
+  nav ul a:hover { color: var(--accent); text-decoration: none; }
+  .nav-cta {
+    background: var(--accent);
+    color: var(--bg0) !important;
+    padding: 8px 16px;
+    border-radius: 7px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .nav-cta:hover { background: var(--accent2); text-decoration: none; }
+  .nav-links { display: flex; align-items: center; gap: 28px; }
+
+  @media (max-width: 720px) {
+    nav ul.menu { display: none; }
+  }
+
+  /* ---------- hero ---------- */
+  header.hero {
+    padding: 96px 0 80px;
+    position: relative;
+    overflow: hidden;
+  }
+  header.hero::before {
+    content: "";
+    position: absolute;
+    top: -200px; right: -200px;
+    width: 600px; height: 600px;
+    background: radial-gradient(circle, rgba(136,192,208,0.14) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 999px;
+    margin-bottom: 24px;
+  }
+  .eyebrow .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+  h1 {
+    font-size: clamp(36px, 5.5vw, 60px);
+    line-height: 1.08;
+    margin: 0 0 20px;
+    color: var(--fg0);
+    letter-spacing: -0.02em;
+    max-width: 760px;
+  }
+  h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .lede {
+    font-size: 19px;
+    color: var(--muted);
+    max-width: 620px;
+    margin: 0 0 36px;
+  }
+  .cta-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 56px; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 13px 24px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 15px;
+    border: 1px solid transparent;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg0) !important;
+  }
+  .btn-primary:hover { background: var(--accent2); text-decoration: none; }
+  .btn-ghost {
+    background: transparent;
+    color: var(--fg1) !important;
+    border-color: var(--bg3);
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent) !important; text-decoration: none; }
+
+  /* terminal mock */
+  .term-mock {
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 30px 60px -20px rgba(0,0,0,0.5);
+  }
+  .term-shot { display: block; width: 100%; height: auto; }
+
+  /* ---------- section shell ---------- */
+  section { padding: 84px 0; }
+  section.alt { background: var(--bg1); border-top: 1px solid var(--bg2); border-bottom: 1px solid var(--bg2); }
+  .section-head { max-width: 620px; margin: 0 0 48px; }
+  .kicker {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+  h2 {
+    font-size: clamp(28px, 3.6vw, 38px);
+    color: var(--fg0);
+    margin: 0 0 14px;
+    letter-spacing: -0.01em;
+  }
+  .section-sub { color: var(--muted); font-size: 16.5px; }
+
+  /* ---------- feature grid ---------- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 26px;
+    transition: border-color .15s ease, transform .15s ease;
+  }
+  section.alt .card { background: var(--bg0); }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .card .icon {
+    width: 40px; height: 40px;
+    border-radius: 9px;
+    background: var(--bg2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px;
+    margin-bottom: 16px;
+  }
+  .card h3 {
+    font-size: 16.5px;
+    color: var(--fg0);
+    margin: 0 0 8px;
+  }
+  .card p {
+    font-size: 14.5px;
+    color: var(--muted);
+    margin: 0;
+  }
+  .card code {
+    background: var(--bg2);
+    color: var(--accent);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+
+  /* ---------- som-tmux spotlight ---------- */
+  .spotlight {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 56px;
+    align-items: center;
+  }
+  @media (max-width: 860px) { .spotlight { grid-template-columns: 1fr; gap: 32px; } }
+  .spotlight-badge {
+    display: inline-block;
+    background: rgba(163,190,140,0.14);
+    color: var(--green);
+    font-size: 12.5px;
+    font-weight: 700;
+    padding: 5px 12px;
+    border-radius: 999px;
+    margin-bottom: 18px;
+  }
+  .spotlight ul {
+    list-style: none;
+    margin: 24px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .spotlight li {
+    display: flex;
+    gap: 12px;
+    font-size: 15px;
+    color: var(--fg2);
+  }
+  .spotlight li .chk {
+    flex-shrink: 0;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: rgba(136,192,208,0.15);
+    color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px;
+    margin-top: 2px;
+  }
+  .diagram {
+    background: var(--bg0);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 28px;
+  }
+  .diagram-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .diagram-row:last-child { margin-bottom: 0; }
+  .diagram-box {
+    flex: 1;
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-size: 13px;
+  }
+  .diagram-box .t { color: var(--fg0); font-weight: 600; margin-bottom: 3px; }
+  .diagram-box .d { color: var(--muted); font-size: 12.5px; }
+  .diagram-arrow { color: var(--muted); font-size: 18px; flex-shrink: 0; }
+
+  /* ---------- platforms ---------- */
+  .platforms {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 720px) { .platforms { grid-template-columns: 1fr; } }
+  .plat-card {
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 28px;
+    text-align: center;
+  }
+  .plat-card .glyph {
+    font-size: 30px;
+    margin-bottom: 12px;
+    color: var(--accent);
+  }
+  .plat-card h3 { margin: 0 0 6px; color: var(--fg0); font-size: 16px; }
+  .plat-card p { margin: 0; color: var(--muted); font-size: 13.5px; }
+
+  /* ---------- config preview ---------- */
+  .config-block {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    align-items: start;
+  }
+  @media (max-width: 860px) { .config-block { grid-template-columns: 1fr; } }
+  pre.code-window {
+    background: var(--bg0);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 22px 24px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.7;
+    margin: 0;
+  }
+  section.alt pre.code-window { background: var(--bg1); }
+  .code-window .k { color: var(--accent2); }
+  .code-window .s { color: var(--green); }
+  .code-window .n { color: var(--yellow); }
+  .code-window .p { color: var(--muted); }
+  .code-window .b { color: var(--fg2); }
+
+  /* ---------- keybinding table ---------- */
+  .kb-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .kb-table td {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--bg2);
+    color: var(--fg2);
+  }
+  .kb-table td:first-child { width: 42%; }
+  .kb-table kbd {
+    background: var(--bg2);
+    border: 1px solid var(--bg3);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-family: "FiraCode Nerd Font", monospace;
+    font-size: 12.5px;
+    color: var(--fg0);
+  }
+
+  /* ---------- CTA footer ---------- */
+  .cta-band {
+    background: linear-gradient(135deg, var(--bg2), var(--bg1));
+    border: 1px solid var(--bg3);
+    border-radius: 16px;
+    padding: 56px 48px;
+    text-align: center;
+  }
+  .cta-band h2 { margin-bottom: 12px; }
+  .cta-band p { color: var(--muted); margin-bottom: 32px; font-size: 16px; }
+
+  footer {
+    border-top: 1px solid var(--bg2);
+    padding: 40px 0;
+  }
+  footer .wrap {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  footer .fmuted { color: var(--muted); font-size: 13.5px; }
+  footer .flinks { display: flex; gap: 22px; }
+  footer .flinks a { color: var(--muted); font-size: 13.5px; }
+  footer .flinks a:hover { color: var(--accent); }
+
+  ::selection { background: var(--accent); color: var(--bg0); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand">
+      <div class="brand-mark"><img src="img/som-icon.png" alt="Som"></div>
+      Som
+    </div>
+    <div class="nav-links">
+      <ul class="menu">
+        <li><a href="#features">Возможности</a></li>
+        <li><a href="#tmux">som-tmux</a></li>
+        <li><a href="#platforms">Платформы</a></li>
+        <li><a href="#config">Настройка</a></li>
+        <li><a href="#keys">Клавиши</a></li>
+      </ul>
+      <a class="nav-cta" href="https://github.com/errordnk/som">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow"><span class="dot"></span> Активная разработка · v1.6</span>
+    <h1>Терминал, который <span class="grad">ничего не забывает</span> и ничего лишнего не делает</h1>
+    <p class="lede">Som — это Zed, из которого вынули весь редактор и оставили только терминал: табы в заголовке окна, сплиты, живые SSH-сессии, которые переживают закрытие окна и разрыв связи. Один бинарник, GPU-рендеринг, ноль лишнего.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/errordnk/som">Скачать на GitHub →</a>
+      <a class="btn btn-ghost" href="#features">Что внутри</a>
+    </div>
+
+    <div class="term-mock">
+      <img class="term-shot" src="img/som-app-screenshot.png" alt="Som: сплит с кодом слева, htop и терминал справа, таб-бар с профилями win/wsl/vpn/pi5/mac/usa">
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Возможности</div>
+      <h2>Всё, что нужно от терминала — и ни байтом больше</h2>
+      <p class="section-sub">Som собран из тех же крейтов, что и Zed — GPUI-рендеринг, тот же движок тем — но без редактора, LSP, AI и коллаборации.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="icon">⚡</div>
+        <h3>GPU-рендеринг</h3>
+        <p>Построен на GPUI — том же UI-фреймворке, что и в Zed. Плавная прокрутка и отрисовка текста без лагов даже на больших scrollback-буферах.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🗂️</div>
+        <h3>Табы в заголовке окна</h3>
+        <p>Без отдельной полосы вкладок — табы живут прямо в title bar. Профили с иконками, быстрое переключение, drag-zone со спиннером восстановления.</p>
+      </div>
+      <div class="card">
+        <div class="icon">▦</div>
+        <h3>Сплиты до 3 уровней</h3>
+        <p><code>Ctrl+\</code> — новый сплит, направление чередуется вправо → вниз. Каждый таб хранит свою раскладку независимо, парковка при переключении.</p>
+      </div>
+      <div class="card">
+        <div class="icon">💾</div>
+        <h3>Полное восстановление сессии</h3>
+        <p>Табы, сплиты, позиция и размер окна — всё в <code>db.json</code>. Перезапуск возвращает вас туда же, где вы остановились, без ожидания подключений.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🎨</div>
+        <h3>Темы от Zed из коробки</h3>
+        <p>Формат тем идентичен Zed — Catppuccin, Tokyo Night, Dracula, One Dark Pro и любые другие Zed-темы работают без конвертации.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔤</div>
+        <h3>Nerd Font и лигатуры</h3>
+        <p>Полный контроль над OpenType-фичами: лигатуры, стилистические наборы, вес шрифта 100–900 — всё как в настоящем редакторском движке.</p>
+      </div>
+      <div class="card">
+        <div class="icon">📦</div>
+        <h3>Один портативный бинарник</h3>
+        <p>Никакой установки. <code>som.exe</code> запускается из любой папки — все вспомогательные библиотеки встроены и разворачиваются сами при первом старте.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🖥️</div>
+        <h3>Гибкий режим окна</h3>
+        <p>Оконный / развёрнутый / полноэкранный / свёрнутый режим, точный отступ терминала от края окна, фиксированная позиция и размер запуска.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⌨️</div>
+        <h3>Настраиваемые клавиши</h3>
+        <p>Каждое действие — от нового таба до фокуса сплита — переопределяется в JSON. Дефолты продуманы отдельно под Windows, macOS и Linux.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="tmux">
+  <div class="wrap">
+    <div class="spotlight">
+      <div>
+        <span class="spotlight-badge">Фирменная фича</span>
+        <h2>som-tmux: сессии, которые не умирают</h2>
+        <p class="section-sub">Свой минималистичный аналог tmux, встроенный прямо в Som. Открыли SSH-таб с <code>"tmux": true</code> — и дальше связь с хостом можно рвать сколько угодно раз.</p>
+        <ul>
+          <li><span class="chk">✓</span> Закрыли Som или потеряли связь — процесс на удалённой машине продолжает работать</li>
+          <li><span class="chk">✓</span> При переподключении вы видите тот же scrollback и те же запущенные программы, а не новую сессию</li>
+          <li><span class="chk">✓</span> Работает и локально: shell переживает перезапуск самого Som на этой же машине</li>
+          <li><span class="chk">✓</span> Автоматически подчищает осиротевшие процессы на удалённых хостах</li>
+          <li><span class="chk">✓</span> Бинарники для Windows, macOS и Linux встроены в Som и деплоятся на сервер сами — руками ничего копировать не нужно</li>
+        </ul>
+      </div>
+      <div class="diagram">
+        <div class="diagram-row">
+          <div class="diagram-box">
+            <div class="t">Som (клиент)</div>
+            <div class="d">SSH-таб с tmux: true</div>
+          </div>
+          <div class="diagram-arrow">→</div>
+        </div>
+        <div class="diagram-row">
+          <div class="diagram-box">
+            <div class="t">HOLDER на удалённом хосте</div>
+            <div class="d">Держит реальный shell и PTY, живёт независимо от Som</div>
+          </div>
+        </div>
+        <div class="diagram-row">
+          <div class="diagram-box">
+            <div class="t">Разрыв связи / закрытие Som</div>
+            <div class="d">Процесс на сервере продолжает работать как ни в чём не бывало</div>
+          </div>
+        </div>
+        <div class="diagram-row">
+          <div class="diagram-box">
+            <div class="t">Повторное открытие таба</div>
+            <div class="d">Реконнект к тому же HOLDER — тот же scrollback, тот же htop</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="platforms">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Платформы</div>
+      <h2>Windows, macOS, Linux — один код, нативная скорость</h2>
+      <p class="section-sub">Каждая сборка — самодостаточный бинарник для своей платформы, без установщика и внешних зависимостей.</p>
+    </div>
+    <div class="platforms">
+      <div class="plat-card">
+        <div class="glyph">⊞</div>
+        <h3>Windows</h3>
+        <p>amd64 · встроенный патченный ConPTY из проекта Windows Terminal — без стандартных багов системной консоли.</p>
+      </div>
+      <div class="plat-card">
+        <div class="glyph">⌘</div>
+        <h3>macOS</h3>
+        <p>Apple Silicon (arm64) · нативная интеграция с system title bar и жестами трекпада.</p>
+      </div>
+      <div class="plat-card">
+        <div class="glyph">🐧</div>
+        <h3>Linux</h3>
+        <p>amd64 · X11 и Wayland через GPUI, som-tmux деплоится и на удалённые Linux-серверы тоже.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="config">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Настройка</div>
+      <h2>Один JSON-файл, живая перезагрузка</h2>
+      <p class="section-sub"><code>~/.config/som/settings.json</code> — правите, сохраняете, изменения применяются мгновенно. Невалидный JSON не ломает Som — покажет баннер с ошибкой и продолжит работать на прежних настройках.</p>
+    </div>
+    <div class="config-block">
+      <pre class="code-window mono"><span class="p">{</span>
+  <span class="k">"window"</span><span class="p">:</span> <span class="p">{</span>
+    <span class="k">"theme"</span><span class="p">:</span> <span class="s">"Nord Dark"</span><span class="p">,</span>
+    <span class="k">"mode"</span><span class="p">:</span> <span class="s">"maximized"</span><span class="p">,</span>
+    <span class="k">"selection"</span><span class="p">:</span> <span class="s">"#88c0d0"</span>
+  <span class="p">},</span>
+  <span class="k">"font"</span><span class="p">:</span> <span class="p">{</span>
+    <span class="k">"face"</span><span class="p">:</span> <span class="s">"FiraCode Nerd Font"</span><span class="p">,</span>
+    <span class="k">"size"</span><span class="p">:</span> <span class="n">14</span><span class="p">,</span>
+    <span class="k">"features"</span><span class="p">:</span> <span class="p">{</span> <span class="k">"calt"</span><span class="p">:</span> <span class="b">true</span> <span class="p">}</span>
+  <span class="p">},</span>
+  <span class="k">"tabs"</span><span class="p">:</span> <span class="p">[</span>
+    <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"local"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"$SHELL"</span><span class="p">,</span> <span class="k">"default"</span><span class="p">:</span> <span class="b">true</span> <span class="p">},</span>
+    <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"prod"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"ssh prod-1"</span><span class="p">,</span> <span class="k">"tmux"</span><span class="p">:</span> <span class="b">true</span> <span class="p">}</span>
+  <span class="p">]</span>
+<span class="p">}</span></pre>
+      <div>
+        <h3 style="color: var(--fg0); font-size: 18px; margin-top:0;">Что настраивается</h3>
+        <p style="color: var(--muted); font-size: 15px;">Тема, шрифт и лигатуры, форма и цвет курсора, скорость прокрутки, профили вкладок с любыми командами (обычный shell, <code>ssh</code>, <code>wsl</code>), горячие клавиши на каждое действие, отступы терминала, стартовая позиция и размер окна.</p>
+        <p style="color: var(--muted); font-size: 15px;">Профиль по умолчанию помечается флагом <code>"default": true</code> — именно его открывает <kbd>Ctrl+N</kbd> и кнопка «+».</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="keys">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Горячие клавиши</div>
+      <h2>Продуманные дефолты, полностью переопределяемые</h2>
+      <p class="section-sub">Все специфичные для Som действия — на <kbd>Ctrl+Shift+*</kbd>, чтобы не конфликтовать со стандартными системными сочетаниями.</p>
+    </div>
+    <div class="grid" style="grid-template-columns: 1fr 1fr;">
+      <table class="kb-table">
+        <tr><td><kbd>Ctrl+Shift+=</kbd></td><td>Новый таб (профиль по умолчанию)</td></tr>
+        <tr><td><kbd>Ctrl+Shift+1</kbd>…<kbd>0</kbd></td><td>Таб из профиля 1–10</td></tr>
+        <tr><td><kbd>Ctrl+Shift+-</kbd></td><td>Закрыть активный таб</td></tr>
+        <tr><td><kbd>Ctrl+Shift+\</kbd></td><td>Новый сплит</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Backspace</kbd></td><td>Закрыть сплит</td></tr>
+      </table>
+      <table class="kb-table">
+        <tr><td><kbd>Ctrl+Shift+←/→</kbd></td><td>Переключить таб</td></tr>
+        <tr><td><kbd>Ctrl+Shift+↑/↓</kbd></td><td>Фокус между сплитами</td></tr>
+        <tr><td><kbd>Ctrl+=/-/0</kbd></td><td>Масштаб шрифта</td></tr>
+        <tr><td><kbd>Ctrl+Scroll</kbd></td><td>Масштаб шрифта колесом</td></tr>
+        <tr><td><kbd>Ctrl+Shift+C/V</kbd></td><td>Копировать / вставить</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <div class="cta-band">
+      <h2>Попробуйте терминал без лишнего</h2>
+      <p>Открытый исходный код, форк Zed, минимум зависимостей. Соберите сами или возьмите готовый релиз.</p>
+      <div class="cta-row" style="justify-content: center;">
+        <a class="btn btn-primary" href="https://github.com/errordnk/som">Открыть на GitHub →</a>
+        <a class="btn btn-ghost" href="https://github.com/errordnk/som/blob/main/MANUAL.md">Читать документацию</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="fmuted">Som — форк <a href="https://github.com/zed-industries/zed">Zed</a>, только терминал. GPL-3.0-or-later.</div>
+    <div class="flinks">
+      <a href="https://github.com/errordnk/som">GitHub</a>
+      <a href="https://github.com/errordnk/som/blob/main/MANUAL.md">Manual</a>
+      <a href="https://github.com/errordnk/som/blob/main/README.md">README</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

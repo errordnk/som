@@ -350,6 +350,30 @@
   .plat-card h3 { margin: 0 0 6px; color: var(--fg0); font-size: 16px; }
   .plat-card p { margin: 0; color: var(--muted); font-size: 13.5px; }
 
+  /* ---------- themes ---------- */
+  .themes {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 18px;
+  }
+  @media (max-width: 860px) { .themes { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) { .themes { grid-template-columns: 1fr; } }
+  .theme-card {
+    display: block;
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: border-color .15s ease, transform .15s ease;
+  }
+  .theme-card:hover { border-color: var(--accent); transform: translateY(-2px); text-decoration: none; }
+  .theme-card .swatch { display: flex; height: 44px; }
+  .theme-card .swatch span { flex: 1; }
+  .theme-card .body { padding: 16px 18px 20px; }
+  .theme-card h3 { margin: 0 0 4px; color: var(--fg0); font-size: 15px; }
+  .theme-card p { margin: 0; color: var(--muted); font-size: 13px; }
+  .themes-note { margin-top: 24px; color: var(--muted); font-size: 14.5px; }
+
   /* ---------- config preview ---------- */
   .config-block {
     display: grid;
@@ -442,6 +466,7 @@
         <li><a href="#tmux">som-tmux</a></li>
         <li><a href="#platforms">Платформы</a></li>
         <li><a href="#config">Настройка</a></li>
+        <li><a href="#themes">Темы</a></li>
         <li><a href="#keys">Клавиши</a></li>
       </ul>
       <a class="nav-cta" href="https://github.com/errordnk/som">GitHub</a>
@@ -486,7 +511,7 @@
       <div class="card">
         <div class="icon">▦</div>
         <h3>Сплиты до 3 уровней</h3>
-        <p><code>Ctrl+\</code> — новый сплит, направление чередуется вправо → вниз. Каждый таб хранит свою раскладку независимо, парковка при переключении.</p>
+        <p><code>Ctrl+Shift+\</code> — новый сплит, направление чередуется вправо → вниз. Каждый таб хранит свою раскладку независимо, парковка при переключении.</p>
       </div>
       <div class="card">
         <div class="icon">💾</div>
@@ -615,16 +640,65 @@
     <span class="k">"features"</span><span class="p">:</span> <span class="p">{</span> <span class="k">"calt"</span><span class="p">:</span> <span class="b">true</span> <span class="p">}</span>
   <span class="p">},</span>
   <span class="k">"tabs"</span><span class="p">:</span> <span class="p">[</span>
-    <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"local"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"$SHELL"</span><span class="p">,</span> <span class="k">"default"</span><span class="p">:</span> <span class="b">true</span> <span class="p">},</span>
+    <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"local"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"/bin/zsh"</span><span class="p">,</span> <span class="k">"default"</span><span class="p">:</span> <span class="b">true</span> <span class="p">},</span>
     <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"prod"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"ssh prod-1"</span><span class="p">,</span> <span class="k">"tmux"</span><span class="p">:</span> <span class="b">true</span> <span class="p">}</span>
   <span class="p">]</span>
 <span class="p">}</span></pre>
       <div>
         <h3 style="color: var(--fg0); font-size: 18px; margin-top:0;">Что настраивается</h3>
         <p style="color: var(--muted); font-size: 15px;">Тема, шрифт и лигатуры, форма и цвет курсора, скорость прокрутки, профили вкладок с любыми командами (обычный shell, <code>ssh</code>, <code>wsl</code>), горячие клавиши на каждое действие, отступы терминала, стартовая позиция и размер окна.</p>
-        <p style="color: var(--muted); font-size: 15px;">Профиль по умолчанию помечается флагом <code>"default": true</code> — именно его открывает <kbd>Ctrl+N</kbd> и кнопка «+».</p>
+        <p style="color: var(--muted); font-size: 15px;">Профиль по умолчанию помечается флагом <code>"default": true</code> — именно его открывает <kbd>Ctrl+Shift+=</kbd> и кнопка «+».</p>
       </div>
     </div>
+  </div>
+</section>
+
+<section id="themes">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Темы</div>
+      <h2>Формат тем как у Zed — любая Zed-тема работает без конвертации</h2>
+      <p class="section-sub">Som поставляется с одной встроенной темой, Nord Dark. Но движок тем поддерживает произвольные JSON-файлы с ~150 цветами — те же файлы, что устанавливают в Zed.</p>
+    </div>
+    <div class="themes">
+      <a class="theme-card" href="https://github.com/catppuccin/zed/blob/main/themes/catppuccin-mauve.json">
+        <div class="swatch">
+          <span style="background:#1e1e2e"></span><span style="background:#cba6f7"></span><span style="background:#f5c2e7"></span><span style="background:#a6e3a1"></span>
+        </div>
+        <div class="body">
+          <h3>Catppuccin</h3>
+          <p>Mauve — пастельная палитра, мягкий контраст</p>
+        </div>
+      </a>
+      <a class="theme-card" href="https://github.com/ssaunderss/zed-tokyo-night/blob/main/themes/tokyo-night.json">
+        <div class="swatch">
+          <span style="background:#1a1b26"></span><span style="background:#7aa2f7"></span><span style="background:#bb9af7"></span><span style="background:#9ece6a"></span>
+        </div>
+        <div class="body">
+          <h3>Tokyo Night</h3>
+          <p>Тёмно-синий фон, неоновые акценты</p>
+        </div>
+      </a>
+      <a class="theme-card" href="https://github.com/MordFustang21/zed-one-dark-pro/blob/main/themes/one-dark.json">
+        <div class="swatch">
+          <span style="background:#282c34"></span><span style="background:#61afef"></span><span style="background:#c678dd"></span><span style="background:#98c379"></span>
+        </div>
+        <div class="body">
+          <h3>One Dark Pro</h3>
+          <p>Классика редакторских тем, привычная многим</p>
+        </div>
+      </a>
+      <a class="theme-card" href="https://github.com/dracula/zed/blob/main/themes/dracula.json">
+        <div class="swatch">
+          <span style="background:#282a36"></span><span style="background:#bd93f9"></span><span style="background:#ff79c6"></span><span style="background:#50fa7b"></span>
+        </div>
+        <div class="body">
+          <h3>Dracula</h3>
+          <p>Высокий контраст, фиолетово-розовые акценты</p>
+        </div>
+      </a>
+    </div>
+    <p class="themes-note">Установка: скачайте JSON-файл темы в <code>~/.config/som/themes/</code>, затем укажите в <code>settings.json</code> значение поля <code>"name"</code> <em>из самого файла</em> как <code>window.theme</code> — оно не всегда совпадает с именем файла, а некоторые файлы описывают сразу несколько вариантов.</p>
   </div>
 </section>
 
@@ -648,7 +722,7 @@
         <tr><td><kbd>Ctrl+Shift+↑/↓</kbd></td><td>Фокус между сплитами</td></tr>
         <tr><td><kbd>Ctrl+=/-/0</kbd></td><td>Масштаб шрифта</td></tr>
         <tr><td><kbd>Ctrl+Scroll</kbd></td><td>Масштаб шрифта колесом</td></tr>
-        <tr><td><kbd>Ctrl+Shift+C/V</kbd></td><td>Копировать / вставить</td></tr>
+        <tr><td><kbd>Ctrl+Shift+C</kbd> / <kbd>Ctrl+V</kbd></td><td>Копировать / вставить</td></tr>
       </table>
     </div>
   </div>

@@ -95,7 +95,7 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 
 ### `tabs`
 
-An ordered array of tab profiles. `Ctrl+N`/`Cmd+N` and the bare `NewTab` action (`Ctrl+Shift+=` in the shipped defaults) open the *default* profile: the one entry with `"default": true`, or `tabs[0]` if none is marked. Entries 2-9 are reachable via `Ctrl+Shift+2`..`Ctrl+Shift+9` on the Windows template regardless of which one is default (see [Default keybindings](#default-keybindings) — macOS/Linux templates currently only wire up profile 1).
+An ordered array of tab profiles. The bare `NewTab` action (`Ctrl+Shift+=`/`Cmd+Shift+=` in the shipped defaults) opens the *default* profile: the one entry with `"default": true`, or `tabs[0]` if none is marked. Entries 2-9 are reachable via `Ctrl+Shift+2`..`Ctrl+Shift+9` on the Windows template regardless of which one is default (see [Default keybindings](#default-keybindings) — macOS/Linux templates currently only wire up profile 1).
 
 ```json
 "tabs": [
@@ -111,7 +111,7 @@ An ordered array of tab profiles. `Ctrl+N`/`Cmd+N` and the bare `NewTab` action 
 | `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. |
 | `home` | string | none | Working directory; `~` is expanded. Must resolve to an existing directory or is ignored. |
 | `tmux` | bool | `false` | Opt-in to the `som-tmux` backend for this profile — keeps the session alive across Som restarts. See [som-tmux](#som-tmux-keeping-remote-sessions-alive). |
-| `default` | bool | `false` | Marks this profile as the one `Ctrl+N`/the `+` button/bare `NewTab` opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
+| `default` | bool | `false` | Marks this profile as the one the `+` button/bare `NewTab` action opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
 
 ### `keys`
 
@@ -209,9 +209,9 @@ Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers
 ## Splits
 
 - Each tab supports up to **3 levels of split panes** (main pane + 3 splits).
-- `Ctrl+\` splits the currently focused pane; direction cycles right → down → right as you keep splitting.
-- `Ctrl+Shift+\` closes the most recently created split and refocuses a neighboring pane.
-- `Ctrl+Left`/`Ctrl+Right` cycle focus between the main pane and any live splits.
+- `Ctrl+Shift+\` splits the currently focused pane; direction cycles right → down → right as you keep splitting.
+- `Ctrl+Shift+Backspace` closes the most recently created split and refocuses a neighboring pane.
+- `Ctrl+Shift+Up`/`Ctrl+Shift+Down` cycle focus between the main pane and any live splits.
 - Switching away from a tab "parks" its splits (removes them from the visible layout but remembers their sizes); switching back restores them exactly as you left them — this works per-tab, so each tab keeps its own independent split layout.
 - Works on `tmux: true` tabs too — each split pane gets its own independent persistent session.
 

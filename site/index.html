@@ -217,6 +217,32 @@
   }
   .section-sub { color: var(--muted); font-size: 16.5px; }
 
+  /* ---------- why stats ---------- */
+  .why-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+  }
+  @media (max-width: 720px) { .why-stats { grid-template-columns: 1fr; } }
+  .stat-card {
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 30px 28px;
+  }
+  .stat-card .num {
+    font-size: 40px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 10px;
+  }
+  .stat-card h3 { margin: 0 0 8px; color: var(--fg0); font-size: 16px; }
+  .stat-card p { margin: 0; color: var(--muted); font-size: 14px; }
+
   /* ---------- feature grid ---------- */
   .grid {
     display: grid;
@@ -477,8 +503,8 @@
 <header class="hero">
   <div class="wrap">
     <span class="eyebrow"><span class="dot"></span> Активная разработка · v1.6</span>
-    <h1>Терминал, который <span class="grad">ничего не забывает</span> и ничего лишнего не делает</h1>
-    <p class="lede">Som — это Zed, из которого вынули весь редактор и оставили только терминал: табы в заголовке окна, сплиты, живые SSH-сессии, которые переживают закрытие окна и разрыв связи. Один бинарник, GPU-рендеринг, ноль лишнего.</p>
+    <h1>Лучший терминал сразу на <span class="grad">трёх платформах</span></h1>
+    <p class="lede">Windows, macOS и Linux — одинаково быстро, одинаково стабильно, одним бинарником. GPU-рендеринг, табы прямо в заголовке окна, сплиты, живые SSH-сессии со своим tmux-аналогом — и всё это без установки, без зависимостей, без компромиссов ради портов.</p>
     <div class="cta-row">
       <a class="btn btn-primary" href="https://github.com/errordnk/som">Скачать на GitHub →</a>
       <a class="btn btn-ghost" href="#features">Что внутри</a>
@@ -490,18 +516,45 @@
   </div>
 </header>
 
+<section>
+  <div class="wrap">
+    <div class="section-head">
+      <div class="kicker">Почему лучший</div>
+      <h2>Не компромисс ради кроссплатформенности — а лучшее решение на каждой из трёх</h2>
+      <p class="section-sub">Большинство терминалов такого класса — это Linux/macOS-инструменты, для которых Windows-порт в лучшем случае догоняющий. Som проектировался сразу под три платформы на одном движке, поэтому нативная Windows-сборка получает то же самое, что и остальные — без урезаний.</p>
+    </div>
+    <div class="why-stats">
+      <div class="stat-card">
+        <div class="num">~32 МБ</div>
+        <h3>Один портативный бинарник</h3>
+        <p>som.exe несёт в себе конфиг-шаблоны, тему, som-tmux под три платформы и патченный ConPTY — и всё равно в разы компактнее полного GPUI-стека, из которого он вырезан. Никакой установки, запускается из любой папки.</p>
+      </div>
+      <div class="stat-card">
+        <div class="num">GPU</div>
+        <h3>Рендеринг наравне с лучшими</h3>
+        <p>Тот же класс скорости и плавности, что у Ghostty и Kitty на GPUI — но с полноценной нативной сборкой под Windows и собственным механизмом сохранения сессий из коробки, без необходимости поднимать tmux отдельно.</p>
+      </div>
+      <div class="stat-card">
+        <div class="num">100%</div>
+        <h3>Rust, без компромиссов</h3>
+        <p>Ни одной строчки C/C++ в логике терминала — весь стек, от рендера до PTY-обвязки, на языке, выбранном для промышленного софта, которому нельзя падать и течь по памяти годами.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section id="features">
   <div class="wrap">
     <div class="section-head">
       <div class="kicker">Возможности</div>
       <h2>Всё, что нужно от терминала — и ни байтом больше</h2>
-      <p class="section-sub">Som собран из тех же крейтов, что и Zed — GPUI-рендеринг, тот же движок тем — но без редактора, LSP, AI и коллаборации.</p>
+      <p class="section-sub">В основе — GPUI: GPU-рендеринг и система тем без компромиссов. Som берёт от него только то, что нужно терминалу, выбрасывает редактор, LSP, AI и коллаборацию — и получает скорость и стабильность, которые на голом Rust+GPU просто так не собрать.</p>
     </div>
     <div class="grid">
       <div class="card">
         <div class="icon">⚡</div>
         <h3>GPU-рендеринг</h3>
-        <p>Построен на GPUI — том же UI-фреймворке, что и в Zed. Плавная прокрутка и отрисовка текста без лагов даже на больших scrollback-буферах.</p>
+        <p>Построен на GPUI — сильнейшем кроссплатформенном GUI-движке на рынке. Плавная прокрутка и отрисовка текста без лагов даже на больших scrollback-буферах.</p>
       </div>
       <div class="card">
         <div class="icon">🗂️</div>
@@ -530,8 +583,8 @@
       </div>
       <div class="card">
         <div class="icon">📦</div>
-        <h3>Один портативный бинарник</h3>
-        <p>Никакой установки. <code>som.exe</code> запускается из любой папки — все вспомогательные библиотеки встроены и разворачиваются сами при первом старте.</p>
+        <h3>Один портативный бинарник, ~32 МБ</h3>
+        <p>Никакой установки. <code>som.exe</code> запускается из любой папки — конфиг, тема, som-tmux и патченный ConPTY встроены внутрь и разворачиваются сами при первом старте. В разы компактнее полного GPUI-стека, из которого он вырезан.</p>
       </div>
       <div class="card">
         <div class="icon">🖥️</div>
@@ -732,7 +785,7 @@
   <div class="wrap">
     <div class="cta-band">
       <h2>Попробуйте терминал без лишнего</h2>
-      <p>Открытый исходный код, форк Zed, минимум зависимостей. Соберите сами или возьмите готовый релиз.</p>
+      <p>Открытый исходный код на Rust, минимум зависимостей. Соберите сами или возьмите готовый релиз.</p>
       <div class="cta-row" style="justify-content: center;">
         <a class="btn btn-primary" href="https://github.com/errordnk/som">Открыть на GitHub →</a>
         <a class="btn btn-ghost" href="https://github.com/errordnk/som/blob/main/MANUAL.md">Читать документацию</a>

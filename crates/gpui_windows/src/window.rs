@@ -857,6 +857,37 @@ impl PlatformWindow for WindowsWindow {
         true
     }
 
+    fn force_redraw(&self) {
+        // Posts the same custom message the GPU-device-lost recovery path
+        // already uses to force a repaint (see platform.rs's
+        // `handle_gpu_device_lost`) — `events.rs` maps this straight to
+        // `draw_window(handle, force_render: true)`, which unconditionally
+        // draws and presents a frame regardless of the `App`-level dirty
+        // flag. `PostMessageW` queues this onto the window's own message
+        // loop and returns immediately — safe to call from any thread,
+        // including a background `cx.spawn` task with no `Window` handle
+        // of its own (unlike `Context::refresh_windows`, which only takes
+        // effect once something ELSE causes the platform to actually poll
+        // for a native repaint).
+        let path = std::env::temp_dir().join("som_paint_diag.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write as _;
+            let _ = writeln!(f, "[{:?}] force_redraw: posting WM_GPUI_FORCE_UPDATE_WINDOW to hwnd={:?}", std::time::Instant::now(), self.0.hwnd);
+        }
+        unsafe {
+            let result = PostMessageW(
+                Some(self.0.hwnd),
+                WM_GPUI_FORCE_UPDATE_WINDOW,
+                WPARAM(self.0.validation_number),
+                LPARAM(0),
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                use std::io::Write as _;
+                let _ = writeln!(f, "[{:?}] force_redraw: PostMessageW result={result:?}", std::time::Instant::now());
+            }
+        }
+    }
+
     fn set_title(&mut self, title: &str) {
         unsafe { SetWindowTextW(self.0.hwnd, &HSTRING::from(title)) }
             .inspect_err(|e| log::error!("Set title failed: {e}"))

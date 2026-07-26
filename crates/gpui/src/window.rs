@@ -1865,6 +1865,16 @@ impl Window {
         }
     }
 
+    /// Force an immediate native repaint, bypassing whatever per-platform
+    /// mechanism normally schedules one — see
+    /// `PlatformWindow::force_redraw`'s doc comment for why `refresh`
+    /// alone isn't always enough (Windows specifically: marking dirty only
+    /// helps the NEXT natively-triggered repaint, it doesn't itself cause
+    /// one to happen).
+    pub fn force_redraw(&self) {
+        self.platform_window.force_redraw();
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;

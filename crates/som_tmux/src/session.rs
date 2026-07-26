@@ -1,4 +1,5 @@
 use crate::bounds::SessionBounds;
+use crate::kitty_replay::KittyReplayBuffer;
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
@@ -167,6 +168,12 @@ pub struct Session {
     /// thread spawned in `spawn()` (a second `Arc` clone, not through
     /// `Session` itself, since that thread starts before `Session` exists).
     subscribers: Arc<std::sync::Mutex<Vec<async_channel::Sender<AlacTermEvent>>>>,
+    /// Raw bytes of every still-relevant Kitty graphics `Transmit` APC
+    /// command seen on this session's PTY stream — see
+    /// `crate::kitty_replay`'s doc comment. Populated by the pump thread
+    /// started in `spawn()` (as `AlacTermEvent::ApcString`s arrive), read
+    /// by `server.rs::handle_relay` for every (re)connecting RELAY.
+    kitty_replay: Arc<KittyReplayBuffer>,
 }
 
 impl Session {
@@ -293,10 +300,17 @@ impl Session {
         let pump_subscribers = subscribers.clone();
         let last_bounds = Arc::new(std::sync::Mutex::new(bounds));
         let pump_last_bounds = last_bounds.clone();
+        let kitty_replay = Arc::new(KittyReplayBuffer::new());
+        let pump_kitty_replay = kitty_replay.clone();
         std::thread::spawn(move || {
             while let Ok(event) = raw_events_rx.recv_blocking() {
                 match event {
                     AlacTermEvent::PtyWrite(bytes) => pump_pty_tx.notify(bytes.into_bytes()),
+                    // See `crate::kitty_replay`'s doc comment — this is the
+                    // ONLY place a HOLDER ever sees Kitty graphics APC data
+                    // at all (it's forwarded, not decoded/rendered, since
+                    // this headless `Term` has no `ImageStore` of its own).
+                    AlacTermEvent::ApcString(bytes, _cursor) => pump_kitty_replay.record(&bytes),
                     // Answers a program's own terminal-size query (e.g. the
                     // `\x1b[18t` "report text area size" escape a full-
                     // screen editor like `micro` sends on startup) with this
@@ -345,6 +359,7 @@ impl Session {
             pid,
             subscribers,
             raw_byte_subscribers,
+            kitty_replay,
         })
     }
 
@@ -461,6 +476,15 @@ impl Session {
         let state = term.snapshot();
         bincode::serde::encode_to_vec(&state, bincode::config::standard())
             .expect("TermState bincode encoding should not fail")
+    }
+
+    /// Raw APC bytes for every Kitty graphics image transmit this session
+    /// still considers relevant — see `crate::kitty_replay`'s doc comment.
+    /// Called once per (re)connecting RELAY, right after `snapshot()`, so
+    /// its real Som-side `Terminal` decodes them exactly as if they'd just
+    /// arrived from a live PTY.
+    pub fn kitty_replay_bytes(&self) -> Vec<u8> {
+        self.kitty_replay.replay_bytes()
     }
 
     /// Waits for the next `Wakeup` on `events_rx` (i.e. the grid actually

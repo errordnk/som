@@ -31,14 +31,24 @@ use std::io::Write;
 /// One cell's content/appearance, as tracked in `Redrawer`'s per-position
 /// history — deliberately a plain tuple-like struct rather than reusing
 /// `alacritty_terminal::term::cell::Cell` (which carries an `Option<Arc<
-/// CellExtra>>` this diff doesn't need, same reasoning as `protocol::
-/// ProtocolCell` — see that type's doc comment).
-#[derive(Clone, Copy, PartialEq)]
+/// CellExtra>>` this diff doesn't need in full, same reasoning as
+/// `protocol::ProtocolCell` — see that type's doc comment), except for
+/// `zerowidth`/`underline_color`, which — unlike `hyperlink` — this diff DOES
+/// need: Kitty terminal graphics protocol's Unicode-placeholder-mode cells
+/// (`crates/terminal/src/kitty_graphics_placeholder.rs`) are encoded
+/// entirely as an ordinary base char (`U+10EEEE`) plus combining diacritics
+/// in `zerowidth` plus an `underline_color` distinct from `fg` — dropping
+/// either here would silently corrupt every placeholder cell's row/column/
+/// placement-id on the very first redraw after a resize, alt-screen swap,
+/// or reconnect (all of which force a full repaint through this same path).
+#[derive(Clone, PartialEq)]
 struct PaintedCell {
     c: char,
     fg: Color,
     bg: Color,
     flags: Flags,
+    underline_color: Option<Color>,
+    zerowidth: Vec<char>,
 }
 
 /// Tracks what's actually been written to the client so far, so repainting
@@ -75,6 +85,13 @@ pub struct Redrawer {
     /// last redraw — the same "nothing changed, emit nothing" diffing this
     /// whole module exists for, applied to the cursor itself.
     real_cursor: Option<(Point, CursorShape)>,
+    /// Last-emitted underline color, distinct from `fg`/`bg` — `None` means
+    /// "no explicit underline color set" (falls back to `fg` for rendering,
+    /// same as `alacritty_terminal::term::cell::Cell::underline_color()`'s
+    /// own `None` meaning). Tracked the same way `fg`/`bg`/`flags` are, so
+    /// `set_attrs` only emits SGR 58 (set underline color) / 59 (reset to
+    /// default) when it actually changes.
+    underline_color: Option<Color>,
     /// Whether the LAST `redraw` call saw `Term` in the alternate screen
     /// buffer (`None` before the first call, same "unknown, don't skip
     /// anything" role as `last_grid` being empty). A real terminal swaps
@@ -143,6 +160,7 @@ impl Redrawer {
             flags: Flags::empty(),
             have_written: false,
             real_cursor: None,
+            underline_color: None,
             last_alt_screen: None,
             last_size: None,
             last_app_cursor: None,
@@ -227,19 +245,25 @@ impl Redrawer {
             while new_grid.len() <= line_ix {
                 new_grid.push(Vec::new());
             }
-            let painted = PaintedCell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags };
-            new_grid[line_ix].push(painted);
+            let underline_color = cell.underline_color();
+            let zerowidth = cell.zerowidth().map(|chars| chars.to_vec()).unwrap_or_default();
+            let painted = PaintedCell {
+                c: cell.c,
+                fg: cell.fg,
+                bg: cell.bg,
+                flags: cell.flags,
+                underline_color,
+                zerowidth,
+            };
 
             // Wide-char spacers are placeholders for the second column of a
             // double-width character — the actual character was already
             // written for the first column; writing the spacer's (blank)
             // `c` here would blank out half of every wide character. Still
-            // recorded into `new_grid` above (a real cell occupies that
+            // recorded into `new_grid` below (a real cell occupies that
             // position and must be diffed against next time), just never
             // painted on its own.
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
+            let is_wide_char_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
 
             // The actual diff: skip this cell ENTIRELY (no position, no
             // SGR, no character byte at all) if it's pixel-for-pixel
@@ -251,20 +275,32 @@ impl Redrawer {
                 .last_grid
                 .get(line_ix)
                 .and_then(|row| row.as_ref())
-                .and_then(|row| row.get(new_grid[line_ix].len() - 1))
-                .copied();
-            if previously_painted == Some(painted) {
+                .and_then(|row| row.get(new_grid[line_ix].len()));
+            let unchanged = previously_painted == Some(&painted);
+
+            if is_wide_char_spacer || unchanged {
+                new_grid[line_ix].push(painted);
                 continue;
             }
 
             self.move_to(point, out)?;
-            self.set_attrs(cell.fg, cell.bg, cell.flags, out)?;
+            self.set_attrs(cell.fg, cell.bg, cell.flags, underline_color, out)?;
             write!(out, "{}", cell.c)?;
+            // Zero-width combining diacritics (Kitty Unicode-placeholder-
+            // mode row/column encoding, or ordinary combining marks/emoji
+            // variation selectors) attach to whatever base character a
+            // real terminal parser last saw — writing them immediately
+            // after the base char above reproduces that attachment exactly
+            // the way the original PTY output did.
+            for zw in &painted.zerowidth {
+                write!(out, "{zw}")?;
+            }
             // Advance the virtual cursor by exactly the columns this
             // character occupies, so the next cell's `move_to` can tell
             // whether a cursor-position escape is actually needed or
             // whether writing continued naturally left-to-right.
             self.cursor_col += if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            new_grid[line_ix].push(painted);
         }
 
         self.last_grid = new_grid.into_iter().map(Some).collect();
@@ -292,8 +328,19 @@ impl Redrawer {
         Ok(())
     }
 
-    fn set_attrs<W: Write>(&mut self, fg: Color, bg: Color, flags: Flags, out: &mut W) -> std::io::Result<()> {
-        if fg == self.fg && bg == self.bg && flags == self.flags {
+    fn set_attrs<W: Write>(
+        &mut self,
+        fg: Color,
+        bg: Color,
+        flags: Flags,
+        underline_color: Option<Color>,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        if fg == self.fg
+            && bg == self.bg
+            && flags == self.flags
+            && underline_color == self.underline_color
+        {
             return Ok(());
         }
         // Simplest correct approach: always reset then re-apply every
@@ -336,10 +383,26 @@ impl Redrawer {
         }
         write_fg(fg, out)?;
         write_bg(bg, out)?;
+        // SGR 58/59 (underline color) — reset above (SGR 0) already cleared
+        // any previously-set underline color, so `None` needs no explicit
+        // action here; only a real `Some` needs emitting. True-color/
+        // indexed-underline-color are the two forms Kitty's own Unicode-
+        // placeholder-mode encoding actually uses (placement id via
+        // underline color, see kitty_graphics_placeholder's doc comment),
+        // so both are supported even though Named isn't a meaningful
+        // underline color in practice.
+        if let Some(color) = underline_color {
+            match color {
+                Color::Spec(rgb) => write_truecolor(rgb, 58, out)?,
+                Color::Indexed(i) => write!(out, "\x1b[58;5;{i}m")?,
+                Color::Named(_) => {},
+            }
+        }
 
         self.fg = fg;
         self.bg = bg;
         self.flags = flags;
+        self.underline_color = underline_color;
         Ok(())
     }
 
@@ -825,6 +888,74 @@ mod tests {
             replayed_text, ground_truth_text,
             "the incremental redraw right after a resize must match a fresh full redraw taken at the same moment — \
              a mismatch here means reflowed text is being scrambled by a diff that trusted stale coordinates"
+        );
+    }
+
+    /// A Kitty Unicode-placeholder-mode cell (KITTY_GRAPHICS_PLAN.md Stage
+    /// 4/6) is a base char (`U+10EEEE`) plus zero-width combining diacritics
+    /// (row/column) plus a distinct underline color (placement id) on top of
+    /// a true-color foreground (image id). None of those three pieces are
+    /// ordinary `fg`/`bg`/`flags` — before `PaintedCell` tracked
+    /// `zerowidth`/`underline_color`, `redraw` would have emitted the base
+    /// char with its true-color fg (matching the pre-existing `write_fg`
+    /// path) but silently dropped the diacritics AND the underline color,
+    /// corrupting every placeholder cell's encoded row/column/placement-id
+    /// on the very first resize/alt-screen-swap/reconnect redraw.
+    #[test]
+    fn redraw_preserves_kitty_placeholder_diacritics_and_underline_color() {
+        let bounds = SessionBounds::new(80, 24);
+        let mut term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+
+        // fg = true-color image id (0x00123456), underline color = true-color
+        // placement id (0x00000001), base char + two combining diacritics
+        // (row 0 = U+0305, column 1 = U+030D) — a realistic placeholder cell
+        // as some other program (not Som itself) would have written it.
+        let raw = "\x1b[38;2;18;52;86m\x1b[58;2;0;0;1m\u{10EEEE}\u{0305}\u{030D}\x1b[0m".as_bytes();
+        parser.advance(&mut term, raw);
+
+        // Sanity: the source Term itself actually captured all three pieces
+        // — otherwise this test would trivially pass no matter what
+        // `redraw` does, having proven nothing.
+        let source_cell = term
+            .renderable_content()
+            .display_iter
+            .find(|indexed| indexed.cell.c == '\u{10EEEE}')
+            .expect("source Term should contain the placeholder cell")
+            .cell
+            .clone();
+        assert_eq!(source_cell.underline_color(), Some(Color::Spec(Rgb { r: 0, g: 0, b: 1 })));
+        assert_eq!(source_cell.zerowidth(), Some(&['\u{0305}', '\u{030D}'][..]));
+
+        let mut redrawer = Redrawer::new();
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("redraw should succeed");
+
+        let mut target_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut target_parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        target_parser.advance(&mut target_term, &bytes);
+
+        let replayed_cell = target_term
+            .renderable_content()
+            .display_iter
+            .find(|indexed| indexed.cell.c == '\u{10EEEE}')
+            .expect("redrawn output should still contain the placeholder cell")
+            .cell
+            .clone();
+        assert_eq!(
+            replayed_cell.fg,
+            Color::Spec(Rgb { r: 18, g: 52, b: 86 }),
+            "image id (encoded via true-color fg) must survive redraw"
+        );
+        assert_eq!(
+            replayed_cell.underline_color(),
+            Some(Color::Spec(Rgb { r: 0, g: 0, b: 1 })),
+            "placement id (encoded via underline color) must survive redraw"
+        );
+        assert_eq!(
+            replayed_cell.zerowidth(),
+            Some(&['\u{0305}', '\u{030D}'][..]),
+            "row/column diacritics must survive redraw"
         );
     }
 

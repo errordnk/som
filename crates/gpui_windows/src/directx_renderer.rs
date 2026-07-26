@@ -224,7 +224,17 @@ impl DirectXRenderer {
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
-        result.ok().context("Presenting swap chain failed")
+        result.ok().context("Presenting swap chain failed")?;
+        // Recomposite the DirectComposition visual tree so this Present is
+        // actually shown, rather than sitting in the swap chain's back
+        // buffer until some unrelated window event forces DWM to recompose
+        // — see DirectComposition::commit's doc comment. No-op when direct
+        // composition is disabled (the swap chain is bound straight to the
+        // hwnd in that path and Present is immediately visible).
+        if let Some(direct_composition) = self.direct_composition.as_ref() {
+            direct_composition.commit()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
@@ -914,6 +924,19 @@ impl DirectComposition {
             self.comp_target.SetRoot(&self.comp_visual)?;
             self.comp_device.Commit()?;
         }
+        Ok(())
+    }
+
+    /// Commit the composition device so the most recent swap-chain `Present`
+    /// is actually composited to the screen. Without this, on some
+    /// driver/DWM configurations a `Present` fills the swap chain's back
+    /// buffer but the DirectComposition visual tree isn't recomposited
+    /// until some unrelated window event (a click, a focus change, a
+    /// keypress) forces DWM to recompose — which manifests as a window that
+    /// only shows its very first frame and then appears frozen until you
+    /// interact with it.
+    pub fn commit(&self) -> Result<()> {
+        unsafe { self.comp_device.Commit()? };
         Ok(())
     }
 }

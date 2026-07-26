@@ -658,6 +658,22 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Force an immediate native repaint of this window, bypassing whatever
+    /// per-platform mechanism normally schedules one (a vsync-driven
+    /// background thread on Windows, a display link on macOS, etc). Setting
+    /// `App`'s dirty flag alone (`Context::refresh_windows`) is not
+    /// sufficient on every platform — on Windows specifically, marking the
+    /// window dirty only makes the NEXT natively-triggered `WM_PAINT`
+    /// actually redraw content; it does not itself cause a `WM_PAINT` to be
+    /// posted. A window that's momentarily not receiving any other native
+    /// message (no keyboard/mouse/focus activity) can otherwise sit for an
+    /// arbitrarily long time with fresh content sitting in `ImageStore`
+    /// (or any other backing model) that's correctly queued for painting
+    /// but never actually reaches the screen. Default no-op: platforms
+    /// whose normal invalidation path is already synchronous/reliable
+    /// don't need to do anything extra here.
+    fn force_redraw(&self) {}
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()

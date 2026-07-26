@@ -758,6 +758,22 @@ impl TerminalPanel {
                 }
             }
             tabs_in_db_order.sort_by_key(|(db_index, _, _)| *db_index);
+            // Move the tab db.json marked active to the end of the queue.
+            // Phase 2 below activates each tab it splits (a real, visible
+            // focus change — see the comment above that loop), so whichever
+            // tab is processed LAST is what's on screen once Phase 2 ends.
+            // Without this, an earlier-in-db-order tab that also has splits
+            // would flash into view after the active tab's real content
+            // already landed, only for the final correction block further
+            // down to snap focus back — a visible wrong-tab flicker on every
+            // restore where a non-active tab happens to have splits too.
+            if let Some(active_pos) = tabs_in_db_order
+                .iter()
+                .position(|(db_index, _, _)| *db_index == db_state.active_tab)
+            {
+                let active_entry = tabs_in_db_order.remove(active_pos);
+                tabs_in_db_order.push(active_entry);
+            }
             window_handle
                 .update(cx, |_, _, cx| {
                     workspace.update(cx, |workspace, cx| {

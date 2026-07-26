@@ -2,6 +2,9 @@ pub mod mappings;
 
 pub use alacritty_terminal;
 
+pub mod kitty_graphics;
+pub mod kitty_graphics_placeholder;
+pub mod kitty_graphics_store;
 mod pty_info;
 mod terminal_hyperlinks;
 pub mod terminal_settings;
@@ -133,6 +136,22 @@ pub fn insert_zed_terminal_env(
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());
+    // Advertise Kitty terminal graphics protocol support (see
+    // `crate::kitty_graphics`). Clients detect this capability one of two
+    // ways: by sending `a=q` and reading the terminal's reply, or — because
+    // that round trip isn't reliable everywhere (notably on Windows, where
+    // `crossterm`-based clients like `yazi` never set
+    // `ENABLE_VIRTUAL_TERMINAL_INPUT` and so can't read the reply at all) —
+    // by sniffing environment variables that known Kitty-graphics-capable
+    // terminals set. `KITTY_WINDOW_ID` is the variable those clients look
+    // for; setting it is what makes them pick the Kitty graphics path
+    // instead of falling back to Sixel/iTerm2/half-block rendering.
+    //
+    // Deliberately NOT setting `TERM=xterm-kitty`: that would additionally
+    // claim Kitty's full terminfo (keyboard protocol, extended key
+    // encodings, ...) which Som doesn't implement, and would break on
+    // systems where the `xterm-kitty` terminfo entry isn't installed.
+    env.insert("KITTY_WINDOW_ID".to_string(), "1".to_string());
 }
 
 ///Upward flowing events, for changing the title and such
@@ -393,6 +412,7 @@ impl TerminalBuilder {
             completion_tx: None,
             term,
             term_config: config,
+            write_output_parser: Default::default(),
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Default::default(),
@@ -426,6 +446,7 @@ impl TerminalBuilder {
             child_exited: None,
             keyboard_input_sent: false,
             last_pty_grid_size: None,
+            kitty_images: kitty_graphics_store::ImageStore::new(),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
@@ -668,6 +689,7 @@ impl TerminalBuilder {
                 completion_tx,
                 term,
                 term_config: config,
+                write_output_parser: Default::default(),
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -704,6 +726,7 @@ impl TerminalBuilder {
                 child_exited: None,
                 keyboard_input_sent: false,
                 last_pty_grid_size: None,
+                kitty_images: kitty_graphics_store::ImageStore::new(),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
@@ -902,6 +925,16 @@ pub struct Terminal {
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<FairMutex<Term<ZedListener>>>,
     term_config: Config,
+    /// Escape-sequence parser for the `write_output` (display-only /
+    /// injected-bytes) path. Must persist across calls: callers feed
+    /// arbitrary slices of a byte stream, and a single escape sequence —
+    /// notably a Kitty graphics APC string, which routinely runs to
+    /// several kilobytes — can straddle any number of those slices. A
+    /// fresh parser per call would silently drop everything before the
+    /// boundary, turning a valid image transmission into a stream of
+    /// orphaned continuation chunks.
+    write_output_parser:
+        alacritty_terminal::vte::ansi::Processor<alacritty_terminal::vte::ansi::StdSyncHandler>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(AlacPoint, AlacDirection)>,
@@ -930,6 +963,12 @@ pub struct Terminal {
     /// Last (cols, rows) actually sent to the PTY. Used to suppress redundant
     /// SIGWINCH when only pixel metrics change but the grid size is identical.
     last_pty_grid_size: Option<(usize, usize)>,
+    /// Decoded Kitty terminal graphics protocol images and their
+    /// placements, if the PTY has sent any (`KITTY_GRAPHICS_PLAN.md`
+    /// Stage 2). Rendering (actually painting them) is Stage 3, not yet
+    /// wired up — this exists so decoding/storage is independently
+    /// observable/testable without depending on that.
+    kitty_images: kitty_graphics_store::ImageStore,
     /// When this terminal was created. A sibling split pane can be resized
     /// (and thus SIGWINCH'd) purely as a side effect of `PaneGroup::split`
     /// restructuring the whole flex layout when a *new* split is added next
@@ -938,10 +977,14 @@ pub struct Terminal {
     /// shows up as visibly duplicated banner text. Suppressing the PTY-side
     /// resize for a short window after creation avoids reaching a
     /// still-connecting remote at all; `last_pty_grid_size` is deliberately
-    /// left unset while suppressed, so the next real resize event (there's
-    /// always another one soon — `prepaint` calls `set_size` every frame)
-    /// sends the correct size once the window passes. The local grid still
-    /// resizes immediately either way, so rendering is never stale.
+    /// left unset while suppressed, so the next resize event sends the
+    /// correct size once the window passes — `set_size` retries on its own
+    /// (see the `pty_grid_stale` check there) rather than assuming `prepaint`
+    /// will call it again soon, since that's false for a tab that isn't
+    /// currently painted (parked, or simply not the active tab during
+    /// restore). The local grid still resizes immediately either way, so
+    /// rendering is never stale on the LOCAL side — only a remote PTY that
+    /// hasn't yet been told about the real size can show stale content.
     created_at: Instant,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
@@ -1072,6 +1115,67 @@ impl Terminal {
             }
             AlacTermEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
+            }
+            AlacTermEvent::ApcString(bytes, apc_cursor) => {
+                // Kitty's terminal graphics protocol is currently the only
+                // thing Som interprets APC strings as — see
+                // `kitty_graphics::parse_command`'s doc comment for why
+                // unrecognized/unsupported commands are silently ignored
+                // rather than logged as errors (a program probing for
+                // protocol support via `a=q` is expected behavior, not a
+                // bug, on a terminal that doesn't answer).
+                if let Some(command) = kitty_graphics::parse_command(&bytes) {
+                    log::trace!("kitty graphics command parsed: {command:?}");
+                    // `a=q` needs a PTY write, which ImageStore deliberately
+                    // has no access to (see ImageStore::apply's Query arm) —
+                    // answer it here instead of forwarding it into the
+                    // store. This is exactly the capability-negotiation
+                    // response programs like yazi wait on before deciding
+                    // whether to use this protocol at all
+                    // (KITTY_GRAPHICS_PLAN.md Stage 5 / acceptance criteria).
+                    if let kitty_graphics::KittyGraphicsCommand::Query(query) = command {
+                        self.write_to_pty(kitty_graphics::query_response(query));
+                    } else {
+                        // Use the cursor position `apc_unhook` captured
+                        // synchronously during VTE parsing (see
+                        // `alacritty_terminal::event::Event::ApcString`'s doc
+                        // comment) — NOT a fresh `self.term.lock()` read
+                        // here. Som's own event loop
+                        // (`Terminal::subscribe`'s `event_loop_task`)
+                        // batches/queues events and can process this one
+                        // well after later terminal output has already
+                        // moved the cursor further (e.g. a client placing
+                        // an image and then printing trailing blank lines
+                        // in the same PTY chunk, like `somcat` does) — a
+                        // fresh read at that point would anchor a
+                        // cursor-relative Kitty placement (`a=p`) to the
+                        // wrong grid position. This was a real, confirmed
+                        // bug (see `project_kitty_graphics_protocol`
+                        // memory): images rendering in the wrong place
+                        // whenever a client's own trailing output scrolled
+                        // the screen between Place and this event actually
+                        // being drained from the queue.
+                        self.kitty_images
+                            .apply(command, (apc_cursor.line.0, apc_cursor.column.0));
+                        // Without this, a new/updated placement sits in
+                        // `ImageStore` correctly but never gets painted
+                        // until something UNRELATED triggers a real
+                        // platform-level repaint (typing another key,
+                        // switching focus, resizing, etc.) — confirmed via
+                        // the user's own manual testing. `cx.emit` and
+                        // `cx.refresh_windows()` both only mark state dirty
+                        // for whenever the platform's own mechanism next
+                        // gets around to actually redrawing (on Windows, a
+                        // background VSync thread calling `RedrawWindow` —
+                        // not synchronous, and not something this event
+                        // handler can rely on firing promptly). See
+                        // `PlatformWindow::force_redraw`'s doc comment for
+                        // why an actual forced native repaint is needed
+                        // here instead.
+                        cx.emit(Event::Wakeup);
+                        cx.force_redraw_windows();
+                    }
+                }
             }
         }
     }
@@ -1404,14 +1508,25 @@ impl Terminal {
             prev_byte = byte;
         }
 
-        let mut processor = alacritty_terminal::vte::ansi::Processor::<
-            alacritty_terminal::vte::ansi::StdSyncHandler,
-        >::new();
         {
             let mut term = self.term.lock();
-            processor.advance(&mut *term, &converted);
+            // Persistent parser (see `write_output_parser`) — a sequence
+            // split across two calls has to resume, not restart.
+            self.write_output_parser.advance(&mut *term, &converted);
         }
         cx.emit(Event::Wakeup);
+    }
+
+    pub fn kitty_image(&self, id: u32) -> Option<&kitty_graphics_store::DecodedImage> {
+        self.kitty_images.image(id)
+    }
+
+    pub fn kitty_placements(
+        &self,
+    ) -> impl Iterator<
+        Item = (u32, u32, &kitty_graphics_store::PlacementInfo, &kitty_graphics_store::DecodedImage),
+    > {
+        self.kitty_images.all_placements()
     }
 
     pub fn total_lines(&self) -> usize {
@@ -1539,7 +1654,26 @@ impl Terminal {
             || old_bounds.cell_width != new_bounds.cell_width
             || old_bounds.line_height != new_bounds.line_height;
 
-        if !requires_resize {
+        // A grid-size change during the creation grace period (see
+        // `created_at`) intentionally skips sending SIGWINCH, banking on
+        // "there's always another resize event soon" to flush the real size
+        // once the grace period passes. That assumption breaks for a tab
+        // that isn't currently painted (parked during restore, or simply not
+        // the active tab) — `prepaint` never runs for it, so `set_size` is
+        // never called again, and the PTY is left believing the terminal is
+        // still whatever size it was BEFORE the grace-period resizes that
+        // got suppressed. A remote program (e.g. `htop` over SSH) then never
+        // repaints for its true size, leaving stale content on screen until
+        // something else (a manual window resize) finally triggers another
+        // `set_size` call. Retry here instead of only in the normal
+        // requires_resize path: if the grid size no longer matches what was
+        // last actually sent to the PTY, queue a resize regardless of
+        // whether pixel bounds changed since the last call — `sync` re-checks
+        // the grace period itself, so this is a no-op until it has elapsed.
+        let grid_size = (new_bounds.num_columns(), new_bounds.num_lines());
+        let pty_grid_stale = self.last_pty_grid_size.is_some_and(|s| s != grid_size);
+
+        if !requires_resize && !pty_grid_stale {
             return;
         }
 
@@ -3440,6 +3574,1168 @@ mod tests {
 
         assert!(line1_col0, "First line should start at column 0");
         assert!(line2_col0, "Second line should start at column 0");
+    }
+
+    #[gpui::test]
+    async fn test_kitty_graphics_apc_reaches_terminal(cx: &mut TestAppContext) {
+        // End-to-end: real PTY-shaped bytes (write_output goes through the
+        // exact same alacritty_terminal::vte::ansi::Processor::advance path
+        // a real PTY read would) containing a Kitty graphics protocol APC
+        // string, all the way through Term's apc_hook/apc_put/apc_unhook
+        // (errordnk/vte + errordnk/alacritty forks) -> Event::ApcString ->
+        // Terminal::process_event -> kitty_graphics::parse_command ->
+        // kitty_graphics_store::ImageStore::apply -> a real decoded image.
+        // This is the test that actually proves the whole Stage 0 (parser
+        // plumbing) + Stage 1 (protocol parsing) + Stage 2 (decode/storage)
+        // chain is wired together correctly, not just that each piece
+        // compiles in isolation.
+        //
+        // A real, valid 1x1 PNG — see kitty_graphics_store's TINY_PNG_BASE64
+        // doc comment for how it was generated/verified; a hand-typed PNG
+        // byte string is not safe to trust (CRC-checked chunks).
+        const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AP////8J+wP9o9FJCgAAAABJRU5ErkJggg==";
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let apc = format!("\x1b_Ga=T,f=100,i=42;{TINY_PNG_BASE64}\x1b\\");
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(apc.as_bytes(), cx);
+        });
+
+        // process_event runs on Terminal's own async event loop (see
+        // Terminal::subscribe), not synchronously inside write_output —
+        // let it actually run before asserting.
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal.kitty_image(42).expect("image 42 should be decoded and stored");
+            assert_eq!(image.render_image.frame_count(), 1);
+            let size = image.render_image.size(0);
+            assert_eq!((size.width.0, size.height.0), (1, 1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_graphics_many_chunks_via_real_vte_parser(cx: &mut TestAppContext) {
+        // Regression test for a REAL bug found via this exact scenario
+        // (2026-07-25, see project_kitty_graphics_protocol memory):
+        // `ImageStore::apply_transmit` used to bail out immediately with
+        // `let Some(id) = transmit.id else { return; }` whenever a
+        // Transmit command's `i=` was absent — but the OFFICIAL Kitty
+        // graphics protocol spec's own reference shell-script example
+        // (`send_chunked`/`transmit_png` at
+        // https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium)
+        // shows `i=` is ONLY ever sent on the FIRST chunk of a multi-chunk
+        // transmission — every continuation chunk is bare `m=1;<payload>`/
+        // `m=0;<payload>`, with no id at all. That early return meant
+        // EVERY real multi-chunk transmission from a spec-compliant
+        // client (this project's own `crates/somcat`, and presumably
+        // `yazi`/`kitten icat`) silently discarded its 2nd+ chunk,
+        // corrupting the image — invisible in earlier tests
+        // (`chunked_transmission_concatenates_before_decoding` etc.)
+        // ONLY because those tests were written incorrectly, manually
+        // repeating `i=` on every chunk (not what real clients do). Found
+        // by testing a REAL 4032x3024 (phone-camera-resolution) PNG
+        // through the REAL vte parser (not `ImageStore::apply` called
+        // directly) — small test fixtures (1-2 chunks) alone never
+        // exercised this path realistically enough to catch it.
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let (width, height) = (4032u32, 3024u32);
+        let buffer = image::RgbaImage::from_pixel(width, height, image::Rgba([80, 140, 200, 255]));
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .expect("encoding the large test fixture PNG must succeed");
+        use base64::Engine as _;
+        let base64_payload = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+        // Same chunking shape as crates/somcat/src/main.rs's
+        // transmit_and_place: `i=`/`f=` ONLY on the first chunk, bare
+        // `m=` on every continuation chunk — deliberately NOT repeating
+        // `i=` on every chunk (the bug this test exists to catch).
+        const CHUNK_SIZE: usize = 4096;
+        let mut all_bytes: Vec<u8> = Vec::new();
+        let bytes = base64_payload.as_bytes();
+        let mut offset = 0;
+        let mut first = true;
+        while offset < bytes.len() {
+            let end = (offset + CHUNK_SIZE).min(bytes.len());
+            let chunk = &bytes[offset..end];
+            let more = end < bytes.len();
+            let more_flag = if more { "1" } else { "0" };
+            if first {
+                all_bytes.extend_from_slice(format!("\x1b_Ga=T,f=100,i=1,m={more_flag};").as_bytes());
+                first = false;
+            } else {
+                all_bytes.extend_from_slice(format!("\x1b_Gm={more_flag};").as_bytes());
+            }
+            all_bytes.extend_from_slice(chunk);
+            all_bytes.extend_from_slice(b"\x1b\\");
+            offset = end;
+        }
+        all_bytes.extend_from_slice(b"\x1b_Ga=p,i=1,p=1,c=40,r=20\x1b\\");
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&all_bytes, cx);
+        });
+        // Bounded poll instead of a single run_until_parked() call — with
+        // ~80 chunks generating ~80 Event::ApcString events processed in
+        // batches (see `subscribe()`'s `events.len() > 100` batching
+        // logic), a single parked-check might not pump the simulated
+        // executor through every batch/yield_now() cycle needed.
+        let mut found = false;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            if terminal.update(cx, |term, _| term.kitty_image(1).is_some()) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(found, "image 1 was never decoded after many chunks through the real vte parser");
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal.kitty_image(1).expect("checked via `found` above");
+            let size = image.render_image.size(0);
+            assert_eq!((size.width.0, size.height.0), (width as i32, height as i32));
+
+            let placements: Vec<_> = terminal.kitty_placements().collect();
+            assert_eq!(placements.len(), 1, "exactly one placement should exist");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_yazis_exact_wire_format_survives_being_split_across_pty_reads(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces `yazi`'s real output byte-for-byte (see
+        // `yazi-adapter/src/drivers/kgp.rs`): raw RGBA pixels (`f=32`) with
+        // the dimensions in `s=`/`v=`, 4096-byte base64 chunks, every
+        // control key it actually sends — then feeds it to the terminal in
+        // AWKWARD SLICES rather than one clean write, the way a real PTY
+        // read loop delivers it. A first chunk that straddles a read
+        // boundary is the difference between an image appearing in yazi's
+        // preview pane and the pane staying blank: it's the only chunk
+        // carrying the id, format and dimensions.
+        use base64::Engine as _;
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // 64x64 RGBA, big enough to need several 4096-byte base64 chunks.
+        let (width, height) = (64u32, 64u32);
+        let raw: Vec<u8> = (0..(width * height * 4))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+
+        let mut wire = Vec::new();
+        let chunks: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let more = usize::from(index + 1 < chunks.len());
+            if index == 0 {
+                wire.extend_from_slice(
+                    format!(
+                        "\x1b_Gq=2,a=T,C=1,U=1,f=32,s={width},v={height},i=24836,m={more};{chunk}\x1b\\"
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                wire.extend_from_slice(format!("\x1b_Gm={more};{chunk}\x1b\\").as_bytes());
+            }
+        }
+
+        // Deliver in irregular slices, deliberately cutting through the
+        // middle of the first chunk's control data and its payload.
+        let slice_points = [7usize, 23, 61, 200, 1500, 4000, 4200, 9000];
+        let mut start = 0usize;
+        let mut writes: Vec<Vec<u8>> = Vec::new();
+        for &point in &slice_points {
+            let end = point.min(wire.len());
+            if end > start {
+                writes.push(wire[start..end].to_vec());
+                start = end;
+            }
+        }
+        if start < wire.len() {
+            writes.push(wire[start..].to_vec());
+        }
+
+        terminal.update(cx, |terminal, cx| {
+            for write in &writes {
+                terminal.write_output(write, cx);
+            }
+        });
+
+        let mut found = false;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            if terminal.update(cx, |term, _| term.kitty_image(24836).is_some()) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            found,
+            "yazi's transmission never produced a stored image — its first chunk (the only one \
+             carrying i=/f=/s=/v=) was lost or misparsed when split across reads"
+        );
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal.kitty_image(24836).expect("checked via `found` above");
+            let size = image.render_image.size(0);
+            assert_eq!(
+                (size.width.0, size.height.0),
+                (width as i32, height as i32),
+                "s=/v= must survive to give the decoded image its dimensions"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_graphics_full_pipeline_renders_correct_pixels(cx: &mut TestAppContext) {
+        // Full raster acceptance test for the Kitty Graphics Protocol
+        // pipeline (KITTY_GRAPHICS_PLAN.md Stage 7) — everything the GUI
+        // live-test with `yazi` would exercise, but driven end-to-end
+        // through the exact real code path (write_output -> real
+        // alacritty_terminal::vte::ansi::Processor::advance -> Term ->
+        // Event::ApcString -> Terminal::process_event ->
+        // kitty_graphics::parse_command -> ImageStore::apply -> real PNG
+        // decode -> BGRA conversion -> Terminal::kitty_placements()),
+        // without touching any GUI/window focus. This is what actually
+        // proves pixel-level correctness, not just "something got stored".
+        //
+        // A real, multi-color 2x2 PNG generated programmatically (NOT
+        // hand-typed/recalled base64 — PNG's IDAT chunks are CRC-checked,
+        // see kitty_graphics_store's TINY_PNG_BASE64 doc comment for why
+        // that specific mistake was made and fixed earlier in this
+        // project) so each pixel's color can be asserted individually
+        // after decode, proving real per-pixel data survived the whole
+        // pipeline rather than just "an image of the right dimensions".
+        let mut png_bytes: Vec<u8> = Vec::new();
+        let pixels: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],   // top-left: red
+            [0, 255, 0, 255],   // top-right: green
+            [0, 0, 255, 255],   // bottom-left: blue
+            [255, 255, 255, 255], // bottom-right: white
+        ];
+        let mut buffer = image::RgbaImage::new(2, 2);
+        buffer.put_pixel(0, 0, image::Rgba(pixels[0]));
+        buffer.put_pixel(1, 0, image::Rgba(pixels[1]));
+        buffer.put_pixel(0, 1, image::Rgba(pixels[2]));
+        buffer.put_pixel(1, 1, image::Rgba(pixels[3]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .expect("encoding the test fixture PNG must succeed");
+        use base64::Engine as _;
+        let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // Move the cursor first (a couple of newlines + spaces), THEN
+        // transmit+display — a real client would send Transmit before
+        // Place, and the placement must anchor to wherever the cursor
+        // actually is at Place time, not (0, 0). This also exercises the
+        // Kitty Place command's c=/r= cell-scaling fields together with
+        // the transmit, not in isolation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\r\n\r\n   "); // move cursor to line 2, column 3
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=T,f=100,i=7;{png_base64}\x1b\\").as_bytes(),
+        );
+        bytes.extend_from_slice(b"\x1b_Ga=p,i=7,p=1,c=4,r=2\x1b\\");
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&bytes, cx);
+        });
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            // 1. The image itself decoded with the correct dimensions and
+            // the correct per-pixel BGRA data (RGBA source -> BGRA target,
+            // see kitty_graphics_store's swap_to_bgra doc comment).
+            let image = terminal.kitty_image(7).expect("image 7 should be decoded and stored");
+            assert_eq!(image.render_image.frame_count(), 1);
+            let size = image.render_image.size(0);
+            assert_eq!((size.width.0, size.height.0), (2, 2), "decoded image must keep the source's 2x2 dimensions");
+
+            let raw = image.render_image.as_bytes(0).expect("frame 0 must have pixel data");
+            assert_eq!(raw.len(), 2 * 2 * 4, "2x2 RGBA/BGRA image must be exactly 16 bytes");
+            // Expected pixel order matches PNG row-major layout: (0,0),
+            // (1,0), (0,1), (1,1) — each as BGRA (blue/green/red swapped
+            // relative to the RGBA source pixels above, alpha unchanged).
+            let expected_bgra: [[u8; 4]; 4] = [
+                [0, 0, 255, 255],   // red pixel -> BGRA
+                [0, 255, 0, 255],   // green pixel -> BGRA (symmetric, unchanged)
+                [255, 0, 0, 255],   // blue pixel -> BGRA
+                [255, 255, 255, 255], // white pixel -> BGRA (symmetric, unchanged)
+            ];
+            for (i, expected) in expected_bgra.iter().enumerate() {
+                let actual = &raw[i * 4..i * 4 + 4];
+                assert_eq!(
+                    actual, expected,
+                    "pixel {i} BGRA bytes mismatch — decode or color-channel-swap pipeline is wrong"
+                );
+            }
+
+            // 2. The placement itself: correct anchor (cursor position at
+            // Place time), correct cell-scaling from c=/r=.
+            let placements: Vec<_> = terminal.kitty_placements().collect();
+            assert_eq!(placements.len(), 1, "exactly one placement should exist");
+            let (image_id, placement_id, info, _decoded) = placements[0];
+            assert_eq!(image_id, 7);
+            assert_eq!(placement_id, 1);
+            assert_eq!(info.anchor, (2, 3), "placement must anchor to the cursor position at Place time (line 2, column 3)");
+            assert_eq!(info.columns, Some(4));
+            assert_eq!(info.rows, Some(2));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_placement_stays_correctly_positioned_after_scroll_caused_by_later_output(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces the user's own manual report ("выводит картинку в
+        // непонятном месте" — displays the image in the wrong place) using
+        // a real client's exact byte sequence: `somcat` places the image
+        // immediately after transmitting it (see
+        // `crates/somcat/src/main.rs::transmit_and_place`), THEN prints a
+        // block of blank lines afterward to leave vertical room (`for _ in
+        // 0..rows { println!(); }`). If the terminal's screen is short
+        // enough that those trailing blank lines scroll the placement's
+        // anchor line off the top of the viewport into scrollback, the
+        // placement must track that scroll (via `display_offset`, exactly
+        // like the cursor and every other piece of on-screen content does)
+        // — not stay pinned to a viewport row number that now points at
+        // different content.
+        //
+        // `TerminalBuilder::new_display_only`'s default test terminal is
+        // only 6 rows tall (`DEBUG_TERMINAL_HEIGHT` / `DEBUG_LINE_HEIGHT` =
+        // 30px / 5px, see terminal.rs's own constants) — small enough that
+        // even a handful of trailing newlines forces a real scroll, exactly
+        // the regime a real (small) Som pane is in after `somcat` prints 20
+        // blank lines following the placement.
+        let mut png_bytes: Vec<u8> = Vec::new();
+        let buffer = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .expect("encoding the test fixture PNG must succeed");
+        use base64::Engine as _;
+        let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // Transmit + Place immediately (matching somcat's own ordering),
+        // right at the cursor's starting position (line 0, column 0 — a
+        // freshly-typed command's output starts here) — then print 20
+        // blank lines exactly like somcat's post-placement loop does.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=T,f=100,i=9;{png_base64}\x1b\\").as_bytes(),
+        );
+        bytes.extend_from_slice(b"\x1b_Ga=p,i=9,p=1,c=2,r=2\x1b\\");
+        for _ in 0..20 {
+            bytes.extend_from_slice(b"\r\n");
+        }
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&bytes, cx);
+        });
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            let placements: Vec<_> = terminal.kitty_placements().collect();
+            assert_eq!(placements.len(), 1, "exactly one placement should exist");
+            let (_, _, info, _) = placements[0];
+
+            // This is the actual bug this test reproduces: before the fix
+            // (capturing the cursor synchronously in
+            // `alacritty_terminal::Term::apc_unhook` — see
+            // `Event::ApcString`'s doc comment in the `errordnk/alacritty`
+            // fork), `Terminal::process_event`'s ApcString handler re-read
+            // `self.term.lock().grid().cursor.point` at EVENT-PROCESSING
+            // time instead. Because Som's event loop
+            // (`Terminal::subscribe`'s `event_loop_task`) batches/queues
+            // events rather than processing each one the instant it's
+            // generated, that re-read saw the cursor already moved down by
+            // all 20 of the trailing `\r\n`s this test sends right after
+            // the Place command — anchoring the placement at line 5
+            // instead of line 0, exactly matching the user's own manually
+            // observed symptom ("картинка в непонятном месте" — the image
+            // rendering in the wrong place).
+            assert_eq!(
+                info.anchor.0, 0,
+                "anchor must record line 0 — the cursor position AT PLACE TIME (synchronously \
+                 captured during VTE parsing), not wherever the cursor ended up after this \
+                 event was eventually drained from Som's batched event queue"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_placement_triggers_a_repaint_without_needing_further_input(
+        cx: &mut TestAppContext,
+    ) {
+        // Second half of the user's own manual report: after the anchor-
+        // timing bug above was fixed, `somcat <image>` still showed
+        // nothing — until the user pressed ANY key, at which point the
+        // image suddenly appeared. Root cause: `Terminal::process_event`'s
+        // `ApcString` branch updated `self.kitty_images` (the data GPUI's
+        // paint pass reads from) but never told GPUI a repaint was needed
+        // — unlike ordinary text output or most other branches of this
+        // same match statement.
+        //
+        // This MUST use a real PTY-backed terminal (`somcat` spawned as an
+        // actual child process via `build_test_terminal_with_arguments`),
+        // NOT `write_output` — `write_output` (used by the display-only
+        // tests elsewhere in this file) unconditionally calls
+        // `cx.emit(Event::Wakeup)` itself at the end of every call,
+        // regardless of what happened during parsing. A test built on
+        // `write_output` would pass even with the bug still present,
+        // because `write_output`'s own blanket emit would mask the
+        // missing one inside the ApcString branch — exactly the gap a
+        // first version of this test fell into (confirmed by temporarily
+        // reverting the fix and observing it stayed green). The real PTY
+        // event loop (`Terminal::subscribe`'s `event_loop_task`) has no
+        // such blanket emit; each `AlacTermEvent` variant is responsible
+        // for signaling its own repaint need.
+        cx.executor().allow_parking();
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let image_path = std::env::temp_dir().join("somcat_wakeup_test_fixture.png");
+        let buffer = image::RgbaImage::from_pixel(32, 16, image::Rgba([5, 6, 7, 255]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&image_path)
+            .expect("writing the test fixture PNG must succeed");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![image_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let (event_tx, event_rx) = async_channel::unbounded::<Event>();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, e, _| {
+                event_tx.send_blocking(e.clone()).unwrap();
+            })
+        })
+        .detach();
+
+        // Poll ONLY for the placement to land in ImageStore and for a
+        // Wakeup event to have been observed — deliberately never send any
+        // further input (no keystrokes, no resize) that could itself
+        // trigger the repaint and mask the bug.
+        let mut placements_found = 0;
+        let mut got_wakeup = false;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            while let Ok(event) = event_rx.try_recv() {
+                if matches!(event, Event::Wakeup) {
+                    got_wakeup = true;
+                }
+            }
+            placements_found = terminal.update(cx, |term, _| term.kitty_placements().count());
+            if placements_found > 0 && got_wakeup {
+                break;
+            }
+        }
+
+        assert!(placements_found > 0, "somcat never produced a placement — test setup problem, not the bug under test");
+        assert!(
+            got_wakeup,
+            "somcat placed an image but Terminal never emitted Event::Wakeup for it — the \
+             placement sits correctly in ImageStore but GPUI is never told to repaint, so it \
+             stays invisible until something UNRELATED (the next keystroke, a resize, ...) \
+             happens to trigger one. This reproduces the user's own manual report: the image \
+             only appeared after they pressed a key."
+        );
+
+        std::fs::remove_file(&image_path).ok();
+    }
+
+    #[gpui::test]
+    async fn test_kitty_graphics_query_does_not_reach_image_store(cx: &mut TestAppContext) {
+        // `a=q` (KITTY_GRAPHICS_PLAN.md Stage 5) must be answered by writing
+        // straight back to the PTY (see kitty_graphics::query_response,
+        // fully unit-tested for its exact byte output on its own) rather
+        // than being forwarded into ImageStore — there's no image/placement
+        // data in a bare query to store. This test only has a
+        // `new_display_only` terminal available (no real PTY to observe the
+        // write on), so it verifies the other half of that split instead:
+        // a query must NOT create any spurious image/placement entry, and
+        // must not panic the event-processing path.
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let apc = "\x1b_Ga=q,i=99\x1b\\";
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(apc.as_bytes(), cx);
+        });
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            assert!(
+                terminal.kitty_image(99).is_none(),
+                "a bare query must not create an image store entry"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_query_response_reaches_a_real_child_process(cx: &mut TestAppContext) {
+        // Real-PTY acceptance test (KITTY_GRAPHICS_PLAN.md Stage 7),
+        // written after extensive manual live testing (2026-07-24/25) with
+        // a real `yazi` process left `Emulator.detect`'s `kgp: false` —
+        // i.e. `yazi` never saw Som's query response, even though every
+        // other test in this file (all `write_output`-driven, no real
+        // PTY) proves the response is correctly parsed/built/written.
+        // Manual investigation (see `project_kitty_graphics_protocol`
+        // memory) traced this specifically to Som's own logs showing the
+        // response really was written to the PTY (`Writing to PTY:
+        // "\x1b_Gi=31;OK\x1b\\"` for both a real `yazi` run and a
+        // hand-built probe) — meaning any remaining gap is in whatever sits
+        // between "written to the PTY" and "a distinct child process's own
+        // stdin actually receives it" on this platform, which no
+        // `write_output`-based unit test can observe at all (those tests
+        // exercise `Term`'s parser directly, never a second real process
+        // reading the other end of a real OS PTY).
+        //
+        // This test spawns `kitty_probe` (a tiny helper binary — see
+        // `src/bin/kitty_probe.rs`'s doc comment for why it has to be a
+        // real separate process) as the terminal's actual child process.
+        // `kitty_probe` writes the same `a=q` query a real Kitty-graphics
+        // client sends, then reads its OWN stdin (exactly like a real
+        // client would) and prints whether it received Som's response.
+        // Since a PTY has no separate stdout/stderr streams, that result
+        // line ends up in the terminal's own visible grid content, right
+        // alongside the input — a real second process, a real PTY, no
+        // GUI/keyboard-focus automation involved anywhere.
+        cx.executor().allow_parking();
+
+        // `CARGO_BIN_EXE_<name>` is only defined for integration tests
+        // (files under `tests/`), not for `#[test]`s inside `src/*.rs` like
+        // this one — so the bin target's path is found manually instead:
+        // `std::env::current_exe()` for a unit test binary is something
+        // like `target/debug/deps/terminal-<hash>.exe`, and Cargo always
+        // places bin targets directly in `target/debug/` (one directory up
+        // from `deps/`), regardless of which specific test binary is
+        // currently running.
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent() // .../target/debug/deps
+            .and_then(|p| p.parent()) // .../target/debug
+            .expect("test binaries always live two directories under target/<profile>");
+        let probe_path = target_debug_dir.join(if cfg!(windows) { "kitty_probe.exe" } else { "kitty_probe" });
+        assert!(
+            probe_path.is_file(),
+            "kitty_probe bin target not found at {probe_path:?} — run `cargo build -p terminal --bin kitty_probe` first"
+        );
+
+        let (terminal, _completion_rx) =
+            build_test_terminal_with_arguments(cx, probe_path.to_string_lossy().into_owned(), Vec::new()).await;
+
+        // Bounded poll, not an unbounded blocking wait — see
+        // feedback_bounded_test_loops memory: `next_change_blocking`
+        // without a cap can hang forever if the process never produces
+        // the expected output; a fixed retry budget with sleeps in
+        // between is the safe pattern already used elsewhere in this file
+        // (see `wait_for_prompt` a few tests below).
+        let mut content = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            content = terminal.update(cx, |term, _| term.get_content());
+            if content.contains("KITTY_PROBE_RESULT") {
+                break;
+            }
+        }
+
+        assert!(
+            content.contains("KITTY_PROBE_RESULT"),
+            "kitty_probe never printed its result at all within the test's time budget — \
+             the child process likely never started/exited unexpectedly. Screen:\n{content:?}"
+        );
+        assert!(
+            content.contains("CONTAINS_OK=true"),
+            "kitty_probe's own stdin never received Som's `a=q` response bytes, even though \
+             Som's `Terminal` wrote them to the PTY (this exact gap is what extensive manual \
+             testing with a real `yazi` process found — see project_kitty_graphics_protocol \
+             memory). Full screen content for diagnosis:\n{content:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_da1_response_reaches_a_real_child_process(cx: &mut TestAppContext) {
+        // Diagnostic sibling of
+        // `test_kitty_query_response_reaches_a_real_child_process` — same
+        // real-child-process/real-PTY mechanism, but probing plain DA1
+        // (`\x1b[0c`, answered via `Term::identify_terminal` ->
+        // `Event::PtyWrite` -> `Terminal::write_to_pty`, the SAME
+        // `write_to_pty` path every other terminal-response — Kitty query,
+        // color request, text-area-size request — also goes through)
+        // instead of a Kitty graphics query. If THIS test also fails the
+        // same way, the gap isn't specific to Kitty graphics at all — it's
+        // in `write_to_pty`/the underlying PTY response-delivery mechanism
+        // itself on this platform, which would mean the fix belongs there
+        // (or in documenting a real platform limitation), not in anything
+        // Kitty-graphics-specific. If THIS test PASSES while the Kitty one
+        // fails, the gap is specific to something about the Kitty response
+        // shape (its bytes, its timing relative to other queries, etc).
+        cx.executor().allow_parking();
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let probe_path = target_debug_dir.join(if cfg!(windows) { "kitty_probe.exe" } else { "kitty_probe" });
+        assert!(
+            probe_path.is_file(),
+            "kitty_probe bin target not found at {probe_path:?} — run `cargo build -p terminal --bin kitty_probe` first"
+        );
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            probe_path.to_string_lossy().into_owned(),
+            vec!["--da1".to_string()],
+        )
+        .await;
+
+        let mut content = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            content = terminal.update(cx, |term, _| term.get_content());
+            if content.contains("KITTY_PROBE_RESULT") {
+                break;
+            }
+        }
+
+        assert!(
+            content.contains("KITTY_PROBE_RESULT"),
+            "kitty_probe --da1 never printed its result at all within the test's time budget. Screen:\n{content:?}"
+        );
+        assert!(
+            content.contains("CONTAINS_OK=true"),
+            "kitty_probe --da1's own stdin never received Som's DA1 response — this would mean \
+             the delivery gap affects EVERY write_to_pty-based terminal response, not just Kitty \
+             graphics. Full screen content for diagnosis:\n{content:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_somcat_reference_client_displays_a_real_image(cx: &mut TestAppContext) {
+        // End-to-end acceptance test using `somcat` (`crates/somcat`) — a
+        // real, standalone Kitty-graphics-protocol reference client
+        // written specifically because `yazi` (which depends on
+        // `crossterm` for Windows console raw mode) cannot reliably be
+        // used to verify Som's implementation on Windows: `crossterm`'s
+        // own `enable_raw_mode()` never sets
+        // `ENABLE_VIRTUAL_TERMINAL_INPUT`, so a real terminal's response
+        // bytes never reach its stdin at all (confirmed via the isolated,
+        // GPUI/Som-independent investigation recorded in the
+        // `project_kitty_graphics_protocol` memory) — a `yazi`-based test
+        // would fail regardless of whether Som's own implementation is
+        // correct, which is exactly backwards for a regression test.
+        // `somcat` sets that flag itself (see `crates/somcat/src/
+        // raw_mode.rs`), so it actually exercises the real
+        // query -> transmit -> place round trip end-to-end, the same as
+        // the manual `yazi` testing was meant to (but couldn't).
+        cx.executor().allow_parking();
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        // A real PNG, generated programmatically (not hand-typed base64 —
+        // see kitty_graphics_store's TINY_PNG_BASE64 doc comment for why
+        // that specific mistake was made and fixed earlier in this
+        // project) and written to a real temp file, since `somcat` is a
+        // real CLI tool that takes a file path, not raw bytes.
+        let image_path = std::env::temp_dir().join("somcat_terminal_test_fixture.png");
+        let buffer = image::RgbaImage::from_pixel(64, 32, image::Rgba([10, 200, 90, 255]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&image_path)
+            .expect("writing the test fixture PNG must succeed");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![image_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let mut placements_found = 0;
+        let mut last_content = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            placements_found = terminal.update(cx, |term, _| term.kitty_placements().count());
+            last_content = terminal.update(cx, |term, _| term.get_content());
+            if placements_found > 0 {
+                break;
+            }
+        }
+
+        assert!(
+            placements_found > 0,
+            "somcat never resulted in a real Kitty graphics placement inside Som's Terminal — \
+             screen content for diagnosis: {last_content:?}\n\
+             either its capability query never got a response, or its transmit+place APC \
+             strings never reached Terminal::process_event. This is the automated equivalent \
+             of the manual yazi live-test the acceptance criteria calls for."
+        );
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal
+                .kitty_image(1)
+                .expect("somcat always uses image id 1 — see crates/somcat/src/main.rs");
+            let size = image.render_image.size(0);
+            assert_eq!(
+                (size.width.0, size.height.0),
+                (64, 32),
+                "the image Som decoded must match the real PNG somcat transmitted, not just any image"
+            );
+        });
+
+        std::fs::remove_file(&image_path).ok();
+    }
+
+    #[gpui::test]
+    async fn test_somcat_works_when_typed_into_a_real_interactive_shell(cx: &mut TestAppContext) {
+        // Sibling of `test_somcat_reference_client_displays_a_real_image`,
+        // closing a real gap that test doesn't cover: that test spawns
+        // `somcat` as the terminal's ONLY/DIRECT child process. A real Som
+        // tab instead spawns the user's interactive shell (PowerShell/etc),
+        // and `somcat` runs as a SECOND-level child, typed as a command —
+        // this is the actual, real-world way a user would invoke it. If
+        // `somcat`'s console-mode setup (GetConsoleMode/SetConsoleMode on
+        // STD_INPUT_HANDLE) behaves differently once a shell has already
+        // established its own console session vs. being the direct PTY
+        // child, this test is what would catch that gap — the direct-spawn
+        // test above cannot, by construction.
+        //
+        // Also wires up Som's own PATCHED conpty.dll exactly the way
+        // `crates/zed/src/main.rs::ensure_conpty_extracted_and_wired` does
+        // for the real application — `cargo test` never calls that
+        // function, so without this, every test in this file (including
+        // both other somcat tests) actually exercises the BASELINE
+        // Windows-provided conpty.dll, not the one real Som tabs use. This
+        // is the one remaining real difference between "passes in an
+        // automated test" and "works in an actual Som tab" that hasn't
+        // been ruled out yet.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir = dirs::home_dir()
+                .expect("home dir must resolve")
+                .join(".config")
+                .join("som")
+                .join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str()))
+                    .expect("SetDllDirectoryW must succeed for this test to be meaningful");
+            } else {
+                panic!(
+                    "patched conpty.dll not found at {conpty_dir:?} — this test can't verify \
+                     the real Som conpty configuration without it"
+                );
+            }
+        }
+
+        cx.executor().allow_parking();
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let image_path = std::env::temp_dir().join("somcat_shell_test_fixture.png");
+        let buffer = image::RgbaImage::from_pixel(48, 24, image::Rgba([220, 90, 10, 255]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&image_path)
+            .expect("writing the test fixture PNG must succeed");
+
+        // Spawn the EXACT shell the user's real "win" profile in
+        // settings.json uses (`C:\Program Files\PowerShell\7\pwsh.exe`),
+        // not `Shell::System`'s auto-detected default — if `Shell::System`
+        // happens to resolve to a DIFFERENT PowerShell (e.g. the built-in
+        // Windows PowerShell 5.1 instead of PowerShell 7) than what the
+        // user's real tab actually launches, that would be exactly the
+        // kind of gap a passing `Shell::System`-based test could hide.
+        let pwsh7_path = std::path::PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        assert!(pwsh7_path.is_file(), "expected pwsh 7 at {pwsh7_path:?} — matches this machine's real settings.json \"win\" profile");
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    None,
+                    task::Shell::WithArguments {
+                        program: pwsh7_path.to_string_lossy().into_owned(),
+                        args: Vec::new(),
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    Vec::new(),
+                    0,
+                    false,
+                    0,
+                    None,
+                    cx,
+                    Vec::new(),
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+
+        // Wait for the shell's own prompt to actually appear before typing
+        // anything — same bounded-poll pattern as this file's other real-
+        // shell tests (see `wait_for_prompt` near the SSH reconnect tests),
+        // not an unbounded wait.
+        let mut prompt_ready = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            let content = terminal.update(cx, |term, _| term.get_content());
+            if content.trim().len() > 1 {
+                prompt_ready = true;
+                break;
+            }
+        }
+        assert!(prompt_ready, "the real interactive shell's prompt never appeared — test setup problem, not the bug under test");
+
+        let command = format!("{} {}\r", somcat_path.to_string_lossy(), image_path.to_string_lossy());
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(command.into_bytes());
+        });
+
+        let mut placements_found = 0;
+        let mut last_content = String::new();
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            placements_found = terminal.update(cx, |term, _| term.kitty_placements().count());
+            last_content = terminal.update(cx, |term, _| term.get_content());
+            if placements_found > 0 {
+                break;
+            }
+        }
+
+        assert!(
+            placements_found > 0,
+            "somcat, typed as a command into a real interactive shell (not spawned directly), \
+             never resulted in a Kitty graphics placement. Screen content for diagnosis: \
+             {last_content:?}"
+        );
+
+        // The user's own manual report: after somcat prints the image, the
+        // shell prompt never comes back — the pane looks permanently hung
+        // (confirmed via burst screenshots of a real Som window: the
+        // cursor sits frozen at column 0 of a blank line for 90+ seconds,
+        // never redrawing the prompt, not responding to further keys typed
+        // into that same pane). If somcat's raw-mode console restore is
+        // silently failing (see raw_mode.rs's `restore` — its
+        // `SetConsoleMode` result used to be discarded with `let _ =`),
+        // the console would be left in a state PSReadLine can't drive,
+        // exactly matching that symptom. Prove/disprove it here: type a
+        // trivial marker command right after somcat exits and confirm the
+        // shell actually echoes/executes it — if the shell is truly wedged
+        // this marker will never appear no matter how long we wait.
+        let marker = "SOMCAT_POST_HANG_MARKER_9f2b";
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(format!("echo {marker}\r").into_bytes());
+        });
+
+        let mut marker_seen = false;
+        let mut post_command_content = String::new();
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            post_command_content = terminal.update(cx, |term, _| term.get_content());
+            if post_command_content.contains(marker) {
+                marker_seen = true;
+                break;
+            }
+        }
+
+        assert!(
+            marker_seen,
+            "the shell never echoed a trivial command typed right after somcat exited — this \
+             reproduces the user's manually-observed hang (prompt never returns after `somcat \
+             <image>` runs in a real interactive pane). Screen content for diagnosis: \
+             {post_command_content:?}"
+        );
+
+        std::fs::remove_file(&image_path).ok();
+    }
+
+    #[gpui::test]
+    async fn test_somcat_displays_a_realistic_large_photo_sized_image(cx: &mut TestAppContext) {
+        // The user's own manual test used a REAL photo
+        // ("2016-10-23-безмятежность.jpg") — a realistic phone-camera
+        // resolution, not the small (48x24/64x32) synthetic fixtures the
+        // other somcat tests use. Every automated test so far has only
+        // exercised tiny images; if something about large images
+        // specifically breaks (base64 payload size vs MAX_STORE_BYTES
+        // budget, GPU texture size limits in GPUI's sprite atlas, PNG
+        // encode/decode time exceeding somcat's own query timeout, etc.),
+        // none of the smaller-image tests would ever catch it. This test
+        // uses a realistic 4032x3024 (a common phone camera resolution)
+        // RGBA image to specifically probe that gap.
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let image_path = std::env::temp_dir().join("somcat_large_photo_test_fixture.png");
+        let buffer = image::RgbaImage::from_pixel(4032, 3024, image::Rgba([80, 140, 200, 255]));
+        image::DynamicImage::ImageRgba8(buffer)
+            .save(&image_path)
+            .expect("writing the large test fixture PNG must succeed");
+        let fixture_size_bytes = std::fs::metadata(&image_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("DIAG: large fixture PNG file size on disk = {fixture_size_bytes} bytes");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![image_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let mut placements_found = 0;
+        let mut last_content = String::new();
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            placements_found = terminal.update(cx, |term, _| term.kitty_placements().count());
+            last_content = terminal.update(cx, |term, _| term.get_content());
+            if placements_found > 0 {
+                break;
+            }
+        }
+
+        assert!(
+            placements_found > 0,
+            "somcat with a realistic large (4032x3024) photo-sized image never resulted in a \
+             Kitty graphics placement — this is the exact gap none of the smaller-image tests \
+             would catch. Screen content for diagnosis: {last_content:?}"
+        );
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal.kitty_image(1).expect("somcat always uses image id 1");
+            let size = image.render_image.size(0);
+            eprintln!("DIAG: decoded image size in Som = {}x{}", size.width.0, size.height.0);
+            assert_eq!((size.width.0, size.height.0), (4032, 3024));
+
+            // The critical check this test exists for: can the actual
+            // pixel bytes be retrieved at all for a texture this large?
+            // If GPUI's sprite atlas or anything downstream chokes on a
+            // 4032x3024 texture, `as_bytes` returning `None` (or this
+            // panicking) is exactly what would explain "nothing shows up
+            // on screen" despite the placement existing in ImageStore.
+            let bytes = image.render_image.as_bytes(0);
+            assert!(
+                bytes.is_some(),
+                "as_bytes(0) returned None for a 4032x3024 image — this would mean the decoded \
+                 pixel data itself is inaccessible even though the placement metadata exists, \
+                 exactly matching \"placement found but nothing rendered\""
+            );
+            let expected_len = 4032usize * 3024 * 4;
+            assert_eq!(
+                bytes.unwrap().len(),
+                expected_len,
+                "decoded byte buffer length doesn't match the expected 4032x3024x4 RGBA/BGRA size"
+            );
+        });
+
+        std::fs::remove_file(&image_path).ok();
+    }
+
+    #[gpui::test]
+    async fn test_unrecognized_apc_string_is_silently_ignored(cx: &mut TestAppContext) {
+        // Degradation check (KITTY_GRAPHICS_PLAN.md Stage 7): APC is a
+        // general-purpose escape mechanism, not exclusively Kitty's — some
+        // OTHER program could legitimately use it for something this
+        // implementation knows nothing about (no leading "G" marker, or a
+        // recognizable "G" marker but garbage control data). Real programs
+        // (e.g. `icat`) probe support via `a=q` and gracefully fall back to
+        // a text/Sixel/ASCII-art rendering path when no response arrives —
+        // that fallback only works correctly if Som's handling of anything
+        // it doesn't understand is a true no-op (no panic, no corrupted
+        // terminal state, no stray image store entries), not a special
+        // "recognized but broken" path. Ordinary text sent immediately
+        // before/after the unrecognized APC string must render completely
+        // unaffected, proving the byte stream itself wasn't disrupted.
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // Three different "not a Kitty graphics command this implementation
+        // recognizes" shapes: no leading G at all, a leading G with
+        // malformed control data, and a leading G with a well-formed but
+        // unsupported action — all wrapped in real ANSI text before/after
+        // to prove the surrounding stream survives intact.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"before");
+        bytes.extend_from_slice(b"\x1b_some_other_protocols_apc_data\x1b\\");
+        bytes.extend_from_slice(b"\x1b_Ggarbage,no,equals,signs\x1b\\");
+        bytes.extend_from_slice(b"\x1b_Ga=zzz\x1b\\");
+        bytes.extend_from_slice(b"after");
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&bytes, cx);
+        });
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            // `last_content` only refreshes via `sync()` — read straight off
+            // the real `Term` instead, same pattern
+            // `test_write_output_preserves_existing_crlf` already uses.
+            let content = {
+                let term = terminal.term.lock_unfair();
+                Terminal::make_content(&term, &terminal.last_content)
+            };
+            let text: String = content.cells.iter().map(|cell| cell.c).collect();
+            assert!(
+                text.contains("before") && text.contains("after"),
+                "ordinary text around an unrecognized APC string must render unaffected — got: {text:?}"
+            );
+            assert!(
+                terminal.kitty_image(0).is_none() && terminal.kitty_image(1).is_none(),
+                "unrecognized APC data must never create spurious image store entries"
+            );
+        });
     }
 
     #[gpui::test]

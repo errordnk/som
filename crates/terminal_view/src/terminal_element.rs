@@ -24,6 +24,7 @@ use terminal::{
             CursorShape as AlacCursorShape, NamedColor,
         },
     },
+    kitty_graphics_placeholder::{self, PlaceholderCell},
     terminal_settings::TerminalSettings,
 };
 use theme::{ActiveTheme, Theme};
@@ -405,6 +406,16 @@ impl TerminalElement {
                 }
                 // Skip wide character spacers - they're just placeholders for the second cell of wide characters
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+
+                // Skip Kitty Unicode-placeholder-mode cells — this glyph
+                // (a private-use codepoint, KITTY_GRAPHICS_PLAN.md Stage 4)
+                // has no real appearance of its own (most fonts render it
+                // as a missing-glyph box) and is painted as an image
+                // instead by paint_kitty_unicode_placeholders, which scans
+                // the same grid independently of this text layout pass.
+                if cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR {
                     continue;
                 }
 
@@ -1393,6 +1404,13 @@ impl Element for TerminalElement {
                         rect.paint(origin, &layout.dimensions, window);
                     }
 
+                    // Kitty graphics placements with a negative z-index draw
+                    // UNDER text — must happen before the text batches below.
+                    // Non-negative (including the default, 0) draw OVER text
+                    // — see the second paint_kitty_placements call below,
+                    // after the text batches.
+                    paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z < 0);
+
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
                             to_highlighted_range_lines(relative_highlighted_range, layout, origin)
@@ -1415,6 +1433,18 @@ impl Element for TerminalElement {
                         batch.paint(origin, &layout.dimensions, window, cx);
                     }
                     let text_paint_time = text_paint_start.elapsed();
+
+                    // Non-negative z-index placements draw OVER text — see
+                    // the under-text call above, before the highlight/text
+                    // painting, for the negative-z-index half of this split.
+                    paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z >= 0);
+
+                    // Unicode-placeholder-mode images (KITTY_GRAPHICS_PLAN.md
+                    // Stage 4) — anchored to grid cells written as ordinary
+                    // (if specially-encoded) text, so they paint alongside
+                    // the text batches rather than through the cursor-
+                    // relative PlacementInfo path above.
+                    paint_kitty_unicode_placeholders(&self.terminal, origin, layout, window, cx);
 
                     if let Some(text_to_mark) = &marked_text_cloned
                         && !text_to_mark.is_empty()
@@ -1635,6 +1665,296 @@ pub fn is_blank(cell: &IndexedCell) -> bool {
     true
 }
 
+/// Paint every currently-live Kitty graphics protocol placement whose
+/// z-index satisfies `z_filter` — called twice from `paint` (see call
+/// sites), once for under-text (`z < 0`) and once for over-text (`z >= 0`)
+/// placements, so images correctly layer with the surrounding text instead
+/// of all landing in one z-order relative to it.
+///
+/// Only cursor-relative placements (`KITTY_GRAPHICS_PLAN.md` Stage 3) are
+/// handled here — unicode-placeholder-mode placements (Stage 4) render
+/// through the normal text-cell path instead, since they're anchored to
+/// specific grid cells written as regular (if specially-encoded) glyphs.
+fn paint_kitty_placements(
+    terminal: &Entity<Terminal>,
+    origin: Point<Pixels>,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+    z_filter: impl Fn(i32) -> bool,
+) {
+    let terminal = terminal.read(cx);
+
+    // Cursor-relative placements (unlike Unicode placeholders — see this
+    // function's doc comment) are anchored to absolute main-screen grid
+    // coordinates tracked entirely outside alacritty_terminal's own grid,
+    // so switching to the alt screen (vim, less, any full-screen TUI) does
+    // NOT automatically stop them from being iterated here the way it does
+    // for placeholder cells. Kitty's own terminal parks (hides, without
+    // discarding) main-screen placements while the alt screen is active —
+    // matched here by simply skipping the paint pass entirely; the
+    // placements themselves stay in ImageStore untouched and reappear the
+    // moment the alt screen exits, same as the text underneath them
+    // already does for free.
+    if terminal.last_content().mode.contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+
+    let num_lines = layout.dimensions.num_lines() as i32;
+    let num_columns = layout.dimensions.num_columns();
+
+    for (_image_id, _placement_id, info, image) in terminal.kitty_placements() {
+        if !z_filter(info.z_index) {
+            continue;
+        }
+
+        let Some((position, size)) = kitty_placement_bounds(
+            info.anchor,
+            info.columns,
+            info.rows,
+            layout.display_offset,
+            num_lines,
+            num_columns,
+            origin,
+            layout.dimensions.cell_width,
+            layout.dimensions.line_height,
+        ) else {
+            // Scrolled out of view — nothing to paint this frame. Not an
+            // error: this is the normal state for a placement anchored to
+            // scrollback content the user isn't currently looking at.
+            continue;
+        };
+
+        window
+            .paint_image(
+                Bounds::new(position, size),
+                gpui::Corners::all(Pixels::ZERO),
+                image.render_image.clone(),
+                0,
+                false,
+            )
+            .log_err();
+    }
+}
+
+/// Compute a Kitty graphics placement's paint bounds, or `None` if it's
+/// currently scrolled out of the visible viewport. Pulled out of
+/// `paint_kitty_placements` as a pure function (no `Window`/`App`
+/// dependency) specifically so the grid-to-pixel math is unit-testable
+/// without a full GPUI paint context.
+#[allow(clippy::too_many_arguments)]
+fn kitty_placement_bounds(
+    anchor: (i32, usize),
+    columns: Option<u32>,
+    rows: Option<u32>,
+    display_offset: usize,
+    num_lines: i32,
+    num_columns: usize,
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> Option<(Point<Pixels>, gpui::Size<Pixels>)> {
+    // anchor is stored in absolute grid coordinates (see
+    // PlacementInfo::anchor's doc comment) — display_offset converts that to
+    // the currently-scrolled viewport's coordinate space, exactly mirroring
+    // DisplayCursor::from's formula for the terminal cursor itself.
+    let display_line = anchor.0 + display_offset as i32;
+    if display_line < 0 || display_line >= num_lines {
+        return None;
+    }
+    if anchor.1 >= num_columns {
+        return None;
+    }
+
+    // columns/rows (c=/r= in the protocol) override the image's natural
+    // cell footprint when the sender wants to scale it; default to a single
+    // cell when unset. A more accurate natural-size fallback (deriving cell
+    // span from the image's pixel dimensions and current cell metrics) is a
+    // reasonable follow-up, not required for this stage to be useful.
+    let cell_columns = columns.unwrap_or(1).max(1) as f32;
+    let cell_rows = rows.unwrap_or(1).max(1) as f32;
+
+    let position = point(
+        origin.x + anchor.1 as f32 * cell_width,
+        origin.y + display_line as f32 * line_height,
+    );
+    let size = gpui::size(cell_width * cell_columns, line_height * cell_rows);
+
+    Some((position, size))
+}
+
+/// Scan the currently-visible grid for Kitty Unicode-placeholder-mode
+/// cells (`KITTY_GRAPHICS_PLAN.md` Stage 4) and paint the image(s) they
+/// reference.
+///
+/// Unlike cursor-relative placements ([`paint_kitty_placements`]), these
+/// aren't tracked in `ImageStore`'s `placements` map at all — the grid
+/// cells themselves (each one a [`kitty_graphics_placeholder::PLACEHOLDER_CHAR`]
+/// glyph plus row/column-encoding combining diacritics, written by
+/// whatever program is using this mode, e.g. `yazi`) ARE the placement.
+/// This function only needs `ImageStore::image(id)` to resolve pixel data —
+/// positioning comes entirely from where those cells landed in the grid.
+fn paint_kitty_unicode_placeholders(
+    terminal: &Entity<Terminal>,
+    origin: Point<Pixels>,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let terminal = terminal.read(cx);
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+
+    // Group every placeholder cell seen this frame by (image_id,
+    // placement_id): a multi-cell image is written as many adjacent
+    // placeholder glyphs, one per covered cell, and the group's on-screen
+    // bounding box (in display-relative line/column units) is exactly the
+    // rectangle the whole image should be painted into — painting the full
+    // image once per group, not once per cell, since paint_image has no
+    // sub-region/crop support to draw just one cell's slice of it.
+    let mut groups: std::collections::HashMap<(u32, u32), CellGroupBounds> =
+        std::collections::HashMap::new();
+
+    for indexed_cell in &terminal.last_content().cells {
+        let fg_rgb = match indexed_cell.cell.fg {
+            AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+            // Named/Indexed colors resolve through the active theme
+            // palette (see convert_color) and can't round-trip an
+            // arbitrary 24-bit id — Kitty's own spec requires senders to
+            // emit true-color escapes for placeholder mode specifically
+            // so the id survives exactly. A cell using a non-true-color
+            // fg is therefore never a valid placeholder cell.
+            _ => continue,
+        };
+        let underline_rgb = match indexed_cell.cell.underline_color() {
+            Some(AnsiColor::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+            Some(_) => continue,
+            None => None,
+        };
+        let diacritics = indexed_cell.cell.zerowidth().unwrap_or(&[]);
+        let Some(PlaceholderCell { image_id, placement_id, .. }) =
+            kitty_graphics_placeholder::decode_placeholder_cell(
+                indexed_cell.cell.c,
+                fg_rgb,
+                underline_rgb,
+                diacritics,
+            )
+        else {
+            continue;
+        };
+
+        let line = indexed_cell.point.line.0;
+        let column = indexed_cell.point.column.0 as i32;
+        groups
+            .entry((image_id, placement_id))
+            .and_modify(|bounds| bounds.extend(line, column))
+            .or_insert_with(|| CellGroupBounds::new(line, column));
+    }
+
+    if !groups.is_empty() {
+        log::trace!(
+            "kitty placeholders: {} group(s): {:?}",
+            groups.len(),
+            groups.keys().collect::<Vec<_>>()
+        );
+    }
+
+    for ((image_id, _placement_id), bounds) in groups {
+        let Some(image) = terminal.kitty_image(image_id) else {
+            log::trace!("kitty placeholders: no stored image for id {image_id}");
+            // Placeholder cells reference an image id the sender never
+            // transmitted (or that was since deleted) — nothing to paint,
+            // not an error (the program driving this may simply not have
+            // sent the Transmit yet on the very first frame after writing
+            // placeholder text, or deleted the image while placeholder
+            // text lingered in scrollback).
+            continue;
+        };
+
+        let display_line = bounds.min_line + layout.display_offset as i32;
+        let display_line_end = bounds.max_line + layout.display_offset as i32;
+        let num_lines = layout.dimensions.num_lines() as i32;
+        if display_line_end < 0 || display_line >= num_lines {
+            continue;
+        }
+
+        let position = point(
+            origin.x + bounds.min_col as f32 * cell_width,
+            origin.y + display_line.max(0) as f32 * line_height,
+        );
+        let visible_line_span = (display_line_end.min(num_lines - 1) - display_line.max(0) + 1)
+            .max(1);
+        let cell_area = gpui::size(
+            cell_width * (bounds.max_col - bounds.min_col + 1) as f32,
+            line_height * visible_line_span as f32,
+        );
+
+        // Fit the image inside the placeholder cells' rectangle preserving
+        // its aspect ratio, rather than stretching it to fill. Senders pick
+        // that cell rectangle by rounding the image's pixel size UP to whole
+        // cells (yazi: `ceil(pixels / cell_size)`), so it's almost never
+        // exactly the image's proportions — stretching to fill visibly
+        // distorts every image whose size isn't an exact multiple of the
+        // cell size. Anchored at the rectangle's top-left, which is where
+        // the sender positioned the first placeholder cell.
+        let image_size = image.render_image.size(0);
+        let size = if image_size.width.0 > 0 && image_size.height.0 > 0 {
+            let scale = (f32::from(cell_area.width) / image_size.width.0 as f32)
+                .min(f32::from(cell_area.height) / image_size.height.0 as f32);
+            gpui::size(
+                px(image_size.width.0 as f32 * scale),
+                px(image_size.height.0 as f32 * scale),
+            )
+        } else {
+            cell_area
+        };
+
+        log::trace!(
+            "kitty placeholders: painting image {image_id} at {position:?} size {size:?} \
+             (cell area {cell_area:?}, image {}x{}, grid lines {}..{}, cols {}..{})",
+            image_size.width.0,
+            image_size.height.0,
+            bounds.min_line,
+            bounds.max_line,
+            bounds.min_col,
+            bounds.max_col,
+        );
+
+        window
+            .paint_image(
+                Bounds::new(position, size),
+                gpui::Corners::all(Pixels::ZERO),
+                image.render_image.clone(),
+                0,
+                false,
+            )
+            .log_err();
+    }
+}
+
+/// The on-screen (grid, not pixel) bounding box of one group of Unicode
+/// placeholder cells sharing an (image_id, placement_id), accumulated as
+/// [`paint_kitty_unicode_placeholders`] scans the visible grid.
+struct CellGroupBounds {
+    min_line: i32,
+    max_line: i32,
+    min_col: i32,
+    max_col: i32,
+}
+
+impl CellGroupBounds {
+    fn new(line: i32, col: i32) -> Self {
+        Self { min_line: line, max_line: line, min_col: col, max_col: col }
+    }
+
+    fn extend(&mut self, line: i32, col: i32) {
+        self.min_line = self.min_line.min(line);
+        self.max_line = self.max_line.max(line);
+        self.min_col = self.min_col.min(col);
+        self.max_col = self.max_col.max(col);
+    }
+}
+
 fn to_highlighted_range_lines(
     range: &RangeInclusive<AlacPoint>,
     layout: &LayoutState,
@@ -1756,6 +2076,142 @@ mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};
     use ui::utils::apca_contrast;
+
+    #[test]
+    fn kitty_placement_visible_computes_pixel_bounds() {
+        let (position, size) = kitty_placement_bounds(
+            (2, 5),   // anchor: line 2, column 5
+            Some(10), // c=10
+            Some(3),  // r=3
+            0,        // display_offset: not scrolled
+            24,       // num_lines
+            80,       // num_columns
+            point(px(0.), px(0.)), // origin
+            px(8.),   // cell_width
+            px(16.),  // line_height
+        )
+        .expect("placement within viewport should be visible");
+
+        assert_eq!(position, point(px(40.), px(32.))); // 5*8, 2*16
+        assert_eq!(size, gpui::size(px(80.), px(48.))); // 10*8, 3*16
+    }
+
+    #[test]
+    fn kitty_placement_defaults_to_one_cell_when_columns_rows_unset() {
+        let (_, size) = kitty_placement_bounds(
+            (0, 0),
+            None,
+            None,
+            0,
+            24,
+            80,
+            point(px(0.), px(0.)),
+            px(8.),
+            px(16.),
+        )
+        .unwrap();
+
+        assert_eq!(size, gpui::size(px(8.), px(16.)));
+    }
+
+    #[test]
+    fn kitty_placement_scrolled_above_viewport_is_hidden() {
+        // anchor line -5, but display_offset only brings it to line -2 —
+        // still above the top of the viewport (line 0).
+        let result = kitty_placement_bounds(
+            (-5, 0),
+            None,
+            None,
+            3,
+            24,
+            80,
+            point(px(0.), px(0.)),
+            px(8.),
+            px(16.),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn kitty_placement_scrolled_into_viewport_is_visible() {
+        // Same anchor as above, but display_offset now brings it exactly to
+        // line 0 — the top of the viewport.
+        let result = kitty_placement_bounds(
+            (-5, 0),
+            None,
+            None,
+            5,
+            24,
+            80,
+            point(px(0.), px(0.)),
+            px(8.),
+            px(16.),
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn kitty_placement_below_viewport_is_hidden() {
+        let result = kitty_placement_bounds(
+            (24, 0), // exactly at num_lines — one past the last visible line
+            None,
+            None,
+            0,
+            24,
+            80,
+            point(px(0.), px(0.)),
+            px(8.),
+            px(16.),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn kitty_placement_beyond_last_column_is_hidden() {
+        let result = kitty_placement_bounds(
+            (0, 80), // exactly at num_columns — one past the last column
+            None,
+            None,
+            0,
+            24,
+            80,
+            point(px(0.), px(0.)),
+            px(8.),
+            px(16.),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cell_group_bounds_single_cell() {
+        let bounds = CellGroupBounds::new(3, 5);
+        assert_eq!((bounds.min_line, bounds.max_line), (3, 3));
+        assert_eq!((bounds.min_col, bounds.max_col), (5, 5));
+    }
+
+    #[test]
+    fn cell_group_bounds_extends_to_cover_every_cell() {
+        // Simulates scanning a 2x3 block of placeholder cells in whatever
+        // order the grid iterator happens to visit them.
+        let mut bounds = CellGroupBounds::new(10, 20);
+        bounds.extend(10, 21);
+        bounds.extend(10, 22);
+        bounds.extend(11, 20);
+        bounds.extend(11, 21);
+        bounds.extend(11, 22);
+
+        assert_eq!((bounds.min_line, bounds.max_line), (10, 11));
+        assert_eq!((bounds.min_col, bounds.max_col), (20, 22));
+    }
+
+    #[test]
+    fn cell_group_bounds_extend_out_of_order_still_finds_correct_min_max() {
+        let mut bounds = CellGroupBounds::new(5, 5);
+        bounds.extend(2, 8);
+        bounds.extend(9, 1);
+        assert_eq!((bounds.min_line, bounds.max_line), (2, 9));
+        assert_eq!((bounds.min_col, bounds.max_col), (1, 8));
+    }
 
     #[test]
     fn test_is_decorative_character() {

@@ -941,6 +941,25 @@ impl App {
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
+    /// Force an immediate native repaint of every open window — see
+    /// `PlatformWindow::force_redraw`'s doc comment for why `refresh_windows`
+    /// alone isn't always sufficient (Windows specifically: marking a
+    /// window dirty only takes effect on whatever repaint the platform
+    /// happens to trigger next on its own; it doesn't itself cause one).
+    /// Applied synchronously (not queued as a pending effect like
+    /// `refresh_windows`) since the underlying platform call
+    /// (`PostMessageW` on Windows) is itself just posting a message to the
+    /// window's own queue — cheap and safe to call directly, including
+    /// from code with no `Window` handle of its own (a background model
+    /// update via `Context<T>`, for instance).
+    pub fn force_redraw_windows(&mut self) {
+        for window in self.windows.values() {
+            if let Some(window) = window.as_deref() {
+                window.force_redraw();
+            }
+        }
+    }
+
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
         self.start_update();
         let result = update(self);

@@ -126,14 +126,22 @@
   /* ---------- toc ---------- */
   nav.toc {
     position: static;
+    background: transparent;
+    backdrop-filter: none;
+    border: none;
+    padding: 0;
+    margin: 32px 0 8px;
+  }
+  nav.toc .wrap {
+    height: auto;
+    display: block;
+  }
+  nav.toc .toc-card {
+    padding: 20px 24px;
     background: var(--bg1);
     border: 1px solid var(--bg2);
     border-radius: var(--radius);
-    padding: 20px 24px;
-    margin: 32px 0 8px;
-    backdrop-filter: none;
   }
-  nav.toc .wrap { padding: 0; max-width: none; height: auto; display: block; }
   nav.toc h2 {
     font-size: 13px;
     text-transform: uppercase;
@@ -294,19 +302,21 @@
 
 <nav class="toc">
   <div class="wrap">
-    <h2>Содержание</h2>
-    <ol>
-      <li><a href="#where">Где что лежит</a></li>
-      <li><a href="#settings">Справочник settings.json</a></li>
-      <li><a href="#keybindings">Горячие клавиши по умолчанию</a></li>
-      <li><a href="#tabs">Табы</a></li>
-      <li><a href="#splits">Сплиты</a></li>
-      <li><a href="#dbjson">Сохранение сессии (db.json)</a></li>
-      <li><a href="#restore">Восстановление при запуске</a></li>
-      <li><a href="#somtmux">som-tmux: живучие удалённые сессии</a></li>
-      <li><a href="#kitty">Kitty Graphics Protocol: картинки в терминале</a></li>
-      <li><a href="#themes">Темы</a></li>
-    </ol>
+    <div class="toc-card">
+      <h2>Содержание</h2>
+      <ol>
+        <li><a href="#where">Где что лежит</a></li>
+        <li><a href="#settings">Справочник settings.json</a></li>
+        <li><a href="#keybindings">Горячие клавиши по умолчанию</a></li>
+        <li><a href="#tabs">Табы</a></li>
+        <li><a href="#splits">Сплиты</a></li>
+        <li><a href="#dbjson">Сохранение сессии (db.json)</a></li>
+        <li><a href="#restore">Восстановление при запуске</a></li>
+        <li><a href="#somtmux">som-tmux: живучие удалённые сессии</a></li>
+        <li><a href="#kitty">Kitty Graphics Protocol: картинки в терминале</a></li>
+        <li><a href="#themes">Темы</a></li>
+      </ol>
+    </div>
   </div>
 </nav>
 

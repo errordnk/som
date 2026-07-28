@@ -12,7 +12,8 @@ This document describes every user-facing feature of Som and every option in `~/
 6. [Session persistence (db.json)](#session-persistence-dbjson)
 7. [Restore on launch](#restore-on-launch)
 8. [som-tmux: keeping remote sessions alive](#som-tmux-keeping-remote-sessions-alive)
-9. [Theming](#theming)
+9. [Kitty Graphics Protocol: images in the terminal](#kitty-graphics-protocol-images-in-the-terminal)
+10. [Theming](#theming)
 
 ---
 
@@ -241,6 +242,18 @@ Setting `"tmux": true` on a tab profile routes that tab's terminal through a sma
 - Splitting a tmux-backed tab works the same as any other tab — each new split pane gets its own independent persistent session (its own pane_id), not a shared one.
 
 This feature has no separate settings.json toggle beyond the per-profile `"tmux": true` — there's no global on/off switch.
+
+## Kitty Graphics Protocol: images in the terminal
+
+Som implements the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), so terminal apps that support it — `yazi` being the main one in practice — render actual images inline instead of falling back to block-character/Sixel approximations. There's no settings.json toggle for this: it's always on, and Som advertises support the way clients already expect (including setting `KITTY_WINDOW_ID` in the shell environment so clients that detect terminals by environment variable, like yazi, pick the Kitty driver instead of probing).
+
+- **Both transmission formats are supported**: PNG, and raw RGB/RGBA pixel streams (the format yazi actually sends), including chunked transfers of multi-megabyte images spread across many PTY reads.
+- **Both placement modes are supported**: the classic cursor-relative placement, and the newer Unicode-placeholder mode (`U=1`) that yazi uses, where the image is anchored to placeholder glyphs in the grid rather than moved with `a=p` commands.
+- **Images keep their aspect ratio.** The protocol only gives Som a cell-grid bounding box (rounded up from the sender's pixel size divided by cell size, so it rarely matches the image's exact proportions) — Som fits the image inside that box rather than stretching it to fill it.
+- **Images survive SSH reconnects on `tmux: true` tabs.** Reattaching to a `som-tmux` session that had images on screen redraws them along with the rest of the scrollback, without a manual refresh.
+- **Rendering goes through the same GPU pipeline as text** — no overlay window, no external helper process. Images are decoded once and painted like any other GPUI content.
+
+Known open issue: navigating file lists with arrow keys in `yazi` can leave a preview un-rendered until the next keypress (clicking with the mouse doesn't have this problem). Being tracked, not yet fixed.
 
 ## Theming
 

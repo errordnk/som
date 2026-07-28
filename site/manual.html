@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Мануал Som — все возможности и опции settings.json</title>
+<meta name="description" content="Полный мануал Som: settings.json, горячие клавиши, табы и сплиты, восстановление сессии, som-tmux и Kitty Graphics Protocol.">
+<link rel="icon" type="image/png" href="img/som-icon.png">
+<style>
+  :root {
+    --bg0: #2e3440;
+    --bg1: #3b4252;
+    --bg2: #434c5e;
+    --bg3: #4c566a;
+    --fg0: #eceff4;
+    --fg1: #e5e9f0;
+    --fg2: #d8dee9;
+    --muted: #8b96ac;
+    --accent: #88c0d0;
+    --accent2: #81a1c1;
+    --green: #a3be8c;
+    --yellow: #ebcb8b;
+    --red: #bf616a;
+    --purple: #b48ead;
+    --radius: 10px;
+    --maxw: 900px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg0);
+    color: var(--fg1);
+    font-family: -apple-system, "Segoe UI", "SF Pro", "Noto Sans", system-ui, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, .mono, pre {
+    font-family: "FiraCode Nerd Font", "Fira Code", "Cascadia Code", Consolas, monospace;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* ---------- nav ---------- */
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: rgba(46, 52, 64, 0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--bg2);
+  }
+  nav .wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 60px;
+    max-width: 1080px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 18px;
+    color: var(--fg0);
+  }
+  .brand-mark {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: flex; align-items: center; justify-content: center;
+    padding: 5px;
+  }
+  .brand-mark img { width: 100%; height: 100%; object-fit: contain; }
+  .nav-cta {
+    background: var(--accent);
+    color: var(--bg0) !important;
+    padding: 8px 16px;
+    border-radius: 7px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .nav-cta:hover { background: var(--accent2); text-decoration: none; }
+  .nav-links { display: flex; align-items: center; gap: 20px; }
+  .nav-links a.back { color: var(--fg2); font-size: 14px; font-weight: 500; }
+  .nav-links a.back:hover { color: var(--accent); text-decoration: none; }
+
+  /* ---------- header ---------- */
+  header.manual-hero {
+    padding: 56px 0 40px;
+  }
+  .kicker {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+  h1 {
+    font-size: clamp(30px, 4.5vw, 42px);
+    line-height: 1.12;
+    margin: 0 0 16px;
+    color: var(--fg0);
+    letter-spacing: -0.02em;
+  }
+  .lede {
+    font-size: 17px;
+    color: var(--muted);
+    max-width: 680px;
+    margin: 0;
+  }
+
+  /* ---------- toc ---------- */
+  nav.toc {
+    position: static;
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin: 32px 0 8px;
+    backdrop-filter: none;
+  }
+  nav.toc .wrap { padding: 0; max-width: none; height: auto; display: block; }
+  nav.toc h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    margin: 0 0 12px;
+  }
+  nav.toc ol {
+    columns: 2;
+    gap: 24px;
+    margin: 0;
+    padding-left: 20px;
+    color: var(--fg2);
+    font-size: 14.5px;
+  }
+  nav.toc li { margin-bottom: 6px; break-inside: avoid; }
+  @media (max-width: 640px) { nav.toc ol { columns: 1; } }
+
+  /* ---------- content ---------- */
+  main { padding: 40px 0 96px; }
+  section.doc { margin-bottom: 56px; }
+  section.doc:last-child { margin-bottom: 0; }
+  h2.doc-title {
+    font-size: clamp(24px, 3vw, 30px);
+    color: var(--fg0);
+    margin: 0 0 18px;
+    padding-top: 8px;
+    letter-spacing: -0.01em;
+    border-top: 1px solid var(--bg2);
+    padding-top: 40px;
+  }
+  section.doc:first-of-type h2.doc-title { border-top: none; padding-top: 0; }
+  h3.doc-sub {
+    font-size: 18px;
+    color: var(--fg0);
+    margin: 28px 0 10px;
+  }
+  h4.doc-sub4 {
+    font-size: 15.5px;
+    color: var(--fg0);
+    margin: 20px 0 8px;
+  }
+  section.doc p { color: var(--fg2); font-size: 15.5px; margin: 0 0 14px; }
+  section.doc ul, section.doc ol.plain { color: var(--fg2); font-size: 15.5px; padding-left: 22px; margin: 0 0 14px; }
+  section.doc li { margin-bottom: 8px; }
+  section.doc code {
+    background: var(--bg2);
+    color: var(--accent);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 13.5px;
+  }
+  section.doc strong { color: var(--fg0); }
+
+  hr.sep { border: none; border-top: 1px solid var(--bg2); margin: 40px 0; }
+
+  /* ---------- tables ---------- */
+  .doc-table-wrap { overflow-x: auto; margin: 0 0 20px; }
+  table.doc-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  table.doc-table th {
+    text-align: left;
+    background: var(--bg2);
+    color: var(--fg0);
+    padding: 10px 14px;
+    font-size: 12.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  table.doc-table td {
+    padding: 10px 14px;
+    border-top: 1px solid var(--bg2);
+    color: var(--fg2);
+    vertical-align: top;
+  }
+  table.doc-table td:first-child { white-space: nowrap; color: var(--fg0); font-family: "FiraCode Nerd Font", monospace; font-size: 13px; }
+  table.doc-table code { white-space: nowrap; }
+
+  /* ---------- code window ---------- */
+  pre.code-window {
+    background: var(--bg1);
+    border: 1px solid var(--bg2);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.7;
+    margin: 0 0 20px;
+    color: var(--fg2);
+  }
+  .code-window .k { color: var(--accent2); }
+  .code-window .s { color: var(--green); }
+  .code-window .n { color: var(--yellow); }
+  .code-window .p { color: var(--muted); }
+  .code-window .b { color: var(--fg2); }
+  .code-window .c { color: var(--muted); }
+
+  kbd {
+    background: var(--bg2);
+    border: 1px solid var(--bg3);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-family: "FiraCode Nerd Font", monospace;
+    font-size: 12px;
+    color: var(--fg0);
+  }
+
+  footer {
+    border-top: 1px solid var(--bg2);
+    padding: 40px 0;
+  }
+  footer .wrap {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    max-width: 1080px;
+  }
+  footer .fmuted { color: var(--muted); font-size: 13.5px; }
+  footer .flinks { display: flex; gap: 22px; }
+  footer .flinks a { color: var(--muted); font-size: 13.5px; }
+  footer .flinks a:hover { color: var(--accent); }
+
+  ::selection { background: var(--accent); color: var(--bg0); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand">
+      <div class="brand-mark"><img src="img/som-icon.png" alt="Som"></div>
+      Som
+    </div>
+    <div class="nav-links">
+      <a class="back" href="index.html">← На сайт</a>
+      <a class="nav-cta" href="https://github.com/errordnk/som">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="manual-hero">
+  <div class="wrap">
+    <div class="kicker">Документация</div>
+    <h1>Мануал Som</h1>
+    <p class="lede">Все пользовательские возможности Som и все опции <code>~/.config/som/settings.json</code>. Отражает реальное поведение кода на момент написания.</p>
+  </div>
+</header>
+
+<nav class="toc">
+  <div class="wrap">
+    <h2>Содержание</h2>
+    <ol>
+      <li><a href="#where">Где что лежит</a></li>
+      <li><a href="#settings">Справочник settings.json</a></li>
+      <li><a href="#keybindings">Горячие клавиши по умолчанию</a></li>
+      <li><a href="#tabs">Табы</a></li>
+      <li><a href="#splits">Сплиты</a></li>
+      <li><a href="#dbjson">Сохранение сессии (db.json)</a></li>
+      <li><a href="#restore">Восстановление при запуске</a></li>
+      <li><a href="#somtmux">som-tmux: живучие удалённые сессии</a></li>
+      <li><a href="#kitty">Kitty Graphics Protocol: картинки в терминале</a></li>
+      <li><a href="#themes">Темы</a></li>
+    </ol>
+  </div>
+</nav>
+
+<main class="wrap">
+
+  <section class="doc" id="where">
+    <h2 class="doc-title">Где что лежит</h2>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Путь</th><th>Назначение</th></tr>
+        <tr><td><code>~/.config/som/settings.json</code></td><td>Ваша конфигурация. Создаётся из платформо-специфичного шаблона при первом запуске. Отслеживается и перезагружается на лету — правки применяются мгновенно, при невалидном JSON показывается баннер с ошибкой прямо в приложении.</td></tr>
+        <tr><td><code>~/.config/som/themes/nord.json</code></td><td>Встроенная тема «Nord», записывается на диск при первом запуске.</td></tr>
+        <tr><td><code>~/.config/som/db.json</code></td><td>Раскладка табов/сплитов/сессий, перезаписывается при каждом изменении таба/сплита и при выходе. Руками редактировать не стоит; описан ниже для диагностики.</td></tr>
+        <tr><td><code>~/.config/som/tmux/{windows-amd,macos-arm,linux-amd}/som-tmux</code></td><td>Предсобранные бинарники <code>som-tmux</code> для деплоя на удалённые хосты при SSH-сессиях с <code>"tmux": true</code> — извлекаются автоматически из копий, встроенных в сам Som, при первом использовании; предоставлять их самостоятельно не нужно.</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section class="doc" id="settings">
+    <h2 class="doc-title">Справочник settings.json</h2>
+    <p>Все поля опциональны; всё, что вы не укажете, откатывается к дефолту для вашей платформы. Неизвестные ключи молча игнорируются (без ошибки), так что опечатка в имени ключа вас не предупредит — сверяйте написание с этой таблицей.</p>
+    <p>Два поведения зафиксированы и не настраиваются: звуковой сигнал терминала всегда отключён (нет настройки для системного звука), а копирование по выделению (автокопирование выделенного текста в буфер обмена) всегда включено.</p>
+
+    <h3 class="doc-sub"><code>window</code></h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>Эффект</th></tr>
+        <tr><td><code>window.theme</code></td><td>строка</td><td>Имя активной темы (например, <code>"Nord Dark"</code>). Применяется корректно.</td></tr>
+        <tr><td><code>window.mode</code></td><td><code>"windowed"</code> (умолч.) / <code>"maximized"</code> / <code>"minimized"</code> / <code>"fullscreen"</code></td><td>Начальное положение окна, применяется при каждом запуске (не только при первом). <code>"windowed"</code> запоминает позицию/размер в <code>db.json</code> — перемещение или изменение размера окна обновляет это автоматически. Если геометрия ещё не была запомнена, по умолчанию берётся размер экрана минус 100px по каждому измерению, с позицией 50px от левого верхнего угла. <code>window.position</code>/<code>window.size</code> (ниже) могут это переопределить.</td></tr>
+        <tr><td><code>window.position.{top,left}</code> / <code>window.size.{width,height}</code></td><td>число, физические пиксели</td><td>Явные позиция/размер при старте, применяются только когда <code>window.mode</code> = <code>"windowed"</code>. Срабатывают <strong>только если заданы одновременно <code>position</code> и <code>size</code>, и все четыре их поля ненулевые</strong> — если хоть одно отсутствует или равно <code>0</code>, всё игнорируется целиком и используется запомненная в <code>db.json</code> геометрия. Не запоминаются/не обновляются впоследствии — перемещение или изменение размера окна всё равно обновляет только <code>db.json</code>, поэтому эти значения будут применять одну и ту же фиксированную геометрию при каждом следующем запуске, пока остаются заданы.</td></tr>
+        <tr><td><code>window.padding.{top,bottom,left,right}</code></td><td>число, пиксели</td><td>Отступ между краем окна ОС и областью терминала/сплитов с этой стороны. Заголовок окна и полоса табов всегда прижаты к краю окна независимо от этой настройки. <code>0</code> (по умолчанию) означает отсутствие отступа.</td></tr>
+        <tr><td><code>window.selection</code></td><td>hex-строка, например <code>"#88c0d0"</code></td><td>Цвет подсветки выделения в терминале (фон за текстом, выделенным мышью). Заодно перекрашивает несколько других акцентных элементов UI (например, подсветку совпадений поиска), поскольку использует общий цвет темы <code>text.accent</code>, а не отдельный терминальный.</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub"><code>log</code></h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>По умолчанию</th><th>Эффект</th></tr>
+        <tr><td><code>log.level</code></td><td>строка</td><td><code>"all"</code> (<code>"trace"</code> в Windows-шаблоне)</td><td>Уровень фильтрации логов, читается один раз при старте.</td></tr>
+        <tr><td><code>log.days</code></td><td>число</td><td><code>7</code></td><td>Только Windows: сколько дней ротированных лог-файлов хранить.</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub"><code>font</code></h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>Эффект</th></tr>
+        <tr><td><code>font.face</code></td><td>строка</td><td>Семейство шрифта терминала И интерфейсного буфера.</td></tr>
+        <tr><td><code>font.size</code></td><td>число</td><td>Размер шрифта терминала (px).</td></tr>
+        <tr><td><code>font.weight</code></td><td>целое, 100-900</td><td>Насыщенность шрифта терминала И интерфейсного буфера (400 = обычный, 700 = жирный). Значения вне диапазона обрезаются.</td></tr>
+        <tr><td><code>font.lineHeight</code></td><td>число</td><td>Множитель высоты строки терминала.</td></tr>
+        <tr><td><code>font.features</code></td><td>объект</td><td>OpenType-фичи шрифта — см. «Лигатуры и фичи шрифта» ниже.</td></tr>
+      </table>
+    </div>
+
+    <h4 class="doc-sub4">Лигатуры и фичи шрифта</h4>
+    <p><code>font.features</code> сопоставляет 4-символьный тег OpenType-фичи либо булеву значению (<code>true</code>/<code>false</code>, включить/выключить), либо целому числу (для фич с несколькими вариантами, например стилистических наборов):</p>
+<pre class="code-window mono"><span class="p">"font"</span><span class="b">:</span> <span class="p">{</span>
+  <span class="k">"face"</span><span class="p">:</span> <span class="s">"FiraCode Nerd Font"</span><span class="p">,</span>
+  <span class="k">"features"</span><span class="p">:</span> <span class="p">{</span>
+    <span class="k">"calt"</span><span class="p">:</span> <span class="b">true</span><span class="p">,</span>
+    <span class="k">"cv02"</span><span class="p">:</span> <span class="n">1</span><span class="p">,</span>
+    <span class="k">"cv01"</span><span class="p">:</span> <span class="n">7</span>
+  <span class="p">}</span>
+<span class="p">}</span></pre>
+    <p><code>calt</code> — стандартный OpenType-тег для контекстных альтернатив, именно его используют большинство шрифтов (включая FiraCode, Cascadia Code, JetBrains Mono) для отрисовки лигатур вроде <code>-&gt;</code>, <code>=&gt;</code>, <code>!=</code>, <code>&gt;=</code>, <code>&amp;&amp;</code> как единых слитных глифов. <strong>Лигатуры по умолчанию выключены</strong> — задайте <code>"calt": true</code>, чтобы включить их (сам шрифт должен поддерживать лигатуры; Som их не синтезирует). Невалидные теги (не ровно 4 буквенно-цифровых символа) или невалидные значения (что угодно, кроме булева или неотрицательного целого) логируются и пропускаются, не ломая остальные настройки.</p>
+
+    <h3 class="doc-sub"><code>cursor</code></h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>Эффект</th></tr>
+        <tr><td><code>cursor.shape</code></td><td><code>"block"</code> / <code>"bar"</code> / <code>"underline"</code> / <code>"hollow"</code></td><td>Форма курсора.</td></tr>
+        <tr><td><code>cursor.color</code></td><td>hex-строка</td><td>Цвет курсора.</td></tr>
+        <tr><td><code>cursor.blinking</code></td><td><code>"on"</code> / <code>"off"</code> / что угодно ещё</td><td><code>"on"</code>/<code>"off"</code> применяются буквально; любое другое значение означает «управляется терминалом» (мигание следует escape-последовательностям самого приложения в шелле).</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub"><code>scroll</code></h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>По умолчанию</th><th>Эффект</th></tr>
+        <tr><td><code>scroll.scrollMultiplier</code></td><td>число</td><td><code>3.0</code></td><td>Множитель скорости прокрутки колесом мыши.</td></tr>
+        <tr><td><code>scroll.maxScrollHistory</code></td><td>число</td><td><code>10000</code></td><td>Лимит строк scrollback (0 отключает прокрутку; внутренне ограничен 100 000).</td></tr>
+        <tr><td><code>scroll.alternateScroll</code></td><td><code>"on"</code> / <code>"off"</code></td><td><code>"on"</code></td><td>Отправлять ли колесо мыши как стрелки внутри alt-screen приложений (vim, less, htop).</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub"><code>tabs</code></h3>
+    <p>Упорядоченный массив профилей табов. Голое действие <code>NewTab</code> (<code>Ctrl+Shift+=</code>/<code>Cmd+Shift+=</code> в поставляемых дефолтах) открывает профиль <em>по умолчанию</em>: тот, что помечен <code>"default": true</code>, либо <code>tabs[0]</code>, если ни один не помечен. Записи 2-9 доступны через <code>Ctrl+Shift+2</code>..<code>Ctrl+Shift+9</code> в Windows-шаблоне независимо от того, какой профиль дефолтный (шаблоны macOS/Linux сейчас подключают только профиль 1).</p>
+<pre class="code-window mono"><span class="k">"tabs"</span><span class="b">:</span> <span class="p">[</span>
+  <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"shell"</span><span class="p">,</span> <span class="k">"icon"</span><span class="p">:</span> <span class="s">""</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"$SHELL"</span><span class="p">,</span> <span class="k">"home"</span><span class="p">:</span> <span class="s">"~"</span> <span class="p">},</span>
+  <span class="p">{</span> <span class="k">"name"</span><span class="p">:</span> <span class="s">"server"</span><span class="p">,</span> <span class="k">"shell"</span><span class="p">:</span> <span class="s">"ssh myhost"</span><span class="p">,</span> <span class="k">"home"</span><span class="p">:</span> <span class="s">"~"</span><span class="p">,</span> <span class="k">"tmux"</span><span class="p">:</span> <span class="b">true</span><span class="p">,</span> <span class="k">"default"</span><span class="p">:</span> <span class="b">true</span> <span class="p">}</span>
+<span class="p">]</span></pre>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Ключ</th><th>Тип</th><th>По умолчанию</th><th>Эффект</th></tr>
+        <tr><td><code>name</code></td><td>строка</td><td><code>""</code></td><td>Заголовок таба и подпись в выпадающем списке профилей.</td></tr>
+        <tr><td><code>icon</code></td><td>строка</td><td>нет</td><td>Глиф, показываемый на табе (лучше всего работает с Nerd Font — см. <code>font.face</code>).</td></tr>
+        <tr><td><code>shell</code></td><td>строка</td><td>системный шелл</td><td>Команда для запуска. Поддерживает обычные шеллы, вызовы <code>ssh &lt;host&gt;</code> и <code>wsl</code>.</td></tr>
+        <tr><td><code>home</code></td><td>строка</td><td>нет</td><td>Рабочая директория; <code>~</code> разворачивается. Должна указывать на существующую директорию, иначе игнорируется.</td></tr>
+        <tr><td><code>tmux</code></td><td>bool</td><td><code>false</code></td><td>Включить бэкенд <code>som-tmux</code> для этого профиля — сохраняет сессию живой между перезапусками Som. См. <a href="#somtmux">som-tmux</a>.</td></tr>
+        <tr><td><code>default</code></td><td>bool</td><td><code>false</code></td><td>Помечает этот профиль как тот, что открывает кнопка <code>+</code>/голое действие <code>NewTab</code>, вместо <code>tabs[0]</code>. Пометить так можно не более одного профиля — <code>settings.json</code> не парсится (откат к встроенным дефолтам с баннером «Invalid settings.json»), если помечено больше одного.</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub"><code>keys</code></h3>
+    <p>Плоская карта сочетание-клавиш → имя действия. Пользовательские записи объединяются с платформенными дефолтами по ключу (нужно перечислить только те клавиши, которые хотите изменить или добавить; остальное сохраняет дефолт).</p>
+<pre class="code-window mono"><span class="k">"keys"</span><span class="b">:</span> <span class="p">{</span>
+  <span class="k">"ctrl-shift-="</span><span class="p">:</span> <span class="s">"NewTab"</span><span class="p">,</span>
+  <span class="k">"ctrl-shift--"</span><span class="p">:</span> <span class="s">"CloseTab"</span><span class="p">,</span>
+  <span class="k">"ctrl-shift-left"</span><span class="p">:</span> <span class="s">"PrevTab"</span>
+<span class="p">}</span></pre>
+    <p>Распознаваемые имена действий: <code>Copy</code>, <code>Paste</code>, <code>CloseTab</code>, <code>NewPane</code>, <code>ClosePane</code>, <code>NextPane</code>, <code>PrevPane</code>, <code>NextTab</code>, <code>PrevTab</code>, <code>Quit</code>, <code>IncreaseFont</code>, <code>DecreaseFont</code>, <code>ResetFont</code>, <code>NewTab</code>, <code>NewTab1</code>..<code>NewTab10</code>. Любая другая строка молча игнорируется — привязка не создаётся, ошибка не показывается, так что сверяйте написание внимательно по этому списку.</p>
+    <p><code>NewTab1</code>..<code>NewTab10</code> открывают <code>tabs[0]</code>..<code>tabs[9]</code> по позиции — если в settings.json меньше профилей (например, <code>NewTab9</code> при всего 5 записях в <code>tabs[]</code>), нажатие этой клавиши покажет уведомление «No profile #9…» вместо того, чтобы молча открыть другой профиль. С голым <code>NewTab</code> так случиться не может: он всегда резолвится в дефолтный профиль, который гарантированно существует.</p>
+    <p>Соглашение об именовании: специфичные для Som действия табов/панелей (<code>NewTab*</code>, <code>CloseTab</code>, <code>NewPane</code>, <code>ClosePane</code>, <code>PrevPane</code>/<code>NextPane</code>, <code>PrevTab</code>/<code>NextTab</code>) задуманы на сочетаниях <code>Ctrl+Shift+*</code> в поставляемых дефолтах, чтобы не конфликтовать с <code>Copy</code>/<code>Paste</code>/<code>Quit</code>/шрифтовыми сочетаниями, которые следуют стандартным системным конвенциям без Shift.</p>
+    <p>Синтаксис сочетаний следует конвенциям GPUI: строчные буквы, модификаторы через дефис, например <code>ctrl-shift-c</code>, <code>cmd-v</code>, <code>alt-f4</code>.</p>
+  </section>
+
+  <section class="doc" id="keybindings">
+    <h2 class="doc-title">Горячие клавиши по умолчанию</h2>
+
+    <h3 class="doc-sub">Windows</h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><td><kbd>Ctrl+Insert</kbd> / <kbd>Ctrl+Shift+C</kbd></td><td>Копировать</td></tr>
+        <tr><td><kbd>Shift+Insert</kbd> / <kbd>Ctrl+V</kbd></td><td>Вставить</td></tr>
+        <tr><td><kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd></td><td>Увеличить / уменьшить / сбросить размер шрифта (только на сессию)</td></tr>
+        <tr><td><kbd>Ctrl+Scroll</kbd></td><td>Масштаб шрифта колесом мыши (только на сессию)</td></tr>
+        <tr><td><kbd>Ctrl+Shift+=</kbd></td><td>Новый таб из профиля по умолчанию</td></tr>
+        <tr><td><kbd>Ctrl+Shift+1</kbd>…<kbd>Ctrl+Shift+9</kbd> / <kbd>Ctrl+Shift+0</kbd></td><td>Новый таб из профиля 1-9 / профиля 10</td></tr>
+        <tr><td><kbd>Ctrl+Shift+-</kbd></td><td>Закрыть активный таб</td></tr>
+        <tr><td><kbd>Ctrl+Shift+\</kbd></td><td>Разделить активную панель (новый сплит)</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Backspace</kbd></td><td>Закрыть активную панель сплита</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Up</kbd> / <kbd>Ctrl+Shift+Down</kbd></td><td>Фокус на предыдущую / следующую панель сплита</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Left</kbd> / <kbd>Ctrl+Shift+Right</kbd></td><td>Активировать предыдущий / следующий таб</td></tr>
+        <tr><td><kbd>Alt+F4</kbd></td><td>Выход</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub">macOS</h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><td><kbd>Cmd+C</kbd></td><td>Копировать</td></tr>
+        <tr><td><kbd>Cmd+V</kbd></td><td>Вставить</td></tr>
+        <tr><td><kbd>Cmd+=</kbd> / <kbd>Cmd+-</kbd> / <kbd>Cmd+0</kbd></td><td>Увеличить / уменьшить / сбросить размер шрифта (только на сессию)</td></tr>
+        <tr><td><kbd>Cmd+Scroll</kbd></td><td>Масштаб шрифта колесом мыши (только на сессию)</td></tr>
+        <tr><td><kbd>Cmd+Shift+=</kbd></td><td>Новый таб из профиля по умолчанию</td></tr>
+        <tr><td><kbd>Cmd+Shift+1</kbd>…<kbd>Cmd+Shift+9</kbd> / <kbd>Cmd+Shift+0</kbd></td><td>Новый таб из профиля 1-9 / профиля 10</td></tr>
+        <tr><td><kbd>Cmd+Shift+-</kbd></td><td>Закрыть активный таб</td></tr>
+        <tr><td><kbd>Cmd+Shift+\</kbd></td><td>Разделить активную панель (новый сплит)</td></tr>
+        <tr><td><kbd>Cmd+Shift+Backspace</kbd></td><td>Закрыть активную панель сплита</td></tr>
+        <tr><td><kbd>Cmd+Shift+Up</kbd> / <kbd>Cmd+Shift+Down</kbd></td><td>Фокус на предыдущую / следующую панель сплита</td></tr>
+        <tr><td><kbd>Cmd+Shift+Left</kbd> / <kbd>Cmd+Shift+Right</kbd></td><td>Активировать предыдущий / следующий таб</td></tr>
+        <tr><td><kbd>Cmd+Q</kbd></td><td>Выход</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub">Linux</h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><td><kbd>Ctrl+Insert</kbd> / <kbd>Ctrl+Shift+C</kbd></td><td>Копировать</td></tr>
+        <tr><td><kbd>Shift+Insert</kbd> / <kbd>Ctrl+V</kbd></td><td>Вставить</td></tr>
+        <tr><td><kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd> / <kbd>Ctrl+0</kbd></td><td>Увеличить / уменьшить / сбросить размер шрифта (только на сессию)</td></tr>
+        <tr><td><kbd>Ctrl+Scroll</kbd></td><td>Масштаб шрифта колесом мыши (только на сессию)</td></tr>
+        <tr><td><kbd>Ctrl+Shift+=</kbd></td><td>Новый таб из профиля по умолчанию</td></tr>
+        <tr><td><kbd>Ctrl+Shift+1</kbd>…<kbd>Ctrl+Shift+9</kbd> / <kbd>Ctrl+Shift+0</kbd></td><td>Новый таб из профиля 1-9 / профиля 10</td></tr>
+        <tr><td><kbd>Ctrl+Shift+-</kbd></td><td>Закрыть активный таб</td></tr>
+        <tr><td><kbd>Ctrl+Shift+\</kbd></td><td>Разделить активную панель (новый сплит)</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Backspace</kbd></td><td>Закрыть активную панель сплита</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Up</kbd> / <kbd>Ctrl+Shift+Down</kbd></td><td>Фокус на предыдущую / следующую панель сплита</td></tr>
+        <tr><td><kbd>Ctrl+Shift+Left</kbd> / <kbd>Ctrl+Shift+Right</kbd></td><td>Активировать предыдущий / следующий таб</td></tr>
+        <tr><td><kbd>Alt+F4</kbd></td><td>Выход</td></tr>
+      </table>
+    </div>
+
+    <h3 class="doc-sub">Всегда активны, не настраиваются через settings.json</h3>
+    <div class="doc-table-wrap">
+      <table class="doc-table">
+        <tr><th>Клавиша</th><th>Контекст</th><th>Действие</th></tr>
+        <tr><td><kbd>Up</kbd> / <kbd>Down</kbd> / <kbd>Tab</kbd></td><td>любое открытое меню/список</td><td>Переместить выделение</td></tr>
+        <tr><td><kbd>Enter</kbd></td><td>любое открытое меню/список</td><td>Подтвердить выбор</td></tr>
+        <tr><td><kbd>Escape</kbd></td><td>любое открытое меню/список</td><td>Закрыть меню</td></tr>
+        <tr><td><kbd>Ctrl+=</kbd> / <kbd>Ctrl+-</kbd></td><td>глобально</td><td>Изменение размера шрифта (только на сессию)</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section class="doc" id="tabs">
+    <h2 class="doc-title">Табы</h2>
+    <ul>
+      <li>Все табы живут в одной строке в <strong>заголовке окна</strong> — отдельной полосы табов под ним нет.</li>
+      <li>Клик по <code>+</code> открывает дефолтный профиль (<code>tabs[0]</code>); если настроено больше одного профиля, маленький выпадающий список рядом с <code>+</code> позволяет выбрать, какой открыть.</li>
+      <li>Полоса табов прокручивается горизонтально колесом мыши, если табов больше, чем помещается.</li>
+      <li>Любое действие «новый таб» — кнопка <code>+</code>, выпадающий список профилей, любая горячая клавиша — идёт через один и тот же код, поэтому поведение одинаково независимо от способа открытия.</li>
+    </ul>
+  </section>
+
+  <section class="doc" id="splits">
+    <h2 class="doc-title">Сплиты</h2>
+    <ul>
+      <li>Каждый таб поддерживает до <strong>3 уровней панелей сплита</strong> (главная панель + 3 сплита).</li>
+      <li><code>Ctrl+Shift+\</code> разделяет текущую сфокусированную панель; направление чередуется вправо → вниз → вправо по мере продолжения разделения.</li>
+      <li><code>Ctrl+Shift+Backspace</code> закрывает последний созданный сплит и переключает фокус на соседнюю панель.</li>
+      <li><code>Ctrl+Shift+Up</code>/<code>Ctrl+Shift+Down</code> циклически переключают фокус между главной панелью и живыми сплитами.</li>
+      <li>Переключение с таба «паркует» его сплиты (убирает их из видимой раскладки, но запоминает размеры); возврат к табу восстанавливает их точно в том виде, в котором вы их оставили — это работает для каждого таба независимо.</li>
+      <li>Работает и на табах с <code>tmux: true</code> — каждая панель сплита получает свою независимую живучую сессию.</li>
+    </ul>
+  </section>
+
+  <section class="doc" id="dbjson">
+    <h2 class="doc-title">Сохранение сессии (db.json)</h2>
+    <p>Som запоминает открытые табы, их раскладку сплитов, (для табов с <code>tmux: true</code>) ID их удалённых сессий и — когда <code>window.mode</code> = <code>"windowed"</code> — последнюю позицию и размер окна, всё в <code>~/.config/som/db.json</code>. Перезапуск Som возвращает вас туда, где вы остановились, включая переподключение к всё ещё работающим удалённым шеллам вместо запуска новых.</p>
+    <p>Этот файл перезаписывается автоматически при каждом открытии/закрытии таба или сплита, переключении табов, изменении размера/перемещении окна или выходе — руками его трогать не нужно. Если он вдруг отсутствует или повреждён, Som просто откатывается к одному пустому табу (и позиции окна по умолчанию), а не отказывается запускаться.</p>
+  </section>
+
+  <section class="doc" id="restore">
+    <h2 class="doc-title">Восстановление при запуске</h2>
+    <p>При старте Som не ждёт медленных подключений, прежде чем показать окно:</p>
+    <ul>
+      <li>Каждый сохранённый таб появляется сразу как плейсхолдер (только имя и иконка), в том же порядке, в котором был в прошлый раз, с уже выбранным ранее активным табом.</li>
+      <li>Реальный терминал/шелл каждого таба подключается в фоне, заменяя плейсхолдер, как только готов — медленный SSH-логин в одном табе не задерживает быстрый локальный шелл в другом.</li>
+      <li>Заголовок окна показывает небольшой спиннер в зоне перетаскивания (пустое место рядом с полосой табов), пока хоть один таб ещё восстанавливается, подключается или проверяется на передеплой tmux — как только всё устаканивается, спиннер исчезает.</li>
+      <li>Панели сплитов пересоздаются после того, как существуют все табы, а ранее сфокусированные таб и панель получают фокус последними.</li>
+    </ul>
+  </section>
+
+  <section class="doc" id="somtmux">
+    <h2 class="doc-title">som-tmux: живучие удалённые сессии</h2>
+    <p>Установка <code>"tmux": true</code> в профиле таба направляет терминал этого таба через небольшой сопутствующий процесс (<code>som-tmux</code>) вместо обычного PTY:</p>
+    <ul>
+      <li><strong>Локальные шеллы:</strong> отсоединённый процесс держит реальный шелл и PTY; он продолжает работать, даже если Som закрыт, так что повторное открытие Som переподключается к точно той же сессии (scrollback, запущенные программы — всё) вместо запуска заново.</li>
+      <li><strong>Удалённые шеллы (<code>ssh</code>/<code>wsl</code>):</strong> тот же механизм работает и на удалённой стороне — Som разворачивает небольшой предсобранный бинарник <code>som-tmux</code> в <code>~/.local/bin/</code> на удалённом хосте (перекопируя его только если версия устарела), и удалённый шелл работает внутри него. Это значит, что нестабильное соединение или закрытие Som не убивает вашу удалённую сессию; переподключение подхватывает тот же шелл обратно. Сам предсобранный бинарник встроен внутрь Som (Windows/macOS/Linux amd64 — Linux arm64 пока не собирается, и профиль с <code>tmux: true</code>, указывающий на такой хост, откатывается к обычному, не живучему подключению с уведомлением, вместо отказа открыться).</li>
+      <li>Каждая панель с tmux-бэкендом получает свою собственную живучую сессию, идентифицируемую внутренне через UUID — это прозрачно для вас, но именно это сохраняется в <code>db.json</code>, чтобы сделать переподключение возможным.</li>
+      <li>Som периодически подчищает заброшенные удалённые сессии (те, что больше не соответствуют ничему в вашем текущем списке табов) на одной и той же машине, чтобы устаревшие процессы не накапливались на хостах, к которым вы часто подключаетесь. Это делается по принципу best-effort: если по какой-то причине не получается, это логируется и игнорируется, не блокируя открытие таба.</li>
+      <li>Разделение таба с tmux-бэкендом работает так же, как и с любым другим табом — каждая новая панель сплита получает свою независимую живучую сессию (свой pane_id), а не общую.</li>
+    </ul>
+    <p>У этой фичи нет отдельного переключателя в settings.json помимо <code>"tmux": true</code> на уровне профиля — глобального включения/выключения нет.</p>
+  </section>
+
+  <section class="doc" id="kitty">
+    <h2 class="doc-title">Kitty Graphics Protocol: картинки в терминале</h2>
+    <p>Som реализует <a href="https://sw.kovidgoyal.net/kitty/graphics-protocol/">Kitty Graphics Protocol</a>, поэтому терминальные приложения, которые его поддерживают — на практике в первую очередь <code>yazi</code> — рисуют настоящие изображения прямо в терминале, а не откатываются к приближениям через блочные символы/Sixel. Отдельного переключателя в settings.json для этого нет: функция всегда включена, и Som заявляет о поддержке протокола так, как этого уже ожидают существующие клиенты (в том числе устанавливая <code>KITTY_WINDOW_ID</code> в окружении шелла, чтобы клиенты, определяющие терминал по переменной окружения, вроде yazi, выбирали драйвер Kitty вместо зондирования).</p>
+    <ul>
+      <li><strong>Поддержаны оба формата передачи</strong>: PNG и сырые потоки пикселей RGB/RGBA (именно этот формат реально использует yazi), включая передачу мегабайтных изображений по частям, растянутую на множество чтений PTY.</li>
+      <li><strong>Поддержаны оба режима размещения</strong>: классическое размещение относительно курсора и более новый режим Unicode-плейсхолдеров (<code>U=1</code>), который использует yazi — там изображение привязывается к плейсхолдер-глифам в сетке, а не двигается командами <code>a=p</code>.</li>
+      <li><strong>Изображения сохраняют пропорции.</strong> Протокол даёт Som только ограничивающий прямоугольник в ячейках сетки (округлённый в большую сторону из пиксельного размера отправителя, делённого на размер ячейки, поэтому он почти никогда точно не совпадает с реальными пропорциями изображения) — Som вписывает изображение в этот прямоугольник, а не растягивает его на всю область.</li>
+      <li><strong>Изображения переживают переподключение SSH на табах с <code>tmux: true</code>.</strong> Переподключение к сессии <code>som-tmux</code>, в которой на экране были картинки, перерисовывает их вместе с остальным содержимым scrollback, без ручного обновления.</li>
+      <li><strong>Рендеринг идёт через тот же GPU-конвейер, что и текст</strong> — нет оверлейного окна, нет внешнего вспомогательного процесса. Изображения декодируются один раз и рисуются как любое другое содержимое GPUI.</li>
+    </ul>
+    <p>Известная открытая проблема: навигация по списку файлов стрелками в <code>yazi</code> может оставить превью неотрисованным до следующего нажатия клавиши (при клике мышью такой проблемы нет). Отслеживается, но пока не исправлена.</p>
+  </section>
+
+  <section class="doc" id="themes">
+    <h2 class="doc-title">Темы</h2>
+    <p>Som поставляется с одной встроенной темой, «Nord Dark» (дефолт <code>window.theme</code>), записываемой в <code>~/.config/som/themes/nord.json</code> при первом запуске. Базовый движок тем поддерживает произвольные файлы тем с примерно 150 индивидуально адресуемыми цветами, но Som пока не предоставляет отдельного способа установки дополнительных тем, кроме ручного размещения совместимого JSON-файла темы в директории тем и указания её имени в <code>window.theme</code>.</p>
+    <p>Поскольку формат тем Som — тот же самый, что использует сам Zed, любой JSON-файл темы Zed работает как есть. Несколько популярных:</p>
+    <ul>
+      <li><a href="https://github.com/catppuccin/zed/blob/main/themes/catppuccin-mauve.json">Catppuccin</a></li>
+      <li><a href="https://github.com/ssaunderss/zed-tokyo-night/blob/main/themes/tokyo-night.json">Tokyo Night</a></li>
+      <li><a href="https://github.com/MordFustang21/zed-one-dark-pro/blob/main/themes/one-dark.json">One Dark Pro</a></li>
+      <li><a href="https://github.com/dracula/zed/blob/main/themes/dracula.json">Dracula</a></li>
+    </ul>
+    <p>Чтобы установить: скачайте JSON-файл темы в <code>~/.config/som/themes/</code>, затем укажите в settings.json в поле <code>window.theme</code> значение поля <code>"name"</code> <em>из самого файла</em> (откройте файл и проверьте — оно не всегда совпадает с именем файла, а некоторые файлы описывают сразу несколько именованных вариантов).</p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="fmuted">Som — форк <a href="https://github.com/zed-industries/zed">Zed</a>, только терминал. GPL-3.0-or-later.</div>
+    <div class="flinks">
+      <a href="index.html">На сайт</a>
+      <a href="https://github.com/errordnk/som">GitHub</a>
+      <a href="https://github.com/errordnk/som/blob/main/MANUAL.md">Manual (EN)</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

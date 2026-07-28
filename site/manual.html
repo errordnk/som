@@ -199,15 +199,15 @@
   hr.sep { border: none; border-top: 1px solid var(--bg2); margin: 40px 0; }
 
   /* ---------- tables ---------- */
-  .doc-table-wrap { overflow-x: auto; margin: 0 0 20px; }
+  .doc-table-wrap { margin: 0 0 20px; }
   table.doc-table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 14px;
     background: var(--bg1);
     border: 1px solid var(--bg2);
     border-radius: var(--radius);
-    overflow: hidden;
   }
   table.doc-table th {
     text-align: left;
@@ -223,9 +223,10 @@
     border-top: 1px solid var(--bg2);
     color: var(--fg2);
     vertical-align: top;
+    overflow-wrap: break-word;
   }
-  table.doc-table td:first-child { white-space: nowrap; color: var(--fg0); font-family: "FiraCode Nerd Font", monospace; font-size: 13px; }
-  table.doc-table code { white-space: nowrap; }
+  table.doc-table td:first-child { color: var(--fg0); font-family: "FiraCode Nerd Font", monospace; font-size: 13px; width: 26%; }
+  table.doc-table code { overflow-wrap: break-word; }
 
   /* ---------- code window ---------- */
   pre.code-window {

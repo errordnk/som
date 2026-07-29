@@ -9,6 +9,7 @@ use crate::{
     TISCopyCurrentKeyboardLayoutInputSource, TISGetInputSourceProperty, kTISPropertyInputSourceID,
     kTISPropertyLocalizedName,
 };
+use crate::events::{NO_MOD, SHIFT_MOD, chars_for_modified_key, usb_hid_usage_to_macos_key_code};
 
 pub(crate) struct MacKeyboardLayout {
     id: String,
@@ -47,6 +48,13 @@ impl PlatformKeyboardMapper for MacKeyboardMapper {
 
     fn get_key_equivalents(&self) -> Option<&HashMap<char, char>> {
         self.key_equivalents.as_ref()
+    }
+
+    fn key_for_physical(&self, usb_hid_usage: u32, shift: bool) -> Option<String> {
+        let key_code = usb_hid_usage_to_macos_key_code(usb_hid_usage)?;
+        let modifiers = if shift { SHIFT_MOD } else { NO_MOD };
+        let chars = chars_for_modified_key(key_code, modifiers);
+        if chars.is_empty() { None } else { Some(chars) }
     }
 }
 

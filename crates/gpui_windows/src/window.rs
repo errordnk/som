@@ -60,6 +60,7 @@ pub struct WindowsWindowState {
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
+    pub last_reported_numlock: Cell<Option<Numlock>>,
     pub hovered: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
@@ -141,6 +142,7 @@ impl WindowsWindowState {
         let pending_surrogate = None;
         let last_reported_modifiers = None;
         let last_reported_capslock = None;
+        let last_reported_numlock = None;
         let hovered = false;
         let click_state = ClickState::new();
         let nc_button_pressed = None;
@@ -167,6 +169,7 @@ impl WindowsWindowState {
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
+            last_reported_numlock: Cell::new(last_reported_numlock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_after_recovery: Cell::new(false),

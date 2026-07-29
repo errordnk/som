@@ -752,11 +752,13 @@ impl WindowsWindowInner {
         if activated {
             this.state.last_reported_modifiers.set(None);
             this.state.last_reported_capslock.set(None);
+            this.state.last_reported_numlock.set(None);
 
             if let Some(mut func) = this.state.callbacks.input.take() {
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: current_modifiers(),
                     capslock: current_capslock(),
+                    numlock: current_numlock(),
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
@@ -1390,6 +1392,7 @@ where
             Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock: current_capslock(),
+                numlock: current_numlock(),
             }))
         }
         VK_PACKET => None,
@@ -1406,6 +1409,23 @@ where
             Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                numlock: current_numlock(),
+            }))
+        }
+        VK_NUMLOCK => {
+            let numlock = current_numlock();
+            if state
+                .last_reported_numlock
+                .get()
+                .is_some_and(|prev_numlock| prev_numlock == numlock)
+            {
+                return None;
+            }
+            state.last_reported_numlock.set(Some(numlock));
+            Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                modifiers,
+                capslock: current_capslock(),
+                numlock,
             }))
         }
         vkey => {
@@ -1460,9 +1480,51 @@ fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {
             VK_F22 => "f22",
             VK_F23 => "f23",
             VK_F24 => "f24",
+            VK_NUMPAD0 => "0",
+            VK_NUMPAD1 => "1",
+            VK_NUMPAD2 => "2",
+            VK_NUMPAD3 => "3",
+            VK_NUMPAD4 => "4",
+            VK_NUMPAD5 => "5",
+            VK_NUMPAD6 => "6",
+            VK_NUMPAD7 => "7",
+            VK_NUMPAD8 => "8",
+            VK_NUMPAD9 => "9",
+            VK_MULTIPLY => "*",
+            VK_ADD => "+",
+            VK_SEPARATOR => "enter",
+            VK_SUBTRACT => "-",
+            VK_DECIMAL => ".",
+            VK_DIVIDE => "/",
             _ => return None,
         }
         .to_string(),
+    )
+}
+
+/// Whether a Windows virtual key belongs to the numeric keypad. Distinct
+/// from the top-row digit/symbol keys, which have different `VIRTUAL_KEY`
+/// values (`VK_0`..`VK_9` vs `VK_NUMPAD0`..`VK_NUMPAD9`, etc.) even though
+/// both produce the same `key` string once NumLock is on.
+fn is_numpad_vkey(vkey: VIRTUAL_KEY) -> bool {
+    matches!(
+        vkey,
+        VK_NUMPAD0
+            | VK_NUMPAD1
+            | VK_NUMPAD2
+            | VK_NUMPAD3
+            | VK_NUMPAD4
+            | VK_NUMPAD5
+            | VK_NUMPAD6
+            | VK_NUMPAD7
+            | VK_NUMPAD8
+            | VK_NUMPAD9
+            | VK_MULTIPLY
+            | VK_ADD
+            | VK_SEPARATOR
+            | VK_SUBTRACT
+            | VK_DECIMAL
+            | VK_DIVIDE
     )
 }
 
@@ -1483,9 +1545,129 @@ fn parse_normal_key(
             modifiers,
             key,
             key_char,
+            is_numpad: is_numpad_vkey(vkey),
+            physical_key: windows_vkey_to_usb_hid_usage(vkey),
         },
         prefer_character_input,
     ))
+}
+
+/// Maps a Windows `VIRTUAL_KEY` to its USB HID Usage ID (Usage Page 0x07,
+/// Keyboard/Keypad) — the layout-independent physical key identity.
+/// `VK_A`..`VK_Z` and `VK_0`..`VK_9` are guaranteed by the Win32 API to
+/// always correspond to their QWERTY physical position regardless of the
+/// active keyboard layout (unlike the *character* a layout produces for
+/// them), which is exactly the property this needs. Covers the keys used
+/// by `som-key`'s drawn layout; returns `None` for anything not in that
+/// table rather than guessing.
+fn windows_vkey_to_usb_hid_usage(vkey: VIRTUAL_KEY) -> Option<u32> {
+    Some(match vkey {
+        VIRTUAL_KEY(0x41) => 0x04, // A
+        VIRTUAL_KEY(0x42) => 0x05, // B
+        VIRTUAL_KEY(0x43) => 0x06, // C
+        VIRTUAL_KEY(0x44) => 0x07, // D
+        VIRTUAL_KEY(0x45) => 0x08, // E
+        VIRTUAL_KEY(0x46) => 0x09, // F
+        VIRTUAL_KEY(0x47) => 0x0A, // G
+        VIRTUAL_KEY(0x48) => 0x0B, // H
+        VIRTUAL_KEY(0x49) => 0x0C, // I
+        VIRTUAL_KEY(0x4A) => 0x0D, // J
+        VIRTUAL_KEY(0x4B) => 0x0E, // K
+        VIRTUAL_KEY(0x4C) => 0x0F, // L
+        VIRTUAL_KEY(0x4D) => 0x10, // M
+        VIRTUAL_KEY(0x4E) => 0x11, // N
+        VIRTUAL_KEY(0x4F) => 0x12, // O
+        VIRTUAL_KEY(0x50) => 0x13, // P
+        VIRTUAL_KEY(0x51) => 0x14, // Q
+        VIRTUAL_KEY(0x52) => 0x15, // R
+        VIRTUAL_KEY(0x53) => 0x16, // S
+        VIRTUAL_KEY(0x54) => 0x17, // T
+        VIRTUAL_KEY(0x55) => 0x18, // U
+        VIRTUAL_KEY(0x56) => 0x19, // V
+        VIRTUAL_KEY(0x57) => 0x1A, // W
+        VIRTUAL_KEY(0x58) => 0x1B, // X
+        VIRTUAL_KEY(0x59) => 0x1C, // Y
+        VIRTUAL_KEY(0x5A) => 0x1D, // Z
+        VIRTUAL_KEY(0x31) => 0x1E, // 1
+        VIRTUAL_KEY(0x32) => 0x1F, // 2
+        VIRTUAL_KEY(0x33) => 0x20, // 3
+        VIRTUAL_KEY(0x34) => 0x21, // 4
+        VIRTUAL_KEY(0x35) => 0x22, // 5
+        VIRTUAL_KEY(0x36) => 0x23, // 6
+        VIRTUAL_KEY(0x37) => 0x24, // 7
+        VIRTUAL_KEY(0x38) => 0x25, // 8
+        VIRTUAL_KEY(0x39) => 0x26, // 9
+        VIRTUAL_KEY(0x30) => 0x27, // 0
+        VK_RETURN => 0x28,
+        VK_ESCAPE => 0x29,
+        VK_BACK => 0x2A,
+        VK_TAB => 0x2B,
+        VK_SPACE => 0x2C,
+        VK_OEM_MINUS => 0x2D,
+        VK_OEM_PLUS => 0x2E,
+        VK_OEM_4 => 0x2F, // [
+        VK_OEM_6 => 0x30, // ]
+        VK_OEM_5 => 0x31, // backslash
+        VK_OEM_1 => 0x33, // ;
+        VK_OEM_7 => 0x34, // '
+        VK_OEM_3 => 0x35, // ` grave
+        VK_OEM_COMMA => 0x36,
+        VK_OEM_PERIOD => 0x37,
+        VK_OEM_2 => 0x38, // /
+        VK_CAPITAL => 0x39,
+        VK_F1 => 0x3A,
+        VK_F2 => 0x3B,
+        VK_F3 => 0x3C,
+        VK_F4 => 0x3D,
+        VK_F5 => 0x3E,
+        VK_F6 => 0x3F,
+        VK_F7 => 0x40,
+        VK_F8 => 0x41,
+        VK_F9 => 0x42,
+        VK_F10 => 0x43,
+        VK_F11 => 0x44,
+        VK_F12 => 0x45,
+        VK_F13 => 0x46,
+        VK_SNAPSHOT => 0x46, // Print Screen (shares F13's usage on full-size boards)
+        VK_SCROLL => 0x47,
+        VK_PAUSE => 0x48,
+        VK_INSERT => 0x49,
+        VK_HOME => 0x4A,
+        VK_PRIOR => 0x4B, // Page Up
+        VK_DELETE => 0x4C,
+        VK_END => 0x4D,
+        VK_NEXT => 0x4E, // Page Down
+        VK_RIGHT => 0x4F,
+        VK_LEFT => 0x50,
+        VK_DOWN => 0x51,
+        VK_UP => 0x52,
+        VK_NUMLOCK => 0x53,
+        VK_DIVIDE => 0x54,
+        VK_MULTIPLY => 0x55,
+        VK_SUBTRACT => 0x56,
+        VK_ADD => 0x57,
+        VK_SEPARATOR => 0x58, // Keypad Enter (Windows reports it as VK_RETURN with the extended-key flag in practice, but VK_SEPARATOR is its nominal vkey)
+        VK_NUMPAD1 => 0x59,
+        VK_NUMPAD2 => 0x5A,
+        VK_NUMPAD3 => 0x5B,
+        VK_NUMPAD4 => 0x5C,
+        VK_NUMPAD5 => 0x5D,
+        VK_NUMPAD6 => 0x5E,
+        VK_NUMPAD7 => 0x5F,
+        VK_NUMPAD8 => 0x60,
+        VK_NUMPAD9 => 0x61,
+        VK_NUMPAD0 => 0x62,
+        VK_DECIMAL => 0x63,
+        VK_LCONTROL => 0xE0,
+        VK_LSHIFT => 0xE1,
+        VK_LMENU => 0xE2,
+        VK_LWIN => 0xE3,
+        VK_RCONTROL => 0xE4,
+        VK_RSHIFT => 0xE5,
+        VK_RMENU => 0xE6,
+        VK_RWIN => 0xE7,
+        _ => return None,
+    })
 }
 
 fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
@@ -1633,6 +1815,7 @@ pub(crate) fn current_modifiers() -> Modifiers {
         shift: is_virtual_key_pressed(VK_SHIFT),
         platform: is_virtual_key_pressed(VK_LWIN) || is_virtual_key_pressed(VK_RWIN),
         function: false,
+        ..Default::default()
     }
 }
 
@@ -1640,6 +1823,12 @@ pub(crate) fn current_modifiers() -> Modifiers {
 pub(crate) fn current_capslock() -> Capslock {
     let on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) & 1 } > 0;
     Capslock { on }
+}
+
+#[inline]
+pub(crate) fn current_numlock() -> Numlock {
+    let on = unsafe { GetKeyState(VK_NUMLOCK.0 as i32) & 1 } > 0;
+    Numlock { on }
 }
 
 // there is some additional non-visible space when talking about window

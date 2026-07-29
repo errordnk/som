@@ -1198,6 +1198,22 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             object: nil
         ];
 
+        // The notification above only fires while some view holds an active
+        // NSTextInputContext (e.g. a text field with IME support) — apps
+        // that only read raw key/modifiers events, like som-key, never
+        // trigger it even though the OS layout genuinely changed. TIS's own
+        // distributed notification fires unconditionally on every layout
+        // switch (keypress-driven or via the input-source menu), so we
+        // also listen for that and route it through the same handler.
+        let distributed_center: *mut Object =
+            msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
+        let tis_name = ns_string("kTISNotifySelectedKeyboardInputSourceChanged");
+        let _: () = msg_send![distributed_center, addObserver: this as id
+            selector: sel!(onKeyboardLayoutChange:)
+            name: tis_name
+            object: nil
+        ];
+
         let thermal_name = ns_string("NSProcessInfoThermalStateDidChangeNotification");
         let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
         let _: () = msg_send![notification_center, addObserver: this as id

@@ -80,8 +80,8 @@ use super::{
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
-    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal,
-    read_fd, reveal_path_internal,
+    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, numlock_from_xkb,
+    open_uri_internal, read_fd, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -95,7 +95,7 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
+    Numlock, Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
     ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TouchPhase, WindowButtonLayout,
     WindowParams, point, profiler, px, size,
 };
@@ -243,6 +243,7 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
+    pub numlock: Numlock,
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
     continuous_scroll_delta: Option<Point<Pixels>>,
@@ -710,8 +711,10 @@ impl WaylandClient {
                 alt: false,
                 function: false,
                 platform: false,
+                ..Default::default()
             },
             capslock: Capslock { on: false },
+            numlock: Numlock { on: false },
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
@@ -1526,10 +1529,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 state.modifiers = modifiers_from_xkb(keymap_state);
                 let keymap_state = state.keymap_state.as_mut().unwrap();
                 state.capslock = capslock_from_xkb(keymap_state);
+                state.numlock = numlock_from_xkb(keymap_state);
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
                     capslock: state.capslock,
+                    numlock: state.numlock,
                 });
                 drop(state);
 
@@ -1704,6 +1709,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                                 modifiers: Modifiers::default(),
                                 key: commit_text.clone(),
                                 key_char: Some(commit_text),
+                                ..Default::default()
                             },
                             is_held: false,
                             prefer_character_input: false,

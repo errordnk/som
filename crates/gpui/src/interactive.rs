@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
+    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Numlock, Pixels, Point,
+    Render, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -64,6 +64,9 @@ pub struct ModifiersChangedEvent {
     pub modifiers: Modifiers,
     /// The new state of the capslock key
     pub capslock: Capslock,
+    /// The new state of the numlock key. Always `on: false` on macOS (see
+    /// `Numlock`'s docs).
+    pub numlock: Numlock,
 }
 
 impl Sealed for ModifiersChangedEvent {}

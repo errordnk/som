@@ -33,6 +33,7 @@ members = [
     "crates/settings_content",
     "crates/settings_json",
     "crates/settings_macros",
+    "crates/som_key",
     "crates/som_tmux",
     "crates/sum_tree",
     "crates/syntax_theme",

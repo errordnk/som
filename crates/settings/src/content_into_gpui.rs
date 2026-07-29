@@ -64,6 +64,7 @@ impl IntoGpui for ModifiersContent {
             shift: self.shift,
             platform: self.platform,
             function: self.function,
+            ..Default::default()
         }
     }
 }

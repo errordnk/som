@@ -1241,6 +1241,7 @@ impl PlatformWindow for MacWindow {
                 shift,
                 platform: command,
                 function,
+                ..Default::default()
             }
         }
     }
@@ -2244,11 +2245,13 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                ..
             }) => {
                 // Only raise modifiers changed event when they have actually changed
                 if let Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: prev_modifiers,
                     capslock: prev_capslock,
+                    ..
                 })) = &lock.previous_modifiers_changed_event
                     && prev_modifiers == modifiers
                     && prev_capslock == capslock

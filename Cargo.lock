@@ -7033,6 +7033,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "som_key"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+]
+
+[[package]]
 name = "som_tmux"
 version = "1.6.0"
 dependencies = [

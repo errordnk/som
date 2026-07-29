@@ -981,7 +981,125 @@ pub(super) fn keystroke_from_xkb(
         modifiers,
         key,
         key_char,
+        is_numpad: key_sym.is_keypad_key(),
+        physical_key: evdev_scancode_to_usb_hid_usage(keycode.raw().wrapping_sub(8)),
     }
+}
+
+/// Maps a Linux evdev scancode (`KEY_*` from `linux/input-event-codes.h`)
+/// to its USB HID Usage ID (Usage Page 0x07, Keyboard/Keypad) — the
+/// layout-independent physical key identity. xkb keycodes are evdev
+/// scancode + 8 by convention, hence the subtraction at the call site.
+/// Covers the keys used by `som-key`'s drawn layout; returns `None` for
+/// anything not in that table rather than guessing.
+fn evdev_scancode_to_usb_hid_usage(evdev: u32) -> Option<u32> {
+    Some(match evdev {
+        30 => 0x04, // KEY_A
+        48 => 0x05, // KEY_B
+        46 => 0x06, // KEY_C
+        32 => 0x07, // KEY_D
+        18 => 0x08, // KEY_E
+        33 => 0x09, // KEY_F
+        34 => 0x0A, // KEY_G
+        35 => 0x0B, // KEY_H
+        23 => 0x0C, // KEY_I
+        36 => 0x0D, // KEY_J
+        37 => 0x0E, // KEY_K
+        38 => 0x0F, // KEY_L
+        50 => 0x10, // KEY_M
+        49 => 0x11, // KEY_N
+        24 => 0x12, // KEY_O
+        25 => 0x13, // KEY_P
+        16 => 0x14, // KEY_Q
+        19 => 0x15, // KEY_R
+        31 => 0x16, // KEY_S
+        20 => 0x17, // KEY_T
+        22 => 0x18, // KEY_U
+        47 => 0x19, // KEY_V
+        17 => 0x1A, // KEY_W
+        45 => 0x1B, // KEY_X
+        21 => 0x1C, // KEY_Y
+        44 => 0x1D, // KEY_Z
+        2 => 0x1E,  // KEY_1
+        3 => 0x1F,  // KEY_2
+        4 => 0x20,  // KEY_3
+        5 => 0x21,  // KEY_4
+        6 => 0x22,  // KEY_5
+        7 => 0x23,  // KEY_6
+        8 => 0x24,  // KEY_7
+        9 => 0x25,  // KEY_8
+        10 => 0x26, // KEY_9
+        11 => 0x27, // KEY_0
+        28 => 0x28, // KEY_ENTER
+        1 => 0x29,  // KEY_ESC
+        14 => 0x2A, // KEY_BACKSPACE
+        15 => 0x2B, // KEY_TAB
+        57 => 0x2C, // KEY_SPACE
+        12 => 0x2D, // KEY_MINUS
+        13 => 0x2E, // KEY_EQUAL
+        26 => 0x2F, // KEY_LEFTBRACE
+        27 => 0x30, // KEY_RIGHTBRACE
+        43 => 0x31, // KEY_BACKSLASH
+        39 => 0x33, // KEY_SEMICOLON
+        40 => 0x34, // KEY_APOSTROPHE
+        41 => 0x35, // KEY_GRAVE
+        51 => 0x36, // KEY_COMMA
+        52 => 0x37, // KEY_DOT
+        53 => 0x38, // KEY_SLASH
+        58 => 0x39, // KEY_CAPSLOCK
+        59 => 0x3A, // KEY_F1
+        60 => 0x3B, // KEY_F2
+        61 => 0x3C, // KEY_F3
+        62 => 0x3D, // KEY_F4
+        63 => 0x3E, // KEY_F5
+        64 => 0x3F, // KEY_F6
+        65 => 0x40, // KEY_F7
+        66 => 0x41, // KEY_F8
+        67 => 0x42, // KEY_F9
+        68 => 0x43, // KEY_F10
+        87 => 0x44, // KEY_F11
+        88 => 0x45, // KEY_F12
+        183 => 0x46, // KEY_F13
+        99 => 0x46, // KEY_SYSRQ (Print Screen, shares F13's usage)
+        70 => 0x47, // KEY_SCROLLLOCK
+        119 => 0x48, // KEY_PAUSE
+        110 => 0x49, // KEY_INSERT
+        102 => 0x4A, // KEY_HOME
+        104 => 0x4B, // KEY_PAGEUP
+        111 => 0x4C, // KEY_DELETE
+        107 => 0x4D, // KEY_END
+        109 => 0x4E, // KEY_PAGEDOWN
+        106 => 0x4F, // KEY_RIGHT
+        105 => 0x50, // KEY_LEFT
+        108 => 0x51, // KEY_DOWN
+        103 => 0x52, // KEY_UP
+        69 => 0x53,  // KEY_NUMLOCK
+        98 => 0x54,  // KEY_KPSLASH
+        55 => 0x55,  // KEY_KPASTERISK
+        74 => 0x56,  // KEY_KPMINUS
+        78 => 0x57,  // KEY_KPPLUS
+        96 => 0x58,  // KEY_KPENTER
+        79 => 0x59,  // KEY_KP1
+        80 => 0x5A,  // KEY_KP2
+        81 => 0x5B,  // KEY_KP3
+        75 => 0x5C,  // KEY_KP4
+        76 => 0x5D,  // KEY_KP5
+        77 => 0x5E,  // KEY_KP6
+        71 => 0x5F,  // KEY_KP7
+        72 => 0x60,  // KEY_KP8
+        73 => 0x61,  // KEY_KP9
+        82 => 0x62,  // KEY_KP0
+        83 => 0x63,  // KEY_KPDOT
+        29 => 0xE0,  // KEY_LEFTCTRL
+        42 => 0xE1,  // KEY_LEFTSHIFT
+        56 => 0xE2,  // KEY_LEFTALT
+        125 => 0xE3, // KEY_LEFTMETA
+        97 => 0xE4,  // KEY_RIGHTCTRL
+        54 => 0xE5,  // KEY_RIGHTSHIFT
+        100 => 0xE6, // KEY_RIGHTALT
+        126 => 0xE7, // KEY_RIGHTMETA
+        _ => return None,
+    })
 }
 
 /**
@@ -1055,6 +1173,7 @@ pub(super) fn modifiers_from_xkb(keymap_state: &State) -> gpui::Modifiers {
         control,
         platform,
         function: false,
+        ..Default::default()
     }
 }
 
@@ -1062,6 +1181,12 @@ pub(super) fn modifiers_from_xkb(keymap_state: &State) -> gpui::Modifiers {
 pub(super) fn capslock_from_xkb(keymap_state: &State) -> gpui::Capslock {
     let on = keymap_state.mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_EFFECTIVE);
     gpui::Capslock { on }
+}
+
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn numlock_from_xkb(keymap_state: &State) -> gpui::Numlock {
+    let on = keymap_state.mod_name_is_active(xkb::MOD_NAME_NUM, xkb::STATE_MODS_EFFECTIVE);
+    gpui::Numlock { on }
 }
 
 /// Resolve a Linux `dev_t` to PCI vendor/device IDs via sysfs, returning a

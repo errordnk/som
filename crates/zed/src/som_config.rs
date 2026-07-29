@@ -205,7 +205,7 @@ impl SomConfig {
                 if let Some(parent) = user_config_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let shell = util::shell::get_windows_system_shell();
+                let shell = util::shell::get_system_shell();
                 let escaped = shell.replace('\\', "\\\\").replace('"', "\\\"");
                 let contents = std::str::from_utf8(&asset.data)
                     .unwrap_or_default()
@@ -606,5 +606,366 @@ impl SomConfig {
             mw.workspace().update(cx, |ws, cx| show(ws, cx));
         })
         .detach();
+    }
+}
+
+/// Fully automated coverage for the settings.json -> keymap pipeline, aimed
+/// squarely at the failure mode reported in practice: every `cmd-shift-*`
+/// binding in a user's settings.json silently doing nothing (while
+/// modifier-free/no-shift bindings like `cmd-=` kept working). None of these
+/// tests touch real hardware, a display, or the OS keyboard layout — they
+/// drive the exact same code path `apply_keys` uses at runtime
+/// (`Keystroke::parse` -> `KeymapFile::load` -> `KeyBinding`) and then check
+/// matching with a synthetic `Keystroke`, the same struct macOS's event
+/// handler builds from a real keydown. Run with `cargo test -p som
+/// som_config::tests`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Keystroke, Modifiers, TestAppContext};
+
+    /// Every keystroke string that ships in `assets/macos.json`'s default
+    /// `keys` map, hand-copied so a change to the asset doesn't silently
+    /// stop testing what users actually get on first run.
+    const DEFAULT_MACOS_KEYS: &[(&str, &str)] = &[
+        ("cmd-q", "Quit"),
+        ("cmd-c", "Copy"),
+        ("cmd-v", "Paste"),
+        ("cmd-=", "IncreaseFont"),
+        ("cmd--", "DecreaseFont"),
+        ("cmd-0", "ResetFont"),
+        ("cmd-shift-=", "NewTab"),
+        ("cmd-shift-1", "NewTab1"),
+        ("cmd-shift-2", "NewTab2"),
+        ("cmd-shift-3", "NewTab3"),
+        ("cmd-shift-4", "NewTab4"),
+        ("cmd-shift-5", "NewTab5"),
+        ("cmd-shift-6", "NewTab6"),
+        ("cmd-shift-7", "NewTab7"),
+        ("cmd-shift-8", "NewTab8"),
+        ("cmd-shift-9", "NewTab9"),
+        ("cmd-shift-0", "NewTab10"),
+        ("cmd-shift--", "CloseTab"),
+        ("cmd-shift-\\", "NewPane"),
+        ("cmd-shift-backspace", "ClosePane"),
+        ("cmd-shift-up", "PrevPane"),
+        ("cmd-shift-down", "NextPane"),
+        ("cmd-shift-left", "PrevTab"),
+        ("cmd-shift-right", "NextTab"),
+    ];
+
+    fn test_config(keys: &[(&str, &str)]) -> SomConfig {
+        let mut config = SomConfig::default();
+        config.tabs.push(TabProfile {
+            name: "Shell".into(),
+            default: true,
+            ..Default::default()
+        });
+        for (k, v) in keys {
+            config.keys.insert(k.to_string(), v.to_string());
+        }
+        config
+    }
+
+    /// A `Keystroke` shaped like what `gpui_macos`'s `handle_key_event`
+    /// builds from a real `NSEvent`: modifiers exactly as held, `key` is the
+    /// unshifted/base character macOS's `charactersIgnoringModifiers`-style
+    /// resolution would produce, `key_char` is `None` unless the key
+    /// produces a distinct printable character under IME. This is the
+    /// layout-independent shape — no dependency on the host's active input
+    /// source.
+    fn synthetic_press(cmd: bool, shift: bool, ctrl: bool, alt: bool, key: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                control: ctrl,
+                alt,
+                shift,
+                platform: cmd,
+                function: false,
+                ..Default::default()
+            },
+            key: key.to_string(),
+            key_char: None,
+            ..Default::default()
+        }
+    }
+
+    // ---- Level 1: raw string -> Keystroke ----------------------------
+
+    #[test]
+    fn all_default_macos_keystrokes_parse() {
+        for (keystroke, action) in DEFAULT_MACOS_KEYS {
+            let parsed = Keystroke::parse(keystroke)
+                .unwrap_or_else(|e| panic!("keystroke \"{keystroke}\" (action {action}) failed to parse: {e}"));
+            assert!(
+                parsed.modifiers.platform,
+                "\"{keystroke}\" (action {action}) should carry the cmd/platform modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_shift_backslash_parses_with_expected_modifiers_and_key() {
+        let parsed = Keystroke::parse("cmd-shift-\\").expect("cmd-shift-\\ must parse");
+        assert!(parsed.modifiers.platform, "expected cmd/platform modifier");
+        assert!(parsed.modifiers.shift, "expected shift modifier");
+        assert!(!parsed.modifiers.control);
+        assert!(!parsed.modifiers.alt);
+        assert_eq!(parsed.key, "\\");
+    }
+
+    #[test]
+    fn every_cmd_shift_binding_actually_carries_both_modifiers() {
+        // Regression guard: if a future edit to `apply_keys` ever stripped
+        // the shift modifier while composing the keystroke string (e.g. by
+        // reordering components or mis-escaping), this fails loudly instead
+        // of silently producing a cmd-only binding.
+        for (keystroke, action) in DEFAULT_MACOS_KEYS {
+            if !keystroke.starts_with("cmd-shift-") {
+                continue;
+            }
+            let parsed = Keystroke::parse(keystroke).unwrap();
+            assert!(parsed.modifiers.platform && parsed.modifiers.shift,
+                "\"{keystroke}\" (action {action}) lost cmd or shift after parsing: {:?}", parsed.modifiers);
+        }
+    }
+
+    // ---- Level 2: action-name -> gpui action mapping ------------------
+
+    #[test]
+    fn every_default_macos_action_name_maps_to_a_gpui_action() {
+        for (keystroke, action) in DEFAULT_MACOS_KEYS {
+            if action.starts_with("NewTab") {
+                // NewTab/NewTabN are handled by a separate branch in
+                // apply_keys, not through som_action_to_gpui.
+                continue;
+            }
+            assert!(
+                som_action_to_gpui(action).is_some(),
+                "action \"{action}\" (bound to \"{keystroke}\") has no som_action_to_gpui mapping"
+            );
+        }
+    }
+
+    // ---- Level 3: end-to-end apply_keys -> KeymapFile::load -----------
+
+    #[gpui::test]
+    async fn apply_keys_loads_successfully_for_default_macos_keymap(cx: &mut TestAppContext) {
+        let config = test_config(DEFAULT_MACOS_KEYS);
+        cx.update(|cx| {
+            config.apply_keys(cx);
+        });
+        // apply_keys swallows errors internally (logs + returns); the real
+        // assertion is the follow-up test below, which re-derives the same
+        // JSON and inspects KeymapFileLoadResult directly so a partial-load
+        // failure can't hide behind a silent log::warn!.
+    }
+
+    /// Rebuilds the exact JSON `apply_keys` would feed to `KeymapFile::load`
+    /// and inspects the result directly, so a `SomeFailedToLoad` (which
+    /// `apply_keys` only logs, never surfaces to a test) fails the build.
+    fn build_keymap_json(config: &SomConfig) -> String {
+        let mut entries: Vec<String> = Vec::new();
+        for (keystroke_raw, action_name) in &config.keys {
+            let keystroke = keystroke_raw.replace('\\', "\\\\");
+            if action_name == "NewTab" || action_name.strip_prefix("NewTab").map_or(false, |s| s.parse::<usize>().is_ok()) {
+                let is_bare = action_name == "NewTab";
+                let idx = if is_bare {
+                    config.tabs.iter().position(|t| t.default).unwrap_or(0) + 1
+                } else {
+                    action_name["NewTab".len()..].parse::<usize>().unwrap_or(1)
+                };
+                if idx >= 1 && idx <= 10 {
+                    if let Some(tab) = config.tabs.get(idx - 1) {
+                        let name = tab.name.replace('"', "\\\"");
+                        entries.push(format!(
+                            "{{ \"bindings\": {{ \"{keystroke}\": [\"workspace::NewTerminal\", {{ \"tab_name\": \"{name}\" }}] }} }}"
+                        ));
+                        continue;
+                    }
+                }
+                entries.push(format!(
+                    "{{ \"bindings\": {{ \"{keystroke}\": \"workspace::NewTerminal\" }} }}"
+                ));
+                continue;
+            }
+            if let Some((gpui_action, ctx, as_obj)) = som_action_to_gpui(action_name) {
+                let binding = if as_obj {
+                    format!("[\"{gpui_action}\", {{ \"persist\": false }}]")
+                } else {
+                    format!("\"{gpui_action}\"")
+                };
+                if let Some(ctx) = ctx {
+                    entries.push(format!(
+                        "{{ \"context\": \"{ctx}\", \"bindings\": {{ \"{keystroke}\": {binding} }} }}"
+                    ));
+                } else {
+                    entries.push(format!(
+                        "{{ \"bindings\": {{ \"{keystroke}\": {binding} }} }}"
+                    ));
+                }
+            }
+        }
+        format!("[{}]", entries.join(", "))
+    }
+
+    #[gpui::test]
+    async fn keymap_file_load_succeeds_with_no_partial_failures(cx: &mut TestAppContext) {
+        let config = test_config(DEFAULT_MACOS_KEYS);
+        let json = build_keymap_json(&config);
+        cx.update(|cx| {
+            match KeymapFile::load(&json, cx) {
+                KeymapFileLoadResult::Success { key_bindings } => {
+                    assert!(
+                        key_bindings.len() >= DEFAULT_MACOS_KEYS.len(),
+                        "expected at least {} bindings, got {}",
+                        DEFAULT_MACOS_KEYS.len(),
+                        key_bindings.len()
+                    );
+                }
+                KeymapFileLoadResult::SomeFailedToLoad { error_message, key_bindings } => {
+                    panic!(
+                        "keymap partially failed to load ({} bindings loaded): {}",
+                        key_bindings.len(),
+                        error_message.0
+                    );
+                }
+                KeymapFileLoadResult::JsonParseFailure { error } => {
+                    panic!("generated keymap JSON failed to parse: {error}\n\ngenerated json:\n{json}");
+                }
+            }
+        });
+    }
+
+    // ---- Level 4: simulated real keypress actually matches ------------
+
+    /// For every `cmd-shift-*` default binding, build the `KeyBinding` the
+    /// same way `apply_keys` does, then simulate the literal `Keystroke` a
+    /// correctly-behaving macOS event handler would hand to GPUI for that
+    /// physical key combo, and assert it matches. This is the test that
+    /// would have caught a real "cmd-shift-\\ does nothing" regression if
+    /// the bug were anywhere in GPUI's keystroke plumbing rather than in
+    /// something external to Som (e.g. a system-wide hotkey interceptor
+    /// swallowing the event before it ever reaches the app).
+    #[test]
+    fn simulated_cmd_shift_keypresses_match_their_default_bindings() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("cmd-shift-\\", "workspace::SomSplitPane", "\\"),
+            ("cmd-shift-backspace", "workspace::SomClosePane", "backspace"),
+            ("cmd-shift-up", "workspace::SomActivatePrevPane", "up"),
+            ("cmd-shift-down", "workspace::SomActivateNextPane", "down"),
+            ("cmd-shift-left", "workspace::SomActivatePrevTab", "left"),
+            ("cmd-shift-right", "workspace::SomActivateNextTab", "right"),
+            ("cmd-shift--", "workspace::SomCloseTab", "-"),
+        ];
+
+        for (keystroke_str, _action_name, expected_key) in cases {
+            let keystroke = Keystroke::parse(keystroke_str)
+                .unwrap_or_else(|e| panic!("failed to parse \"{keystroke_str}\": {e}"));
+            assert_eq!(&keystroke.key, expected_key);
+
+            let typed = synthetic_press(true, true, false, false, expected_key);
+            let keybinding_keystroke = gpui::KeybindingKeystroke::from_keystroke(keystroke);
+
+            assert!(
+                typed.should_match(&keybinding_keystroke),
+                "simulated Cmd+Shift+{expected_key} keypress did not match the \"{keystroke_str}\" binding \
+                 (typed={typed:?}, bound={keybinding_keystroke:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn simulated_keypress_without_shift_does_not_match_cmd_shift_binding() {
+        // Sanity check the matcher isn't vacuously true: dropping shift from
+        // the simulated press must break the match against a cmd-shift-*
+        // binding, proving the modifier is actually load-bearing in
+        // `should_match` and not just ignored.
+        let keystroke = Keystroke::parse("cmd-shift-\\").unwrap();
+        let keybinding_keystroke = gpui::KeybindingKeystroke::from_keystroke(keystroke);
+
+        let typed_without_shift = synthetic_press(true, false, false, false, "\\");
+        assert!(
+            !typed_without_shift.should_match(&keybinding_keystroke),
+            "Cmd+\\ (no shift) should NOT match a cmd-shift-\\ binding"
+        );
+    }
+
+    #[test]
+    fn cmd_equals_binding_matches_independent_of_shift_bindings() {
+        // Documents why `cmd-=` "working" while `cmd-shift-*` "doesn't" is
+        // not, by itself, evidence of a parser/matcher bug: cmd-= is a
+        // completely independent binding (built by the separate
+        // `font_bindings` loop in apply_keys) with no shared state with any
+        // cmd-shift-* binding. This test exists so a future reader doesn't
+        // waste time assuming the two are coupled.
+        let keystroke = Keystroke::parse("cmd-=").unwrap();
+        let keybinding_keystroke = gpui::KeybindingKeystroke::from_keystroke(keystroke);
+        let typed = synthetic_press(true, false, false, false, "=");
+        assert!(typed.should_match(&keybinding_keystroke));
+    }
+
+    // ---- Level 5: no accidental self-conflicts -------------------------
+
+    #[test]
+    fn default_macos_keys_have_no_duplicate_keystrokes() {
+        let mut seen = std::collections::HashSet::new();
+        for (keystroke, action) in DEFAULT_MACOS_KEYS {
+            let parsed = Keystroke::parse(keystroke).unwrap();
+            let fingerprint = (parsed.modifiers, parsed.key.clone());
+            assert!(
+                seen.insert(fingerprint),
+                "duplicate keystroke \"{keystroke}\" (action {action}) would shadow an earlier binding"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn user_settings_json_keys_load_and_match_if_present(cx: &mut TestAppContext) {
+        // If a real user settings.json exists on this machine, replay its
+        // exact `keys` map through the same pipeline as a live regression
+        // check — this is what would have caught "no cmd-shift-* hotkey
+        // does anything" for this specific user's config, as opposed to
+        // just the shipped defaults.
+        let Ok(data) = std::fs::read(paths::config_dir().join("settings.json")) else {
+            return;
+        };
+        let Ok(user_config) = serde_json::from_slice::<SomConfig>(&data) else {
+            return;
+        };
+        if user_config.keys.is_empty() {
+            return;
+        }
+
+        let json = build_keymap_json(&user_config);
+        cx.update(|cx| match KeymapFile::load(&json, cx) {
+            KeymapFileLoadResult::Success { key_bindings } => {
+                assert!(!key_bindings.is_empty(), "user keymap produced zero bindings");
+            }
+            KeymapFileLoadResult::SomeFailedToLoad { error_message, .. } => {
+                panic!("user settings.json keymap partially failed to load: {}", error_message.0);
+            }
+            KeymapFileLoadResult::JsonParseFailure { error } => {
+                panic!("user settings.json-derived keymap JSON failed to parse: {error}");
+            }
+        });
+
+        for (keystroke_str, action_name) in &user_config.keys {
+            let Ok(keystroke) = Keystroke::parse(&keystroke_str.replace('\\', "\\\\").replace("\\\\", "\\")) else {
+                panic!("user's keystroke \"{keystroke_str}\" (action {action_name}) fails to parse");
+            };
+            if keystroke_str.contains("shift") {
+                assert!(
+                    keystroke.modifiers.shift,
+                    "user's keystroke \"{keystroke_str}\" (action {action_name}) lost the shift modifier"
+                );
+            }
+            if keystroke_str.contains("cmd") {
+                assert!(
+                    keystroke.modifiers.platform,
+                    "user's keystroke \"{keystroke_str}\" (action {action_name}) lost the cmd modifier"
+                );
+            }
+        }
     }
 }

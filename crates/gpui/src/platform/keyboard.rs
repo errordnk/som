@@ -21,6 +21,16 @@ pub trait PlatformKeyboardMapper {
     /// Get the key equivalents for the current keyboard layout,
     /// only used on macOS
     fn get_key_equivalents(&self) -> Option<&HashMap<char, char>>;
+    /// Translate a physical key (identified by its layout-independent USB
+    /// HID Usage ID, as reported in `Keystroke.physical_key`) to the
+    /// character it currently produces under the active keyboard layout,
+    /// without requiring an actual keypress — e.g. for drawing an on-screen
+    /// keyboard whose labels must update the instant the layout changes.
+    /// Returns `None` for keys with no printed character (arrows, function
+    /// keys, modifiers, ...) or if this platform doesn't support the query.
+    fn key_for_physical(&self, _usb_hid_usage: u32, _shift: bool) -> Option<String> {
+        None
+    }
 }
 
 /// A dummy implementation of the platform keyboard mapper

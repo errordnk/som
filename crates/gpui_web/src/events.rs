@@ -343,6 +343,7 @@ impl WebWindowInner {
             this.dispatch_input(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                ..Default::default()
             }));
 
             let key = dom_key_to_gpui_key(&event);
@@ -360,6 +361,7 @@ impl WebWindowInner {
                 modifiers,
                 key,
                 key_char: key_char.clone(),
+                ..Default::default()
             };
 
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
@@ -405,6 +407,7 @@ impl WebWindowInner {
             this.dispatch_input(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                ..Default::default()
             }));
 
             let key = dom_key_to_gpui_key(&event);
@@ -421,6 +424,7 @@ impl WebWindowInner {
                 modifiers,
                 key,
                 key_char,
+                ..Default::default()
             };
 
             this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
@@ -571,6 +575,7 @@ fn modifiers_from_keyboard_event(event: &web_sys::KeyboardEvent, _is_mac: bool) 
         shift: event.shift_key(),
         platform: event.meta_key(),
         function: false,
+        ..Default::default()
     }
 }
 
@@ -582,6 +587,7 @@ fn modifiers_from_mouse_event(event: &web_sys::PointerEvent, _is_mac: bool) -> M
         shift: mouse_event.shift_key(),
         platform: mouse_event.meta_key(),
         function: false,
+        ..Default::default()
     }
 }
 
@@ -592,6 +598,7 @@ fn modifiers_from_wheel_event(event: &web_sys::MouseEvent, _is_mac: bool) -> Mod
         shift: event.shift_key(),
         platform: event.meta_key(),
         function: false,
+        ..Default::default()
     }
 }
 

@@ -1,8 +1,8 @@
 use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
-    NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    NavigationDirection, Numlock, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
+    ScrollWheelEvent, Side, TouchPhase, point, px,
 };
 
 use crate::{
@@ -82,6 +82,18 @@ pub fn key_to_native(key: &str) -> Cow<'_, str> {
     Cow::Owned(String::from_utf16(&[code]).unwrap())
 }
 
+/// Maps the `NSEvent.keyCode` carried by an `NSFlagsChanged` event to which
+/// physical instance (left/right) of that modifier key changed state.
+/// These virtual key codes are fixed by the ANSI/ISO/JIS USB HID keyboard
+/// usage tables and don't vary by keyboard layout.
+fn side_for_flags_changed_key_code(key_code: CGKeyCode) -> Option<Side> {
+    match key_code {
+        56 | 59 | 58 | 55 => Some(Side::Left),   // Shift, Control, Option, Command
+        60 | 62 | 61 | 54 => Some(Side::Right),  // RightShift, RightControl, RightOption, RightCommand
+        _ => None,
+    }
+}
+
 unsafe fn read_modifiers(native_event: id) -> Modifiers {
     unsafe {
         let modifiers = native_event.modifierFlags();
@@ -97,6 +109,7 @@ unsafe fn read_modifiers(native_event: id) -> Modifiers {
             shift,
             platform: command,
             function,
+            ..Default::default()
         }
     }
 }
@@ -119,13 +132,18 @@ pub(crate) unsafe fn platform_input_from_native(
 
         match event_type {
             NSEventType::NSFlagsChanged => {
+                let mut modifiers = read_modifiers(native_event);
+                modifiers.side = side_for_flags_changed_key_code(native_event.keyCode());
                 Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                    modifiers: read_modifiers(native_event),
+                    modifiers,
                     capslock: Capslock {
                         on: native_event
                             .modifierFlags()
                             .contains(NSEventModifierFlags::NSAlphaShiftKeyMask),
                     },
+                    // macOS numeric keypads have a non-toggling "Clear" key,
+                    // not a numlock toggle — always off.
+                    numlock: Numlock::default(),
                 }))
             }
             NSEventType::NSKeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {
@@ -489,11 +507,201 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                 shift,
                 platform: command,
                 function,
+                ..Default::default()
             },
             key,
             key_char,
+            is_numpad: is_numpad_key_code(native_event.keyCode()),
+            physical_key: macos_key_code_to_usb_hid_usage(native_event.keyCode()),
         }
     }
+}
+
+/// Maps a macOS ADB/USB virtual key code (`NSEvent.keyCode`) to its USB HID
+/// Usage ID (Usage Page 0x07, Keyboard/Keypad) — the layout-independent
+/// physical key identity. This mapping is fixed by Apple's ADB->USB HID
+/// translation table and is the same across every Mac keyboard layout.
+/// Covers the keys used by `som-key`'s drawn layout; returns `None` for
+/// anything not in that table rather than guessing.
+fn macos_key_code_to_usb_hid_usage(key_code: CGKeyCode) -> Option<u32> {
+    Some(match key_code {
+        0 => 0x04,  // A
+        11 => 0x05, // B
+        8 => 0x06,  // C
+        2 => 0x07,  // D
+        14 => 0x08, // E
+        3 => 0x09,  // F
+        5 => 0x0A,  // G
+        4 => 0x0B,  // H
+        34 => 0x0C, // I
+        38 => 0x0D, // J
+        40 => 0x0E, // K
+        37 => 0x0F, // L
+        46 => 0x10, // M
+        45 => 0x11, // N
+        31 => 0x12, // O
+        35 => 0x13, // P
+        12 => 0x14, // Q
+        15 => 0x15, // R
+        1 => 0x16,  // S
+        17 => 0x17, // T
+        32 => 0x18, // U
+        9 => 0x19,  // V
+        13 => 0x1A, // W
+        7 => 0x1B,  // X
+        16 => 0x1C, // Y
+        6 => 0x1D,  // Z
+        18 => 0x1E, // 1
+        19 => 0x1F, // 2
+        20 => 0x20, // 3
+        21 => 0x21, // 4
+        23 => 0x22, // 5
+        22 => 0x23, // 6
+        26 => 0x24, // 7
+        28 => 0x25, // 8
+        25 => 0x26, // 9
+        29 => 0x27, // 0
+        36 => 0x28, // Return
+        53 => 0x29, // Escape
+        51 => 0x2A, // Backspace/Delete
+        48 => 0x2B, // Tab
+        49 => 0x2C, // Space
+        27 => 0x2D, // -
+        24 => 0x2E, // =
+        33 => 0x2F, // [
+        30 => 0x30, // ]
+        42 => 0x31, // \
+        41 => 0x33, // ;
+        39 => 0x34, // '
+        50 => 0x35, // ` (grave)
+        43 => 0x36, // ,
+        47 => 0x37, // .
+        44 => 0x38, // /
+        57 => 0x39, // Caps Lock
+        122 => 0x3A, // F1
+        120 => 0x3B, // F2
+        99 => 0x3C,  // F3
+        118 => 0x3D, // F4
+        96 => 0x3E,  // F5
+        97 => 0x3F,  // F6
+        98 => 0x40,  // F7
+        100 => 0x41, // F8
+        101 => 0x42, // F9
+        109 => 0x43, // F10
+        103 => 0x44, // F11
+        111 => 0x45, // F12
+        105 => 0x46, // F13 / Print Screen
+        107 => 0x47, // F14 / Scroll Lock
+        113 => 0x48, // F15 / Pause
+        114 => 0x49, // Insert / Help
+        115 => 0x4A, // Home
+        116 => 0x4B, // Page Up
+        117 => 0x4C, // Forward Delete
+        119 => 0x4D, // End
+        121 => 0x4E, // Page Down
+        124 => 0x4F, // Right Arrow
+        123 => 0x50, // Left Arrow
+        125 => 0x51, // Down Arrow
+        126 => 0x52, // Up Arrow
+        71 => 0x53,  // Num Lock / Clear
+        75 => 0x54,  // Keypad /
+        67 => 0x55,  // Keypad *
+        78 => 0x56,  // Keypad -
+        69 => 0x57,  // Keypad +
+        76 => 0x58,  // Keypad Enter
+        83 => 0x59,  // Keypad 1
+        84 => 0x5A,  // Keypad 2
+        85 => 0x5B,  // Keypad 3
+        86 => 0x5C,  // Keypad 4
+        87 => 0x5D,  // Keypad 5
+        88 => 0x5E,  // Keypad 6
+        89 => 0x5F,  // Keypad 7
+        91 => 0x60,  // Keypad 8
+        92 => 0x61,  // Keypad 9
+        82 => 0x62,  // Keypad 0
+        65 => 0x63,  // Keypad .
+        59 => 0xE0,  // Left Control
+        58 => 0xE2,  // Left Option/Alt
+        55 => 0xE3,  // Left Command
+        56 => 0xE1,  // Left Shift
+        60 => 0xE5,  // Right Shift
+        61 => 0xE6,  // Right Option/Alt
+        62 => 0xE4,  // Right Control
+        54 => 0xE7,  // Right Command
+        63 => 0x03,  // fn (not a standard HID usage; Apple-specific, reusing 0x03 which is Reserved)
+        _ => return None,
+    })
+}
+
+/// The inverse of `macos_key_code_to_usb_hid_usage`, restricted to the keys
+/// with a layout-dependent printed character (letters, numbers, symbols) —
+/// used to translate a physical key back to an ADB key code so its current
+/// character can be looked up via `UCKeyTranslate` without an actual
+/// keypress. Modifier/nav/function keys aren't included since they have no
+/// such character.
+pub(crate) fn usb_hid_usage_to_macos_key_code(usb_hid: u32) -> Option<CGKeyCode> {
+    Some(match usb_hid {
+        0x04 => 0,  // A
+        0x05 => 11, // B
+        0x06 => 8,  // C
+        0x07 => 2,  // D
+        0x08 => 14, // E
+        0x09 => 3,  // F
+        0x0A => 5,  // G
+        0x0B => 4,  // H
+        0x0C => 34, // I
+        0x0D => 38, // J
+        0x0E => 40, // K
+        0x0F => 37, // L
+        0x10 => 46, // M
+        0x11 => 45, // N
+        0x12 => 31, // O
+        0x13 => 35, // P
+        0x14 => 12, // Q
+        0x15 => 15, // R
+        0x16 => 1,  // S
+        0x17 => 17, // T
+        0x18 => 32, // U
+        0x19 => 9,  // V
+        0x1A => 13, // W
+        0x1B => 7,  // X
+        0x1C => 16, // Y
+        0x1D => 6,  // Z
+        0x1E => 18, // 1
+        0x1F => 19, // 2
+        0x20 => 20, // 3
+        0x21 => 21, // 4
+        0x22 => 23, // 5
+        0x23 => 22, // 6
+        0x24 => 26, // 7
+        0x25 => 28, // 8
+        0x26 => 25, // 9
+        0x27 => 29, // 0
+        0x2D => 27, // -
+        0x2E => 24, // =
+        0x2F => 33, // [
+        0x30 => 30, // ]
+        0x31 => 42, // \
+        0x33 => 41, // ;
+        0x34 => 39, // '
+        0x35 => 50, // ` (grave)
+        0x36 => 43, // ,
+        0x37 => 47, // .
+        0x38 => 44, // /
+        _ => return None,
+    })
+}
+
+/// Whether a `NSEvent.keyCode` belongs to the numeric keypad. These virtual
+/// key codes are fixed by the ANSI/ISO/JIS USB HID keyboard usage tables
+/// and don't vary by keyboard layout. A numpad "1" and a top-row "1"
+/// produce the same `characters`/`charactersIgnoringModifiers`, so `key`
+/// alone can't tell them apart — this is the only signal that can.
+fn is_numpad_key_code(key_code: CGKeyCode) -> bool {
+    matches!(
+        key_code,
+        65 | 67 | 69 | 71 | 75 | 76 | 78 | 81 | 82 | 83 | 84 | 85 | 86 | 87 | 88 | 89 | 91 | 92
+    )
 }
 
 fn always_use_command_layout() -> bool {
@@ -504,12 +712,12 @@ fn always_use_command_layout() -> bool {
     chars_for_modified_key(0, CMD_MOD).is_ascii()
 }
 
-const NO_MOD: u32 = 0;
+pub(crate) const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
-const SHIFT_MOD: u32 = 2;
+pub(crate) const SHIFT_MOD: u32 = 2;
 const OPTION_MOD: u32 = 8;
 
-fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
+pub(crate) fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
     // shifted >> 8 for UCKeyTranslate
     const CG_SPACE_KEY: u16 = 49;

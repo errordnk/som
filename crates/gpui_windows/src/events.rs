@@ -1377,10 +1377,11 @@ where
     F: FnOnce(Keystroke, bool) -> PlatformInput,
 {
     let virtual_key = VIRTUAL_KEY(wparam.loword());
-    let modifiers = current_modifiers();
+    let mut modifiers = current_modifiers();
 
     match virtual_key {
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN => {
+            modifiers.side = side_for_modifier_key(virtual_key, lparam);
             if state
                 .last_reported_modifiers
                 .get()
@@ -1808,6 +1809,43 @@ fn is_virtual_key_pressed(vkey: VIRTUAL_KEY) -> bool {
 }
 
 #[inline]
+/// Which physical Ctrl/Shift/Alt/Win produced this key event. `VK_LWIN`/
+/// `VK_RWIN` already arrive as side-specific virtual keys, so those need no
+/// extra work. `VK_SHIFT`/`VK_CONTROL`/`VK_MENU` arrive as the *generic*
+/// virtual key (Windows never sends `VK_LSHIFT`/`VK_RSHIFT` etc. as
+/// `wparam`'s low word) — the side has to be recovered from `lparam`
+/// instead.
+///
+/// Shift's left/right scan codes actually differ (0x2A vs 0x36), so
+/// `MapVirtualKeyW(scan_code, MAPVK_VSC_TO_VK_EX)` resolves it correctly.
+/// Control and Alt do NOT work this way: both sides share the exact same
+/// scan code (0x1D for Control, 0x38 for Alt) — the side is instead
+/// encoded in `lparam`'s bit 24, the "extended key" flag (0 = left, 1 =
+/// right), which `MapVirtualKeyW` has no way to consult on its own. Using
+/// `MAPVK_VSC_TO_VK_EX` for Control/Alt would silently always resolve to
+/// the *left* variant, which is exactly the bug this replaced: right Alt
+/// and right Ctrl both lit up the left indicator in `som-key`.
+fn side_for_modifier_key(virtual_key: VIRTUAL_KEY, lparam: LPARAM) -> Option<Side> {
+    const EXTENDED_KEY_FLAG: u32 = 1 << 24;
+    let is_extended = (lparam.0 as u32 & EXTENDED_KEY_FLAG) != 0;
+
+    match virtual_key {
+        VK_LWIN | VK_LMENU => Some(Side::Left),
+        VK_RWIN | VK_RMENU => Some(Side::Right),
+        VK_CONTROL | VK_MENU => Some(if is_extended { Side::Right } else { Side::Left }),
+        VK_SHIFT => {
+            let scan_code = (lparam.0 as u32 >> 16) & 0xFF;
+            let side_specific = unsafe { MapVirtualKeyW(scan_code, MAPVK_VSC_TO_VK_EX) };
+            match VIRTUAL_KEY(side_specific as u16) {
+                VK_LSHIFT => Some(Side::Left),
+                VK_RSHIFT => Some(Side::Right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn current_modifiers() -> Modifiers {
     Modifiers {
         control: is_virtual_key_pressed(VK_CONTROL),
@@ -1845,6 +1883,95 @@ fn get_frame_thicknessy(dpi: u32) -> i32 {
     let resize_frame_thickness = unsafe { GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) };
     let padding_thickness = unsafe { GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) };
     resize_frame_thickness + padding_thickness
+}
+
+#[cfg(test)]
+mod side_for_modifier_key_tests {
+    use super::{
+        LPARAM, Side, VK_CONTROL, VK_LMENU, VK_LWIN, VK_MENU, VK_RMENU, VK_RWIN, VK_SHIFT,
+        side_for_modifier_key,
+    };
+
+    const EXTENDED_KEY_FLAG: u32 = 1 << 24;
+
+    /// Builds the `lparam` `handle_key_event` would receive for a key event
+    /// whose scan code is `scan_code`, matching the bit layout Windows uses
+    /// for `WM_KEYDOWN`/`WM_KEYUP` (scan code in bits 16-23), optionally
+    /// with the extended-key flag (bit 24) set — the only signal that
+    /// distinguishes right Ctrl/Alt from left, since both sides share the
+    /// same scan code (unlike Shift, whose sides have distinct scan codes).
+    fn lparam_for_scan_code(scan_code: u32, extended: bool) -> LPARAM {
+        let mut bits = (scan_code & 0xFF) << 16;
+        if extended {
+            bits |= EXTENDED_KEY_FLAG;
+        }
+        LPARAM(bits as isize)
+    }
+
+    #[test]
+    fn left_and_right_win_are_side_specific_without_consulting_lparam() {
+        // VK_LWIN/VK_RWIN already arrive as side-specific virtual keys, so
+        // any lparam (even a garbage scan code) must not affect the result.
+        assert_eq!(side_for_modifier_key(VK_LWIN, LPARAM(0)), Some(Side::Left));
+        assert_eq!(side_for_modifier_key(VK_RWIN, LPARAM(0)), Some(Side::Right));
+    }
+
+    #[test]
+    fn left_and_right_menu_are_side_specific_without_consulting_lparam() {
+        assert_eq!(side_for_modifier_key(VK_LMENU, LPARAM(0)), Some(Side::Left));
+        assert_eq!(side_for_modifier_key(VK_RMENU, LPARAM(0)), Some(Side::Right));
+    }
+
+    #[test]
+    fn generic_shift_resolves_side_from_scan_code() {
+        // 0x2A = left shift, 0x36 = right shift on every standard PC scan
+        // code set (Set 1) — these are fixed hardware scan codes, not
+        // layout-dependent, so this holds regardless of the active
+        // keyboard layout on the machine running the test.
+        assert_eq!(
+            side_for_modifier_key(VK_SHIFT, lparam_for_scan_code(0x2A, false)),
+            Some(Side::Left)
+        );
+        assert_eq!(
+            side_for_modifier_key(VK_SHIFT, lparam_for_scan_code(0x36, false)),
+            Some(Side::Right)
+        );
+    }
+
+    #[test]
+    fn generic_control_resolves_side_from_the_extended_key_flag() {
+        // Both sides of Control share scan code 0x1D — only the
+        // extended-key flag (bit 24) tells them apart. This is the bug
+        // this function was rewritten to fix: using MapVirtualKeyW's
+        // MAPVK_VSC_TO_VK_EX on a bare scan code always resolved to the
+        // left variant, so right Ctrl lit up the left indicator.
+        assert_eq!(
+            side_for_modifier_key(VK_CONTROL, lparam_for_scan_code(0x1D, false)),
+            Some(Side::Left)
+        );
+        assert_eq!(
+            side_for_modifier_key(VK_CONTROL, lparam_for_scan_code(0x1D, true)),
+            Some(Side::Right)
+        );
+    }
+
+    #[test]
+    fn generic_menu_resolves_side_from_the_extended_key_flag() {
+        // Same story as Control: both sides of Alt share scan code 0x38.
+        assert_eq!(
+            side_for_modifier_key(VK_MENU, lparam_for_scan_code(0x38, false)),
+            Some(Side::Left)
+        );
+        assert_eq!(
+            side_for_modifier_key(VK_MENU, lparam_for_scan_code(0x38, true)),
+            Some(Side::Right)
+        );
+    }
+
+    #[test]
+    fn unrelated_scan_code_yields_no_side() {
+        assert_eq!(side_for_modifier_key(VK_SHIFT, lparam_for_scan_code(0x00, false)), None);
+    }
 }
 
 fn notify_frame_changed(handle: HWND) {

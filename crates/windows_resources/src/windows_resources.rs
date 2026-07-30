@@ -38,13 +38,26 @@ fn product_version() -> String {
     format!("{pkg_version}+{metadata}")
 }
 
-const ICON_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zed/resources/windows");
 const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/manifest.xml");
 
+const ZED_ICON_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../zed/resources/windows/app-icon.ico");
+
 pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (icon_filename, product_name) = ("app-icon.ico", "Som");
-    let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
-    let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");
+    compile_with_icon(manifest, std::path::Path::new(ZED_ICON_PATH), "Som")
+}
+
+/// Like `compile`, but for a binary other than Som itself — `icon_path`
+/// must be an absolute path (build a caller-relative one with
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "/...")` from the calling
+/// crate's own `build.rs`, since `CARGO_MANIFEST_DIR` resolves to
+/// *this* crate's directory if read from here instead).
+pub fn compile_with_icon(
+    manifest: bool,
+    icon_path: &std::path::Path,
+    product_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let icon_escaped = icon_path.to_string_lossy().replace('\\', "\\\\");
 
     let manifest_line = if manifest {
         let escaped = MANIFEST_PATH.replace('\\', "\\\\");

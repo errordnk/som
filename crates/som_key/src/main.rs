@@ -262,10 +262,11 @@ fn bottom_row() -> Vec<KeyCell> {
         modifier("ctrl", ModifierKind::Control, Side::Left, 1.3),
         modifier("win", ModifierKind::Platform, Side::Left, 1.3),
         modifier("alt", ModifierKind::Alt, Side::Left, 1.3),
-        wkey("space", "space", 5.6),
-        modifier("alt", ModifierKind::Alt, Side::Right, 1.3),
-        modifier("win", ModifierKind::Platform, Side::Right, 1.3),
-        modifier("ctrl", ModifierKind::Control, Side::Right, 1.3),
+        wkey("space", "space", 6.0),
+        modifier("alt", ModifierKind::Alt, Side::Right, 1.275),
+        modifier("fn", ModifierKind::Function, Side::Right, 1.275),
+        modifier("win", ModifierKind::Platform, Side::Right, 1.275),
+        modifier("ctrl", ModifierKind::Control, Side::Right, 1.275),
     ]
 }
 
@@ -487,6 +488,14 @@ impl SomKey {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Without this, Alt-held combinations are reported as "not
+        // consumed" all the way back to the platform layer, and on
+        // Windows an unhandled WM_SYSKEYDOWN falls through to
+        // DefWindowProc, which plays the system error beep — since
+        // som-key is a standalone diagnostic tool with no other key
+        // handler competing for these events, it's always correct to
+        // claim every keypress.
+        cx.stop_propagation();
         let ks = &event.keystroke;
         self.active_modifiers = ks.modifiers;
         if let Some(id) = Self::canonical_key_id(ks) {
@@ -575,7 +584,11 @@ impl SomKey {
     fn on_layout_changed(&mut self, cx: &App) {
         self.dynamic_labels.clear();
         let mapper = cx.keyboard_mapper();
-        let is_russian = cx.keyboard_layout().id().contains("Russian");
+        // `id()` is a stable-but-opaque identifier (e.g. a Windows KLID
+        // hex string, or a macOS input-source id that isn't always
+        // English) — the human-readable `name()` is what actually
+        // contains "Russian" across platforms.
+        let is_russian = cx.keyboard_layout().name().contains("Russian");
         for &usb_hid in KNOWN_PHYSICAL_KEYS {
             // The backslash-position key (USB HID 0x31) has no consistent
             // cross-platform answer under a Russian layout: Windows ЙЦУКЕН
@@ -883,8 +896,19 @@ const DIM: u32 = 0x4c566a;
 /// log's "what's held" reads consistently with the keyboard itself.
 const HELD: u32 = 0x88c0d0;
 
-/// One log row: SHIFT CTRL ALT CMD (cyan when held for this keypress, dim
-/// otherwise), then the key name and its scan code — see `LogRow`.
+/// The platform modifier's name in the log columns — matches the label
+/// `bottom_row` draws on the key itself for the same modifier (command on
+/// macOS, win on Windows, super elsewhere).
+#[cfg(target_os = "macos")]
+const PLATFORM_MODIFIER_LABEL: &str = "CMD";
+#[cfg(target_os = "windows")]
+const PLATFORM_MODIFIER_LABEL: &str = "WIN";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const PLATFORM_MODIFIER_LABEL: &str = "SUPER";
+
+/// One log row: SHIFT CTRL ALT <platform modifier> (cyan when held for this
+/// keypress, dim otherwise), then the key name and its scan code — see
+/// `LogRow`.
 fn render_log_row(row: &LogRow) -> impl IntoElement {
     div()
         .flex()
@@ -892,7 +916,7 @@ fn render_log_row(row: &LogRow) -> impl IntoElement {
         .child(div().w(px(48.0)).text_color(if row.shift { rgb(HELD) } else { rgb(DIM) }).child("SHIFT"))
         .child(div().w(px(40.0)).text_color(if row.ctrl { rgb(HELD) } else { rgb(DIM) }).child("CTRL"))
         .child(div().w(px(36.0)).text_color(if row.alt { rgb(HELD) } else { rgb(DIM) }).child("ALT"))
-        .child(div().w(px(40.0)).text_color(if row.cmd { rgb(HELD) } else { rgb(DIM) }).child("CMD"))
+        .child(div().w(px(48.0)).text_color(if row.cmd { rgb(HELD) } else { rgb(DIM) }).child(PLATFORM_MODIFIER_LABEL))
         .child(
             div().w(px(120.0)).text_color(rgb(BRIGHT)).child(if row.key_name.is_empty() {
                 "<empty>".to_string()

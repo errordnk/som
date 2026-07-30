@@ -10,6 +10,33 @@ use windows::Win32::UI::{
     WindowsAndMessaging::KL_NAMELENGTH,
 };
 
+/// The inverse of `windows_vkey_to_usb_hid_usage` (see `events.rs`) for the
+/// subset of keys with a layout-dependent printed character — letters,
+/// digits, and the OEM symbol keys. Used by `key_for_physical` to answer
+/// "what does this physical key print under the *current* layout" without
+/// requiring an actual keypress, which is what lets `som-key` redraw every
+/// key's label the instant the layout changes instead of only after the
+/// user has pressed it again.
+fn usb_hid_usage_to_windows_vkey(usb_hid_usage: u32) -> Option<VIRTUAL_KEY> {
+    Some(match usb_hid_usage {
+        0x04..=0x1D => VIRTUAL_KEY(0x41 + (usb_hid_usage - 0x04) as u16), // A-Z
+        0x1E..=0x26 => VIRTUAL_KEY(0x31 + (usb_hid_usage - 0x1E) as u16), // 1-9
+        0x27 => VK_0,
+        0x2D => VK_OEM_MINUS,
+        0x2E => VK_OEM_PLUS,
+        0x2F => VK_OEM_4, // [
+        0x30 => VK_OEM_6, // ]
+        0x31 => VK_OEM_5, // backslash
+        0x33 => VK_OEM_1, // ;
+        0x34 => VK_OEM_7, // '
+        0x35 => VK_OEM_3, // ` grave
+        0x36 => VK_OEM_COMMA,
+        0x37 => VK_OEM_PERIOD,
+        0x38 => VK_OEM_2, // /
+        _ => return None,
+    })
+}
+
 use gpui::{
     KeybindingKeystroke, Keystroke, Modifiers, PlatformKeyboardLayout, PlatformKeyboardMapper,
 };
@@ -87,6 +114,15 @@ impl PlatformKeyboardMapper for WindowsKeyboardMapper {
 
     fn get_key_equivalents(&self) -> Option<&HashMap<char, char>> {
         None
+    }
+
+    fn key_for_physical(&self, usb_hid_usage: u32, shift: bool) -> Option<String> {
+        let vkey = usb_hid_usage_to_windows_vkey(usb_hid_usage)?;
+        let scan_code = unsafe { MapVirtualKeyW(vkey.0 as u32, MAPVK_VK_TO_VSC) };
+        if scan_code == 0 {
+            return None;
+        }
+        generate_key_char(vkey, scan_code, false, shift, false)
     }
 }
 

@@ -1528,8 +1528,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 state.modifiers = modifiers_from_xkb(keymap_state);
                 let keymap_state = state.keymap_state.as_mut().unwrap();
-                state.capslock = capslock_from_xkb(keymap_state);
-                state.numlock = numlock_from_xkb(keymap_state);
+                let capslock = capslock_from_xkb(keymap_state);
+                let numlock = numlock_from_xkb(keymap_state);
+                state.capslock = capslock;
+                state.numlock = numlock;
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,

@@ -17,13 +17,29 @@ use gpui::{
 };
 use gpui_platform::application;
 use std::collections::HashSet;
+use std::time::Duration;
+
+/// How long a toggle key (CapsLock/NumLock/ScrollLock) stays visually
+/// "pressed" after each press that flips its toggle state — whether that
+/// flips the LED on OR off. Windows (and other platforms) only ever
+/// report ONE `ModifiersChangedEvent` per physical press of these keys,
+/// never a matching key-up when the key is physically released, since the
+/// toggle state doesn't change again until the *next* press. There is no
+/// reliable cross-platform signal for "this toggle key was just
+/// released," so this flashes the key briefly instead of trying to track
+/// true press/release for it. The LED indicator (see
+/// `render_lock_indicators`) shows the actual persistent on/off state;
+/// this flash is purely "a keypress just happened here," independent of
+/// which direction the toggle moved.
+const TOGGLE_KEY_FLASH_DURATION: Duration = Duration::from_millis(150);
 
 /// Which physical keyboard form factor to draw. Selected via a command-line
 /// argument (`--60`, `--80`/`--tkl`, `--100`/`--full`) since macOS doesn't
 /// hand out a way to ask "what keyboard is this" without an Input
 /// Monitoring permission prompt tied to IOHIDManager — not worth the
-/// friction for a diagnostic tool. Defaults to TKL/80%, the most common
-/// desk keyboard size.
+/// friction for a diagnostic tool. Defaults to Full100 (with the numpad)
+/// so the tool is immediately useful for numpad-specific keys without
+/// requiring a flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum KeyboardProfile {
     Compact60,
@@ -40,7 +56,7 @@ fn keyboard_profile_from_args() -> KeyboardProfile {
             _ => {}
         }
     }
-    KeyboardProfile::Tkl80
+    KeyboardProfile::Full100
 }
 
 /// Identifies one physical key on the drawn layout.
@@ -129,14 +145,6 @@ fn ukey_w(label: &'static str, usb_hid: u32, width: f32) -> KeyCell {
 /// don't agree on a `key` string for it) but whose label never changes.
 fn ukey_static(label: &'static str, usb_hid: u32) -> KeyCell {
     KeyCell { label, id: KeyId::PhysicalStatic(usb_hid), width: 1.0, small_text: label.len() > 4 }
-}
-
-fn npkey(label: &'static str, key: &'static str) -> KeyCell {
-    KeyCell { label, id: KeyId::Numpad(key), width: 1.0, small_text: false }
-}
-
-fn npkey_w(label: &'static str, key: &'static str, width: f32) -> KeyCell {
-    KeyCell { label, id: KeyId::Numpad(key), width, small_text: false }
 }
 
 fn modifier(label: &'static str, kind: ModifierKind, side: Side, width: f32) -> KeyCell {
@@ -320,9 +328,11 @@ fn arrow_cluster_rows() -> Vec<Vec<Option<KeyCell>>> {
 #[cfg(target_os = "macos")]
 const NUMPAD_LOCK_LABEL: &str = "clear";
 #[cfg(not(target_os = "macos"))]
-const NUMPAD_LOCK_LABEL: &str = "num lock";
+const NUMPAD_LOCK_LABEL: &str = "numlk";
 
-const MAX_LOG_LINES: usize = 12;
+/// Total rows kept across all `LOG_COLUMNS` log columns (see `render_log`)
+/// — 10 rows per column, so this must stay a multiple of `LOG_COLUMNS`.
+const MAX_LOG_LINES: usize = 30;
 
 /// Every `KeyId::Char` variant that appears anywhere in the drawn layout —
 /// i.e. keys with no layout-dependent printed form, so matching by the raw
@@ -422,6 +432,7 @@ struct SomKey {
     pressed_modifiers: HashSet<(ModifierKind, Side)>,
     numlock_on: bool,
     capslock_on: bool,
+    scrolllock_on: bool,
     /// Set once at startup from the command line — see
     /// `keyboard_profile_from_args`.
     profile: KeyboardProfile,
@@ -449,6 +460,7 @@ impl SomKey {
             pressed_modifiers: HashSet::new(),
             numlock_on: false,
             capslock_on: false,
+            scrolllock_on: false,
             dynamic_labels: std::collections::HashMap::new(),
         }
     }
@@ -568,9 +580,39 @@ impl SomKey {
         }
 
         self.active_modifiers = m;
+        // Windows reports a ModifiersChangedEvent for these keys on every
+        // physical press that flips the toggle — whether that flips it to
+        // on OR off — so the flash has to fire on any change, not just
+        // the on-transition, or every other press (the ones that toggle
+        // the LED off) would silently produce no visual feedback at all.
+        for (id, was_on, now_on) in [
+            (KeyId::Char("capslock"), self.capslock_on, event.capslock.on),
+            (KeyId::Numpad("numlock"), self.numlock_on, event.numlock.on),
+            (KeyId::PhysicalStatic(0x47), self.scrolllock_on, event.scrolllock.on),
+        ] {
+            if was_on != now_on {
+                self.flash_toggle_key(id, cx);
+            }
+        }
         self.numlock_on = event.numlock.on;
         self.capslock_on = event.capslock.on;
+        self.scrolllock_on = event.scrolllock.on;
         cx.notify();
+    }
+
+    /// Briefly lights up a toggle key (see `TOGGLE_KEY_FLASH_DURATION`'s
+    /// docs for why this exists instead of tracking true press/release).
+    fn flash_toggle_key(&mut self, id: KeyId, cx: &mut Context<Self>) {
+        self.pressed_keys.insert(id);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOGGLE_KEY_FLASH_DURATION).await;
+            this.update(cx, |this, cx| {
+                this.pressed_keys.remove(&id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The active keyboard layout changed — every remembered character is
@@ -616,11 +658,6 @@ impl SomKey {
 
     fn is_pressed(&self, id: KeyId) -> bool {
         match id {
-            // CapsLock is a toggle, not a held key — macOS (and other
-            // platforms) report it exclusively through `ModifiersChangedEvent`,
-            // never `key_down`/`key_up`, so `pressed_keys` never gets an
-            // entry for it. Light it up whenever the toggle is on instead.
-            KeyId::Char("capslock") => self.capslock_on,
             KeyId::Char(_) | KeyId::Numpad(_) | KeyId::Physical(_) | KeyId::PhysicalStatic(_) => {
                 self.pressed_keys.contains(&id)
             }
@@ -747,10 +784,110 @@ fn render_arrow_cluster(state: &SomKey) -> impl IntoElement {
         }))
 }
 
-fn render_tall_key(label: &'static str, pressed: bool) -> impl IntoElement {
+/// Draws one LED indicator dot + label, matching the "Indicator Lights"
+/// row above a full-size keyboard's numpad (num lock / caps lock / scroll
+/// lock) — lit green when on, dim gray otherwise.
+fn render_lock_indicator(label: &'static str, on: bool) -> impl IntoElement {
     div()
-        .w(px(KEY_UNIT))
-        .h(px(2.0 * KEY_UNIT + KEY_GAP))
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .size(px(8.0))
+                .rounded_full()
+                .when(on, |el| el.bg(rgb(0xa3be8c)))
+                .when(!on, |el| el.bg(rgb(0x4c566a))),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(if on { rgb(0xeceff4) } else { rgb(0x4c566a) })
+                .child(label),
+        )
+}
+
+/// Total width of `render_numpad`'s output: a true 4-column CSS grid
+/// (`+`/`enter` are placed *inside* this same 4-column grid via
+/// `col_span`/`row_span`, not in a 5th column next to it — this constant
+/// was previously computed as if there were a separate operator column,
+/// which overcounted the width by one extra `KEY_UNIT + KEY_GAP` and was
+/// what threw off `KEYBOARD_TOTAL_WIDTH` below).
+const NUMPAD_WIDTH: f32 = 4.0 * KEY_UNIT + 3.0 * KEY_GAP;
+
+/// Width of `render_function_row`'s output: esc (1) + 3 groups of 4 F-keys
+/// + F13 (1), 16px between groups instead of `KEY_GAP` within them — this
+/// is the widest row in `main_block` (wider than `number_row`'s 13 unit
+/// keys + 1 double-width backspace), so it sets `main_block`'s width.
+const FUNCTION_ROW_WIDTH: f32 = KEY_UNIT // esc
+    + 16.0
+    + 4.0 * KEY_UNIT + 3.0 * KEY_GAP // F1-F4
+    + 16.0
+    + 4.0 * KEY_UNIT + 3.0 * KEY_GAP // F5-F8
+    + 16.0
+    + 4.0 * KEY_UNIT + 3.0 * KEY_GAP // F9-F12
+    + 16.0
+    + KEY_UNIT; // F13
+
+/// Width of `system_row` + nav cluster + arrow cluster: 3 unit-width keys
+/// in a row.
+const NAV_ARROW_WIDTH: f32 = 3.0 * KEY_UNIT + 2.0 * KEY_GAP;
+
+/// The gap `Render::render` puts between `main_block`, the nav/arrow
+/// block, and the numpad block.
+const BLOCK_GAP: f32 = KEY_UNIT * 0.5;
+
+/// Total width of the full keyboard row (`main_block` + nav/arrow +
+/// numpad, with the gaps between them) — every one of these three blocks
+/// is present at the `Full100` profile, which is what `som-key` now
+/// always starts at (see `keyboard_profile_from_args`), so this is the
+/// steady-state width the log row (see `render_log`) is constrained to.
+const KEYBOARD_TOTAL_WIDTH: f32 =
+    FUNCTION_ROW_WIDTH + BLOCK_GAP + NAV_ARROW_WIDTH + BLOCK_GAP + NUMPAD_WIDTH;
+
+/// The row of 3 LED indicators (num lock / caps lock / scroll lock) drawn
+/// above the numpad, centered over its full width — mirrors the
+/// "Indicator Lights" cluster on a real full-size keyboard, positioned
+/// the same way relative to the numpad.
+///
+/// Carries the same `mb(KEY_UNIT * 0.1)` margin as `main_block`'s
+/// function-row and `nav_arrow_block`'s system-row, so the numpad's
+/// second row (`7 8 9`) lines up with `number_row` like the rest of the
+/// keyboard, instead of starting 0.1 unit too high.
+fn render_lock_indicators(state: &SomKey) -> impl IntoElement {
+    div()
+        .w(px(NUMPAD_WIDTH))
+        .h(px(KEY_UNIT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .mb(px(KEY_UNIT * 0.1))
+        .child(render_lock_indicator("num", state.numlock_on))
+        .child(render_lock_indicator("caps", state.capslock_on))
+        .child(render_lock_indicator("scrl", state.scrolllock_on))
+}
+
+/// A single numpad grid cell — same visual style as `render_key`, but
+/// placed by `render_numpad` via explicit `col_span`/`row_span` instead of
+/// being sized by `KeyCell.width` like the rest of the keyboard, since
+/// numpad keys only ever span whole grid cells (never fractional widths).
+fn render_numpad_key(
+    label: &'static str,
+    id: KeyId,
+    col_span: u16,
+    row_span: u16,
+    state: &SomKey,
+) -> impl IntoElement {
+    let pressed = state.is_pressed(id);
+    // Long labels (`numlk`) and the NumLock-off nav labels (`home`, `pgup`,
+    // the arrow glyphs, etc.) all share the smaller size — the nav labels
+    // wouldn't otherwise qualify by length alone (some are a single arrow
+    // glyph), so a length check can't drive this by itself.
+    let small = label.len() > 4 || matches!(label, "home" | "end" | "pgup" | "pgdn" | "ins" | "del" | "↑" | "↓" | "←" | "→");
+    div()
+        .col_span(col_span)
+        .row_span(row_span)
         .flex()
         .items_center()
         .justify_center()
@@ -759,49 +896,58 @@ fn render_tall_key(label: &'static str, pressed: bool) -> impl IntoElement {
         .when(pressed, |el| el.bg(rgb(0x88c0d0)).border_color(rgb(0x88c0d0)))
         .when(!pressed, |el| el.bg(rgb(0x2e3440)).border_color(rgb(0x4c566a)))
         .text_color(if pressed { rgb(0x2e3440) } else { rgb(0xd8dee9) })
-        .text_size(px(10.0))
+        .text_size(px(if small { 10.0 } else { 13.0 }))
         .child(label)
 }
 
-/// The 4x5 digit/operator grid plus the right-hand `+`/`enter` column that
-/// spans 2 rows each, matching a real numeric keypad's physical layout.
+/// The numpad as a true 4-column x 5-row CSS grid, matching a real numeric
+/// keypad's physical layout exactly: `+` and `enter` each span 2 rows
+/// (vertical merge of two cells), and `0` spans 2 columns (horizontal
+/// merge). A `flex`-based layout can't express this — any attempt to mix
+/// a 2-row-tall key into the same row as normal-height ones makes that
+/// row's total height the tallest child's height, throwing off every row
+/// below it — so this uses GPUI's grid support instead, which places each
+/// key by grid line rather than by accumulated flex-row height.
 fn render_numpad(state: &SomKey) -> impl IntoElement {
-    let plus_pressed = state.is_pressed(KeyId::Numpad("+"));
-    let enter_pressed = state.is_pressed(KeyId::Numpad("enter"));
+    const COLS: u16 = 4;
+    const ROWS: u16 = 5;
+    let width = px(COLS as f32 * KEY_UNIT + (COLS - 1) as f32 * KEY_GAP);
+    let height = px(ROWS as f32 * KEY_UNIT + (ROWS - 1) as f32 * KEY_GAP);
+
+    // A real numpad's digit keys double as cursor-navigation keys when
+    // NumLock is off — the physical key (and its `KeyId`, matched by the
+    // same underlying position) never changes, only the printed/displayed
+    // function does. `0` becomes Insert and `.` becomes Delete too.
+    let (l7, l8, l9, l4, l6, l1, l2, l3, l0, ldot) = if state.numlock_on {
+        ("7", "8", "9", "4", "6", "1", "2", "3", "0", ".")
+    } else {
+        ("home", "↑", "pgup", "←", "→", "end", "↓", "pgdn", "ins", "del")
+    };
+
     div()
-        .flex()
-        .flex_col()
+        .grid()
+        .grid_cols(COLS)
+        .grid_rows(ROWS)
         .gap(px(KEY_GAP))
-        // Row 1: numlock / * -  (no 4th-column key here — `-` sits alone,
-        // `+` starts one row down, directly under it).
-        .child(render_row(
-            vec![
-                npkey(NUMPAD_LOCK_LABEL, "numlock"),
-                npkey("/", "/"),
-                npkey("*", "*"),
-                npkey("-", "-"),
-            ],
-            state,
-        ))
-        // Rows 2-3: 7 8 9 / 4 5 6, with `+` spanning both, directly under `-`.
-        .child(
-            div()
-                .flex()
-                .gap(px(KEY_GAP))
-                .child(render_row(vec![npkey("7", "7"), npkey("8", "8"), npkey("9", "9")], state))
-                .child(render_tall_key("+", plus_pressed)),
-        )
-        .child(render_row(vec![npkey("4", "4"), npkey("5", "5"), npkey("6", "6")], state))
-        // Rows 4-5: 1 2 3 / 0 0 ., with `enter` spanning both, directly
-        // under `+`.
-        .child(
-            div()
-                .flex()
-                .gap(px(KEY_GAP))
-                .child(render_row(vec![npkey("1", "1"), npkey("2", "2"), npkey("3", "3")], state))
-                .child(render_tall_key("enter", enter_pressed)),
-        )
-        .child(render_row(vec![npkey_w("0", "0", 2.0), npkey(".", ".")], state))
+        .w(width)
+        .h(height)
+        .child(render_numpad_key(NUMPAD_LOCK_LABEL, KeyId::Numpad("numlock"), 1, 1, state))
+        .child(render_numpad_key("/", KeyId::Numpad("/"), 1, 1, state))
+        .child(render_numpad_key("*", KeyId::Numpad("*"), 1, 1, state))
+        .child(render_numpad_key("-", KeyId::Numpad("-"), 1, 1, state))
+        .child(render_numpad_key(l7, KeyId::Numpad("7"), 1, 1, state))
+        .child(render_numpad_key(l8, KeyId::Numpad("8"), 1, 1, state))
+        .child(render_numpad_key(l9, KeyId::Numpad("9"), 1, 1, state))
+        .child(render_numpad_key("+", KeyId::Numpad("+"), 1, 2, state))
+        .child(render_numpad_key(l4, KeyId::Numpad("4"), 1, 1, state))
+        .child(render_numpad_key("5", KeyId::Numpad("5"), 1, 1, state))
+        .child(render_numpad_key(l6, KeyId::Numpad("6"), 1, 1, state))
+        .child(render_numpad_key(l1, KeyId::Numpad("1"), 1, 1, state))
+        .child(render_numpad_key(l2, KeyId::Numpad("2"), 1, 1, state))
+        .child(render_numpad_key(l3, KeyId::Numpad("3"), 1, 1, state))
+        .child(render_numpad_key("enter", KeyId::Numpad("enter"), 1, 2, state))
+        .child(render_numpad_key(l0, KeyId::Numpad("0"), 2, 1, state))
+        .child(render_numpad_key(ldot, KeyId::Numpad("."), 1, 1, state))
 }
 
 impl Render for SomKey {
@@ -846,7 +992,7 @@ impl Render for SomKey {
                 .flex()
                 .flex_col()
                 .gap(px(KEY_GAP))
-                .child(div().h(px(KEY_UNIT)))
+                .child(render_lock_indicators(self))
                 .child(render_numpad(self))
         });
 
@@ -867,26 +1013,82 @@ impl Render for SomKey {
             .child(
                 div()
                     .flex()
-                    .gap(px(KEY_UNIT * 0.5))
-                    .child(main_block)
-                    .children(nav_arrow_block)
-                    .children(numpad_block),
-            )
-            .child(
-                div()
-                    .flex()
                     .flex_col()
-                    .flex_1()
-                    .gap_1()
-                    .mt_2()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(rgb(0x4c566a))
-                    .text_size(px(11.0))
-                    .overflow_hidden()
-                    .children(self.log.iter().rev().map(render_log_row)),
+                    .gap(px(KEY_GAP))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(KEY_UNIT * 0.5))
+                            .child(main_block)
+                            .children(nav_arrow_block)
+                            .children(numpad_block),
+                    )
+                    .child(render_log(&self.log)),
             )
     }
+}
+
+/// How many side-by-side columns the event log fills (see `render_log`).
+const LOG_COLUMNS: usize = 3;
+
+/// Gap between the log's columns.
+const LOG_COLUMN_GAP: f32 = 16.0;
+
+/// Fixed width of each log column: `KEYBOARD_TOTAL_WIDTH` minus the gaps
+/// between columns, divided evenly.
+const LOG_COLUMN_WIDTH: f32 =
+    (KEYBOARD_TOTAL_WIDTH - (LOG_COLUMNS as f32 - 1.0) * LOG_COLUMN_GAP) / LOG_COLUMNS as f32;
+
+/// Renders the event log as `LOG_COLUMNS` side-by-side columns that fill
+/// top to bottom: newest entries start at the top of the first column, and
+/// once that column is full, older entries continue at the top of the
+/// next one — so all columns read newest-first, left-to-right, matching
+/// how someone visually scans a multi-column list rather than a single
+/// tall one that needs scrolling.
+///
+/// Both the log and each column have an EXPLICIT fixed width
+/// (`KEYBOARD_TOTAL_WIDTH` / `LOG_COLUMN_WIDTH`) rather than `w_full()` +
+/// `flex_1()` — letting the log inherit its parent's width dynamically
+/// repeatedly produced a mismatch with the keyboard's actual on-screen
+/// width (the parent's own width was itself ambiguous under
+/// `align-items: flex-start` with a `w_full()` child, and resolved
+/// against the window instead of the sibling keyboard row). A fixed
+/// width computed from the same per-key constants the keyboard itself is
+/// built from is unambiguous by construction — `overflow_hidden()` (see
+/// `render_log_row`) still clips any single row whose content is wider
+/// than a column, so long unbroken content (e.g. `0xNN` scan codes)
+/// cannot silently re-widen the column past its fixed size.
+fn render_log(log: &[LogRow]) -> impl IntoElement {
+    let newest_first: Vec<&LogRow> = log.iter().rev().collect();
+    let column_len = newest_first.len().div_ceil(LOG_COLUMNS).max(1);
+
+    let column = |rows: &[(usize, &&LogRow)]| {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(LOG_COLUMN_WIDTH))
+            .gap_1()
+            .children(rows.iter().map(|(index, row)| render_log_row(*index + 1, row)))
+    };
+
+    div()
+        .flex()
+        .w(px(KEYBOARD_TOTAL_WIDTH))
+        .gap(px(LOG_COLUMN_GAP))
+        .mt_2()
+        .pt_2()
+        .border_t_1()
+        .border_color(rgb(0x4c566a))
+        .text_size(px(11.0))
+        .overflow_hidden()
+        .children(
+            newest_first
+                .iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+                .chunks(column_len)
+                .map(|chunk| column(chunk)),
+        )
 }
 
 const BRIGHT: u32 = 0xeceff4;
@@ -906,34 +1108,60 @@ const PLATFORM_MODIFIER_LABEL: &str = "WIN";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const PLATFORM_MODIFIER_LABEL: &str = "SUPER";
 
-/// One log row: SHIFT CTRL ALT <platform modifier> (cyan when held for this
-/// keypress, dim otherwise), then the key name and its scan code — see
-/// `LogRow`.
-fn render_log_row(row: &LogRow) -> impl IntoElement {
+/// One log row, prefixed with its 1-based position among the newest
+/// `MAX_LOG_LINES` keypresses (01 = newest), then: SHIFT CTRL ALT
+/// <platform modifier> (cyan when held for this keypress, dim otherwise),
+/// then the key name and its scan code — see `LogRow`.
+fn render_log_row(number: usize, row: &LogRow) -> impl IntoElement {
     div()
         .flex()
+        .min_w(px(0.))
+        .overflow_hidden()
         .gap_2()
+        .child(div().w(px(22.0)).text_color(rgb(DIM)).child(format!("{number:02}")))
         .child(div().w(px(48.0)).text_color(if row.shift { rgb(HELD) } else { rgb(DIM) }).child("SHIFT"))
         .child(div().w(px(40.0)).text_color(if row.ctrl { rgb(HELD) } else { rgb(DIM) }).child("CTRL"))
         .child(div().w(px(36.0)).text_color(if row.alt { rgb(HELD) } else { rgb(DIM) }).child("ALT"))
         .child(div().w(px(48.0)).text_color(if row.cmd { rgb(HELD) } else { rgb(DIM) }).child(PLATFORM_MODIFIER_LABEL))
-        .child(
-            div().w(px(120.0)).text_color(rgb(BRIGHT)).child(if row.key_name.is_empty() {
-                "<empty>".to_string()
-            } else {
-                row.key_name.to_string()
-            }),
-        )
+        // Key name and scan code are grouped with their own small gap so
+        // they read as a pair, instead of picking up the same wide gap
+        // used to separate the modifier indicators from each other.
         .child(
             div()
-                .text_color(rgb(BRIGHT))
-                .child(row.scan_code.map_or_else(|| "-".to_string(), |c| format!("0x{c:02X}"))),
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(36.0))
+                        .text_color(rgb(BRIGHT))
+                        .child(row.scan_code.map_or_else(|| "-".to_string(), |c| format!("0x{c:02X}"))),
+                )
+                .child(
+                    div().text_color(rgb(BRIGHT)).child(if row.key_name.is_empty() {
+                        "<empty>".to_string()
+                    } else {
+                        row.key_name.to_string()
+                    }),
+                ),
         )
 }
 
 fn main() {
     application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1180.), px(640.0)), cx);
+        // Sized to fit the content with only a small margin, not a
+        // generic default — a window much larger than the keyboard row +
+        // log leaves visible empty space on the right and at the bottom.
+        // Width: KEYBOARD_TOTAL_WIDTH plus the root's p_4() padding
+        // (16px each side = 32px) plus a small margin for rounding/border
+        // slop. Height: keyboard row (6 main-block rows, or equivalently
+        // 5 numpad rows + the lock-indicator row, whichever is taller)
+        // plus the log (10 rows of 11px text plus its own borders/margins)
+        // plus the root's own padding and inter-block gap.
+        let bounds = Bounds::centered(
+            None,
+            size(px(KEYBOARD_TOTAL_WIDTH + 40.0), px(560.0)),
+            cx,
+        );
         let window = cx
             .open_window(
                 WindowOptions {
@@ -944,11 +1172,36 @@ fn main() {
             )
             .unwrap();
 
+        // Grab keyboard focus immediately — without this, GPUI leaves the
+        // window with no focused element until the user clicks into it,
+        // so no key_down/key_up/modifiers_changed events reach `SomKey`
+        // at all until then (the window looks alive — it paints, it
+        // responds to the OS chrome — but every key press is silently
+        // dropped, which reads exactly like "toggle keys stopped
+        // working" if you happen to test one of those first).
+        window
+            .update(cx, |view, window, cx| {
+                window.focus(&view.focus_handle(cx), cx);
+            })
+            .ok();
+
         // Populate labels for whatever layout is active at startup — not
         // just future switches — so e.g. launching straight into a Russian
         // layout draws Cyrillic immediately instead of QWERTY placeholders.
         window
             .update(cx, |view, _, cx| view.on_layout_changed(cx))
+            .ok();
+
+        // Read the real lock-key state at launch instead of assuming
+        // everything starts off — the user may already have CapsLock,
+        // NumLock, or ScrollLock toggled on before som-key even opens.
+        window
+            .update(cx, |view, window, cx| {
+                view.numlock_on = window.numlock().on;
+                view.capslock_on = window.capslock().on;
+                view.scrolllock_on = window.scrolllock().on;
+                cx.notify();
+            })
             .ok();
 
         // Catches layout switches made through the system input-source menu

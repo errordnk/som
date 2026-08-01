@@ -1189,6 +1189,15 @@ pub(super) fn numlock_from_xkb(keymap_state: &State) -> gpui::Numlock {
     gpui::Numlock { on }
 }
 
+/// Scroll lock has no modifier mask of its own in X11/xkb — unlike
+/// caps/num lock, it's only ever exposed as a keyboard LED indicator, so
+/// this reads `led_name_is_active` instead of `mod_name_is_active`.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn scrolllock_from_xkb(keymap_state: &State) -> gpui::Scrolllock {
+    let on = keymap_state.led_name_is_active(xkb::LED_NAME_SCROLL);
+    gpui::Scrolllock { on }
+}
+
 /// Resolve a Linux `dev_t` to PCI vendor/device IDs via sysfs, returning a
 /// [`CompositorGpuHint`] that the GPU adapter selection code can use to
 /// prioritize the compositor's rendering device.

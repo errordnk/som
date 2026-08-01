@@ -81,7 +81,7 @@ use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, SCROLL_LINES,
     capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
     keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, numlock_from_xkb,
-    open_uri_internal, read_fd, reveal_path_internal,
+    open_uri_internal, read_fd, reveal_path_internal, scrolllock_from_xkb,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -96,8 +96,8 @@ use gpui::{
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Numlock, Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TouchPhase, WindowButtonLayout,
-    WindowParams, point, profiler, px, size,
+    ScrollDelta, ScrollWheelEvent, Scrolllock, SharedString, Size, TaskTiming, TouchPhase,
+    WindowButtonLayout, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -244,6 +244,7 @@ pub(crate) struct WaylandClientState {
     pub modifiers: Modifiers,
     pub capslock: Capslock,
     pub numlock: Numlock,
+    pub scrolllock: Scrolllock,
     axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
     continuous_scroll_delta: Option<Point<Pixels>>,
@@ -715,6 +716,7 @@ impl WaylandClient {
             },
             capslock: Capslock { on: false },
             numlock: Numlock { on: false },
+            scrolllock: Scrolllock { on: false },
             scroll_event_received: false,
             axis_source: AxisSource::Wheel,
             mouse_location: None,
@@ -1530,13 +1532,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keymap_state = state.keymap_state.as_mut().unwrap();
                 let capslock = capslock_from_xkb(keymap_state);
                 let numlock = numlock_from_xkb(keymap_state);
+                let scrolllock = scrolllock_from_xkb(keymap_state);
                 state.capslock = capslock;
                 state.numlock = numlock;
+                state.scrolllock = scrolllock;
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
                     capslock: state.capslock,
                     numlock: state.numlock,
+                    scrolllock: state.scrolllock,
                 });
                 drop(state);
 

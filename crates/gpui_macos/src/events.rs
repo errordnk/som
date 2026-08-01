@@ -2,7 +2,7 @@ use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, Numlock, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, Side, TouchPhase, point, px,
+    ScrollWheelEvent, Scrolllock, Side, TouchPhase, point, px,
 };
 
 use crate::{
@@ -144,6 +144,8 @@ pub(crate) unsafe fn platform_input_from_native(
                     // macOS numeric keypads have a non-toggling "Clear" key,
                     // not a numlock toggle — always off.
                     numlock: Numlock::default(),
+                    // macOS keyboards/OS don't expose a scroll lock state.
+                    scrolllock: Scrolllock::default(),
                 }))
             }
             NSEventType::NSKeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {

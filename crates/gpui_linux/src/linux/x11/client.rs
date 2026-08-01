@@ -54,7 +54,7 @@ use crate::linux::{
     keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, numlock_from_xkb,
     open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
-    reveal_path_internal,
+    reveal_path_internal, scrolllock_from_xkb,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
@@ -62,8 +62,8 @@ use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_x
 use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, Numlock, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Scrolllock,
+    Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -201,11 +201,13 @@ pub struct X11ClientState {
     pub modifiers: Modifiers,
     pub capslock: Capslock,
     pub numlock: Numlock,
+    pub scrolllock: Scrolllock,
     // TODO: Can the other updates to `modifiers` be removed so that this is unnecessary?
     // capslock logic was done analog to modifiers
     pub last_modifiers_changed_event: Modifiers,
     pub last_capslock_changed_event: Capslock,
     pub last_numlock_changed_event: Numlock,
+    pub last_scrolllock_changed_event: Scrolllock,
 
     pub(crate) compose_state: Option<xkbc::compose::State>,
     pub(crate) pre_edit_text: Option<String>,
@@ -515,9 +517,11 @@ impl X11Client {
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
             numlock: Numlock::default(),
+            scrolllock: Scrolllock::default(),
             last_modifiers_changed_event: Modifiers::default(),
             last_capslock_changed_event: Capslock::default(),
             last_numlock_changed_event: Numlock::default(),
+            last_scrolllock_changed_event: Scrolllock::default(),
             event_loop: Some(event_loop),
             loop_handle: handle,
             common,
@@ -1022,9 +1026,11 @@ impl X11Client {
                 let modifiers = modifiers_from_xkb(&state.xkb);
                 let capslock = capslock_from_xkb(&state.xkb);
                 let numlock = numlock_from_xkb(&state.xkb);
+                let scrolllock = scrolllock_from_xkb(&state.xkb);
                 if state.last_modifiers_changed_event == modifiers
                     && state.last_capslock_changed_event == capslock
                     && state.last_numlock_changed_event == numlock
+                    && state.last_scrolllock_changed_event == scrolllock
                 {
                     drop(state);
                 } else {
@@ -1035,6 +1041,8 @@ impl X11Client {
                     state.last_capslock_changed_event = capslock;
                     state.numlock = numlock;
                     state.last_numlock_changed_event = numlock;
+                    state.scrolllock = scrolllock;
+                    state.last_scrolllock_changed_event = scrolllock;
                     drop(state);
 
                     let focused_window = self.get_window(focused_window_id)?;
@@ -1043,6 +1051,7 @@ impl X11Client {
                             modifiers,
                             capslock,
                             numlock,
+                            scrolllock,
                         },
                     ));
                 }

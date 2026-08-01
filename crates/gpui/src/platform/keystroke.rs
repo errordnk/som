@@ -768,6 +768,19 @@ pub struct Numlock {
     pub on: bool,
 }
 
+/// The state of the scroll lock key at some point in time. Modern
+/// keyboards mostly lack a physical Scroll Lock key, and the OS state can
+/// still be toggled (e.g. a Print Screen/Scroll Lock combo key, or a
+/// software toggle), but it has no effect on typed characters the way
+/// capslock/numlock do — this exists purely so tools like `som-key` can
+/// show the indicator, not because any keybinding logic depends on it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize, Hash, JsonSchema)]
+pub struct Scrolllock {
+    /// The scroll lock key is on
+    #[serde(default)]
+    pub on: bool,
+}
+
 impl AsKeystroke for Keystroke {
     fn as_keystroke(&self) -> &Keystroke {
         self

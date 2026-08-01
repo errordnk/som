@@ -10,9 +10,10 @@ use crate::{
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    Numlock, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Scrolllock, Shadow, SharedString,
+    Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
@@ -997,6 +998,8 @@ pub struct Window {
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
+    numlock: Numlock,
+    scrolllock: Scrolllock,
     scale_factor: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
@@ -1316,6 +1319,8 @@ impl Window {
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
+        let numlock = platform_window.numlock();
+        let scrolllock = platform_window.scrolllock();
         let content_size = platform_window.content_size();
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
@@ -1569,6 +1574,8 @@ impl Window {
                         window.active.set(active);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
+                        window.numlock = window.platform_window.numlock();
+                        window.scrolllock = window.platform_window.scrolllock();
                         window
                             .activation_observers
                             .clone()
@@ -1711,6 +1718,8 @@ impl Window {
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
+            numlock,
+            scrolllock,
             scale_factor,
             bounds_observers: SubscriberSet::new(),
             appearance,
@@ -2587,6 +2596,16 @@ impl Window {
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
         self.capslock
+    }
+
+    /// The current state of the keyboard's numlock
+    pub fn numlock(&self) -> Numlock {
+        self.numlock
+    }
+
+    /// The current state of the keyboard's scroll lock
+    pub fn scrolllock(&self) -> Scrolllock {
+        self.scrolllock
     }
 
     fn complete_frame(&self) {
@@ -4514,6 +4533,8 @@ impl Window {
             PlatformInput::ModifiersChanged(modifiers_changed) => {
                 self.modifiers = modifiers_changed.modifiers;
                 self.capslock = modifiers_changed.capslock;
+                self.numlock = modifiers_changed.numlock;
+                self.scrolllock = modifiers_changed.scrolllock;
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {

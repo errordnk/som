@@ -61,6 +61,7 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub last_reported_numlock: Cell<Option<Numlock>>,
+    pub last_reported_scrolllock: Cell<Option<Scrolllock>>,
     pub hovered: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
@@ -143,6 +144,7 @@ impl WindowsWindowState {
         let last_reported_modifiers = None;
         let last_reported_capslock = None;
         let last_reported_numlock = None;
+        let last_reported_scrolllock = None;
         let hovered = false;
         let click_state = ClickState::new();
         let nc_button_pressed = None;
@@ -170,6 +172,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             last_reported_numlock: Cell::new(last_reported_numlock),
+            last_reported_scrolllock: Cell::new(last_reported_scrolllock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_after_recovery: Cell::new(false),
@@ -692,6 +695,14 @@ impl PlatformWindow for WindowsWindow {
 
     fn capslock(&self) -> Capslock {
         current_capslock()
+    }
+
+    fn numlock(&self) -> Numlock {
+        current_numlock()
+    }
+
+    fn scrolllock(&self) -> Scrolllock {
+        current_scrolllock()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {

@@ -1436,6 +1436,28 @@ impl PlatformWindow for X11Window {
             .unwrap_or_default()
     }
 
+    fn numlock(&self) -> gpui::Numlock {
+        self.0
+            .state
+            .borrow()
+            .client
+            .0
+            .upgrade()
+            .map(|ref_cell| ref_cell.borrow().numlock)
+            .unwrap_or_default()
+    }
+
+    fn scrolllock(&self) -> gpui::Scrolllock {
+        self.0
+            .state
+            .borrow()
+            .client
+            .0
+            .upgrade()
+            .map(|ref_cell| ref_cell.borrow().scrolllock)
+            .unwrap_or_default()
+    }
+
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.0.state.borrow_mut().input_handler = Some(input_handler);
     }

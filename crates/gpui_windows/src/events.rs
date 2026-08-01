@@ -759,6 +759,7 @@ impl WindowsWindowInner {
                     modifiers: current_modifiers(),
                     capslock: current_capslock(),
                     numlock: current_numlock(),
+                    scrolllock: current_scrolllock(),
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
@@ -1394,6 +1395,7 @@ where
                 modifiers,
                 capslock: current_capslock(),
                 numlock: current_numlock(),
+                scrolllock: current_scrolllock(),
             }))
         }
         VK_PACKET => None,
@@ -1411,6 +1413,7 @@ where
                 modifiers,
                 capslock,
                 numlock: current_numlock(),
+                scrolllock: current_scrolllock(),
             }))
         }
         VK_NUMLOCK => {
@@ -1427,6 +1430,24 @@ where
                 modifiers,
                 capslock: current_capslock(),
                 numlock,
+                scrolllock: current_scrolllock(),
+            }))
+        }
+        VK_SCROLL => {
+            let scrolllock = current_scrolllock();
+            if state
+                .last_reported_scrolllock
+                .get()
+                .is_some_and(|prev_scrolllock| prev_scrolllock == scrolllock)
+            {
+                return None;
+            }
+            state.last_reported_scrolllock.set(Some(scrolllock));
+            Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                modifiers,
+                capslock: current_capslock(),
+                numlock: current_numlock(),
+                scrolllock,
             }))
         }
         vkey => {
@@ -1456,6 +1477,8 @@ fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {
             VK_ESCAPE => "escape",
             VK_INSERT => "insert",
             VK_DELETE => "delete",
+            VK_PAUSE => "pause",
+            VK_SNAPSHOT => "printscreen",
             VK_APPS => "menu",
             VK_F1 => "f1",
             VK_F2 => "f2",
@@ -1867,6 +1890,12 @@ pub(crate) fn current_capslock() -> Capslock {
 pub(crate) fn current_numlock() -> Numlock {
     let on = unsafe { GetKeyState(VK_NUMLOCK.0 as i32) & 1 } > 0;
     Numlock { on }
+}
+
+#[inline]
+pub(crate) fn current_scrolllock() -> Scrolllock {
+    let on = unsafe { GetKeyState(VK_SCROLL.0 as i32) & 1 } > 0;
+    Scrolllock { on }
 }
 
 // there is some additional non-visible space when talking about window

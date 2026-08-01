@@ -623,6 +623,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
+    /// The current state of the numlock key, queried on demand (not from
+    /// the last `ModifiersChanged` event) — lets a window ask "is numlock
+    /// on right now" the instant it opens, before any key has been
+    /// pressed. Always `on: false` on macOS (see `Numlock`'s docs).
+    fn numlock(&self) -> Numlock {
+        Numlock::default()
+    }
+    /// The current state of the scroll lock key, queried on demand — see
+    /// `numlock`'s docs for why this exists as a query rather than only
+    /// an event field. Always `on: false` on macOS (no scroll lock LED).
+    fn scrolllock(&self) -> Scrolllock {
+        Scrolllock::default()
+    }
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
     fn prompt(

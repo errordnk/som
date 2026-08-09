@@ -1827,13 +1827,16 @@ fn paint_kitty_placements(
 /// grid-to-pixel math ([`kitty_placement_bounds`]) since both protocols
 /// anchor a placement to a cursor-relative grid cell the same way.
 ///
-/// Always paints at a single, fixed 1-cell-wide-by-1-cell-tall footprint
-/// for now — SRP has no `columns`/`rows` sizing command the way Kitty's
-/// `a=p` does yet (see `rich_content_cache::CacheEntry::anchor`'s doc
-/// comment on why placement is implicit, decided by first-chunk arrival
-/// rather than an explicit command); natural-size-aware footprint is a
-/// reasonable follow-up once that's needed, not required for a first
-/// working paint path.
+/// SRP has no `columns`/`rows` sizing command the way Kitty's `a=p` does
+/// (see `rich_content_cache::CacheEntry::anchor`'s doc comment on why
+/// placement is implicit, decided by first-chunk arrival rather than an
+/// explicit command) — so the footprint is always derived from the
+/// decoded frame's own natural pixel size via [`natural_cell_span`]
+/// instead of an explicit override, unlike Kitty's `columns`/`rows`
+/// (which — see `kitty_placement_bounds`'s own doc comment — currently
+/// default to a plain 1x1 cell when unset, since Kitty senders routinely
+/// DO specify `c=`/`r=` and this codebase hasn't needed a natural-size
+/// fallback there yet).
 fn paint_rich_content_placements(
     terminal: &Entity<Terminal>,
     origin: Point<Pixels>,
@@ -1851,10 +1854,12 @@ fn paint_rich_content_placements(
     let mut any_animating = false;
 
     for (anchor, render_image, current_frame, is_animating) in terminal.rich_content_placements() {
+        let (columns, rows) =
+            natural_cell_span(render_image.size(0), layout.dimensions.cell_width, layout.dimensions.line_height);
         let Some((position, size)) = kitty_placement_bounds(
             anchor,
-            None,
-            None,
+            Some(columns),
+            Some(rows),
             layout.display_offset,
             num_lines,
             num_columns,
@@ -1872,6 +1877,26 @@ fn paint_rich_content_placements(
     }
 
     any_animating
+}
+
+/// How many grid cells wide/tall a decoded frame's own pixel dimensions
+/// naturally span, given the current font's cell metrics — `ceil`'d up
+/// (a frame narrower than one full cell still needs at least 1 column/row
+/// to be visible at all, and rounding DOWN would clip the last partial
+/// cell's worth of image data instead of just leaving a little unused
+/// margin in it). `image_size` and `cell_width`/`line_height` are both
+/// treated as the same unit here (as the rest of this module's grid-to-
+/// pixel math already does for `cell_width`/`line_height` themselves —
+/// see `kitty_placement_bounds`) rather than converting through a device-
+/// pixel-vs-logical-pixel scale factor, since the visible result is a
+/// GIF stretched to fill whole cells either way, not pixel-perfect 1:1
+/// image-to-screen mapping.
+fn natural_cell_span(image_size: gpui::Size<gpui::DevicePixels>, cell_width: Pixels, line_height: Pixels) -> (u32, u32) {
+    let width_px: f32 = i32::from(image_size.width) as f32;
+    let height_px: f32 = i32::from(image_size.height) as f32;
+    let columns = (width_px / f32::from(cell_width)).ceil().max(1.0) as u32;
+    let rows = (height_px / f32::from(line_height)).ceil().max(1.0) as u32;
+    (columns, rows)
 }
 
 /// Compute a Kitty graphics placement's paint bounds, or `None` if it's
@@ -2271,6 +2296,46 @@ mod tests {
             px(16.),
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn natural_cell_span_rounds_up_to_whole_cells() {
+        // A 100x50px image with 8x16 cells: 100/8 = 12.5 -> 13 columns,
+        // 50/16 = 3.125 -> 4 rows. Rounding UP (not down/nearest) matters
+        // here — a frame that's e.g. 8.1 cells wide still needs 9 columns
+        // to show its last sliver of pixel data, not 8 (which would clip
+        // it).
+        let (columns, rows) = natural_cell_span(gpui::size(gpui::DevicePixels(100), gpui::DevicePixels(50)), px(8.), px(16.));
+        assert_eq!((columns, rows), (13, 4));
+    }
+
+    #[test]
+    fn natural_cell_span_exact_multiple_does_not_round_up_an_extra_cell() {
+        // Exactly 10 cells wide/tall (80px / 8px, 160px / 16px) must stay
+        // at 10, not 11 — floating point ceil() of an exact integer ratio
+        // must not spuriously round up due to representation error.
+        let (columns, rows) = natural_cell_span(gpui::size(gpui::DevicePixels(80), gpui::DevicePixels(160)), px(8.), px(16.));
+        assert_eq!((columns, rows), (10, 10));
+    }
+
+    #[test]
+    fn natural_cell_span_never_returns_zero_cells_for_a_tiny_image() {
+        // A 1x1px image is still at least 1 column/row — a placement that
+        // computed to 0 cells would be invisible even though it has real
+        // pixel data to show.
+        let (columns, rows) = natural_cell_span(gpui::size(gpui::DevicePixels(1), gpui::DevicePixels(1)), px(8.), px(16.));
+        assert_eq!((columns, rows), (1, 1));
+    }
+
+    #[test]
+    fn natural_cell_span_scales_with_a_realistic_gif_size() {
+        // giphy.gif (the checked-in fixture used across the rich-content
+        // test suite) is 480x480px — sanity-checks the whole function
+        // against a real, not synthetic, size at a plausible terminal
+        // font's cell metrics.
+        let (columns, rows) = natural_cell_span(gpui::size(gpui::DevicePixels(480), gpui::DevicePixels(480)), px(8.), px(17.));
+        assert_eq!(columns, 60); // 480 / 8, exact
+        assert_eq!(rows, 29); // ceil(480 / 17) = ceil(28.235...)
     }
 
     #[test]

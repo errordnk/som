@@ -187,6 +187,12 @@ mod tests {
             file_id,
             chunk_offset: offset,
             total_size: 0,
+            metadata: crate::rich_content_transport::ContentMetadata::Image {
+                width_px: 0,
+                height_px: 0,
+                color_bits: 0,
+                is_animated: false,
+            },
             payload: payload.to_vec(),
         }
     }

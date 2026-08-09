@@ -85,12 +85,25 @@
 //! [chunk_offset:      8 bytes LE]
 //! [chunk_len:         4 bytes LE, length of the RAW (pre-encoding) payload]
 //! [total_size:        8 bytes LE, 0 = unknown]
+//! [width_px:          4 bytes LE, natural decoded pixel width, 0 = unknown]
+//! [height_px:         4 bytes LE, natural decoded pixel height, 0 = unknown]
+//! [color_bits:        1 byte, bits per pixel in the decoded image]
+//! [is_animated:       1 byte, 0 or 1 — see Chunk::is_animated]
 //! [crc32:             4 bytes LE, over the raw payload]
 //! ```
 //! `chunk_len` and `crc32` describe the raw payload bytes, not their
 //! base91-encoded size on the wire — [`RichContentCache`](crate::rich_content_cache::RichContentCache)
 //! and every downstream decoder work exclusively in terms of real file
 //! bytes and must never need to know this module's wire encoding exists.
+//!
+//! `width_px`/`height_px`/`color_bits`/`is_animated` travel on EVERY chunk
+//! (not just the first) rather than being a separate one-time command —
+//! this keeps the envelope format uniform (a receiver never needs to
+//! special-case "the first chunk looks different") at the cost of a few
+//! redundant bytes per chunk, which base91's own per-byte overhead
+//! already dwarfs. See [`Chunk::width_px`]'s doc comment for why the
+//! paint path needs this sent explicitly rather than inferred from
+//! however much of the file happens to be decoded so far.
 //!
 //! Sent as `ESC _ S <header_b91> <SEPARATOR> <payload_b91> ESC \` — the
 //! leading `S` (Som) is what a receiver checks first to route bytes here
@@ -115,9 +128,12 @@ pub const VERSION: u8 = 1;
 
 /// Size, in raw (pre-base91) bytes, of the fixed header fields that come
 /// after [`MARKER`] — version, content_type, session_id, file_id,
-/// chunk_offset, chunk_len, total_size, crc32. See this module's doc
-/// comment for the exact field layout.
-const HEADER_FIELDS_LEN: usize = 1 + 1 + 4 + 4 + 8 + 4 + 8 + 4;
+/// chunk_offset, chunk_len, total_size, encoded `ContentMetadata`
+/// ([`METADATA_ENCODED_LEN`] bytes — see that constant and
+/// [`ContentMetadata`]'s own doc comment for why this is fixed-length
+/// regardless of which variant a chunk carries), crc32. See this module's
+/// doc comment for the exact field layout.
+const HEADER_FIELDS_LEN: usize = 1 + 1 + 4 + 4 + 8 + 4 + 8 + METADATA_ENCODED_LEN + 4;
 
 /// Separates the base91-encoded header from the base91-encoded payload on
 /// the wire. basE91's bit-packing means the ENCODED length of a
@@ -282,6 +298,96 @@ impl ContentType {
     }
 }
 
+/// Known video codecs — placeholder for when [`ContentType::Video`] is
+/// wired up end-to-end (not yet). One byte in [`ContentMetadata::Video`],
+/// kept as a real enum rather than a bare `u8` so unrecognized values are
+/// caught at parse time instead of silently carried through as garbage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VideoCodec {
+    Unknown = 0,
+    H264 = 1,
+    H265 = 2,
+    Vp9 = 3,
+    Av1 = 4,
+}
+
+impl VideoCodec {
+    fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::H264),
+            2 => Some(Self::H265),
+            3 => Some(Self::Vp9),
+            4 => Some(Self::Av1),
+            _ => None,
+        }
+    }
+}
+
+/// Per-content-type metadata carried in every chunk's header — deliberately
+/// NOT a single flat set of fields shared across every [`ContentType`]:
+/// a still/animated image, an audio stream, a video stream, and markdown
+/// text each need genuinely different descriptive fields (pixel
+/// dimensions and color depth make no sense for audio; sample rate and
+/// channel count make no sense for an image), and a flat struct would
+/// force every chunk to carry fields meaningless for its own content type
+/// (either wasted wire bytes or, worse, fields silently reinterpreted
+/// across unrelated content types as more variants get added later).
+///
+/// Every variant's fields are fixed-size integers (no `Vec`/`String`), so
+/// the WHOLE enum still encodes to a fixed number of header bytes — see
+/// [`metadata_field_count`] and [`encode_metadata`]/[`decode_metadata`]
+/// for how a shorter variant (e.g. [`Self::Markdown`], which carries no
+/// fields at all) is padded out to the same length as the longest
+/// variant ([`Self::Video`]) rather than needing a variable-length
+/// header the way [`SEPARATOR`] exists to handle for `payload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentMetadata {
+    /// A still or animated raster image — GIF today, PNG/JPEG once those
+    /// `ContentType`s exist. `width_px`/`height_px` are the DECODED pixel
+    /// dimensions (not anything about the file's compressed byte size).
+    /// 0/0 means unknown, mirroring `Chunk::total_size`'s own convention.
+    ///
+    /// Sent explicitly by the client (parsed from the source file's own
+    /// header before streaming — see `crates/somcat`'s `stream_file`)
+    /// rather than left for the receiving side to infer from whatever
+    /// prefix of the file happens to have decoded so far: a GIF's logical
+    /// screen descriptor isn't guaranteed to land inside the FIRST chunk
+    /// once a large file is split, and the paint path needs a stable size
+    /// to lay out the placement's grid footprint as soon as ANY chunk for
+    /// a new file arrives, not only once decoding has progressed far
+    /// enough on its own.
+    Image {
+        width_px: u32,
+        height_px: u32,
+        /// Bits per pixel in the DECODED image, e.g. 32 for RGBA.
+        color_bits: u8,
+        /// Whether the sender knows this file has more than one frame (a
+        /// real animation) as opposed to a single still frame —
+        /// determined client-side from the source file's own frame count
+        /// before streaming, not left for the receiver to discover only
+        /// after progressively decoding far enough to see a second
+        /// frame.
+        is_animated: bool,
+    },
+    /// Reserved for [`ContentType::Audio`] — not wired up to any decoder
+    /// yet, but the field shape is settled now so adding real audio
+    /// support later doesn't need another header-format break.
+    Audio { sample_rate: u32, channels: u8, bits_per_sample: u8 },
+    /// Reserved for [`ContentType::Video`] — same rationale as
+    /// [`Self::Audio`]. `fps_numerator`/`fps_denominator` (rather than a
+    /// single float or rounded integer fps) mirrors how GIF/video
+    /// container formats themselves commonly express frame rate as a
+    /// rational (e.g. NTSC's 30000/1001), so this doesn't lose precision
+    /// converting to/from whatever a real decoder reports.
+    Video { width_px: u32, height_px: u32, fps_numerator: u32, fps_denominator: u32, codec: VideoCodec },
+    /// [`ContentType::Markdown`] carries no geometric/format metadata at
+    /// all — plain text, rendered by whatever overlay eventually consumes
+    /// it, not sized like a raster image or timed like audio/video.
+    Markdown,
+}
+
 /// One fully-parsed chunk of a progressive file transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -303,6 +409,9 @@ pub struct Chunk {
     /// yet", and should rely on chunk arrival order/completion signaling
     /// from a higher layer instead.
     pub total_size: u64,
+    /// See [`ContentMetadata`]'s own doc comment for why this isn't a
+    /// flat set of fields shared across every `ContentType`.
+    pub metadata: ContentMetadata,
     /// Raw (decoded) file bytes for this chunk — [`build_envelope`]
     /// base91-encodes this for the wire; [`parse_envelope`] decodes it
     /// back. No byte value is off-limits here; the wire encoding handles
@@ -331,6 +440,10 @@ pub enum DecodeError {
     UnsupportedVersion(u8),
     /// `content_type` byte didn't match any [`ContentType`] variant.
     UnknownContentType(u8),
+    /// The encoded [`ContentMetadata`] had an unrecognized discriminant
+    /// tag, or (specifically for [`ContentMetadata::Video`]) an
+    /// unrecognized [`VideoCodec`] byte.
+    InvalidMetadata,
     /// `chunk_len` in the header didn't match the actual decoded payload
     /// length — a truncated or corrupted envelope.
     LengthMismatch { declared: u32, actual: usize },
@@ -350,6 +463,7 @@ impl fmt::Display for DecodeError {
             Self::InvalidPayloadEncoding => write!(f, "payload base91 encoding is malformed"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported envelope version {v}"),
             Self::UnknownContentType(b) => write!(f, "unknown content type byte {b}"),
+            Self::InvalidMetadata => write!(f, "content metadata tag or codec byte is unrecognized"),
             Self::LengthMismatch { declared, actual } => {
                 write!(f, "declared chunk_len {declared} does not match actual payload length {actual}")
             },
@@ -378,6 +492,100 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// `ContentMetadata` discriminant bytes on the wire — deliberately NOT
+/// tied to `ContentType`'s own discriminant values (a future content type
+/// could reuse an existing metadata shape, e.g. a second image format
+/// sharing [`ContentMetadata::Image`]), so this is its own independent
+/// enumeration.
+const METADATA_TAG_IMAGE: u8 = 0;
+const METADATA_TAG_AUDIO: u8 = 1;
+const METADATA_TAG_VIDEO: u8 = 2;
+const METADATA_TAG_MARKDOWN: u8 = 3;
+
+/// How many raw bytes [`ContentMetadata`]'s field payload (everything
+/// after the 1-byte discriminant) occupies on the wire — fixed at the
+/// longest variant's size ([`ContentMetadata::Video`]: 4+4+4+4+1 = 17
+/// bytes) so every variant, including [`ContentMetadata::Markdown`]
+/// (which has no fields of its own), encodes to the exact same header
+/// length. This is what lets [`HEADER_FIELDS_LEN`] stay a plain constant
+/// instead of depending on which variant a given chunk happens to carry.
+const METADATA_FIELDS_LEN: usize = 4 + 4 + 4 + 4 + 1;
+
+/// Total wire size of an encoded [`ContentMetadata`]: 1 discriminant byte
+/// plus [`METADATA_FIELDS_LEN`] bytes of (possibly zero-padded) fields.
+const METADATA_ENCODED_LEN: usize = 1 + METADATA_FIELDS_LEN;
+
+/// Encodes `metadata` into exactly [`METADATA_ENCODED_LEN`] raw bytes:
+/// a 1-byte discriminant tag followed by that variant's fields packed in
+/// declaration order (as fixed-width little-endian integers), zero-padded
+/// out to [`METADATA_FIELDS_LEN`] for any variant shorter than
+/// [`ContentMetadata::Video`].
+fn encode_metadata(metadata: ContentMetadata) -> [u8; METADATA_ENCODED_LEN] {
+    let mut out = [0u8; METADATA_ENCODED_LEN];
+    out[0] = match metadata {
+        ContentMetadata::Image { .. } => METADATA_TAG_IMAGE,
+        ContentMetadata::Audio { .. } => METADATA_TAG_AUDIO,
+        ContentMetadata::Video { .. } => METADATA_TAG_VIDEO,
+        ContentMetadata::Markdown => METADATA_TAG_MARKDOWN,
+    };
+    let fields = &mut out[1..];
+    match metadata {
+        ContentMetadata::Image { width_px, height_px, color_bits, is_animated } => {
+            fields[0..4].copy_from_slice(&width_px.to_le_bytes());
+            fields[4..8].copy_from_slice(&height_px.to_le_bytes());
+            fields[8] = color_bits;
+            fields[9] = is_animated as u8;
+        },
+        ContentMetadata::Audio { sample_rate, channels, bits_per_sample } => {
+            fields[0..4].copy_from_slice(&sample_rate.to_le_bytes());
+            fields[4] = channels;
+            fields[5] = bits_per_sample;
+        },
+        ContentMetadata::Video { width_px, height_px, fps_numerator, fps_denominator, codec } => {
+            fields[0..4].copy_from_slice(&width_px.to_le_bytes());
+            fields[4..8].copy_from_slice(&height_px.to_le_bytes());
+            fields[8..12].copy_from_slice(&fps_numerator.to_le_bytes());
+            fields[12..16].copy_from_slice(&fps_denominator.to_le_bytes());
+            fields[16] = codec as u8;
+        },
+        ContentMetadata::Markdown => {},
+    }
+    out
+}
+
+/// Reverses [`encode_metadata`]. `bytes` must be exactly
+/// [`METADATA_ENCODED_LEN`] long (callers slice it out of the already
+/// fixed-length decoded header — see [`parse_envelope`]). Returns `None`
+/// for an unrecognized discriminant tag or (for [`ContentMetadata::Video`])
+/// an unrecognized [`VideoCodec`] byte — both are treated the same as any
+/// other malformed-header case by the caller.
+fn decode_metadata(bytes: &[u8]) -> Option<ContentMetadata> {
+    debug_assert_eq!(bytes.len(), METADATA_ENCODED_LEN);
+    let fields = &bytes[1..];
+    match bytes[0] {
+        METADATA_TAG_IMAGE => Some(ContentMetadata::Image {
+            width_px: u32::from_le_bytes(fields[0..4].try_into().unwrap()),
+            height_px: u32::from_le_bytes(fields[4..8].try_into().unwrap()),
+            color_bits: fields[8],
+            is_animated: fields[9] != 0,
+        }),
+        METADATA_TAG_AUDIO => Some(ContentMetadata::Audio {
+            sample_rate: u32::from_le_bytes(fields[0..4].try_into().unwrap()),
+            channels: fields[4],
+            bits_per_sample: fields[5],
+        }),
+        METADATA_TAG_VIDEO => Some(ContentMetadata::Video {
+            width_px: u32::from_le_bytes(fields[0..4].try_into().unwrap()),
+            height_px: u32::from_le_bytes(fields[4..8].try_into().unwrap()),
+            fps_numerator: u32::from_le_bytes(fields[8..12].try_into().unwrap()),
+            fps_denominator: u32::from_le_bytes(fields[12..16].try_into().unwrap()),
+            codec: VideoCodec::from_u8(fields[16])?,
+        }),
+        METADATA_TAG_MARKDOWN => Some(ContentMetadata::Markdown),
+        _ => None,
+    }
+}
+
 /// Builds one complete envelope ready to be wrapped in `ESC _ S ... ESC \`
 /// and written to a PTY.
 pub fn build_envelope(chunk: &Chunk) -> Vec<u8> {
@@ -389,6 +597,7 @@ pub fn build_envelope(chunk: &Chunk) -> Vec<u8> {
     fields.extend_from_slice(&chunk.chunk_offset.to_le_bytes());
     fields.extend_from_slice(&(chunk.payload.len() as u32).to_le_bytes());
     fields.extend_from_slice(&chunk.total_size.to_le_bytes());
+    fields.extend_from_slice(&encode_metadata(chunk.metadata));
     fields.extend_from_slice(&crc32(&chunk.payload).to_le_bytes());
     debug_assert_eq!(fields.len(), HEADER_FIELDS_LEN);
 
@@ -443,6 +652,8 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Chunk, DecodeError> {
     offset += 4;
     let total_size = u64::from_le_bytes(fields[offset..offset + 8].try_into().unwrap());
     offset += 8;
+    let metadata = decode_metadata(&fields[offset..offset + METADATA_ENCODED_LEN]).ok_or(DecodeError::InvalidMetadata)?;
+    offset += METADATA_ENCODED_LEN;
     let declared_crc32 = u32::from_le_bytes(fields[offset..offset + 4].try_into().unwrap());
     offset += 4;
     debug_assert_eq!(offset, HEADER_FIELDS_LEN);
@@ -457,7 +668,7 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Chunk, DecodeError> {
         return Err(DecodeError::ChecksumMismatch { expected: declared_crc32, actual: actual_crc32 });
     }
 
-    Ok(Chunk { content_type, session_id, file_id, chunk_offset, total_size, payload })
+    Ok(Chunk { content_type, session_id, file_id, chunk_offset, total_size, metadata, payload })
 }
 
 /// Splits `data` into payload-sized pieces no larger than `max_len` raw
@@ -483,6 +694,7 @@ mod tests {
             file_id: 0x1234_5678,
             chunk_offset: 4096,
             total_size: 500_000,
+            metadata: ContentMetadata::Image { width_px: 480, height_px: 480, color_bits: 32, is_animated: true },
             payload,
         }
     }
@@ -636,6 +848,7 @@ mod tests {
         fields.extend_from_slice(&chunk.chunk_offset.to_le_bytes());
         fields.extend_from_slice(&(chunk.payload.len() as u32).to_le_bytes());
         fields.extend_from_slice(&chunk.total_size.to_le_bytes());
+        fields.extend_from_slice(&encode_metadata(chunk.metadata));
         fields.extend_from_slice(&crc32(&chunk.payload).to_le_bytes());
         fields[field_index] = new_value;
 
@@ -772,6 +985,7 @@ mod tests {
                 file_id: 1,
                 chunk_offset: 0,
                 total_size: 0,
+                metadata: ContentMetadata::Image { width_px: 0, height_px: 0, color_bits: 0, is_animated: false },
                 payload: piece.clone(),
             };
             let envelope = build_envelope(&chunk);

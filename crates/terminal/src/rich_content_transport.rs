@@ -144,16 +144,60 @@ pub struct Chunk {
     /// yet", and should rely on chunk arrival order/completion signaling
     /// from a higher layer instead.
     pub total_size: u64,
-    /// MUST NOT contain `0x1B` — see this module's doc comment for why
-    /// and what to do instead ([`Self::trailing_esc_byte`]).
+    /// MUST NOT contain `0x1B` or `0x0A` — see this module's doc comment
+    /// for why and what to do instead ([`Self::trailing_byte`]).
     /// [`build_envelope`] panics if this invariant is violated.
     pub payload: Vec<u8>,
-    /// When `true`, exactly one literal `0x1B` byte belongs in the cache
-    /// file immediately after `payload` (i.e. at file offset
+    /// When [`Some`], exactly one literal byte of that value belongs in
+    /// the cache file immediately after `payload` (i.e. at file offset
     /// `chunk_offset + payload.len()`) — the sender's way of transmitting
-    /// a source `0x1B` byte without ever putting it inside `payload`
-    /// itself. See this module's doc comment for the full rationale.
-    pub trailing_esc_byte: bool,
+    /// a source `0x1B`/`0x0A` byte without ever putting it inside
+    /// `payload` itself. See this module's doc comment for the full
+    /// rationale.
+    pub trailing_byte: Option<TrailingByte>,
+}
+
+/// The two byte values that can never appear inside [`Chunk::payload`] —
+/// see this module's doc comment ("Why `payload` can never contain
+/// certain bytes") for why each one is dangerous, and why one shared
+/// mechanism ([`Chunk::trailing_byte`]) handles both instead of two
+/// separate boolean flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TrailingByte {
+    /// `0x1B` (ESC) — the only byte the patched VTE parser still treats
+    /// specially inside an APC string (it's the terminator's first byte).
+    Esc = 0x1B,
+    /// `0x0A` (LF) — Windows ConPTY inserts an extra `0x0D` (CR)
+    /// immediately before every bare `0x0A` byte in a child process's
+    /// output BEFORE that data ever reaches this process — confirmed via
+    /// `alacritty_terminal`'s own `EventLoop::collapse_cr_cr_lf` doc
+    /// comment, which documents this exact ConPTY behavior for an
+    /// unrelated reason (SSH double-pty CRLF duplication). This is
+    /// operating-system-level behavior outside this protocol's control —
+    /// no amount of care in `somcat`'s own write path can prevent it, so
+    /// `0x0A` gets the same trailing-byte treatment as `0x1B` rather than
+    /// being allowed to travel inside `payload` and arrive corrupted.
+    Lf = 0x0A,
+}
+
+impl TrailingByte {
+    fn from_marker(byte: u8) -> Option<Self> {
+        match byte {
+            0 => None,
+            0x1B => Some(Self::Esc),
+            0x0A => Some(Self::Lf),
+            other => unreachable!("invalid trailing_byte marker {other} — parse_envelope should have rejected this"),
+        }
+    }
+
+    fn to_marker(this: Option<Self>) -> u8 {
+        match this {
+            None => 0,
+            Some(Self::Esc) => 0x1B,
+            Some(Self::Lf) => 0x0A,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +211,9 @@ pub enum DecodeError {
     UnsupportedVersion(u8),
     /// `content_type` byte didn't match any [`ContentType`] variant.
     UnknownContentType(u8),
+    /// `trailing_byte` marker byte wasn't `0`, `0x1B`, or `0x0A` — see
+    /// [`TrailingByte`].
+    UnknownTrailingByte(u8),
     /// `chunk_len` in the header didn't match the actual remaining byte
     /// count after the header — a truncated or corrupted envelope.
     LengthMismatch { declared: u32, actual: usize },
@@ -184,6 +231,7 @@ impl fmt::Display for DecodeError {
             Self::WrongMarker => write!(f, "leading byte is not the rich-content marker"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported envelope version {v}"),
             Self::UnknownContentType(b) => write!(f, "unknown content type byte {b}"),
+            Self::UnknownTrailingByte(b) => write!(f, "unknown trailing_byte marker {b:#04x}"),
             Self::LengthMismatch { declared, actual } => {
                 write!(f, "declared chunk_len {declared} does not match actual payload length {actual}")
             },
@@ -217,23 +265,23 @@ fn crc32(data: &[u8]) -> u32 {
 ///
 /// # Panics
 ///
-/// If `chunk.payload` contains a `0x1B` byte — see this module's doc
-/// comment for why that's a hard protocol invariant rather than something
-/// this function could silently work around, and what a caller should do
-/// instead (split the chunk before the `0x1B` and set
-/// `trailing_esc_byte: true` on it).
+/// If `chunk.payload` contains a `0x1B` or `0x0A` byte — see this
+/// module's doc comment for why that's a hard protocol invariant rather
+/// than something this function could silently work around, and what a
+/// caller should do instead (split the chunk before the dangerous byte
+/// and set `trailing_byte` on it).
 pub fn build_envelope(chunk: &Chunk) -> Vec<u8> {
     assert!(
-        !chunk.payload.contains(&0x1B),
-        "rich_content_transport::Chunk::payload must never contain 0x1B — split the chunk before \
-         the ESC byte and set trailing_esc_byte instead (see this module's doc comment)"
+        !chunk.payload.contains(&0x1B) && !chunk.payload.contains(&0x0A),
+        "rich_content_transport::Chunk::payload must never contain 0x1B or 0x0A — split the chunk \
+         before the dangerous byte and set trailing_byte instead (see this module's doc comment)"
     );
 
     let mut envelope = Vec::with_capacity(HEADER_LEN + chunk.payload.len());
     envelope.push(MARKER);
     envelope.push(VERSION);
     envelope.push(chunk.content_type as u8);
-    envelope.push(chunk.trailing_esc_byte as u8);
+    envelope.push(TrailingByte::to_marker(chunk.trailing_byte));
     envelope.extend_from_slice(&chunk.session_id.to_le_bytes());
     envelope.extend_from_slice(&chunk.file_id.to_le_bytes());
     envelope.extend_from_slice(&chunk.chunk_offset.to_le_bytes());
@@ -263,7 +311,10 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Chunk, DecodeError> {
         return Err(DecodeError::UnsupportedVersion(bytes[1]));
     }
     let content_type = ContentType::from_u8(bytes[2]).ok_or(DecodeError::UnknownContentType(bytes[2]))?;
-    let trailing_esc_byte = bytes[3] != 0;
+    let trailing_byte = match bytes[3] {
+        0 | 0x1B | 0x0A => TrailingByte::from_marker(bytes[3]),
+        other => return Err(DecodeError::UnknownTrailingByte(other)),
+    };
 
     let mut offset = 4;
     let session_id = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
@@ -297,36 +348,40 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Chunk, DecodeError> {
         chunk_offset,
         total_size,
         payload: payload.to_vec(),
-        trailing_esc_byte,
+        trailing_byte,
     })
 }
 
-/// Splits `data` into a sequence of `(payload, trailing_esc_byte)` pieces
+/// Splits `data` into a sequence of `(payload, trailing_byte)` pieces
 /// suitable for building one [`Chunk`] each, guaranteeing every resulting
-/// `payload` slice is both `0x1B`-free (satisfying [`build_envelope`]'s
-/// hard invariant) and no longer than `max_len`. A run of consecutive
-/// `0x1B` bytes in `data` produces one zero-length-payload,
-/// `trailing_esc_byte: true` piece per `0x1B` — correct, if not maximally
-/// compact, and simple enough that a client (see `crates/somcat`) doesn't
-/// need to duplicate this splitting logic itself.
-pub fn split_into_chunks(data: &[u8], max_len: usize) -> Vec<(Vec<u8>, bool)> {
+/// `payload` slice is free of BOTH dangerous bytes (`0x1B` and `0x0A` —
+/// satisfying [`build_envelope`]'s hard invariant) and no longer than
+/// `max_len`. A run of consecutive dangerous bytes in `data` produces one
+/// zero-length-payload, `trailing_byte: Some(_)` piece per dangerous byte
+/// — correct, if not maximally compact, and simple enough that a client
+/// (see `crates/somcat`) doesn't need to duplicate this splitting logic
+/// itself.
+pub fn split_into_chunks(data: &[u8], max_len: usize) -> Vec<(Vec<u8>, Option<TrailingByte>)> {
     assert!(max_len > 0, "max_len must be positive");
     let mut pieces = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
-        match rest.iter().position(|&b| b == 0x1B) {
+        match rest.iter().position(|&b| b == 0x1B || b == 0x0A) {
             Some(0) => {
-                pieces.push((Vec::new(), true));
+                let marker = TrailingByte::from_marker(rest[0]);
+                pieces.push((Vec::new(), marker));
                 rest = &rest[1..];
             },
-            Some(esc_pos) => {
-                let take = esc_pos.min(max_len);
-                pieces.push((rest[..take].to_vec(), take == esc_pos && take < rest.len()));
-                rest = &rest[take + if take == esc_pos { 1 } else { 0 }..];
+            Some(dangerous_pos) => {
+                let take = dangerous_pos.min(max_len);
+                let hit_dangerous_byte = take == dangerous_pos && take < rest.len();
+                let marker = if hit_dangerous_byte { TrailingByte::from_marker(rest[take]) } else { None };
+                pieces.push((rest[..take].to_vec(), marker));
+                rest = &rest[take + if hit_dangerous_byte { 1 } else { 0 }..];
             },
             None => {
                 let take = rest.len().min(max_len);
-                pieces.push((rest[..take].to_vec(), false));
+                pieces.push((rest[..take].to_vec(), None));
                 rest = &rest[take..];
             },
         }

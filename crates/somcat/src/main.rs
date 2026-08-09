@@ -465,9 +465,9 @@ fn stream_file(path: &str) -> Result<(), String> {
 
     let pieces = split_into_chunks(&bytes, CHUNK_SIZE);
     let mut offset = 0u64;
-    for (payload, trailing_esc_byte) in pieces {
+    for (payload, trailing_byte) in pieces {
         let payload_len = payload.len() as u64;
-        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, payload, trailing_esc_byte };
+        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, payload, trailing_byte };
         // `build_envelope` already produces the complete envelope
         // (marker + version + ... + payload) — this just wraps it in the
         // APC start/end sequence (`ESC _` ... `ESC \`).
@@ -477,7 +477,7 @@ fn stream_file(path: &str) -> Result<(), String> {
         apc.extend_from_slice(&envelope);
         apc.extend_from_slice(&[0x1B, b'\\']);
         write_raw_stdout(&apc)?;
-        offset += payload_len + if chunk.trailing_esc_byte { 1 } else { 0 };
+        offset += payload_len + if chunk.trailing_byte.is_some() { 1 } else { 0 };
     }
     Ok(())
 }

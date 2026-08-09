@@ -4,7 +4,7 @@
 
 Этот документ фиксирует все значимые архитектурные и технические решения по ходу реализации — не туториал, а рабочий журнал решений с обоснованием "почему", чтобы не терять контекст между сессиями.
 
-**Статус: транспорт полностью работает end-to-end через реальный ConPTY**, подтверждено ключевым бенчмарком `bench_rich_content_stream_progressive_playback_starts_before_transfer_completes` — первый частичный декод GIF происходит примерно через 230мс после старта передачи (пока процесс-отправитель ещё работает), полное завершение (все 47 кадров) — примерно через 2 секунды для 980KB файла.
+**Статус: транспорт И paint-путь полностью работают end-to-end через реальный ConPTY**, подтверждено ключевым бенчмарком `bench_rich_content_stream_progressive_playback_starts_before_transfer_completes` — первый частичный декод GIF происходит примерно через 230мс после старта передачи (пока процесс-отправитель ещё работает), полное завершение (все 47 кадров) — примерно через 2 секунды для 980KB файла. Рендер на экране реализован (`paint_rich_content_placements`) и доказан headless-тестом через реальный подпроцесс (`test_rich_content_placements_reach_the_paint_path_via_a_real_process`); визуальное подтверждение "GIF реально виден на экране" через живой AutoIt-тест ещё предстоит (не выполнялось автономно — см. этого документа секцию "Paint-путь" ниже, почему).
 
 ## Зачем свой протокол, а не Kitty
 
@@ -147,11 +147,25 @@ Content-type определяется по расширению файла (`.gi
 
 `crates/terminal/src/terminal.rs` — end-to-end тесты через реальный (патченый) VTE-парсер (`test_rich_content_chunk_reaches_terminal_via_real_vte_parser`, включая байт `0x1B` внутри payload — доказывает, что base91-кодирование делает это не-проблемой), диагностический тест изоляции транспорта от ConPTY (`test_rich_content_many_real_chunks_via_write_output_reconstructs_file_exactly`), и ключевой бенчмарк через РЕАЛЬНЫЙ подпроцесс/ConPTY (`bench_rich_content_stream_progressive_playback_starts_before_transfer_completes`) — единственный тест, доказывающий саму суть архитектуры: первый частичный декод происходит РАНЬШЕ окончания передачи файла.
 
-Все 41 rich_content-теста + весь остальной набор `terminal`-крейта (кроме pre-existing, не связанных с SRP падений в `terminal_hyperlinks`, не менявшихся в этой работе) — зелёные.
+`test_rich_content_placements_reach_the_paint_path_via_a_real_process` — проверяет именно то, что `paint_rich_content_placements` реально использует (`Terminal::rich_content_placements()`) через реальный `somcat --stream` подпроцесс: непустой anchor, непустой `RenderImage`, продвигающийся `current_frame` между опросами.
+
+Все 179 тестов `terminal`-крейта (кроме pre-existing, не связанных с SRP падений в `terminal_hyperlinks`, не менявшихся в этой работе) + все 54 теста `terminal_view` — зелёные.
+
+## Paint-путь (реализовано)
+
+`crates/terminal/src/rich_content_player.rs` — `RichContentPlayer`: paint-ready decode-состояние (аналог `kitty_graphics_store::DecodedImage` — тот же `Arc<RenderImage>` + `Cell`-based animation playback), но управляется передекодированием растущего кэш-файла (`rich_content_gif_player::try_decode_progressive`), а не накоплением Kitty `a=f`-команд. `refresh_or_create` — ре-декодирует только если `contiguous_len` выросла с последнего декода (проверено тестом на identity-равенство `Arc`-указателя — доказывает, что переиспользование, а не слепое передекодирование на каждый вызов).
+
+`crates/terminal/src/rich_content_cache.rs` — `CacheEntry` получил новое поле `anchor: (i32, usize)`, записываемое ОДИН РАЗ при первом чанке новой пары `(session_id, file_id)`. **Важное архитектурное решение**: у SRP нет отдельной Place-команды (`a=p` у Kitty) — протокол пока умеет только слать чанки данных без явной команды позиционирования. Anchor = позиция курсора в момент первого чанка (тот же `apc_cursor`, что `process_event`'s `ApcString`-обработчик уже получает от `alacritty_terminal`, используется идентично Kitty's cursor-relative placement модели, просто определяется неявно первым чанком вместо явной команды).
+
+`Terminal::rich_content_placements(&self) -> Vec<((i32, usize), Arc<RenderImage>, usize, bool)>` — новый метод, `&self` (не `&mut self`) несмотря на внутренний refresh состояния: `rich_content_players: RefCell<HashMap<...>>` на `Terminal`, тот же паттерн, что `kitty_graphics_store::DecodedImage`'s `animation: Cell<...>` уже использует и по той же причине — paint-проход имеет только `Entity::read`-доступ к `Terminal` (см. `paint_kitty_placements`'s доккомментарий: `Entity::update` изнутри активного paint-вызова уже пробовали и откатили, ломало даже самый первый кадр).
+
+`crates/terminal_view/src/terminal_element.rs` — `paint_rich_content_placements`, вызывается рядом с (не вместо) `paint_kitty_placements`, переиспользует ту же самую grid→pixel математику (`kitty_placement_bounds`) — оба протокола одинаково анкорят placement к grid-ячейке. Пока всегда фиксированный 1×1-клеточный footprint (у SRP ещё нет `columns`/`rows`-команды, как у Kitty's `a=p` — не критично для первой рабочей версии). Общий с Kitty троттлинг `force_redraw`/`request_animation_frame` (тот же `any_kitty_animating`-флаг, тот же `Terminal::kitty_force_redraw_due`-таймер — специально НЕ заведён отдельный таймер, чтобы не удваивать эффективную частоту форсированных redraw).
+
+**Не проверено визуально живым тестом** (AutoIt `Send()` недопустим для автономной работы без прямого наблюдения пользователя — см. `feedback_autoit_focus_check` память, категорический запрет после трёх инцидентов со сбросом сессии/порчей файлов) — вместо этого logic-путь до самого вызова `window.paint_image` полностью покрыт headless-тестом через реальный ConPTY-подпроцесс. Живая визуальная проверка (открыть Som, `somcat --stream giphy.gif`, увидеть анимацию) — TODO, требует либо явного разрешения пользователя на конкретный момент, либо protocol-level способа ввода команды в PTY без затрагивания фокуса экрана.
 
 ## Следующие нереализованные этапы (вне текущего прогресса)
 
-- **Paint-путь**: `paint_rich_content_placements` в `crates/terminal_view/src/terminal_element.rs` — рендер декодированных GIF-кадров через GPUI `paint_image`, рядом с (не вместо) `paint_kitty_placements`. Транспорт и progressive-decode готовы, но результат ещё нигде не отображается на экране — только пишется в кэш-файл и прогрессивно декодируется в тестах.
 - Аудио: symphonia (декодирование) + `cpal` (воспроизведение, уже в зависимостях) поверх того же конверта с `content_type=Audio`.
 - Markdown: `crates/markdown/src/markdown.rs` (уже существующий GPUI-виджет из Zed) как overlay поверх терминального грида.
 - Видео (mp4/mkv/webm) и PDF — отдельные, более крупные этапы.
+- SRP-эквивалент Kitty's `a=p`/`columns`/`rows`/z-index — если понадобится управление размером/слоями плейсмента отдельно от неявного 1×1-anchor-при-первом-чанке.

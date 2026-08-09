@@ -1409,7 +1409,8 @@ impl Element for TerminalElement {
                     // Non-negative (including the default, 0) draw OVER text
                     // — see the second paint_kitty_placements call below,
                     // after the text batches.
-                    paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z < 0);
+                    let mut any_kitty_animating =
+                        paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z < 0);
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
@@ -1437,14 +1438,88 @@ impl Element for TerminalElement {
                     // Non-negative z-index placements draw OVER text — see
                     // the under-text call above, before the highlight/text
                     // painting, for the negative-z-index half of this split.
-                    paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z >= 0);
+                    any_kitty_animating |=
+                        paint_kitty_placements(&self.terminal, origin, layout, window, cx, |z| z >= 0);
 
                     // Unicode-placeholder-mode images (KITTY_GRAPHICS_PLAN.md
                     // Stage 4) — anchored to grid cells written as ordinary
                     // (if specially-encoded) text, so they paint alongside
                     // the text batches rather than through the cursor-
                     // relative PlacementInfo path above.
-                    paint_kitty_unicode_placeholders(&self.terminal, origin, layout, window, cx);
+                    any_kitty_animating |=
+                        paint_kitty_unicode_placeholders(&self.terminal, origin, layout, window, cx);
+
+                    // Som's own rich-content protocol (SRP) — entirely
+                    // independent from Kitty above (own store, own
+                    // marker byte), painted over text like Kitty's
+                    // non-negative-z-index placements since SRP has no
+                    // z-index concept of its own yet. Shares the same
+                    // `any_kitty_animating`-driven force-redraw/animation-
+                    // frame logic below rather than a separate throttle —
+                    // see `Terminal::kitty_force_redraw_due`'s doc comment
+                    // for why one shared budget matters (two independent
+                    // throttles could each individually stay "due" and
+                    // double the effective forced-redraw rate).
+                    any_kitty_animating |=
+                        paint_rich_content_placements(&self.terminal, origin, layout, window, cx);
+
+                    // At least one Kitty graphics animation is currently
+                    // playing on screen — nothing else would otherwise
+                    // prompt GPUI to repaint this element on the next tick
+                    // (unlike, say, a keystroke or PTY output), so ask for
+                    // one explicitly. Mirrors `gpui::elements::img`'s own
+                    // GIF/WebP animation driving (`Img::request_layout`'s
+                    // `window.request_animation_frame()` call) — see that
+                    // module for the equivalent non-terminal codepath this
+                    // was modeled on.
+                    //
+                    // `request_animation_frame()` alone is NOT enough on
+                    // Windows: it only marks this element dirty for
+                    // whenever the platform's own mechanism next gets
+                    // around to actually redrawing (a background VSync
+                    // thread calling `RedrawWindow`) — not synchronous, and
+                    // confirmed (live testing a real animated GIF through
+                    // `somcat`) to never actually fire on its own once the
+                    // window is idle: the same "doesn't repaint until you
+                    // press a key" gap already documented for multi-chunk
+                    // Kitty transmits in `Terminal::process_event`'s
+                    // `ApcString` handler, here for animation frame
+                    // advancement instead of chunk arrival. An explicit
+                    // forced native repaint (unconditional `window.refresh()`
+                    // + `draw()` + `present()`, see
+                    // `PlatformWindow::force_redraw`'s doc comment) is
+                    // needed to actually get the next frame on screen
+                    // rather than just have it sit correctly decoded in
+                    // `ImageStore` forever.
+                    //
+                    // MUST be throttled the same way `process_event`'s own
+                    // chunk-arrival redraw is (`Terminal::kitty_force_redraw_due`,
+                    // sharing that same timer/budget) — the earlier
+                    // assumption written here ("paint() itself only runs as
+                    // often as a real repaint already happens, so this
+                    // can't runaway") was WRONG: `force_redraw_windows()`
+                    // synchronously does a full `draw()+present()` and
+                    // `request_animation_frame()` schedules another `paint()`
+                    // right after, so once an animation is active this
+                    // becomes a tight self-sustaining paint -> force_redraw
+                    // -> paint loop with no pacing at all, confirmed live to
+                    // starve the PTY-reader/event-loop task of CPU time
+                    // badly enough that a single somcat invocation (one
+                    // 500x500 GIF, 47 frames) took over a minute end-to-end
+                    // instead of the ~5-10s headless benchmarks
+                    // (`bench_somcat_*` in `crates/terminal/src/terminal.rs`)
+                    // consistently show with no competing native repaint
+                    // loop. `read(cx)` (immutable), NOT `Entity::update` —
+                    // going through `update` from inside an in-progress
+                    // paint call was tried and reverted earlier in this
+                    // same investigation: it broke even the FIRST frame
+                    // from ever appearing.
+                    if any_kitty_animating {
+                        window.request_animation_frame();
+                        if self.terminal.read(cx).kitty_force_redraw_due() {
+                            cx.force_redraw_windows();
+                        }
+                    }
 
                     if let Some(text_to_mark) = &marked_text_cloned
                         && !text_to_mark.is_empty()
@@ -1675,6 +1750,10 @@ pub fn is_blank(cell: &IndexedCell) -> bool {
 /// handled here — unicode-placeholder-mode placements (Stage 4) render
 /// through the normal text-cell path instead, since they're anchored to
 /// specific grid cells written as regular (if specially-encoded) glyphs.
+/// Returns `true` if at least one painted placement is a currently-playing
+/// animation — the caller uses this to decide whether to call
+/// `window.request_animation_frame()` so GPUI keeps repainting this element
+/// on its own (see this function's callers in `TerminalElement::paint`).
 fn paint_kitty_placements(
     terminal: &Entity<Terminal>,
     origin: Point<Pixels>,
@@ -1682,7 +1761,7 @@ fn paint_kitty_placements(
     window: &mut Window,
     cx: &mut App,
     z_filter: impl Fn(i32) -> bool,
-) {
+) -> bool {
     let terminal = terminal.read(cx);
 
     // Cursor-relative placements (unlike Unicode placeholders — see this
@@ -1697,11 +1776,12 @@ fn paint_kitty_placements(
     // moment the alt screen exits, same as the text underneath them
     // already does for free.
     if terminal.last_content().mode.contains(TermMode::ALT_SCREEN) {
-        return;
+        return false;
     }
 
     let num_lines = layout.dimensions.num_lines() as i32;
     let num_columns = layout.dimensions.num_columns();
+    let mut any_animating = false;
 
     for (_image_id, _placement_id, info, image) in terminal.kitty_placements() {
         if !z_filter(info.z_index) {
@@ -1725,16 +1805,73 @@ fn paint_kitty_placements(
             continue;
         };
 
+        any_animating |= image.is_animating();
         window
             .paint_image(
                 Bounds::new(position, size),
                 gpui::Corners::all(Pixels::ZERO),
                 image.render_image.clone(),
-                0,
+                image.current_frame(),
                 false,
             )
             .log_err();
     }
+
+    any_animating
+}
+
+/// Paints Som's own rich-content protocol images/animations
+/// ([`terminal::rich_content_transport`]) — independent from
+/// [`paint_kitty_placements`] above (separate protocol, separate store,
+/// see that module's doc comment for why), but reusing the exact same
+/// grid-to-pixel math ([`kitty_placement_bounds`]) since both protocols
+/// anchor a placement to a cursor-relative grid cell the same way.
+///
+/// Always paints at a single, fixed 1-cell-wide-by-1-cell-tall footprint
+/// for now — SRP has no `columns`/`rows` sizing command the way Kitty's
+/// `a=p` does yet (see `rich_content_cache::CacheEntry::anchor`'s doc
+/// comment on why placement is implicit, decided by first-chunk arrival
+/// rather than an explicit command); natural-size-aware footprint is a
+/// reasonable follow-up once that's needed, not required for a first
+/// working paint path.
+fn paint_rich_content_placements(
+    terminal: &Entity<Terminal>,
+    origin: Point<Pixels>,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let terminal = terminal.read(cx);
+    if terminal.last_content().mode.contains(TermMode::ALT_SCREEN) {
+        return false;
+    }
+
+    let num_lines = layout.dimensions.num_lines() as i32;
+    let num_columns = layout.dimensions.num_columns();
+    let mut any_animating = false;
+
+    for (anchor, render_image, current_frame, is_animating) in terminal.rich_content_placements() {
+        let Some((position, size)) = kitty_placement_bounds(
+            anchor,
+            None,
+            None,
+            layout.display_offset,
+            num_lines,
+            num_columns,
+            origin,
+            layout.dimensions.cell_width,
+            layout.dimensions.line_height,
+        ) else {
+            continue;
+        };
+
+        any_animating |= is_animating;
+        window
+            .paint_image(Bounds::new(position, size), gpui::Corners::all(Pixels::ZERO), render_image, current_frame, false)
+            .log_err();
+    }
+
+    any_animating
 }
 
 /// Compute a Kitty graphics placement's paint bounds, or `None` if it's
@@ -1800,10 +1937,11 @@ fn paint_kitty_unicode_placeholders(
     layout: &LayoutState,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> bool {
     let terminal = terminal.read(cx);
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
+    let mut any_animating = false;
 
     // Group every placeholder cell seen this frame by (image_id,
     // placement_id): a multi-cell image is written as many adjacent
@@ -1920,16 +2058,19 @@ fn paint_kitty_unicode_placeholders(
             bounds.max_col,
         );
 
+        any_animating |= image.is_animating();
         window
             .paint_image(
                 Bounds::new(position, size),
                 gpui::Corners::all(Pixels::ZERO),
                 image.render_image.clone(),
-                0,
+                image.current_frame(),
                 false,
             )
             .log_err();
     }
+
+    any_animating
 }
 
 /// The on-screen (grid, not pixel) bounding box of one group of Unicode

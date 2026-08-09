@@ -6,6 +6,9 @@ pub mod kitty_graphics;
 pub mod kitty_graphics_placeholder;
 pub mod kitty_graphics_store;
 mod pty_info;
+pub mod rich_content_cache;
+pub mod rich_content_gif_player;
+pub mod rich_content_transport;
 mod terminal_hyperlinks;
 pub mod terminal_settings;
 
@@ -125,6 +128,15 @@ const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 /// for anything but its first size-set. See `created_at` on `Terminal`.
 const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Minimum spacing between consecutive `cx.force_redraw_windows()` calls
+/// triggered by Kitty graphics commands — see the call site (inside
+/// `Terminal::process_event`'s `ApcString` handler) for the full
+/// reasoning. ~33ms is roughly 30fps: fast enough that an animated GIF's
+/// frames still visibly stream in as they arrive, slow enough that a
+/// dozens-of-frames burst doesn't starve the window's message queue the
+/// way calling this on every single frame did (confirmed live).
+const KITTY_FORCE_REDRAW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
 /// Inserts Zed-specific environment variables for terminal sessions.
 /// Used by both local terminals and remote terminals (via SSH).
 pub fn insert_zed_terminal_env(
@@ -213,6 +225,26 @@ pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
         self.0.unbounded_send(event).ok();
+    }
+}
+
+/// Where `rich_content_cache::RichContentCache` writes progressively-
+/// arriving files. In tests, `paths::config_dir()` would point at a real
+/// user's `~/.config/som/` (it's a process-global `OnceLock`, not
+/// test-aware — see `paths::config_dir`'s own implementation) — every
+/// test run would otherwise write real files there and tests running in
+/// parallel with the same session/file id would collide. `std::env::
+/// temp_dir()` here mirrors the existing test-fixture pattern already
+/// used for `somcat_*_test_fixture.png` elsewhere in this file's test
+/// module.
+fn rich_content_cache_dir() -> std::path::PathBuf {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        std::env::temp_dir().join("som_rich_content_cache_runtime")
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        paths::config_dir().join("media_cache")
     }
 }
 
@@ -427,6 +459,7 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
+            is_tmux_relay_shell: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -447,6 +480,8 @@ impl TerminalBuilder {
             keyboard_input_sent: false,
             last_pty_grid_size: None,
             kitty_images: kitty_graphics_store::ImageStore::new(),
+            rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+            last_kitty_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
@@ -649,16 +684,23 @@ impl TerminalBuilder {
 
             let pty_info = PtyProcessInfo::new(&pty);
 
-            // Detects a `som_tmux`-wrapped `ssh` profile by shape (the
-            // literal `~/.local/bin/som-tmux` argument
-            // `wrap_remote_command_args` always inserts), the same key
-            // `rebuild_tmux_shell_with_fresh_pane_id` uses. Only these go
+            // Detects a `som_tmux`-wrapped profile by shape — either a
+            // remote (`ssh`/`wsl`) profile, where `wrap_remote_command_
+            // args` always inserts the literal `~/.local/bin/som-tmux`
+            // argument (the same key `rebuild_tmux_shell_with_fresh_pane_
+            // id` uses), or a LOCAL `tmux: true` profile, where `tmux_
+            // wrapped_shell`'s `RemoteKind::Local` branch makes `som-tmux
+            // .exe` itself the PROGRAM (not one of its args) — checking
+            // `args` alone misses this case entirely. Only these go
             // through the double-pty (`-tt` remote + Windows ConPTY)
-            // output path that produces `\r\r\n` — see `collapse_cr_cr_lf`.
-            let is_tmux_relay_shell = shell_params
-                .as_ref()
-                .and_then(|params| params.args.as_ref())
-                .is_some_and(|args| args.iter().any(|arg| arg.contains("som-tmux")));
+            // output path that produces `\r\r\n` (see `collapse_cr_cr_lf`)
+            // AND are the RELAY side of a HOLDER that already answers
+            // capability queries on the real PTY itself (see `is_tmux_
+            // relay_shell`'s second use below, in `process_event`).
+            let is_tmux_relay_shell = shell_params.as_ref().is_some_and(|params| {
+                params.program.contains("som-tmux")
+                    || params.args.as_ref().is_some_and(|args| args.iter().any(|arg| arg.contains("som-tmux")))
+            });
 
             //And connect them together
             let event_loop = EventLoop::new(
@@ -707,6 +749,7 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
+                is_tmux_relay_shell,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -727,6 +770,8 @@ impl TerminalBuilder {
                 keyboard_input_sent: false,
                 last_pty_grid_size: None,
                 kitty_images: kitty_graphics_store::ImageStore::new(),
+                rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+                last_kitty_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
@@ -768,6 +813,7 @@ impl TerminalBuilder {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
+                log::trace!("DIAGLOOP: events_rx yielded an event, entering process+drain cycle");
                 terminal.update(cx, |terminal, cx| {
                     //Process the first event immediately for lowered latency
                     terminal.process_event(event, cx);
@@ -797,9 +843,11 @@ impl TerminalBuilder {
                                     }
 
                                     if events.len() > 100 {
+                                        log::trace!("DIAGLOOP: drain loop hit the 100-event cap, breaking early");
                                         break;
                                     }
                                 } else {
+                                    log::trace!("DIAGLOOP: events_rx closed (child exited?)");
                                     break;
                                 }
                             },
@@ -807,10 +855,12 @@ impl TerminalBuilder {
                     }
 
                     if events.is_empty() && !wakeup {
+                        log::trace!("DIAGLOOP: drain cycle empty, yielding and breaking 'outer (back to waiting on events_rx.next())");
                         yield_now().await;
                         break 'outer;
                     }
 
+                    log::trace!("DIAGLOOP: draining {} events (wakeup={wakeup})", events.len());
                     terminal.update(cx, |this, cx| {
                         if wakeup {
                             this.process_event(AlacTermEvent::Wakeup, cx);
@@ -951,6 +1001,15 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
+    /// True for a `tmux: true` profile's RELAY-side terminal (local or
+    /// SSH/WSL) — see `is_tmux_relay_shell`'s doc comment at its
+    /// definition site for how this is detected. Gates whether
+    /// `process_event` answers capability queries (`PtyWrite`/
+    /// `ColorRequest`) itself — see those match arms' doc comments for why
+    /// a RELAY's own answering duplicates the HOLDER's, corrupting
+    /// whatever the real client program (e.g. `yazi`) is currently
+    /// rendering.
+    is_tmux_relay_shell: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
     mouse_down_hyperlink: Option<(String, bool, Match)>,
@@ -969,6 +1028,25 @@ pub struct Terminal {
     /// wired up — this exists so decoding/storage is independently
     /// observable/testable without depending on that.
     kitty_images: kitty_graphics_store::ImageStore,
+    /// Progressive on-disk cache for Som's own rich-content protocol
+    /// ([`rich_content_transport`]) — entirely separate from
+    /// `kitty_images` above (different protocol, different marker byte,
+    /// see that module's doc comment for why).
+    rich_content_cache: rich_content_cache::RichContentCache,
+    /// When `process_event`'s `ApcString` handler last called
+    /// `cx.force_redraw_windows()` for a Kitty graphics command — throttles
+    /// how often that forced native repaint actually fires (see that call
+    /// site's own doc comment for why `force_redraw` is needed at all on
+    /// Windows). An animated GIF re-encoded by `crates/somcat` sends one
+    /// `a=f` command per frame (dozens for a real GIF), each non-
+    /// intermediate — calling `force_redraw_windows()` on every single one
+    /// back-to-back reproduces the EXACT SAME "~340 full redraws"
+    /// message-queue starvation already documented for multi-chunk PNG
+    /// transmits, just keyed on frame count instead of chunk count
+    /// (confirmed live: a 47-frame GIF took 2+ minutes to finish
+    /// uploading with no throttle). `None` means "never yet, redraw
+    /// unconditionally on the next opportunity."
+    last_kitty_force_redraw: std::cell::Cell<Option<Instant>>,
     /// When this terminal was created. A sibling split pane can be resized
     /// (and thus SIGWINCH'd) purely as a side effect of `PaneGroup::split`
     /// restructuring the whole flex layout when a *new* split is added next
@@ -1077,9 +1155,63 @@ impl Terminal {
                     .into_bytes(),
                 )
             }
-            AlacTermEvent::PtyWrite(out) => self.write_to_pty(out.into_bytes()),
+            // A `tmux: true` RELAY's own `Term` sees the SAME raw PTY
+            // bytes its HOLDER already parsed and answered on the real
+            // PTY (som_tmux's `RawByteBroadcaster` mirrors bytes to every
+            // connected RELAY before the HOLDER's own event loop finishes
+            // handling them). If this RELAY's `Term` ALSO answers, the
+            // client program (e.g. `yazi`) receives the query echoed back
+            // to it a second time after it's already stopped expecting a
+            // VT reply — which it then renders as literal on-screen text
+            // instead of consuming as a control sequence. Confirmed root
+            // cause of yazi's "Shell:"/"Find:" popups filling with raw
+            // escape bytes in a `tmux: true` tab. This exactly mirrors
+            // real tmux's own architecture — `input.c`'s `input_reply`
+            // (DA1, DECRPM, cursor-position report, cell-pixel-size, etc.)
+            // all answer on the SERVER side, against the real PTY, never
+            // forwarded to the attaching client to answer a second time.
+            // A HOLDER always answers these on the real PTY on its own
+            // (see `som_tmux::session`'s permanent pump thread) whether or
+            // not any RELAY is attached, so silently dropping them here
+            // (rather than writing to a PTY som-tmux treats as a HOLDER-
+            // facing pipe, not the real shell's PTY) is correct.
+            //
+            // This does NOT include mode-report bytes that only look like
+            // ordinary `PtyWrite` output but actually carry SESSION STATE
+            // (is mouse tracking on? is DECCKM on?) rather than a fixed
+            // reply — those depend on the RELAY's own `Term`'s mode bits,
+            // which a HOLDER's separate headless `Term` can't answer on
+            // Som's behalf. Real tmux solves this the same way: `tty.c`'s
+            // `tty_update_mode` re-emits the raw DECSET/DECRST bytes for
+            // any mode bit that flipped, entirely SEPARATE from `input.c`'s
+            // `input_reply`. `som_tmux::redraw::Redrawer` does the exact
+            // same thing for `TermMode::APP_CURSOR`/mouse-tracking bits —
+            // see its `last_app_cursor`/`last_mouse_mode` fields — so by
+            // the time any capability query about THOSE modes could even
+            // be parsed, the RELAY's own `Term` already has the right
+            // mode bits from the Redrawer's explicit resend, independent
+            // of this gate.
+            AlacTermEvent::PtyWrite(out) => {
+                if !self.is_tmux_relay_shell {
+                    self.write_to_pty(out.into_bytes())
+                }
+            }
+            // `\x1b[18t`/`\x1b[16t`-style "report text area size" queries
+            // are DIFFERENT from `PtyWrite`'s general case: `alacritty_
+            // terminal` doesn't stringify the reply itself (it can't know
+            // the caller's actual GPUI pixel bounds) — instead `terminal::
+            // Terminal` supplies its own `self.last_content.terminal_
+            // bounds` here to build the answer, and a `tmux: true` HOLDER
+            // has its own equally-authoritative real pane-size answer
+            // ready via `som_tmux::session`'s `pump_last_bounds` (that's
+            // what fixed a real `micro`-doesn't-fill-the-pane bug — see
+            // that field's doc comment), so answering AGAIN here would
+            // just be redundant, not wrong, but skipping it keeps this
+            // one query type as one clean single reply instead of two.
             AlacTermEvent::TextAreaSizeRequest(format) => {
-                self.write_to_pty(format(self.last_content.terminal_bounds.into()).into_bytes())
+                if !self.is_tmux_relay_shell {
+                    self.write_to_pty(format(self.last_content.terminal_bounds.into()).into_bytes())
+                }
             }
             AlacTermEvent::CursorBlinkingChange => {
                 let terminal = self.term.lock();
@@ -1101,6 +1233,19 @@ impl Terminal {
                 }
             }
             AlacTermEvent::ColorRequest(index, format) => {
+                // Unlike `PtyWrite` (see its doc comment above), this
+                // reply's CONTENT actually differs between Som and a
+                // `tmux: true` HOLDER: this arm answers with the user's
+                // real configured theme color (`cx.theme()`, right below),
+                // while a HOLDER has no GPUI `Theme` to consult and falls
+                // back to a hardcoded Nord Darker color (see `som_tmux::
+                // session`'s `ColorRequest` arm). Always answering here —
+                // same as the non-tmux path — means the client sees Som's
+                // actual color even when a HOLDER's own (possibly
+                // mismatched, if the user's theme isn't Nord Darker) reply
+                // arrives first or second; a client that just uses
+                // whichever reply lands first would otherwise sometimes
+                // get the wrong one.
                 // It's important that the color request is processed here to retain relative order
                 // with other PTY writes. Otherwise applications might witness out-of-order
                 // responses to requests. For example: An application sending `OSC 11 ; ? ST`
@@ -1117,8 +1262,61 @@ impl Terminal {
                 self.register_task_finished(Some(exit_status), cx);
             }
             AlacTermEvent::ApcString(bytes, apc_cursor) => {
+                // Two independent APC-based protocols share this one
+                // event: Kitty's terminal graphics protocol (leading byte
+                // `G`, unmodified for third-party client compatibility —
+                // see `kitty_graphics`'s module doc comment) and Som's own
+                // rich-content protocol (leading byte
+                // `rich_content_transport::MARKER`, i.e. `S`). The two are
+                // mutually exclusive by construction — `MARKER` and `G`
+                // can't both be the first byte of the same string — so
+                // trying the rich-content marker first and falling
+                // through to Kitty parsing otherwise never misroutes a
+                // real Kitty command.
+                if bytes.first().copied() == Some(rich_content_transport::MARKER) {
+                    match rich_content_transport::parse_envelope(&bytes) {
+                        Ok(chunk) => {
+                            log::trace!(
+                                "rich-content chunk parsed: content_type={:?} session={:#x} file={:#x} offset={} len={}",
+                                chunk.content_type,
+                                chunk.session_id,
+                                chunk.file_id,
+                                chunk.chunk_offset,
+                                chunk.payload.len()
+                            );
+                            match self.rich_content_cache.apply_chunk(&chunk) {
+                                Ok(_contiguous_len) => {
+                                    // Painting/decoding is wired up in a
+                                    // later step of this plan — for now
+                                    // just persisting chunks to disk is
+                                    // the observable behavior, same as
+                                    // Kitty's own chunk-accumulation
+                                    // stage before its paint path existed.
+                                    cx.emit(Event::Wakeup);
+                                },
+                                Err(err) => {
+                                    log::warn!("rich-content chunk write failed: {err}");
+                                },
+                            }
+                        },
+                        // A malformed envelope (checksum mismatch,
+                        // truncated, wrong version) is dropped silently
+                        // at trace level, not surfaced as a user-visible
+                        // error — same tolerance principle as Kitty's own
+                        // `parse_command` returning `None` for anything
+                        // it doesn't recognize (see that function's doc
+                        // comment): a single corrupted chunk shouldn't
+                        // abort an otherwise-healthy progressive
+                        // transfer, and a higher layer (not implemented
+                        // yet) is expected to handle retransmission.
+                        Err(err) => {
+                            log::trace!("rich-content envelope failed to parse: {err}");
+                        },
+                    }
+                    return;
+                }
                 // Kitty's terminal graphics protocol is currently the only
-                // thing Som interprets APC strings as — see
+                // OTHER thing Som interprets APC strings as — see
                 // `kitty_graphics::parse_command`'s doc comment for why
                 // unrecognized/unsupported commands are silently ignored
                 // rather than logged as errors (a program probing for
@@ -1136,6 +1334,33 @@ impl Terminal {
                     if let kitty_graphics::KittyGraphicsCommand::Query(query) = command {
                         self.write_to_pty(kitty_graphics::query_response(query));
                     } else {
+                        // A multi-chunk transmission (yazi routinely splits
+                        // one image across hundreds of `m=1` chunks) only
+                        // produces a visible change on its LAST chunk —
+                        // `ImageStore::apply_transmit` just appends every
+                        // earlier chunk's payload to `pending` and returns.
+                        // Forcing a full native repaint (unconditional
+                        // `window.refresh()` + `draw()` + `present()`, see
+                        // `PlatformWindow::force_redraw`'s doc comment) on
+                        // EVERY one of those chunks was confirmed (via a
+                        // temporary diagnostic log counting real command
+                        // types against `force_redraw` calls) to be the
+                        // actual cause of the "image doesn't appear until
+                        // you press a key" bug: forcing ~340 full redraws
+                        // back-to-back for one image starves the window's
+                        // message queue and the PTY reader thread of CPU
+                        // time, so the final chunk — the one that actually
+                        // finishes decoding the image — doesn't get painted
+                        // promptly; a completely unrelated repaint (a
+                        // keypress) was what let the queue drain far enough
+                        // to reach it. Only force a redraw for commands that
+                        // can actually change what's on screen.
+                        let is_intermediate_chunk = matches!(
+                            command,
+                            kitty_graphics::KittyGraphicsCommand::Transmit(
+                                kitty_graphics::TransmitCommand { more_chunks: true, .. }
+                            )
+                        );
                         // Use the cursor position `apc_unhook` captured
                         // synchronously during VTE parsing (see
                         // `alacritty_terminal::event::Event::ApcString`'s doc
@@ -1172,8 +1397,39 @@ impl Terminal {
                         // `PlatformWindow::force_redraw`'s doc comment for
                         // why an actual forced native repaint is needed
                         // here instead.
+                        //
+                        // Throttled to at most once per
+                        // `KITTY_FORCE_REDRAW_MIN_INTERVAL` — an animated
+                        // GIF re-encoded by `crates/somcat` sends one
+                        // `a=f` per frame (dozens for a real GIF), each
+                        // non-intermediate, and calling
+                        // `force_redraw_windows()` on every single one
+                        // back-to-back reproduces the EXACT SAME "~340
+                        // full redraws" message-queue starvation this
+                        // comment already describes for multi-chunk PNG
+                        // transmits, just keyed on frame count instead of
+                        // chunk count (confirmed live: a 47-frame GIF took
+                        // 2+ minutes to finish uploading with no
+                        // throttle). Unlike excluding `a=f` from this
+                        // entirely (tried first, reverted — see git
+                        // history), still forcing a redraw periodically
+                        // during a long frame burst matters: leaving a
+                        // tab with ZERO forced redraws for the whole
+                        // burst reproduced a distinct bug where the pane
+                        // stopped visibly updating at all until manually
+                        // switched away and back (confirmed live) —
+                        // apparently something about a sufficiently long
+                        // gap with no native repaint at all, not just "a
+                        // late one", on Windows. `cx.emit`/`refresh` still
+                        // run unconditionally on every command either way
+                        // — cheap dirty-flag marking, not the expensive
+                        // part — so the throttle only ever delays how
+                        // promptly a burst's LATEST state reaches the
+                        // screen, never drops it.
                         cx.emit(Event::Wakeup);
-                        cx.force_redraw_windows();
+                        if !is_intermediate_chunk && self.kitty_force_redraw_due() {
+                            cx.force_redraw_windows();
+                        }
                     }
                 }
             }
@@ -1521,6 +1777,30 @@ impl Terminal {
         self.kitty_images.image(id)
     }
 
+    /// Atomically checks-and-marks whether `KITTY_FORCE_REDRAW_MIN_INTERVAL`
+    /// has elapsed since the last forced Kitty-graphics redraw, via a `Cell`
+    /// (not `Entity::update` — see `terminal_element.rs`'s `paint()`, the
+    /// only caller besides `process_event`'s own chunk-arrival throttle,
+    /// for why: `paint()` only ever has `&self`/read access to the
+    /// `Entity<Terminal>` it's painting, and going through `Entity::update`
+    /// from inside an in-progress paint call was tried and reverted — it
+    /// broke even the FIRST frame from ever appearing, confirmed live).
+    /// Shared by both callers so there's exactly one throttle window across
+    /// chunk-arrival forced redraws and animation-frame-advance forced
+    /// redraws, instead of two independent budgets that could each
+    /// individually stay "due" and double the effective redraw rate.
+    pub fn kitty_force_redraw_due(&self) -> bool {
+        let now = Instant::now();
+        let due = self
+            .last_kitty_force_redraw
+            .get()
+            .is_none_or(|last| now.duration_since(last) >= KITTY_FORCE_REDRAW_MIN_INTERVAL);
+        if due {
+            self.last_kitty_force_redraw.set(Some(now));
+        }
+        due
+    }
+
     pub fn kitty_placements(
         &self,
     ) -> impl Iterator<
@@ -1859,7 +2139,27 @@ impl Terminal {
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let term = self.term.clone();
-        let mut terminal = term.lock_unfair();
+        // `lock()` (fair), NOT `lock_unfair()` — this runs on the render
+        // thread, on every single paint, and `FairMutex`'s whole fairness
+        // guarantee (`lease()`/`lock()` queuing through the `next` mutex)
+        // only holds between callers that BOTH go through `lock()`. A
+        // `lock_unfair()` caller bypasses `next` entirely and can grab
+        // `data` out from under a PTY reader thread that's already queued
+        // via `lease()`, no matter how long that reader has been waiting —
+        // confirmed as the actual cause of a real animated GIF's
+        // transmission (`somcat` through Kitty's graphics protocol,
+        // dozens of KB of base64 in a sustained burst) reliably stalling
+        // partway through in a real Som window, while an equivalent
+        // headless test (identical PTY/EventLoop code, but no real
+        // render thread ever calling this method at all) completed
+        // reliably: `pty_read`'s `try_lock_unfair()` failing while this
+        // was held doesn't block — it `continue`s and reads MORE bytes
+        // into its buffer instead of parking — so a render thread that
+        // reliably wins the unfair race back-to-back can starve the
+        // reader for however long it takes `unprocessed` to hit
+        // `READ_BUFFER_SIZE` (1MB) and force a genuinely blocking
+        // `lock_unfair()`, over and over, every single paint.
+        let mut terminal = term.lock();
         //Note that the ordering of events matters for event processing
         while let Some(e) = self.events.pop_front() {
             self.process_terminal_event(&e, &mut terminal, window, cx)
@@ -3627,6 +3927,87 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_rich_content_chunk_reaches_terminal_via_real_vte_parser(cx: &mut TestAppContext) {
+        // Mirrors `test_kitty_graphics_apc_reaches_terminal` exactly, but
+        // for Som's own rich-content protocol instead of Kitty's — proves
+        // the routing added to `process_event`'s `ApcString` arm (marker
+        // byte dispatch between `rich_content_transport::parse_envelope`
+        // and `kitty_graphics::parse_command`) actually works end to end
+        // through the REAL (patched) VTE parser, not just that
+        // `rich_content_transport`'s own unit tests pass in isolation —
+        // those never exercise `apc_hook`/`apc_put`/`apc_unhook` or the
+        // patched full-8-bit passthrough at all.
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // Deliberately exercises `trailing_esc_byte`, not a raw ESC byte
+        // inside `payload` — `rich_content_transport::build_envelope`
+        // hard-panics on that (see its own doc comment for why an
+        // application-level escaping scheme doesn't work with the
+        // patched VTE parser: the parser terminates on the FIRST 0x1B of
+        // any escaped pair before this protocol's own code ever sees it,
+        // a bug this very test caught the first time it ran against the
+        // real parser instead of just `parse_envelope` called directly).
+        let payload_before_esc = b"abc".to_vec();
+        let payload_after_esc = b"de".to_vec();
+        let chunk1 = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Gif,
+            session_id: 0x1111_2222,
+            file_id: 0x3333_4444,
+            chunk_offset: 0,
+            total_size: 6,
+            payload: payload_before_esc.clone(),
+            trailing_esc_byte: true,
+        };
+        let chunk2 = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Gif,
+            session_id: 0x1111_2222,
+            file_id: 0x3333_4444,
+            chunk_offset: 4, // 3 payload bytes + 1 literal ESC byte from chunk1.
+            total_size: 6,
+            payload: payload_after_esc.clone(),
+            trailing_esc_byte: false,
+        };
+
+        let mut apc = Vec::new();
+        for chunk in [&chunk1, &chunk2] {
+            apc.extend_from_slice(&[0x1B, b'_']); // ESC _
+            apc.extend_from_slice(&rich_content_transport::build_envelope(chunk));
+            apc.extend_from_slice(&[0x1B, b'\\']); // ESC \
+        }
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&apc, cx);
+        });
+
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            let contiguous = terminal.rich_content_cache.contiguous_len(chunk1.session_id, chunk1.file_id);
+            assert_eq!(contiguous, 6, "both chunks (3 + 1 literal ESC + 2 bytes) must have landed contiguously");
+            let path = terminal
+                .rich_content_cache
+                .path(chunk1.session_id, chunk1.file_id)
+                .expect("a cache file must exist after a chunk was applied");
+            let on_disk = std::fs::read(path).expect("cache file must be readable");
+            let mut expected = payload_before_esc;
+            expected.push(0x1B);
+            expected.extend_from_slice(&payload_after_esc);
+            assert_eq!(on_disk, expected, "the literal ESC byte from trailing_esc_byte must appear on disk between the two chunks' payloads");
+        });
+    }
+
+    #[gpui::test]
     async fn test_kitty_graphics_many_chunks_via_real_vte_parser(cx: &mut TestAppContext) {
         // Regression test for a REAL bug found via this exact scenario
         // (2026-07-25, see project_kitty_graphics_protocol memory):
@@ -3938,6 +4319,82 @@ mod tests {
             assert_eq!(info.anchor, (2, 3), "placement must anchor to the cursor position at Place time (line 2, column 3)");
             assert_eq!(info.columns, Some(4));
             assert_eq!(info.rows, Some(2));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_kitty_graphics_animated_gif_pipeline_via_real_vte_parser(cx: &mut TestAppContext) {
+        // End-to-end acceptance test for GIF animation support, matching
+        // exactly the byte sequence `crates/somcat/src/main.rs`'s
+        // `transmit_and_animate` sends for a real animated GIF (raw RGBA
+        // `a=T` base frame, then `a=f` per additional frame with its own
+        // `z=` gap, then `a=a` to start playback) — driven through the
+        // real vte parser, not `ImageStore::apply` called directly (see
+        // `kitty_graphics_store.rs`'s own unit tests for the lower-level
+        // store behavior; this test's job is proving the real Term ->
+        // Event::ApcString -> Terminal::process_event plumbing carries
+        // a=f/a=a through correctly, same as
+        // test_kitty_graphics_full_pipeline_renders_correct_pixels does
+        // for a=T/a=p).
+        use base64::Engine as _;
+        fn rgba_pixel(r: u8, g: u8, b: u8) -> String {
+            base64::engine::general_purpose::STANDARD.encode([r, g, b, 255u8])
+        }
+
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let mut bytes = Vec::new();
+        // Base frame (red), 1x1 raw RGBA, displayed immediately.
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i=21;{}\x1b\\", rgba_pixel(255, 0, 0)).as_bytes(),
+        );
+        bytes.extend_from_slice(b"\x1b_Ga=p,i=21,p=1\x1b\\");
+        // Two more animation frames (green, then blue), each with its own gap.
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=f,i=21,z=40;{}\x1b\\", rgba_pixel(0, 255, 0)).as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("\x1b_Ga=f,i=21,z=60;{}\x1b\\", rgba_pixel(0, 0, 255)).as_bytes(),
+        );
+        bytes.extend_from_slice(b"\x1b_Ga=a,i=21,s=3\x1b\\");
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&bytes, cx);
+        });
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            let image = terminal.kitty_image(21).expect("image 21 should be decoded and stored");
+            assert_eq!(image.render_image.frame_count(), 3, "base frame + two a=f frames");
+            assert!(image.is_animating(), "a=a must have started playback");
+
+            assert_eq!(&image.render_image.as_bytes(0).unwrap()[0..4], &[0, 0, 255, 255], "red -> BGRA");
+            assert_eq!(&image.render_image.as_bytes(1).unwrap()[0..4], &[0, 255, 0, 255], "green -> BGRA");
+            assert_eq!(&image.render_image.as_bytes(2).unwrap()[0..4], &[255, 0, 0, 255], "blue -> BGRA");
+
+            assert_eq!(
+                std::time::Duration::from(image.render_image.delay(1)),
+                std::time::Duration::from_millis(40)
+            );
+            assert_eq!(
+                std::time::Duration::from(image.render_image.delay(2)),
+                std::time::Duration::from_millis(60)
+            );
+
+            let placements: Vec<_> = terminal.kitty_placements().collect();
+            assert_eq!(placements.len(), 1, "the a=p placement must survive the animation frames arriving after it");
+            assert_eq!(placements[0].0, 21);
         });
     }
 
@@ -4378,10 +4835,20 @@ mod tests {
         );
 
         terminal.update(cx, |terminal, _cx| {
-            let image = terminal
-                .kitty_image(1)
-                .expect("somcat always uses image id 1 — see crates/somcat/src/main.rs");
-            let size = image.render_image.size(0);
+            // `somcat` assigns each invocation its own id (not a fixed
+            // `1` — see crates/somcat/src/main.rs's `next_image_id` doc
+            // comment for why a fixed id is a real, confirmed bug), so
+            // find whichever id its one placement actually landed under
+            // rather than assuming `1`.
+            let (image_id, _, _, _) = terminal
+                .kitty_placements()
+                .next()
+                .expect("checked via `placements_found > 0` above");
+            let size = terminal
+                .kitty_image(image_id)
+                .expect("id came from an existing placement")
+                .render_image
+                .size(0);
             assert_eq!(
                 (size.width.0, size.height.0),
                 (64, 32),
@@ -4644,7 +5111,15 @@ mod tests {
         );
 
         terminal.update(cx, |terminal, _cx| {
-            let image = terminal.kitty_image(1).expect("somcat always uses image id 1");
+            // `somcat` assigns each invocation its own id — see
+            // crates/somcat/src/main.rs's `next_image_id` doc comment.
+            let (image_id, _, _, _) = terminal
+                .kitty_placements()
+                .next()
+                .expect("checked via `placements_found > 0` above");
+            let image = terminal
+                .kitty_image(image_id)
+                .expect("id came from an existing placement");
             let size = image.render_image.size(0);
             eprintln!("DIAG: decoded image size in Som = {}x{}", size.width.0, size.height.0);
             assert_eq!((size.width.0, size.height.0), (4032, 3024));
@@ -4671,6 +5146,670 @@ mod tests {
         });
 
         std::fs::remove_file(&image_path).ok();
+    }
+
+    #[gpui::test]
+    async fn bench_somcat_animated_gif_end_to_end_transmission_time(cx: &mut TestAppContext) {
+        // Headless performance benchmark for animated GIF transmission —
+        // written specifically to replace unreliable manual AutoIt/visual
+        // testing (tab-focus confusion, racy `tasklist` polling) with a
+        // real, reproducible number measured entirely inside the test
+        // binary. Spawns the REAL `somcat` binary against the REAL test
+        // fixture (`giphy.gif`, checked into the repo root) as the
+        // terminal's actual child process — same mechanism as
+        // `test_somcat_displays_a_realistic_large_photo_sized_image` — and
+        // times from the moment the process is spawned to the moment
+        // `ImageStore` reports a fully-animating multi-frame image.
+        //
+        // This measures the SAME code path a real Som window uses
+        // end-to-end (real `alacritty_terminal` PTY, real `EventLoop`
+        // thread, real `Terminal::process_event`/`force_redraw_windows`
+        // throttle) minus only the GPUI window/compositor itself — so a
+        // regression here is a real regression, not a windowing/focus
+        // artifact. Not a strict pass/fail gate (transmission time isn't
+        // fully under this codebase's control — see the `eprintln!`
+        // breakdown below) — its value is a REPRODUCIBLE number to
+        // compare across changes, printed via `eprintln!` so `cargo test
+        // -- --nocapture` shows it directly.
+        cx.executor().allow_parking();
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(
+            giphy_path.is_file(),
+            "giphy.gif not found at {giphy_path:?} — this benchmark needs it at the repo root"
+        );
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let spawn_start = Instant::now();
+        let (terminal, completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![giphy_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        // Bounded poll (see feedback_bounded_test_loops memory) — 300
+        // iterations * 200ms = 60s ceiling, generous relative to every
+        // manually-observed run this session (worst case seen: ~2
+        // minutes pre-throttle-fix, ~50s post-fix) without risking an
+        // actually-hung run blocking the test suite forever.
+        let mut frame_count = 0usize;
+        let mut is_animating = false;
+        let mut elapsed_at_first_frame = None;
+        let mut elapsed_at_full_animation = None;
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let (fc, animating) = terminal.update(cx, |term, _| {
+                term.kitty_placements()
+                    .next()
+                    .map(|(id, _, _, _)| id)
+                    .and_then(|id| term.kitty_image(id))
+                    .map(|image| (image.render_image.frame_count(), image.is_animating()))
+                    .unwrap_or((0, false))
+            });
+            if fc > 0 && elapsed_at_first_frame.is_none() {
+                elapsed_at_first_frame = Some(spawn_start.elapsed());
+                eprintln!(
+                    "BENCH: first frame visible after {:?} (poll iteration {i})",
+                    elapsed_at_first_frame.unwrap()
+                );
+            }
+            if fc != frame_count {
+                eprintln!("BENCH: frame_count changed {frame_count} -> {fc} at {:?}", spawn_start.elapsed());
+                frame_count = fc;
+            }
+            if animating && elapsed_at_full_animation.is_none() {
+                elapsed_at_full_animation = Some(spawn_start.elapsed());
+                is_animating = animating;
+                eprintln!(
+                    "BENCH: animation fully active ({fc} frames) after {:?} (poll iteration {i})",
+                    elapsed_at_full_animation.unwrap()
+                );
+                break;
+            }
+            if i % 10 == 0 {
+                let exit_status = completion_rx.try_recv().ok();
+                let content = terminal.update(cx, |term, _| term.get_content());
+                eprintln!(
+                    "BENCH: poll {i} at {:?}, child exit_status={exit_status:?}, screen={content:?}",
+                    spawn_start.elapsed()
+                );
+            }
+        }
+
+        eprintln!(
+            "BENCH SUMMARY: first_frame={:?} full_animation={:?} total_frames={frame_count}",
+            elapsed_at_first_frame, elapsed_at_full_animation
+        );
+
+        if elapsed_at_first_frame.is_none() {
+            let screen = terminal.update(cx, |term, _| term.get_content());
+            eprintln!("BENCH: screen content on failure:\n{screen}");
+        }
+
+        assert!(
+            elapsed_at_first_frame.is_some(),
+            "somcat never produced even a first placed frame within the 60s budget — this is a \
+             hang, not just slow transmission"
+        );
+        assert!(
+            is_animating,
+            "the GIF's frames all arrived (frame_count={frame_count}) but a=a never finalized \
+             playback (is_animating() stayed false) within the 60s budget"
+        );
+        assert!(
+            frame_count > 1,
+            "expected a multi-frame animation from giphy.gif, got frame_count={frame_count}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn bench_somcat_animated_gif_via_pwsh_wrapper(cx: &mut TestAppContext) {
+        // Same benchmark as `bench_somcat_animated_gif_end_to_end_transmission_time`,
+        // but spawns `somcat` as a CHILD of `pwsh.exe` (via `-Command`)
+        // instead of as the terminal's own direct child process — exactly
+        // matching Som's real "win" tab profile (`shell:
+        // "C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), where ConPTY is
+        // bound to pwsh and somcat's output reaches conout only via pwsh's
+        // own inherited stdout handle, not a direct ConPTY attachment.
+        // Written specifically to test the hypothesis that this EXTRA
+        // process hop (real Som window: 0/N successful GIF animations;
+        // headless test spawning somcat directly: ~9/10) is itself the
+        // reproducible difference, after live testing consistently showed
+        // the animation stalling in a real Som window while this same
+        // codebase's direct-spawn benchmark passed reliably.
+        cx.executor().allow_parking();
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(
+            giphy_path.is_file(),
+            "giphy.gif not found at {giphy_path:?} — this benchmark needs it at the repo root"
+        );
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join("somcat.exe");
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let pwsh_path = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+        assert!(
+            std::path::Path::new(pwsh_path).is_file(),
+            "pwsh.exe not found at {pwsh_path:?} — this benchmark mirrors Som's real \"win\" tab profile"
+        );
+
+        let command = format!(
+            "& '{}' '{}'",
+            somcat_path.to_string_lossy(),
+            giphy_path.to_string_lossy()
+        );
+
+        let spawn_start = Instant::now();
+        let (terminal, completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            pwsh_path.to_string(),
+            vec!["-NoLogo".to_string(), "-Command".to_string(), command],
+        )
+        .await;
+
+        let mut frame_count = 0usize;
+        let mut is_animating = false;
+        let mut elapsed_at_first_frame = None;
+        let mut elapsed_at_full_animation = None;
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let (fc, animating) = terminal.update(cx, |term, _| {
+                term.kitty_placements()
+                    .next()
+                    .map(|(id, _, _, _)| id)
+                    .and_then(|id| term.kitty_image(id))
+                    .map(|image| (image.render_image.frame_count(), image.is_animating()))
+                    .unwrap_or((0, false))
+            });
+            if fc > 0 && elapsed_at_first_frame.is_none() {
+                elapsed_at_first_frame = Some(spawn_start.elapsed());
+                eprintln!(
+                    "BENCH(pwsh): first frame visible after {:?} (poll iteration {i})",
+                    elapsed_at_first_frame.unwrap()
+                );
+            }
+            if fc != frame_count {
+                eprintln!("BENCH(pwsh): frame_count changed {frame_count} -> {fc} at {:?}", spawn_start.elapsed());
+                frame_count = fc;
+            }
+            if animating && elapsed_at_full_animation.is_none() {
+                elapsed_at_full_animation = Some(spawn_start.elapsed());
+                is_animating = animating;
+                eprintln!(
+                    "BENCH(pwsh): animation fully active ({fc} frames) after {:?} (poll iteration {i})",
+                    elapsed_at_full_animation.unwrap()
+                );
+                break;
+            }
+            if i % 10 == 0 {
+                let exit_status = completion_rx.try_recv().ok();
+                let content = terminal.update(cx, |term, _| term.get_content());
+                eprintln!(
+                    "BENCH(pwsh): poll {i} at {:?}, child exit_status={exit_status:?}, screen={content:?}",
+                    spawn_start.elapsed()
+                );
+            }
+        }
+
+        eprintln!(
+            "BENCH(pwsh) SUMMARY: first_frame={:?} full_animation={:?} total_frames={frame_count}",
+            elapsed_at_first_frame, elapsed_at_full_animation
+        );
+
+        if elapsed_at_first_frame.is_none() {
+            let screen = terminal.update(cx, |term, _| term.get_content());
+            eprintln!("BENCH(pwsh): screen content on failure:\n{screen}");
+        }
+
+        assert!(
+            elapsed_at_first_frame.is_some(),
+            "somcat (via pwsh) never produced even a first placed frame within the 60s budget"
+        );
+        assert!(
+            is_animating,
+            "the GIF's frames all arrived (frame_count={frame_count}) but a=a never finalized \
+             playback (is_animating() stayed false) within the 60s budget, via pwsh"
+        );
+        assert!(
+            frame_count > 1,
+            "expected a multi-frame animation from giphy.gif via pwsh, got frame_count={frame_count}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn bench_somcat_animated_gif_via_interactive_pwsh(cx: &mut TestAppContext) {
+        // Same as `bench_somcat_animated_gif_via_pwsh_wrapper`, but spawns
+        // an INTERACTIVE `pwsh.exe` session (no `-Command`, matching Som's
+        // real "win" tab profile exactly: `shell: "...\\pwsh.exe"`, no
+        // args) and drives it by writing the command text + Enter through
+        // `write_to_pty` — i.e. as real simulated keystrokes echoed back
+        // by pwsh itself, not passed as a one-shot `-Command` argument.
+        // `-Command` never actually exercises pwsh's own interactive
+        // input-then-echo-then-spawn-child path at all. Written after live
+        // testing in a real Som window consistently stalled partway
+        // through an animated GIF transmission (a fixed, reproducible
+        // ~126/1382 Kitty commands received, sender completed
+        // successfully every time) while EVERY headless variant so far
+        // (direct spawn, `-Command` pwsh wrapper) completed reliably —
+        // testing whether it's specifically pwsh's OWN interactive
+        // input/echo machinery, not just "a shell is involved", that
+        // makes the difference.
+        cx.executor().allow_parking();
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(
+            giphy_path.is_file(),
+            "giphy.gif not found at {giphy_path:?} — this benchmark needs it at the repo root"
+        );
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join("somcat.exe");
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let pwsh_path = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+        assert!(
+            std::path::Path::new(pwsh_path).is_file(),
+            "pwsh.exe not found at {pwsh_path:?} — this benchmark mirrors Som's real \"win\" tab profile"
+        );
+
+        let spawn_start = Instant::now();
+        let (terminal, completion_rx) =
+            build_test_terminal_with_arguments(cx, pwsh_path.to_string(), vec![]).await;
+
+        // Give pwsh a moment to actually start up and print its own
+        // banner/prompt before typing into it — matches how a real user
+        // interacts with a freshly-opened tab, and avoids racing keystrokes
+        // against pwsh's own startup.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+
+        let command_line = format!(
+            "& '{}' '{}'\r",
+            somcat_path.to_string_lossy(),
+            giphy_path.to_string_lossy()
+        );
+        terminal.update(cx, |term, _| {
+            term.write_to_pty(command_line.into_bytes());
+        });
+
+        let mut frame_count = 0usize;
+        let mut is_animating = false;
+        let mut elapsed_at_first_frame = None;
+        let mut elapsed_at_full_animation = None;
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let (fc, animating) = terminal.update(cx, |term, _| {
+                term.kitty_placements()
+                    .next()
+                    .map(|(id, _, _, _)| id)
+                    .and_then(|id| term.kitty_image(id))
+                    .map(|image| (image.render_image.frame_count(), image.is_animating()))
+                    .unwrap_or((0, false))
+            });
+            if fc > 0 && elapsed_at_first_frame.is_none() {
+                elapsed_at_first_frame = Some(spawn_start.elapsed());
+                eprintln!(
+                    "BENCH(interactive pwsh): first frame visible after {:?} (poll iteration {i})",
+                    elapsed_at_first_frame.unwrap()
+                );
+            }
+            if fc != frame_count {
+                eprintln!(
+                    "BENCH(interactive pwsh): frame_count changed {frame_count} -> {fc} at {:?}",
+                    spawn_start.elapsed()
+                );
+                frame_count = fc;
+            }
+            if animating && elapsed_at_full_animation.is_none() {
+                elapsed_at_full_animation = Some(spawn_start.elapsed());
+                is_animating = animating;
+                eprintln!(
+                    "BENCH(interactive pwsh): animation fully active ({fc} frames) after {:?} (poll iteration {i})",
+                    elapsed_at_full_animation.unwrap()
+                );
+                break;
+            }
+            if i % 10 == 0 {
+                let exit_status = completion_rx.try_recv().ok();
+                let content = terminal.update(cx, |term, _| term.get_content());
+                eprintln!(
+                    "BENCH(interactive pwsh): poll {i} at {:?}, child exit_status={exit_status:?}, screen={content:?}",
+                    spawn_start.elapsed()
+                );
+            }
+        }
+
+        eprintln!(
+            "BENCH(interactive pwsh) SUMMARY: first_frame={:?} full_animation={:?} total_frames={frame_count}",
+            elapsed_at_first_frame, elapsed_at_full_animation
+        );
+
+        if elapsed_at_first_frame.is_none() {
+            let screen = terminal.update(cx, |term, _| term.get_content());
+            eprintln!("BENCH(interactive pwsh): screen content on failure:\n{screen}");
+        }
+
+        assert!(
+            elapsed_at_first_frame.is_some(),
+            "somcat (via interactive pwsh) never produced even a first placed frame within the 60s budget"
+        );
+        assert!(
+            is_animating,
+            "the GIF's frames all arrived (frame_count={frame_count}) but a=a never finalized \
+             playback (is_animating() stayed false) within the 60s budget, via interactive pwsh"
+        );
+        assert!(
+            frame_count > 1,
+            "expected a multi-frame animation from giphy.gif via interactive pwsh, got frame_count={frame_count}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn bench_somcat_run_twice_in_one_session_both_placements_survive(cx: &mut TestAppContext) {
+        // Regression test for the user-reported "second somcat invocation
+        // erases the first image instead of scrolling it into history, and
+        // the second run sometimes hangs" behavior — same interactive-pwsh
+        // driving mechanism as `bench_somcat_animated_gif_via_interactive_pwsh`
+        // (real keystrokes + Enter through `write_to_pty`, not `-Command`),
+        // but runs `somcat` TWICE in the SAME pwsh session, back to back,
+        // then asserts both resulting placements are still present in
+        // `ImageStore` with DIFFERENT image ids — i.e. the second run must
+        // not overwrite or hang waiting on the first.
+        cx.executor().allow_parking();
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(
+            giphy_path.is_file(),
+            "giphy.gif not found at {giphy_path:?} — this benchmark needs it at the repo root"
+        );
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("test binaries always live two directories under target/<profile>");
+        let somcat_path = target_debug_dir.join("somcat.exe");
+        assert!(
+            somcat_path.is_file(),
+            "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat` first"
+        );
+
+        let pwsh_path = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+        assert!(
+            std::path::Path::new(pwsh_path).is_file(),
+            "pwsh.exe not found at {pwsh_path:?} — this benchmark mirrors Som's real \"win\" tab profile"
+        );
+
+        let spawn_start = Instant::now();
+        let (terminal, completion_rx) =
+            build_test_terminal_with_arguments(cx, pwsh_path.to_string(), vec![]).await;
+
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+
+        // Poll until the first run's animation is fully active (mirrors
+        // `bench_somcat_animated_gif_via_interactive_pwsh`'s own wait), then
+        // immediately fire the SAME command a second time in the same
+        // session — exactly what the user did manually.
+        let run_command = || {
+            format!(
+                "& '{}' '{}'\r",
+                somcat_path.to_string_lossy(),
+                giphy_path.to_string_lossy()
+            )
+        };
+
+        terminal.update(cx, |term, _| term.write_to_pty(run_command().into_bytes()));
+
+        let mut first_run_id = None;
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let (id, animating) = terminal.update(cx, |term, _| {
+                term.kitty_placements()
+                    .next()
+                    .map(|(id, _, _, _)| id)
+                    .map(|id| (Some(id), term.kitty_image(id).map(|img| img.is_animating()).unwrap_or(false)))
+                    .unwrap_or((None, false))
+            });
+            if animating {
+                first_run_id = id;
+                eprintln!(
+                    "BENCH(run-twice): first somcat run fully animating (id={id:?}) after {:?} (poll {i})",
+                    spawn_start.elapsed()
+                );
+                break;
+            }
+            if i % 10 == 0 {
+                let exit_status = completion_rx.try_recv().ok();
+                eprintln!(
+                    "BENCH(run-twice): first-run poll {i} at {:?}, child exit_status={exit_status:?}",
+                    spawn_start.elapsed()
+                );
+            }
+        }
+        let first_run_id = first_run_id.expect(
+            "first somcat run never reached a fully-animating state within the 60s budget \
+             (run-once benchmarks already cover this path in isolation — see \
+             bench_somcat_animated_gif_via_interactive_pwsh)",
+        );
+
+        // Second run, same session, same command — this is the exact
+        // scenario the user reported hanging/erasing under.
+        let second_run_start = Instant::now();
+        terminal.update(cx, |term, _| term.write_to_pty(run_command().into_bytes()));
+
+        let mut second_run_id = None;
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            let ids_animating: Vec<(u32, bool)> = terminal.update(cx, |term, _| {
+                term.kitty_placements()
+                    .map(|(id, _, _, _)| {
+                        let animating = term.kitty_image(id).map(|img| img.is_animating()).unwrap_or(false);
+                        (id, animating)
+                    })
+                    .collect()
+            });
+            if let Some(&(id, _)) = ids_animating.iter().find(|&&(id, animating)| id != first_run_id && animating) {
+                second_run_id = Some(id);
+                eprintln!(
+                    "BENCH(run-twice): second somcat run fully animating (id={id}) after {:?} (poll {i})",
+                    second_run_start.elapsed()
+                );
+                break;
+            }
+            if i % 10 == 0 {
+                let exit_status = completion_rx.try_recv().ok();
+                eprintln!(
+                    "BENCH(run-twice): second-run poll {i} at {:?}, child exit_status={exit_status:?}, \
+                     placements_so_far={ids_animating:?}",
+                    second_run_start.elapsed()
+                );
+            }
+        }
+        let second_run_id = second_run_id.expect(
+            "second somcat run (same session, same command) never reached a fully-animating \
+             state within the 60s budget — this is the hang the user reported live",
+        );
+
+        assert_ne!(
+            first_run_id, second_run_id,
+            "both runs ended up with the same image id — somcat's per-invocation id generation \
+             regressed back to colliding ids"
+        );
+
+        // Both placements must still be present and independently decoded —
+        // i.e. the second run must not have evicted/overwritten the first's
+        // pixel data, which is exactly the "first image erases" symptom the
+        // user described.
+        let (first_still_present, second_still_present) = terminal.update(cx, |term, _| {
+            (term.kitty_image(first_run_id).is_some(), term.kitty_image(second_run_id).is_some())
+        });
+        assert!(
+            first_still_present,
+            "first somcat run's image (id={first_run_id}) was evicted once the second run finished \
+             — images should scroll into history, not get erased by a later unrelated run"
+        );
+        assert!(second_still_present, "second somcat run's image (id={second_run_id}) is missing");
+    }
+
+    #[gpui::test]
+    async fn bench_rich_content_stream_progressive_playback_starts_before_transfer_completes(cx: &mut TestAppContext) {
+        // The core property that distinguishes the rich-content protocol
+        // (`somcat --stream`, `rich_content_transport`/`rich_content_cache`/
+        // `rich_content_gif_player`) from the OLD Kitty-animation path this
+        // whole redesign replaced: a decoder must be able to start showing
+        // frames from a file that is STILL being written to disk, not only
+        // once the entire transfer has finished. This test proves that
+        // property directly — not just "it eventually works end to end"
+        // (see the various `bench_somcat_*` tests above for that, on the
+        // OLD Kitty path) but specifically that SOME frames are decodable
+        // from a growing file BEFORE the underlying `somcat --stream`
+        // process has exited, by racing the two: poll
+        // `rich_content_cache::contiguous_len` + `try_decode_progressive`
+        // on a fixed cadence while independently watching for process exit,
+        // and assert the frame count was already nonzero on an iteration
+        // where the process was confirmed still running.
+        cx.executor().allow_parking();
+
+        // Same patched-conpty.dll setup `test_somcat_displays_a_realistic_large_photo_sized_image`
+        // uses — without it, this test falls back to Windows' own
+        // baseline ConPTY implementation, which has materially different
+        // (worse, per `alacritty_terminal`'s own doc comment on
+        // `conpty.rs`) buffering behavior than the patched one this
+        // project ships/expects in production.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+
+        let (terminal, completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec!["--stream".to_string(), giphy_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let spawn_start = Instant::now();
+        let mut saw_partial_frames_while_process_still_running = false;
+        let mut first_partial_frame_count = 0usize;
+        let mut elapsed_at_first_partial_frames = None;
+        let mut final_frame_count = 0usize;
+
+        // Same bounded-poll shape as the other `bench_somcat_*` tests
+        // (200ms * 300 = 60s ceiling) — see `feedback_bounded_test_loops`
+        // memory for why an unbounded loop here would be a real hazard,
+        // not just style.
+        for i in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            let still_running = completion_rx.try_recv().is_err();
+
+            let (session_id, file_id, path) = terminal.update(cx, |term, _| {
+                // Only one file is ever streamed in this test — grab
+                // whatever (session_id, file_id) the cache has recorded
+                // so far, if any chunk has arrived yet.
+                term.rich_content_cache
+                    .all_known_ids()
+                    .into_iter()
+                    .next()
+                    .map(|(s, f)| (s, f, term.rich_content_cache.path(s, f).map(|p| p.to_path_buf())))
+                    .unwrap_or((0, 0, None))
+            });
+
+            if let Some(path) = path {
+                let available = terminal.update(cx, |term, _| term.rich_content_cache.contiguous_len(session_id, file_id));
+                if let Ok(Some(decoded)) = rich_content_gif_player::try_decode_progressive(&path, available) {
+                    let fc = decoded.frames.len();
+                    if fc > 0 && first_partial_frame_count == 0 {
+                        first_partial_frame_count = fc;
+                        elapsed_at_first_partial_frames = Some(spawn_start.elapsed());
+                        eprintln!(
+                            "BENCH(stream): first partial decode ({fc} frames, complete={}) after {:?} (poll {i}, still_running={still_running})",
+                            decoded.complete,
+                            elapsed_at_first_partial_frames.unwrap()
+                        );
+                    }
+                    if fc > 0 && still_running {
+                        saw_partial_frames_while_process_still_running = true;
+                    }
+                    final_frame_count = fc;
+                    if decoded.complete {
+                        eprintln!("BENCH(stream): transfer complete, {fc} total frames, after {:?}", spawn_start.elapsed());
+                        break;
+                    }
+                }
+            }
+
+            if !still_running && final_frame_count > 0 {
+                // Process exited and we've already decoded whatever the
+                // final state is — no point polling further.
+                break;
+            }
+        }
+
+        eprintln!(
+            "BENCH(stream) SUMMARY: first_partial={:?} at {:?}, final_frame_count={final_frame_count}, \
+             saw_partial_while_running={saw_partial_frames_while_process_still_running}",
+            first_partial_frame_count, elapsed_at_first_partial_frames
+        );
+
+        assert!(first_partial_frame_count > 0, "somcat --stream never produced even a partial decode within the 15s budget");
+        assert_eq!(final_frame_count, 47, "giphy.gif fixture is known to have 47 frames — the final decode must reach all of them");
+        assert!(
+            saw_partial_frames_while_process_still_running,
+            "never observed a nonzero partial frame count while the somcat --stream process was still running — \
+             this is the core progressive-playback property this benchmark exists to prove, and it did not hold"
+        );
     }
 
     #[gpui::test]

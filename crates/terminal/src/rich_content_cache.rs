@@ -100,19 +100,21 @@ impl RichContentCache {
 
         entry.file.seek(SeekFrom::Start(chunk.chunk_offset))?;
         entry.file.write_all(&chunk.payload)?;
-        // `trailing_esc_byte` is how a sender transmits a source `0x1B`
+        // `trailing_byte` is how a sender transmits a source `0x1B`/`0x0A`
         // byte without ever putting it inside `payload` itself — see
         // `rich_content_transport`'s module doc comment for why that's a
         // hard protocol invariant, not a choice. Write the literal byte
         // right after the payload we just wrote, at the same seek
         // position (no separate seek needed — the file cursor is already
         // there).
-        if chunk.trailing_esc_byte {
-            entry.file.write_all(&[0x1B])?;
-        }
+        let trailing_len = if let Some(trailing_byte) = chunk.trailing_byte {
+            entry.file.write_all(&[trailing_byte as u8])?;
+            1
+        } else {
+            0
+        };
 
-        let chunk_end =
-            chunk.chunk_offset + chunk.payload.len() as u64 + if chunk.trailing_esc_byte { 1 } else { 0 };
+        let chunk_end = chunk.chunk_offset + chunk.payload.len() as u64 + trailing_len;
         if chunk.chunk_offset <= entry.contiguous_len {
             // Either exactly at the watermark, or overlapping/behind it
             // (a retransmit of already-seen data) — either way this

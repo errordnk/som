@@ -8,6 +8,7 @@ pub mod kitty_graphics_store;
 mod pty_info;
 pub mod rich_content_cache;
 pub mod rich_content_gif_player;
+pub mod rich_content_player;
 pub mod rich_content_transport;
 mod terminal_hyperlinks;
 pub mod terminal_settings;
@@ -481,6 +482,7 @@ impl TerminalBuilder {
             last_pty_grid_size: None,
             kitty_images: kitty_graphics_store::ImageStore::new(),
             rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+            rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_kitty_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
@@ -771,6 +773,7 @@ impl TerminalBuilder {
                 last_pty_grid_size: None,
                 kitty_images: kitty_graphics_store::ImageStore::new(),
                 rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+            rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_kitty_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
@@ -1033,6 +1036,16 @@ pub struct Terminal {
     /// `kitty_images` above (different protocol, different marker byte,
     /// see that module's doc comment for why).
     rich_content_cache: rich_content_cache::RichContentCache,
+    /// Paint-ready decode state for the same files `rich_content_cache`
+    /// tracks bytes-on-disk for — keyed identically (`(session_id,
+    /// file_id)`) and refreshed lazily at paint time via
+    /// [`Self::rich_content_players`] rather than eagerly on every chunk
+    /// arrival, since re-decoding a GIF prefix isn't free and most chunk
+    /// arrivals don't need a fresh decode yet (see
+    /// `rich_content_player::refresh_or_create`'s own doc comment on the
+    /// reuse-when-unchanged fast path).
+    rich_content_players:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_player::RichContentPlayer>>,
     /// When `process_event`'s `ApcString` handler last called
     /// `cx.force_redraw_windows()` for a Kitty graphics command — throttles
     /// how often that forced native repaint actually fires (see that call
@@ -1284,14 +1297,11 @@ impl Terminal {
                                 chunk.chunk_offset,
                                 chunk.payload.len()
                             );
-                            match self.rich_content_cache.apply_chunk(&chunk) {
+                            match self
+                                .rich_content_cache
+                                .apply_chunk(&chunk, (apc_cursor.line.0, apc_cursor.column.0))
+                            {
                                 Ok(_contiguous_len) => {
-                                    // Painting/decoding is wired up in a
-                                    // later step of this plan — for now
-                                    // just persisting chunks to disk is
-                                    // the observable behavior, same as
-                                    // Kitty's own chunk-accumulation
-                                    // stage before its paint path existed.
                                     cx.emit(Event::Wakeup);
                                 },
                                 Err(err) => {
@@ -1833,6 +1843,47 @@ impl Terminal {
         Item = (u32, u32, &kitty_graphics_store::PlacementInfo, &kitty_graphics_store::DecodedImage),
     > {
         self.kitty_images.all_placements()
+    }
+
+    /// Every rich-content file with a currently paintable (at least one
+    /// decoded frame) player, refreshing each against
+    /// `rich_content_cache`'s latest `contiguous_len` first — a `&self`
+    /// method (not `&mut self`) despite refreshing internal state, using
+    /// `RefCell` the same way `kitty_graphics_store::DecodedImage`'s
+    /// `animation: Cell<...>` does, for the identical reason: a paint pass
+    /// only ever has read (`Entity::read`) access to the `Terminal` it's
+    /// painting (see `paint_kitty_placements`'s own doc comment on why
+    /// `Entity::update` from inside `paint()` was tried and reverted).
+    ///
+    /// Returns owned `(anchor, Arc<RenderImage>, current_frame,
+    /// is_animating)` tuples rather than borrowed references into the
+    /// `RefCell` — cloning an `Arc` is cheap (no pixel data copied) and
+    /// sidesteps holding a `Ref` alive across the caller's own paint loop.
+    pub fn rich_content_placements(
+        &self,
+    ) -> Vec<((i32, usize), std::sync::Arc<gpui::RenderImage>, usize, bool)> {
+        let mut players = self.rich_content_players.borrow_mut();
+        let mut out = Vec::new();
+        for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
+            let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+                continue;
+            };
+            let Some(anchor) = self.rich_content_cache.anchor(session_id, file_id) else {
+                continue;
+            };
+            let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
+            let key = (session_id, file_id);
+            let existing = players.remove(&key);
+            let Some(refreshed) = rich_content_player::refresh_or_create(existing, path, contiguous_len) else {
+                continue;
+            };
+            let current_frame = refreshed.current_frame();
+            let is_animating = refreshed.is_animating();
+            let render_image = refreshed.render_image().clone();
+            players.insert(key, refreshed);
+            out.push((anchor, render_image, current_frame, is_animating));
+        }
+        out
     }
 
     pub fn total_lines(&self) -> usize {
@@ -5915,6 +5966,87 @@ mod tests {
             saw_partial_frames_while_process_still_running,
             "never observed a nonzero partial frame count while the somcat --stream process was still running — \
              this is the core progressive-playback property this benchmark exists to prove, and it did not hold"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rich_content_placements_reach_the_paint_path_via_a_real_process(cx: &mut TestAppContext) {
+        // Proves the LAST link in the SRP pipeline that
+        // `bench_rich_content_stream_progressive_playback_starts_before_
+        // transfer_completes` above doesn't itself check: that
+        // `Terminal::rich_content_placements()` — the exact method
+        // `terminal_view::terminal_element::paint_rich_content_placements`
+        // calls at paint time — returns a real anchor plus a non-empty,
+        // advancing `RenderImage` once a real `somcat --stream` child
+        // process (real ConPTY, not `write_output`) has sent enough of
+        // giphy.gif. Doesn't paint anything itself (no `Window`/`App`
+        // paint context available in a `#[gpui::test]`) — this is the
+        // data-availability half of the paint path, not a pixel-level
+        // rendering check.
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec!["--stream".to_string(), giphy_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let mut saw_nonempty_placements = false;
+        let mut saw_frame_advance = false;
+        let mut first_frame_seen: Option<usize> = None;
+
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            let placements = terminal.update(cx, |term, _| term.rich_content_placements());
+            if let Some((anchor, render_image, current_frame, _is_animating)) = placements.into_iter().next() {
+                saw_nonempty_placements = true;
+                assert!(render_image.frame_count() > 0, "a placement must always have at least one decoded frame");
+                // The anchor is whatever line/column the real shell's
+                // cursor happened to be at when `somcat --stream` started
+                // — not asserting an exact value (that would couple this
+                // test to `build_test_terminal_with_arguments`'s exact
+                // shell startup banner), just that SOME real position was
+                // captured, not an obviously-uninitialized sentinel.
+                assert!(anchor.0 >= 0, "anchor line must be a real (non-negative) grid row");
+
+                match first_frame_seen {
+                    None => first_frame_seen = Some(current_frame),
+                    Some(first) if current_frame != first => saw_frame_advance = true,
+                    Some(_) => {},
+                }
+
+                if saw_nonempty_placements && saw_frame_advance {
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_nonempty_placements, "rich_content_placements() never returned a placement within the poll budget");
+        assert!(
+            saw_frame_advance,
+            "current_frame never advanced across polls — animation playback isn't ticking through the paint-path accessor"
         );
     }
 

@@ -29,6 +29,7 @@ mod raw_mode;
 
 use base64::Engine as _;
 use image::AnimationDecoder as _;
+use image::ImageDecoder as _;
 use image::codecs::gif::GifDecoder;
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -439,8 +440,37 @@ fn send_chunked(first_control_data: &str, base64_payload: &str) -> Result<(), St
 /// Content type is inferred from the file extension; only GIF is
 /// recognized right now (audio/markdown/video are reserved
 /// `ContentType` variants, not wired up to any extension yet).
+/// Reads just enough of a GIF file to describe it — natural pixel
+/// dimensions (via `ImageDecoder::dimensions`, which reads the fixed-size
+/// logical screen descriptor without touching any frame's compressed
+/// image data) and whether it's animated (more than one frame).
+///
+/// Deliberately does NOT use `decode_gif_frames`/`AnimationDecoder::
+/// into_frames` (the Kitty path's own full decoder, used above) for the
+/// animated check — that decodes and re-buffers every frame's full pixel
+/// data, wasteful for a file that could be many megabytes when all this
+/// needs is "is there a second frame at all." Instead, scans the raw file
+/// bytes directly for a second GIF Image Descriptor block (`0x2C`, the
+/// per-frame marker every GIF frame's data starts with) after the fixed
+/// logical screen descriptor + optional global color table — finding one
+/// proves a second frame exists without decoding either frame's pixels.
+/// Not a general-purpose GIF parser (doesn't walk extension blocks
+/// precisely byte-for-byte) — a plain byte scan for `0x2C` after the
+/// header is good enough for "more than one frame," since `0x2C` cannot
+/// legitimately appear as a sub-block length/data byte in the handful of
+/// extension block shapes real encoders emit before the first frame.
+fn gif_metadata(bytes: &[u8]) -> Result<(u32, u32, bool), String> {
+    let decoder = GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let (width, height) = decoder.dimensions();
+
+    let frame_marker_count = bytes.iter().filter(|&&b| b == 0x2C).count();
+    let is_animated = frame_marker_count > 1;
+
+    Ok((width, height, is_animated))
+}
+
 fn stream_file(path: &str) -> Result<(), String> {
-    use terminal::rich_content_transport::{Chunk, ContentType, build_envelope, split_into_chunks};
+    use terminal::rich_content_transport::{Chunk, ContentMetadata, ContentType, build_envelope, split_into_chunks};
 
     let content_type = match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
         Some("gif") => ContentType::Gif,
@@ -450,6 +480,13 @@ fn stream_file(path: &str) -> Result<(), String> {
 
     let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
     let total_size = bytes.len() as u64;
+
+    let (width_px, height_px, is_animated) = gif_metadata(&bytes)?;
+    // Every pixel this protocol sends is decoded to RGBA before reaching
+    // the wire (see `rich_content_gif_player`/`gpui::RenderImage`'s own
+    // frame buffers) — 32 bits per pixel regardless of the source GIF's
+    // own (typically <=8-bit indexed/palette) on-disk color depth.
+    let metadata = ContentMetadata::Image { width_px, height_px, color_bits: 32, is_animated };
 
     // Same per-invocation-unique id principle as the Kitty path's
     // `next_image_id` above (see that variable's own doc comment for the
@@ -466,7 +503,7 @@ fn stream_file(path: &str) -> Result<(), String> {
     let mut offset = 0u64;
     for payload in pieces {
         let payload_len = payload.len() as u64;
-        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, payload };
+        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, metadata, payload };
         // `build_envelope` already produces the complete envelope
         // (marker + header + base91-encoded payload) — this just wraps it
         // in the APC start/end sequence (`ESC _` ... `ESC \`).

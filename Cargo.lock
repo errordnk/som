@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/errordnk/alacritty?rev=9f084e4a#9f084e4a118b448c8703434fb808951b56e2f087"
+source = "git+https://github.com/errordnk/alacritty?rev=c9f86ad4#c9f86ad4492600402f284cafe17e1e806e172a5e"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.0",
@@ -7070,6 +7070,7 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "libc",
+ "terminal",
  "windows 0.61.3",
 ]
 
@@ -7539,6 +7540,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "paths",
  "percent-encoding",
  "rand 0.9.4",
  "regex",
@@ -8569,7 +8571,7 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "git+https://github.com/errordnk/vte?rev=8b57234#8b57234fc8f4f1e84fe7ad647a7b1cb37752f9f8"
+source = "git+https://github.com/errordnk/vte?rev=649d0a6#649d0a68fd60abd45a447ac135c3feda89f423de"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",

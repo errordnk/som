@@ -1,0 +1,286 @@
+//! Progressive on-disk cache for Som's own rich-content protocol
+//! ([`crate::rich_content_transport`]) — receives chunks (possibly
+//! out of order, though [`crate::somcat`]'s streaming client always sends
+//! them in offset order today) and writes them to a local file, tracking
+//! how many leading bytes are contiguously present so a decoder can know
+//! it's safe to read up to that point without hitting a hole.
+//!
+//! Deliberately separate from [`crate::kitty_graphics_store::ImageStore`]
+//! — this protocol doesn't reuse Kitty's in-memory `ImageStore` at all
+//! (see `rich_content_transport`'s module doc comment for why), and its
+//! own state (per-file cache handle + watermark) has a different shape:
+//! bytes-on-disk plus a byte offset, not a `HashMap<u32, DecodedImage>`.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
+
+use crate::rich_content_transport::{Chunk, ContentType};
+
+/// One file's progressive-write state: the open handle plus how many
+/// bytes starting from offset 0 are known to be present with no gaps.
+///
+/// `contiguous_len` is only ever advanced by a chunk landing EXACTLY at
+/// the current watermark (`chunk.chunk_offset == contiguous_len`) — an
+/// out-of-order or gapped chunk is still written to disk at its own
+/// offset (so it doesn't need to be re-sent once the gap-filling chunk
+/// arrives), but does not advance the watermark until the gap closes.
+/// This is what lets a decoder trust "the first `contiguous_len` bytes
+/// are complete and correct" without needing to track individual chunk
+/// ranges itself.
+struct CacheEntry {
+    file: File,
+    path: PathBuf,
+    contiguous_len: u64,
+    /// Out-of-order chunks that landed ahead of the current watermark,
+    /// kept here (not yet counted into `contiguous_len`) until the gap
+    /// before them closes. Keyed by chunk_offset. Expected to stay small
+    /// in practice — `somcat --stream` sends strictly in order — but
+    /// correctness shouldn't depend on that assumption holding for every
+    /// future client.
+    pending_ranges: Vec<(u64, u64)>,
+}
+
+/// Per-terminal-session store of in-progress and completed rich-content
+/// file transfers. One instance lives on `Terminal`, mirroring
+/// `kitty_graphics_store::ImageStore`'s lifetime.
+pub struct RichContentCache {
+    cache_dir: PathBuf,
+    entries: HashMap<(u32, u32), CacheEntry>,
+}
+
+impl RichContentCache {
+    /// `cache_dir` is the directory chunks get written under — callers
+    /// pass `paths::config_dir().join("media_cache")` in production (see
+    /// `paths::config_dir`'s existing use in
+    /// `crates/som_tmux/src/protocol.rs` for the established pattern of a
+    /// per-purpose subdirectory under the same config root), and a
+    /// throwaway `tempdir` in tests so test runs never touch a real
+    /// user's `~/.config/som/media_cache/`.
+    pub fn new(cache_dir: PathBuf) -> Self {
+        Self { cache_dir, entries: HashMap::new() }
+    }
+
+    fn extension_for(content_type: ContentType) -> &'static str {
+        match content_type {
+            ContentType::Gif => "gif",
+            ContentType::Audio => "audio",
+            ContentType::Markdown => "md",
+            ContentType::Video => "video",
+        }
+    }
+
+    /// Applies one chunk: opens (or reuses) the file for
+    /// `(session_id, file_id)`, writes the payload at `chunk_offset`,
+    /// advances the contiguous watermark as far as newly-arrived data
+    /// allows, and returns the number of contiguous bytes now available
+    /// from the start of the file — the caller (a decoder) reads at most
+    /// this many bytes and knows they're gap-free.
+    ///
+    /// Errors (directory creation failure, seek/write failure) are
+    /// returned rather than panicking — a single corrupted/failed chunk
+    /// write shouldn't take down the whole terminal session; the caller
+    /// decides whether to drop the chunk and continue or surface the
+    /// error further.
+    pub fn apply_chunk(&mut self, chunk: &Chunk) -> std::io::Result<u64> {
+        let key = (chunk.session_id, chunk.file_id);
+        if !self.entries.contains_key(&key) {
+            std::fs::create_dir_all(&self.cache_dir)?;
+            let ext = Self::extension_for(chunk.content_type);
+            let path = self.cache_dir.join(format!(
+                "{session:08x}-{file:08x}.{ext}",
+                session = chunk.session_id,
+                file = chunk.file_id
+            ));
+            let file = OpenOptions::new().create(true).write(true).truncate(true).read(true).open(&path)?;
+            self.entries.insert(key, CacheEntry { file, path, contiguous_len: 0, pending_ranges: Vec::new() });
+        }
+        let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
+
+        entry.file.seek(SeekFrom::Start(chunk.chunk_offset))?;
+        entry.file.write_all(&chunk.payload)?;
+        // `trailing_esc_byte` is how a sender transmits a source `0x1B`
+        // byte without ever putting it inside `payload` itself — see
+        // `rich_content_transport`'s module doc comment for why that's a
+        // hard protocol invariant, not a choice. Write the literal byte
+        // right after the payload we just wrote, at the same seek
+        // position (no separate seek needed — the file cursor is already
+        // there).
+        if chunk.trailing_esc_byte {
+            entry.file.write_all(&[0x1B])?;
+        }
+
+        let chunk_end =
+            chunk.chunk_offset + chunk.payload.len() as u64 + if chunk.trailing_esc_byte { 1 } else { 0 };
+        if chunk.chunk_offset <= entry.contiguous_len {
+            // Either exactly at the watermark, or overlapping/behind it
+            // (a retransmit of already-seen data) — either way this
+            // chunk's own bytes extend (or don't move) the watermark.
+            entry.contiguous_len = entry.contiguous_len.max(chunk_end);
+            // A previously-out-of-order chunk might now be contiguous
+            // with the advanced watermark — keep absorbing pending
+            // ranges as long as one starts at (or before) the current
+            // watermark. Small linear scan is fine: `pending_ranges` is
+            // expected to stay tiny (see its own doc comment).
+            loop {
+                let Some(pos) =
+                    entry.pending_ranges.iter().position(|&(offset, _)| offset <= entry.contiguous_len)
+                else {
+                    break;
+                };
+                let (offset, end) = entry.pending_ranges.remove(pos);
+                entry.contiguous_len = entry.contiguous_len.max(end.max(offset));
+            }
+        } else {
+            entry.pending_ranges.push((chunk.chunk_offset, chunk_end));
+        }
+
+        Ok(entry.contiguous_len)
+    }
+
+    /// The on-disk path for a given file, if any chunk for it has arrived
+    /// yet. A decoder reads from this path directly (up to
+    /// [`Self::contiguous_len`] bytes) rather than through this store —
+    /// mirrors the "receiver reads bytes off disk itself" model the whole
+    /// progressive-copy design is built around, instead of routing
+    /// decoded pixel data back through an in-memory store the way
+    /// `ImageStore` does for Kitty.
+    pub fn path(&self, session_id: u32, file_id: u32) -> Option<&std::path::Path> {
+        self.entries.get(&(session_id, file_id)).map(|e| e.path.as_path())
+    }
+
+    /// Every `(session_id, file_id)` pair with at least one chunk applied
+    /// so far — a caller that doesn't already know the exact id (e.g. a
+    /// test polling for whatever `somcat --stream` happens to be sending)
+    /// uses this to discover it rather than needing the ids threaded
+    /// through some other channel.
+    pub fn all_known_ids(&self) -> Vec<(u32, u32)> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// How many leading bytes of the file are contiguously present and
+    /// safe to read.
+    pub fn contiguous_len(&self, session_id: u32, file_id: u32) -> u64 {
+        self.entries.get(&(session_id, file_id)).map(|e| e.contiguous_len).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rich_content_transport::ContentType;
+
+    fn chunk(session_id: u32, file_id: u32, offset: u64, payload: &[u8]) -> Chunk {
+        Chunk {
+            content_type: ContentType::Gif,
+            session_id,
+            file_id,
+            chunk_offset: offset,
+            total_size: 0,
+            payload: payload.to_vec(),
+            trailing_esc_byte: false,
+        }
+    }
+
+    fn temp_cache_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("som_rich_content_cache_test_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sequential_chunks_advance_watermark_and_write_correct_bytes() {
+        let dir = temp_cache_dir("sequential");
+        let mut cache = RichContentCache::new(dir.clone());
+
+        let len1 = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        assert_eq!(len1, 6);
+        let len2 = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
+        assert_eq!(len2, 11);
+
+        let path = cache.path(1, 1).unwrap().to_path_buf();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, b"hello world");
+        assert_eq!(cache.contiguous_len(1, 1), 11);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn out_of_order_chunk_writes_but_does_not_advance_watermark_until_gap_closes() {
+        let dir = temp_cache_dir("out_of_order");
+        let mut cache = RichContentCache::new(dir.clone());
+
+        // Chunk 2 (offset 6) arrives before chunk 1 (offset 0) — write
+        // succeeds, but the watermark must stay at 0 since bytes 0..6
+        // are still missing.
+        let len_after_second = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
+        assert_eq!(len_after_second, 0, "watermark must not advance past a gap");
+
+        // Now the gap-filling chunk arrives — watermark should jump all
+        // the way to the end, absorbing the already-written pending range.
+        let len_after_first = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        assert_eq!(len_after_first, 11, "watermark must absorb the pending range once the gap closes");
+
+        let path = cache.path(1, 1).unwrap().to_path_buf();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, b"hello world", "bytes on disk must be correct regardless of arrival order");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn different_session_or_file_ids_use_separate_cache_entries() {
+        let dir = temp_cache_dir("separate_entries");
+        let mut cache = RichContentCache::new(dir.clone());
+
+        cache.apply_chunk(&chunk(1, 1, 0, b"first")).unwrap();
+        cache.apply_chunk(&chunk(2, 1, 0, b"second-session")).unwrap();
+        cache.apply_chunk(&chunk(1, 2, 0, b"second-file")).unwrap();
+
+        assert_eq!(cache.contiguous_len(1, 1), 5);
+        assert_eq!(cache.contiguous_len(2, 1), 14);
+        assert_eq!(cache.contiguous_len(1, 2), 11);
+        assert_ne!(cache.path(1, 1), cache.path(2, 1));
+        assert_ne!(cache.path(1, 1), cache.path(1, 2));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_session_file_pair_reports_zero_and_no_path() {
+        let dir = temp_cache_dir("unknown");
+        let cache = RichContentCache::new(dir.clone());
+        assert_eq!(cache.contiguous_len(99, 99), 0);
+        assert!(cache.path(99, 99).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retransmitted_chunk_at_or_behind_watermark_does_not_move_watermark_backward() {
+        let dir = temp_cache_dir("retransmit");
+        let mut cache = RichContentCache::new(dir.clone());
+
+        cache.apply_chunk(&chunk(1, 1, 0, b"hello world")).unwrap();
+        assert_eq!(cache.contiguous_len(1, 1), 11);
+
+        // Re-apply the first half again (offset 0, shorter payload) —
+        // watermark must not regress even though this chunk's own
+        // `chunk_end` (6) is less than the current watermark (11).
+        let len = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        assert_eq!(len, 11, "watermark must never move backward on a retransmit");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extension_matches_content_type() {
+        let dir = temp_cache_dir("extension");
+        let mut cache = RichContentCache::new(dir.clone());
+        cache.apply_chunk(&chunk(1, 1, 0, b"x")).unwrap();
+        let path = cache.path(1, 1).unwrap();
+        assert_eq!(path.extension().unwrap(), "gif");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -99,5 +99,39 @@ fn restore(guard: &RawModeGuard) {
     }
 }
 
+/// Sets `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout only, without
+/// touching stdin's console mode at all — for callers (Som's own
+/// rich-content `--stream` mode, see `main.rs`) that never read stdin, so
+/// `full::enable()`'s `GetStdHandle(STD_INPUT_HANDLE)` +
+/// `GetConsoleMode`/`SetConsoleMode` sequence would be pure risk (it's
+/// what previously failed with "The handle is invalid" when this
+/// function's caller had no real console input handle to query) for zero
+/// benefit. No RAII guard/restore — a `--stream` invocation always exits
+/// right after finishing the transfer, there's no interactive session
+/// afterward whose console mode this could leave in a surprising state.
+#[cfg(windows)]
+pub fn enable_output_vt_processing() {
+    use windows::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+    unsafe {
+        if let Ok(output_handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
+            let mut out_mode = Default::default();
+            if GetConsoleMode(output_handle, &mut out_mode).is_ok() {
+                let _ = SetConsoleMode(
+                    output_handle,
+                    windows::Win32::System::Console::CONSOLE_MODE(out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn enable_output_vt_processing() {
+    // Unix terminals already interpret VT escape sequences without any
+    // opt-in console mode flag — nothing to do here.
+}
+
 #[cfg(not(any(unix, windows)))]
 compile_error!("somcat's raw_mode module only supports Unix and Windows");

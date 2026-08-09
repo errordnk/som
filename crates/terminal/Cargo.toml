@@ -36,6 +36,7 @@ image.workspace = true
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
+paths.workspace = true
 regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true

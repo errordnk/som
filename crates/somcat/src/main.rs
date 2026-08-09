@@ -427,15 +427,14 @@ fn send_chunked(first_control_data: &str, base64_payload: &str) -> Result<(), St
 
 /// Streams `path` to Som's own binary rich-content protocol
 /// (`terminal::rich_content_transport`) instead of Kitty's — the file's
-/// raw bytes go over the wire unmodified, chunk by chunk, with no
-/// per-frame re-encoding (no PNG, no base64): the receiving side
-/// (`terminal::rich_content_cache`/`rich_content_gif_player`) decodes the
-/// file format itself, progressively, directly off the growing cache file
-/// on disk. This is a dramatically simpler client-side path than the
-/// Kitty animation flow above (`transmit_and_animate`/`decode_gif_frames`)
-/// precisely because none of that re-encoding work happens here anymore —
-/// see `rich_content_transport`'s module doc comment for the full
-/// rationale behind the whole progressive-copy design.
+/// raw bytes go over the wire base91-encoded (see that module's doc
+/// comment for why), chunk by chunk, with no per-frame re-encoding (no
+/// PNG): the receiving side (`terminal::rich_content_cache`/
+/// `rich_content_gif_player`) decodes the file format itself,
+/// progressively, directly off the growing cache file on disk. This is a
+/// dramatically simpler client-side path than the Kitty animation flow
+/// above (`transmit_and_animate`/`decode_gif_frames`) precisely because
+/// none of that re-encoding work happens here anymore.
 ///
 /// Content type is inferred from the file extension; only GIF is
 /// recognized right now (audio/markdown/video are reserved
@@ -465,19 +464,19 @@ fn stream_file(path: &str) -> Result<(), String> {
 
     let pieces = split_into_chunks(&bytes, CHUNK_SIZE);
     let mut offset = 0u64;
-    for (payload, trailing_byte) in pieces {
+    for payload in pieces {
         let payload_len = payload.len() as u64;
-        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, payload, trailing_byte };
+        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, payload };
         // `build_envelope` already produces the complete envelope
-        // (marker + version + ... + payload) — this just wraps it in the
-        // APC start/end sequence (`ESC _` ... `ESC \`).
+        // (marker + header + base91-encoded payload) — this just wraps it
+        // in the APC start/end sequence (`ESC _` ... `ESC \`).
         let envelope = build_envelope(&chunk);
         let mut apc = Vec::with_capacity(2 + envelope.len() + 2);
         apc.extend_from_slice(&[0x1B, b'_']);
         apc.extend_from_slice(&envelope);
         apc.extend_from_slice(&[0x1B, b'\\']);
         write_raw_stdout(&apc)?;
-        offset += payload_len + if chunk.trailing_byte.is_some() { 1 } else { 0 };
+        offset += payload_len;
     }
     Ok(())
 }

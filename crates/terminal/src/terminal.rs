@@ -1754,13 +1754,39 @@ impl Terminal {
         // cursor down a line but does not move it back to the initial column. This makes
         // the rendered output look ridiculous. To prevent this, we insert a CR (\r) before
         // each LF that didn't already have one. (Alacritty doesn't have a setting for this.)
+        //
+        // NOT applied while inside an active APC string (`ESC _` ... `ESC \`)
+        // — found the hard way (`test_rich_content_many_real_chunks_via_
+        // write_output_reconstructs_file_exactly`, isolating Som's own
+        // binary rich-content protocol, see `rich_content_transport`'s
+        // module doc comment): this blind LF->CRLF rewrite corrupts ANY
+        // binary APC payload containing a bare `0x0A` byte, inserting an
+        // extra `0x0D` right in the middle of a conveyed byte stream that
+        // has nothing to do with line wrapping at all — APC content is not
+        // line-oriented text and must pass through completely unmodified.
+        // A minimal state tracker (only `ESC _` entering, `ESC \` leaving)
+        // is enough here — this is a text-injection helper for
+        // display-only terminals, not a second VTE parser; it only needs
+        // to know "am I inside an APC string right now," not parse
+        // anything about its contents.
         let mut converted = Vec::with_capacity(bytes.len());
         let mut prev_byte = 0u8;
+        let mut prev_prev_byte = 0u8;
+        let mut in_apc_string = false;
         for &byte in bytes {
-            if byte == b'\n' && prev_byte != b'\r' {
+            if in_apc_string {
+                if prev_byte == 0x1B && byte == b'\\' {
+                    in_apc_string = false;
+                }
+            } else if prev_prev_byte == 0x1B && prev_byte == b'_' {
+                in_apc_string = true;
+            }
+
+            if byte == b'\n' && prev_byte != b'\r' && !in_apc_string {
                 converted.push(b'\r');
             }
             converted.push(byte);
+            prev_prev_byte = prev_byte;
             prev_byte = byte;
         }
 
@@ -3950,41 +3976,27 @@ mod tests {
             .subscribe(cx)
         });
 
-        // Deliberately exercises `trailing_esc_byte`, not a raw ESC byte
-        // inside `payload` — `rich_content_transport::build_envelope`
-        // hard-panics on that (see its own doc comment for why an
-        // application-level escaping scheme doesn't work with the
-        // patched VTE parser: the parser terminates on the FIRST 0x1B of
-        // any escaped pair before this protocol's own code ever sees it,
-        // a bug this very test caught the first time it ran against the
-        // real parser instead of just `parse_envelope` called directly).
-        let payload_before_esc = b"abc".to_vec();
-        let payload_after_esc = b"de".to_vec();
-        let chunk1 = rich_content_transport::Chunk {
+        // Deliberately includes a raw `0x1B` (ESC) byte INSIDE `payload` —
+        // proving the base91 wire encoding (see `rich_content_transport`'s
+        // module doc comment) makes this a non-issue: every wire byte is
+        // drawn from a 91-symbol printable-ASCII alphabet that never
+        // contains `0x1B`, so the real (patched) VTE parser never sees
+        // anything resembling its `ESC \` terminator until the genuine one
+        // at the end of the APC string.
+        let payload_with_esc = vec![b'a', b'b', b'c', 0x1B, b'd', b'e'];
+        let chunk = rich_content_transport::Chunk {
             content_type: rich_content_transport::ContentType::Gif,
             session_id: 0x1111_2222,
             file_id: 0x3333_4444,
             chunk_offset: 0,
             total_size: 6,
-            payload: payload_before_esc.clone(),
-            trailing_esc_byte: true,
-        };
-        let chunk2 = rich_content_transport::Chunk {
-            content_type: rich_content_transport::ContentType::Gif,
-            session_id: 0x1111_2222,
-            file_id: 0x3333_4444,
-            chunk_offset: 4, // 3 payload bytes + 1 literal ESC byte from chunk1.
-            total_size: 6,
-            payload: payload_after_esc.clone(),
-            trailing_esc_byte: false,
+            payload: payload_with_esc.clone(),
         };
 
         let mut apc = Vec::new();
-        for chunk in [&chunk1, &chunk2] {
-            apc.extend_from_slice(&[0x1B, b'_']); // ESC _
-            apc.extend_from_slice(&rich_content_transport::build_envelope(chunk));
-            apc.extend_from_slice(&[0x1B, b'\\']); // ESC \
-        }
+        apc.extend_from_slice(&[0x1B, b'_']); // ESC _
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']); // ESC \
 
         terminal.update(cx, |terminal, cx| {
             terminal.write_output(&apc, cx);
@@ -3993,17 +4005,111 @@ mod tests {
         cx.run_until_parked();
 
         terminal.update(cx, |terminal, _cx| {
-            let contiguous = terminal.rich_content_cache.contiguous_len(chunk1.session_id, chunk1.file_id);
-            assert_eq!(contiguous, 6, "both chunks (3 + 1 literal ESC + 2 bytes) must have landed contiguously");
+            let contiguous = terminal.rich_content_cache.contiguous_len(chunk.session_id, chunk.file_id);
+            assert_eq!(contiguous, 6, "the full 6-byte payload (including the embedded ESC byte) must land contiguously");
             let path = terminal
                 .rich_content_cache
-                .path(chunk1.session_id, chunk1.file_id)
+                .path(chunk.session_id, chunk.file_id)
                 .expect("a cache file must exist after a chunk was applied");
             let on_disk = std::fs::read(path).expect("cache file must be readable");
-            let mut expected = payload_before_esc;
-            expected.push(0x1B);
-            expected.extend_from_slice(&payload_after_esc);
-            assert_eq!(on_disk, expected, "the literal ESC byte from trailing_esc_byte must appear on disk between the two chunks' payloads");
+            assert_eq!(on_disk, payload_with_esc, "the embedded ESC byte must survive on disk exactly as sent");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rich_content_many_real_chunks_via_write_output_reconstructs_file_exactly(cx: &mut TestAppContext) {
+        // Regression-style test isolating the transport from the
+        // real-process/real-ConPTY variable entirely — feeds ALL ~3000+
+        // chunks a real giphy.gif produces (via the exact same
+        // `split_into_chunks` a real `somcat --stream` invocation uses)
+        // straight through `write_output` (synchronous injection into
+        // the VTE parser, no child process, no PTY) in one shot. Written
+        // to isolate whether `bench_rich_content_stream_progressive_
+        // playback_starts_before_transfer_completes`'s mystery failure
+        // (all envelopes individually confirmed reaching `process_event`
+        // successfully via `log::trace!`, yet `term.get_content()` shows
+        // garbled binary-as-text and the GIF never decodes even
+        // partially) is a transport/parser-scale problem (this test
+        // would also fail) or is specific to the real subprocess/ConPTY
+        // path that test uses (this test would pass, narrowing the bug
+        // to process/PTY-specific plumbing instead of the APC parsing
+        // itself). Reconstructs the on-disk file from all chunks and
+        // asserts it's byte-for-byte identical to the source GIF —
+        // catches ANY corruption, not just "did some frames decode."
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        let source_bytes = std::fs::read(&giphy_path).unwrap_or_else(|e| panic!("reading {giphy_path:?}: {e}"));
+
+        let session_id = 0x5EED_0001u32;
+        let file_id = 0x5EED_0002u32;
+        let pieces = rich_content_transport::split_into_chunks(&source_bytes, 4096);
+
+        let mut all_apc_bytes: Vec<u8> = Vec::new();
+        let mut offset = 0u64;
+        for payload in &pieces {
+            let chunk = rich_content_transport::Chunk {
+                content_type: rich_content_transport::ContentType::Gif,
+                session_id,
+                file_id,
+                chunk_offset: offset,
+                total_size: source_bytes.len() as u64,
+                payload: payload.clone(),
+            };
+            all_apc_bytes.extend_from_slice(&[0x1B, b'_']);
+            all_apc_bytes.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+            all_apc_bytes.extend_from_slice(&[0x1B, b'\\']);
+            offset += payload.len() as u64;
+        }
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&all_apc_bytes, cx);
+        });
+        // `write_output` only enqueues `Event::ApcString` onto the async
+        // `events_tx`/`events_rx` channel (see `ZedListener::send_event`);
+        // the actual `process_event` handler that parses envelopes and
+        // writes into `rich_content_cache` runs on the event-loop task
+        // spawned by `subscribe`, which only makes progress once the test
+        // executor is given a chance to drive it.
+        cx.run_until_parked();
+
+        terminal.update(cx, |terminal, _cx| {
+            let contiguous = terminal.rich_content_cache.contiguous_len(session_id, file_id);
+            eprintln!("TEST: contiguous_len after write_output = {contiguous} (source was {} bytes)", source_bytes.len());
+            assert_eq!(
+                contiguous,
+                source_bytes.len() as u64,
+                "contiguous watermark must reach the full source file length — a gap here means some \
+                 chunk failed to parse/apply even though this test bypasses the real subprocess/ConPTY entirely"
+            );
+            let path = terminal.rich_content_cache.path(session_id, file_id).expect("cache file must exist");
+            let on_disk = std::fs::read(path).expect("cache file must be readable");
+            assert_eq!(
+                on_disk, source_bytes,
+                "reconstructed file must be byte-for-byte identical to the source GIF — any mismatch \
+                 here (even one byte) means the APC transport corrupted data somewhere in the stream"
+            );
+
+            // Also confirm the reconstructed file actually decodes as a
+            // real, complete GIF — the strongest possible proof the
+            // transport-level byte-identity check above isn't missing
+            // something a naive comparison could paper over.
+            let decoded = rich_content_gif_player::try_decode_progressive(path, contiguous)
+                .expect("decode must not error")
+                .expect("a full, valid GIF must decode into at least one frame");
+            assert!(decoded.complete, "the full reconstructed file must decode as complete, not partial");
+            assert_eq!(decoded.frames.len(), 47, "giphy.gif fixture is known to have 47 frames");
         });
     }
 

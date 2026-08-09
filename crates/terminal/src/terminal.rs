@@ -4041,6 +4041,12 @@ mod tests {
             file_id: 0x3333_4444,
             chunk_offset: 0,
             total_size: 6,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 0,
+                height_px: 0,
+                color_bits: 0,
+                is_animated: false,
+            },
             payload: payload_with_esc.clone(),
         };
 
@@ -4116,6 +4122,12 @@ mod tests {
                 file_id,
                 chunk_offset: offset,
                 total_size: source_bytes.len() as u64,
+                metadata: rich_content_transport::ContentMetadata::Image {
+                    width_px: 480,
+                    height_px: 480,
+                    color_bits: 32,
+                    is_animated: true,
+                },
                 payload: payload.clone(),
             };
             all_apc_bytes.extend_from_slice(&[0x1B, b'_']);

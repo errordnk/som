@@ -113,14 +113,25 @@ impl std::io::Write for RawByteBroadcaster {
         }
         self.last_write = Some((buf.to_vec(), now));
 
-        let subs = self.subscribers.lock().unwrap();
-        for sub in subs.iter() {
-            // `try_send`, not `send`/blocking — a slow or vanished RELAY
-            // must never stall the HOLDER's own PTY-reading thread (which
-            // also feeds the headless `Term` that every OTHER RELAY, and
-            // this session's own liveness, depends on).
-            sub.try_send(buf.to_vec()).ok();
-        }
+        let mut subs = self.subscribers.lock().unwrap();
+        // `try_send`, not `send`/blocking — a slow or vanished RELAY must
+        // never stall the HOLDER's own PTY-reading thread (which also
+        // feeds the headless `Term` that every OTHER RELAY, and this
+        // session's own liveness, depends on). `retain` here (rather than
+        // the previous fire-and-forget `.ok()`) actually drops a
+        // disconnected RELAY's sender once its receiver is gone —
+        // `TrySendError::Closed` is the unambiguous signal for that,
+        // distinct from `Full` (a live-but-slow receiver, which must NOT
+        // be dropped just because one send didn't fit its buffer).
+        // Without this, `subscribers` only ever grows for a HOLDER's
+        // entire lifetime — a stale disconnected sender sitting in the
+        // list makes `ColorRequest`'s `pump_raw_byte_subscribers.is_empty
+        // ()` check (see this session's OSC11 handling) permanently think
+        // a RELAY is still attached even long after the last one vanished
+        // (e.g. Som fully closed), so the HOLDER would then never again
+        // answer capability queries programs like `yazi` need to avoid
+        // hanging on a genuinely orphaned session.
+        subs.retain(|sub| !matches!(sub.try_send(buf.to_vec()), Err(async_channel::TrySendError::Closed(_))));
         Ok(original_len)
     }
 
@@ -346,6 +357,41 @@ impl Session {
                         }
                         break;
                     }
+                    // A program (e.g. `yazi`) asking "what color is index
+                    // N" (most commonly OSC 11, the background color) is
+                    // deliberately left UNANSWERED here — unlike `PtyWrite`
+                    // /DA1 (a fixed, content-free reply, always safe for
+                    // the HOLDER to answer on the real PTY — see
+                    // `terminal::Terminal::process_event`'s `PtyWrite`
+                    // arm), this reply's CONTENT differs from what Som
+                    // would answer with the user's REAL configured theme
+                    // (`cx.theme()`): this headless `Term` has no GPUI
+                    // `Theme` to consult and can only guess a hardcoded
+                    // default. A "only answer if no RELAY is attached yet"
+                    // gate was tried and confirmed NOT to work in practice
+                    // — a RELAY subscribes to raw bytes during its initial
+                    // handshake (`server::handle_relay`), long before any
+                    // program actually running inside it (e.g. `yazi`,
+                    // started well after the shell prompt appears) gets
+                    // around to sending its own color query, so by the
+                    // time a real query arrives a RELAY is essentially
+                    // always already attached — the gate condition was
+                    // never actually true for a live client program's
+                    // query, and the HOLDER's own guess still arrived
+                    // late, rendered as literal on-screen text once the
+                    // client had moved on from expecting a VT reply.
+                    // Confirmed root cause of yazi's "Shell:"/"Find:"
+                    // popups filling with raw escape bytes even after the
+                    // DA1/DECRPM half of this same double-answer bug was
+                    // fixed. The accepted tradeoff: a client program
+                    // querying its background color in a session that has
+                    // NEVER had a single RELAY attach (e.g. spawned
+                    // directly against a bare HOLDER with nothing ever
+                    // reading its output) hangs waiting for a reply nothing
+                    // will ever send — an edge case unreachable through
+                    // Som's own UI, which always attaches a RELAY the
+                    // moment a `tmux: true` tab opens.
+                    AlacTermEvent::ColorRequest(_, _) => {}
                     _ => {}
                 }
             }
@@ -425,6 +471,15 @@ impl Session {
     /// behavior.
     pub fn resize(&self, bounds: SessionBounds) {
         let mut last_bounds = self.last_bounds.lock().unwrap();
+        // `bounds`'s `cell_width`/`cell_height` may be `0` ("unknown" —
+        // see `SessionBounds::with_pixel_size`'s doc comment) if the
+        // caller (a RELAY's resize-poll thread) hasn't yet received a
+        // real pixel-size marker from Som — resolve that against whatever
+        // this session already had BEFORE the equality check below, so a
+        // cols/rows-only resize doesn't get wrongly treated as "changed"
+        // (or "unchanged") based on a placeholder that was never meant to
+        // overwrite a real known pixel size.
+        let bounds = bounds.with_pixel_size(bounds.cell_width, bounds.cell_height, Some(*last_bounds));
         if bounds == *last_bounds {
             return;
         }
@@ -455,6 +510,9 @@ impl Session {
     /// place still skipping it.
     pub fn force_resize(&self, bounds: SessionBounds) {
         let mut last_bounds = self.last_bounds.lock().unwrap();
+        // See `resize`'s identical comment — `bounds`'s pixel size may be
+        // the RELAY's initial "unknown" (`0`) sentinel.
+        let bounds = bounds.with_pixel_size(bounds.cell_width, bounds.cell_height, Some(*last_bounds));
         *last_bounds = bounds;
         self.term.lock().resize(bounds);
         let window_size: WindowSize = bounds.into();

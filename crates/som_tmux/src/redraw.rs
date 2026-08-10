@@ -23,7 +23,7 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use std::io::Write;
@@ -143,6 +143,23 @@ pub struct Redrawer {
     /// way `ALT_SCREEN` already gets tracked (just for a different
     /// purpose: forcing a repaint, not re-emitting anything).
     last_app_cursor: Option<bool>,
+    /// The mouse-tracking-related `TermMode` bits active on the HOLDER's
+    /// `Term` as of the last `redraw` call — `None` before the first call.
+    /// Same category of problem as `last_app_cursor` (see its doc comment):
+    /// mouse mode controls nothing about what's ON screen, only whether
+    /// `terminal::Terminal::mouse_mode` starts forwarding clicks/motion to
+    /// the PTY at all, so the grid diff below — which only ever reproduces
+    /// visible cell content — can never carry it, and it has to be
+    /// re-emitted explicitly on every flip instead. Confirmed root cause of
+    /// a real bug report: a `tmux: true` tab's mouse stopped working
+    /// entirely in a mouse-driven client (`yazi`) — but ONLY after a
+    /// (re)attach, since a client that enabled mouse mode on a connection
+    /// that never dropped had already sent the real `?1000h` etc. bytes
+    /// down the ordinary live-byte-forwarding path (`HolderOutput::Bytes`,
+    /// unaffected by this — see `crate::server`'s `spawn_forwarder`), which
+    /// only bypasses `Redrawer` (and this gap) once a FRESH `Snapshot` is
+    /// what a reconnecting RELAY sees first.
+    last_mouse_mode: Option<TermMode>,
 }
 
 impl Redrawer {
@@ -164,6 +181,7 @@ impl Redrawer {
             last_alt_screen: None,
             last_size: None,
             last_app_cursor: None,
+            last_mouse_mode: None,
         }
     }
 
@@ -234,6 +252,48 @@ impl Redrawer {
             out.write_all(if app_cursor { b"\x1b[?1h" } else { b"\x1b[?1l" })?;
         }
         self.last_app_cursor = Some(app_cursor);
+
+        // See `last_mouse_mode`'s doc comment: re-emit the exact DECSET/
+        // DECRST pair for each individual mouse-tracking bit that actually
+        // flipped since the last redraw — one pair per protocol variant
+        // (`?1000`=click, `?1002`=drag, `?1003`=all-motion, `?1006`=SGR
+        // coordinate encoding, `?1005`=UTF-8 coordinate encoding), not a
+        // single blanket "mouse on/off" toggle, since a client (`yazi`
+        // sends `?1000h?1002h?1015h?1006h` together) can combine several
+        // of these and a coarser toggle would lose which ones specifically
+        // were requested.
+        let mouse_mode = term.mode().intersection(
+            TermMode::MOUSE_REPORT_CLICK
+                | TermMode::MOUSE_DRAG
+                | TermMode::MOUSE_MOTION
+                | TermMode::SGR_MOUSE
+                | TermMode::UTF8_MOUSE,
+        );
+        if self.last_mouse_mode != Some(mouse_mode) {
+            for (bit, csi) in [
+                (TermMode::MOUSE_REPORT_CLICK, "?1000"),
+                (TermMode::MOUSE_DRAG, "?1002"),
+                (TermMode::MOUSE_MOTION, "?1003"),
+                (TermMode::UTF8_MOUSE, "?1005"),
+                (TermMode::SGR_MOUSE, "?1006"),
+            ] {
+                let was_set = self.last_mouse_mode.is_some_and(|prev| prev.contains(bit));
+                let now_set = mouse_mode.contains(bit);
+                if was_set != now_set || self.last_mouse_mode.is_none() {
+                    if now_set {
+                        write!(out, "\x1b[{csi}h")?;
+                    } else if self.last_mouse_mode.is_some() {
+                        // Only RESET a bit that a PRIOR redraw actually SET
+                        // — on the very first redraw (`last_mouse_mode ==
+                        // None`), a bit that's simply off needs no `l`
+                        // sequence at all (that's already the client's
+                        // default state).
+                        write!(out, "\x1b[{csi}l")?;
+                    }
+                }
+            }
+        }
+        self.last_mouse_mode = Some(mouse_mode);
 
         let content = term.renderable_content();
         let mut new_grid: Vec<Vec<PaintedCell>> = Vec::new();
@@ -772,6 +832,108 @@ mod tests {
         assert!(
             !client_term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR),
             "client-side Term should have APP_CURSOR cleared again after redraw forwarded the real app's DECCKM-disable"
+        );
+    }
+
+    /// Same category of bug as the DECCKM test above, but for mouse
+    /// tracking — confirmed root cause of a real user report: a `tmux:
+    /// true` tab's mouse worked fine on a connection that never dropped
+    /// (those bytes go through the ordinary live-forwarding path, see
+    /// `crate::server::spawn_forwarder`), but stopped working ENTIRELY —
+    /// clicks in `yazi` did nothing — specifically after a (re)attach,
+    /// because `Redrawer::redraw` never re-emitted the mouse-mode DECSET
+    /// bytes a (re)connecting RELAY's fresh `Snapshot` needs, even though
+    /// the real app (`yazi`, on its own first-ever startup, well before
+    /// this particular reconnect) had already enabled mouse mode long ago.
+    #[test]
+    fn redraw_forwards_mouse_mode_changes_to_the_client() {
+        let bounds = SessionBounds::new(80, 24);
+        let mut term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        let mut redrawer = Redrawer::new();
+
+        parser.advance(&mut term, b"PS>");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("initial redraw should succeed");
+
+        let mut client_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut client_parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            !client_term.mode().contains(alacritty_terminal::term::TermMode::MOUSE_MODE),
+            "client should start without mouse mode set, matching the real shell's own initial state"
+        );
+
+        // yazi's own startup sequence: click + drag + urxvt + SGR encoding,
+        // all together in one write (see yazi-tty's `EnableMouseCapture`).
+        // Mouse-tracking sub-modes are mutually exclusive in alacritty's own
+        // `Handler::set_private_mode` (each one clears `MOUSE_MODE` before
+        // setting its own bit — see that function's "Mouse protocols are
+        // mutually exclusive" comment) — yazi's four SETs together end up
+        // with only the LAST one, `?1002` (`MOUSE_DRAG`), actually active,
+        // not all three `MOUSE_MODE` bits at once. `.intersects`, not
+        // `.contains`, is the right check here — any ONE of them being on
+        // is what makes `Terminal::mouse_mode` (`self.last_content.mode.
+        // intersects(TermMode::MOUSE_MODE)`) start forwarding clicks.
+        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("redraw after enabling mouse mode should succeed");
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            client_term.mode().intersects(alacritty_terminal::term::TermMode::MOUSE_MODE),
+            "client-side Term should have mouse mode set after redraw forwarded yazi's mouse-enable — this is \
+             the exact bug: without forwarding it, Som's `Terminal::mouse_mode` never returns true, so clicks \
+             never get forwarded to the PTY at all, even though the real app IS listening for them"
+        );
+        assert!(
+            client_term.mode().contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
+            "client-side Term should also have picked up SGR coordinate encoding specifically"
+        );
+
+        // Mouse mode disabled again (e.g. app exits back to a plain shell).
+        parser.advance(&mut term, b"\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1000l");
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("redraw after disabling mouse mode should succeed");
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            !client_term.mode().intersects(alacritty_terminal::term::TermMode::MOUSE_MODE),
+            "client-side Term should have mouse mode cleared again after redraw forwarded the real app's disable"
+        );
+    }
+
+    /// The specific scenario from the real bug report: mouse mode was
+    /// already ON (the real app enabled it long before this particular
+    /// (re)connect — e.g. `yazi` was already running, minutes earlier,
+    /// when the RELAY dropped and reconnected) — so `redraw`'s very FIRST
+    /// call for this fresh `Redrawer` (mirroring what a genuinely fresh
+    /// `Snapshot`-triggered redraw looks like on reconnect, not the
+    /// incremental-update case the two tests above cover) has to notice
+    /// mouse mode is ALREADY set and forward it, not just react to a
+    /// FLIP — there's no earlier `redraw` call for a flip to be relative
+    /// to.
+    #[test]
+    fn redraw_forwards_already_enabled_mouse_mode_on_the_very_first_call() {
+        let bounds = SessionBounds::new(80, 24);
+        let mut term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+
+        // Mouse mode enabled BEFORE the first redraw ever runs — exactly
+        // what a HOLDER's long-lived headless `Term` looks like when a
+        // fresh RELAY (re)connects well after `yazi` already started.
+        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h");
+
+        let mut redrawer = Redrawer::new();
+        let mut bytes = Vec::new();
+        redrawer.redraw(&term, &mut bytes).expect("first redraw should succeed");
+
+        let mut client_term = Term::new(Config::default(), &bounds, VoidListener);
+        let mut client_parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        client_parser.advance(&mut client_term, &bytes);
+        assert!(
+            client_term.mode().intersects(alacritty_terminal::term::TermMode::MOUSE_MODE),
+            "the very first redraw against a HOLDER that already has mouse mode on must forward it — this is \
+             the real (re)connect bug: a client that only reacts to a mode FLIP relative to a prior redraw call \
+             never notices a mode that was already on before this Redrawer even existed, got bytes: {bytes:?}"
         );
     }
 

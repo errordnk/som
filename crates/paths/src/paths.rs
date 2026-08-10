@@ -274,12 +274,6 @@ pub fn old_log_file() -> &'static PathBuf {
     OLD_LOG_FILE.get_or_init(|| logs_dir().join("old.log"))
 }
 
-/// Returns the path to the database directory.
-pub fn database_dir() -> &'static PathBuf {
-    static DATABASE_DIR: OnceLock<PathBuf> = OnceLock::new();
-    DATABASE_DIR.get_or_init(|| data_dir().join("db"))
-}
-
 /// Returns the path to the crashes directory, if it exists for the current platform.
 pub fn crashes_dir() -> &'static Option<PathBuf> {
     static CRASHES_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();

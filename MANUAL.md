@@ -255,6 +255,8 @@ Som implements the [Kitty Graphics Protocol](https://sw.kovidgoyal.net/kitty/gra
 
 Known open issue: navigating file lists with arrow keys in `yazi` can leave a preview un-rendered until the next keypress (clicking with the mouse doesn't have this problem). Being tracked, not yet fixed.
 
+**Windows setup note:** `yazi` needs the `file` command to detect a file's MIME type before it'll even attempt to preview it as an image — without it you'll see "Cannot find `file` to detect the file's MIME type" instead of a preview. Windows has no built-in `file`, and `yazi` doesn't search `PATH` for it there; install [Git for Windows](https://git-scm.com/download/win) (which bundles `file.exe`) and set a `YAZI_FILE_ONE` environment variable pointing at it, e.g. `C:\Program Files\Git\usr\bin\file.exe`. Restart Som (or any terminal that reads user environment variables at launch) after setting it.
+
 ## Theming
 
 Som ships a single bundled theme, "Nord Dark" (`window.theme` / `general` default), written to `~/.config/som/themes/nord.json` on first run. The underlying theme engine supports arbitrary theme files with about 150 individually addressable colors, but Som doesn't currently expose a way to install additional themes other than manually placing a compatible theme JSON file in the themes directory and setting `window.theme` to its name.

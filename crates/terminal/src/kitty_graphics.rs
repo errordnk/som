@@ -32,6 +32,15 @@ pub enum KittyGraphicsCommand {
     /// at all must answer (see `KITTY_GRAPHICS_PLAN.md` Stage 5) by
     /// echoing back whichever identifiers the sender used.
     Query(QueryCommand),
+    /// `a=f` — append an animation frame to an already-transmitted image.
+    /// Same chunked-payload shape as `Transmit` (an `m=1` sequence of
+    /// bare-payload continuation APC strings can follow), which is why
+    /// this carries its own `more_chunks`/`payload_base64` rather than
+    /// reusing `TransmitCommand` wholesale — a frame has no `f=`/medium of
+    /// its own beyond what the base image already established.
+    Frame(FrameCommand),
+    /// `a=a` — animation control (start/stop looping, jump to a frame).
+    Animation(AnimationCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +118,110 @@ pub struct TransmitCommand {
     /// Raw base64 text from this APC string's payload section, NOT yet decoded
     /// or concatenated with any other chunk.
     pub payload_base64: String,
+    /// Whether this chunk actually carried an `a=` key, vs. defaulting to
+    /// `t` because `a=` was entirely absent (a continuation chunk of ANY
+    /// multi-chunk command — `a=T`, `a=t`, or `a=f` — omits `a=` per spec,
+    /// not just `a=t`/`a=T`'s own continuations). This parser is
+    /// deliberately stateless (see this module's doc comment) and has no
+    /// way to know which multi-chunk transmission is actually in progress,
+    /// so it can't itself route an action-less chunk to the right variant —
+    /// it has to guess `t` and let the caller (`kitty_graphics_store`,
+    /// which DOES track that state via `active_pending_id`/
+    /// `active_frame_id`) correct the guess. Skipping that correction was a
+    /// real, confirmed bug: every `a=f` frame's continuation chunks were
+    /// silently misrouted here and dropped, so a real animated GIF's frames
+    /// past the first chunk of each never made it into `ImageStore` at all.
+    pub explicit_action: bool,
+}
+
+/// A frame's `z=` gap, resolved to its three distinct meanings per
+/// <https://sw.kovidgoyal.net/kitty/graphics-protocol/#animation-frames>'s
+/// "Keys for animation frame loading" table: `z=0`/absent both mean "use
+/// the protocol's default" (which is NOT "reuse the previous frame's gap"
+/// — that rule doesn't exist in the spec — it's a flat 40ms), while a
+/// negative value means "gapless" (advance to the next frame immediately,
+/// no wait at all). Modeled as its own enum rather than a raw
+/// `Option<i32>` so a caller can't accidentally treat `Gapless` as "0ms",
+/// which per spec is a materially different, faster-than-representable
+/// behavior (immediate) rather than a very short timed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameGap {
+    /// `z=0` or absent — 40ms, the spec's stated default.
+    Default,
+    /// `z=<positive>` — this many milliseconds.
+    Milliseconds(u32),
+    /// `z=<negative>` — advance immediately, no wait.
+    Gapless,
+}
+
+impl FrameGap {
+    fn from_z(z: Option<i32>) -> Self {
+        match z {
+            None | Some(0) => Self::Default,
+            Some(n) if n < 0 => Self::Gapless,
+            Some(n) => Self::Milliseconds(n as u32),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameCommand {
+    /// `i=` — the image this frame belongs to. Like a `Transmit`
+    /// continuation chunk, only the first APC string of a (possibly
+    /// chunked) frame transmission carries this; later ones resolve
+    /// against whichever frame transmission is in progress, mirroring
+    /// `ImageStore::active_pending_id`'s reasoning for `Transmit`.
+    pub id: Option<u32>,
+    /// `z=` — this frame's own display duration before advancing to the
+    /// next one. See [`FrameGap`]'s doc comment for its three-way meaning.
+    pub gap: FrameGap,
+    /// `m=1` — more chunks of this SAME frame's payload follow.
+    pub more_chunks: bool,
+    /// Raw base64 payload for this chunk, not yet decoded/concatenated.
+    pub payload_base64: String,
+}
+
+/// `s=` on `a=a` — see [`AnimationCommand::SetState`]'s doc comment for the
+/// full per-value spec citation. Kitty's own three states, verbatim
+/// (`kitty/graphics.c`'s `ANIMATION_STOPPED`/`ANIMATION_LOADING`/
+/// `ANIMATION_RUNNING`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationState {
+    /// `s=1` — stop the animation, freezing on whichever frame is current.
+    Stopped,
+    /// `s=2` — run the animation, but in "loading" mode: on reaching the
+    /// last transmitted frame, wait for more frames to arrive instead of
+    /// looping back to the first one.
+    Loading,
+    /// `s=3` — run the animation normally: after the last frame, loop back
+    /// to the first.
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationCommand {
+    /// `s=1`/`s=2`/`s=3` — change (or, for a client-driven animation with
+    /// no `s=` at all, leave unchanged — see `parse_animation`) playback
+    /// state. Spec: "The animation state is controlled by the `s` key.
+    /// `s=1` stops the animation. `s=2` runs the animation, but in
+    /// *loading* mode... `s=3` runs the animation normally... after the
+    /// last frame, the terminal loops back to the first frame."
+    SetState { id: Option<u32>, state: AnimationState },
+    /// `c=<n>` — make the 1-based `n`th frame the current one (client-
+    /// driven animation, no autoplay). Spec: "To change the current
+    /// frame, use the `c` key... This will make the seventh frame... the
+    /// current frame", table: "The 1-based frame number of the frame that
+    /// should be made the current frame."
+    SetCurrentFrame { id: Option<u32>, frame: u32 },
+    /// `r=<n>,z=<gap>` — set the `n`th frame's gap after the fact. The
+    /// ONLY way to give the root frame (the base image from `a=T`/`a=t`,
+    /// which itself has no gap-setting `z=` of its own — there `z=` would
+    /// collide with z-index) a nonzero gap: spec's own example is
+    /// `a=a,i=7,r=3,z=48` ("sets the gap for the third frame... to 48
+    /// milliseconds") and "the first frame or *root frame* is created
+    /// with the base image data and has no gap, so its gap must be set
+    /// using this control code."
+    SetFrameGap { id: Option<u32>, frame: u32, gap: FrameGap },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +283,7 @@ pub fn parse_command(bytes: &[u8]) -> Option<KittyGraphicsCommand> {
     };
 
     let controls = parse_control_data(control_bytes)?;
+    let explicit_action = controls.contains_key("a");
     let action = controls.get("a").copied().unwrap_or("t");
 
     match action {
@@ -179,8 +293,10 @@ pub fn parse_command(bytes: &[u8]) -> Option<KittyGraphicsCommand> {
         })),
         "d" => parse_delete(&controls).map(KittyGraphicsCommand::Delete),
         "p" => Some(KittyGraphicsCommand::Place(parse_place(&controls))),
-        "t" | "T" => parse_transmit(&controls, payload_bytes, action == "T")
+        "t" | "T" => parse_transmit(&controls, payload_bytes, action == "T", explicit_action)
             .map(KittyGraphicsCommand::Transmit),
+        "f" => parse_frame(&controls, payload_bytes).map(KittyGraphicsCommand::Frame),
+        "a" => parse_animation(&controls).map(KittyGraphicsCommand::Animation),
         _ => None,
     }
 }
@@ -219,6 +335,7 @@ fn parse_transmit(
     controls: &HashMap<&str, &str>,
     payload_bytes: &[u8],
     display_immediately: bool,
+    explicit_action: bool,
 ) -> Option<TransmitCommand> {
     let format = match controls.get("f").copied().unwrap_or("32") {
         "24" => ImageFormat::Rgb,
@@ -244,7 +361,53 @@ fn parse_transmit(
         width: parse_u32(controls, "s"),
         height: parse_u32(controls, "v"),
         payload_base64,
+        explicit_action,
     })
+}
+
+fn parse_frame(controls: &HashMap<&str, &str>, payload_bytes: &[u8]) -> Option<FrameCommand> {
+    Some(FrameCommand {
+        id: parse_u32(controls, "i"),
+        gap: FrameGap::from_z(parse_i32(controls, "z")),
+        more_chunks: controls.get("m").copied() == Some("1"),
+        payload_base64: std::str::from_utf8(payload_bytes).ok()?.to_string(),
+    })
+}
+
+/// `s=0`/absent (no `c=` or `r=` either) is a legitimate no-op per spec —
+/// "The animation state is controlled by the `s` key" table's own default
+/// row (`s` default `0`) plus `kitty/graphics.c`'s own dispatch
+/// (`if (g->animation_state) { switch (...) }` — state 0 skips the switch
+/// entirely, leaving playback untouched). Returns `None` for that case
+/// rather than inventing a `Start`/default action the spec doesn't
+/// describe — see this file's `KITTY_GRAPHICS_PLAN.md`-linked doc comments
+/// elsewhere in this crate for the same "don't guess" principle applied to
+/// unrecognized `a=`/`d=` values.
+fn parse_animation(controls: &HashMap<&str, &str>) -> Option<AnimationCommand> {
+    let id = parse_u32(controls, "i");
+
+    if let Some(frame) = parse_u32(controls, "r")
+        && controls.contains_key("z")
+    {
+        return Some(AnimationCommand::SetFrameGap {
+            id,
+            frame,
+            gap: FrameGap::from_z(parse_i32(controls, "z")),
+        });
+    }
+
+    match controls.get("s").copied() {
+        Some("1") => return Some(AnimationCommand::SetState { id, state: AnimationState::Stopped }),
+        Some("2") => return Some(AnimationCommand::SetState { id, state: AnimationState::Loading }),
+        Some("3") => return Some(AnimationCommand::SetState { id, state: AnimationState::Running }),
+        _ => {},
+    }
+
+    if let Some(frame) = parse_u32(controls, "c") {
+        return Some(AnimationCommand::SetCurrentFrame { id, frame });
+    }
+
+    None
 }
 
 fn parse_place(controls: &HashMap<&str, &str>) -> PlaceCommand {
@@ -415,6 +578,7 @@ mod tests {
                 width: None,
                 height: None,
                 payload_base64: "AAA=".to_string(),
+                explicit_action: true,
             })
         );
     }
@@ -598,6 +762,137 @@ mod tests {
             },
             _ => panic!("expected Transmit"),
         }
+    }
+
+    #[test]
+    fn parse_frame_append() {
+        let cmd = parse_command(b"Ga=f,i=7,z=100;AAA=").unwrap();
+        assert_eq!(
+            cmd,
+            KittyGraphicsCommand::Frame(FrameCommand {
+                id: Some(7),
+                gap: FrameGap::Milliseconds(100),
+                more_chunks: false,
+                payload_base64: "AAA=".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_frame_append_chunked() {
+        let cmd = parse_command(b"Ga=f,i=7,m=1;AAA=").unwrap();
+        match cmd {
+            KittyGraphicsCommand::Frame(f) => {
+                assert_eq!(f.id, Some(7));
+                assert!(f.more_chunks);
+                assert_eq!(f.gap, FrameGap::Default);
+            },
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_zero_gap_is_default_not_gapless() {
+        let cmd = parse_command(b"Ga=f,i=7,z=0;AAA=").unwrap();
+        match cmd {
+            KittyGraphicsCommand::Frame(f) => assert_eq!(f.gap, FrameGap::Default),
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_negative_gap_is_gapless() {
+        let cmd = parse_command(b"Ga=f,i=7,z=-1;AAA=").unwrap();
+        match cmd {
+            KittyGraphicsCommand::Frame(f) => assert_eq!(f.gap, FrameGap::Gapless),
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_animation_bare_with_no_s_c_or_r_is_a_no_op() {
+        // Per spec, s defaults to 0 ("not specified, don't change state")
+        // — a bare "a=a,i=7" with none of s=/c=/r=+z= present carries no
+        // actionable instruction at all, so this must return None, NOT
+        // invent a "start" action the spec doesn't describe.
+        assert_eq!(parse_command(b"Ga=a,i=7"), None);
+    }
+
+    #[test]
+    fn parse_animation_s1_stops() {
+        // Spec: "s=1 stops the animation." (NOT "starts" — this is the
+        // exact inversion a prior, unverified implementation got wrong.)
+        assert_eq!(
+            parse_command(b"Ga=a,i=7,s=1"),
+            Some(KittyGraphicsCommand::Animation(AnimationCommand::SetState {
+                id: Some(7),
+                state: AnimationState::Stopped
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_animation_s2_runs_in_loading_mode() {
+        // Spec: "s=2 runs the animation, but in loading mode... instead of
+        // looping, the terminal will wait for the arrival of more frames."
+        assert_eq!(
+            parse_command(b"Ga=a,i=7,s=2"),
+            Some(KittyGraphicsCommand::Animation(AnimationCommand::SetState {
+                id: Some(7),
+                state: AnimationState::Loading
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_animation_s3_runs_and_loops() {
+        // Spec: "s=3 runs the animation normally, after the last frame,
+        // the terminal loops back to the first frame."
+        assert_eq!(
+            parse_command(b"Ga=a,i=7,s=3"),
+            Some(KittyGraphicsCommand::Animation(AnimationCommand::SetState {
+                id: Some(7),
+                state: AnimationState::Running
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_animation_set_current_frame_via_c() {
+        // Spec's own example: "<ESC>_Ga=a,i=3,c=7<ESC>\ This will make the
+        // seventh frame in the image with id 3 the current frame." — NOT
+        // r=, which (in a=a context) means something else entirely (see
+        // parse_animation_set_frame_gap_via_r_and_z below).
+        assert_eq!(
+            parse_command(b"Ga=a,i=3,c=7"),
+            Some(KittyGraphicsCommand::Animation(AnimationCommand::SetCurrentFrame {
+                id: Some(3),
+                frame: 7
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_animation_set_frame_gap_via_r_and_z() {
+        // Spec's own example: "<ESC>_Ga=a,i=7,r=3,z=48<ESC>\ This sets the
+        // gap for the third frame of the image with id 7 to 48
+        // milliseconds." — this is the ONLY way to set the root frame's
+        // gap (a=T/a=t's own z= means z-index, not gap).
+        assert_eq!(
+            parse_command(b"Ga=a,i=7,r=3,z=48"),
+            Some(KittyGraphicsCommand::Animation(AnimationCommand::SetFrameGap {
+                id: Some(7),
+                frame: 3,
+                gap: FrameGap::Milliseconds(48)
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_animation_r_without_z_is_not_a_frame_gap_command() {
+        // r= alone (no z=) doesn't match the spec's set-frame-gap shape —
+        // must not be misparsed as SetFrameGap with a bogus default gap.
+        assert_eq!(parse_command(b"Ga=a,i=7,r=3"), None);
     }
 
     #[test]

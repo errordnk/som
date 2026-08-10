@@ -53,6 +53,19 @@ struct Args {
     /// Mirrors Som's own `TerminalSettings::max_scroll_history_lines` — same
     /// reasoning as `cursor_shape` above.
     scrollback: Option<usize>,
+    /// Som's real font cell size in pixels (`width;height`) at the moment
+    /// it spawned this RELAY — see `relay::run`'s own doc comment for why
+    /// this is a one-time command-line value (Som's `TerminalBounds::
+    /// cell_width()`/`line_height()`, the same figures GPUI actually
+    /// renders text with) rather than something updated live for the rest
+    /// of the session: a live channel (an escape-sequence marker injected
+    /// into the same PTY byte stream real keystrokes/VT responses flow
+    /// through) was tried and confirmed to introduce multi-second delays
+    /// in unrelated Kitty graphics image data sharing that same pipe —
+    /// this flag exists specifically to avoid that shared-channel
+    /// contention, at the cost of never updating if the font/DPI changes
+    /// mid-session (rare enough to accept).
+    cell_pixel_size: Option<(u16, u16)>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +77,7 @@ fn parse_args() -> Args {
     let mut client_id = None;
     let mut cursor_shape = None;
     let mut scrollback = None;
+    let mut cell_pixel_size = None;
     let mut extra_args = Vec::new();
 
     let mut iter = std::env::args().skip(1).peekable();
@@ -89,6 +103,12 @@ fn parse_args() -> Args {
             "--client-id" => client_id = iter.next(),
             "--cursor-shape" => cursor_shape = iter.next(),
             "--scrollback" => scrollback = iter.next().and_then(|s| s.parse().ok()),
+            "--cell-pixel-size" => {
+                cell_pixel_size = iter.next().and_then(|s| {
+                    let (w, h) = s.split_once(';')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                });
+            }
             "--" => {
                 extra_args.extend(iter.by_ref());
             }
@@ -127,7 +147,7 @@ fn parse_args() -> Args {
     let Some(pane_id) = pane_id.filter(|s| !s.trim().is_empty()) else { usage() };
     let Some(program) = program.filter(|s| !s.trim().is_empty()) else { usage() };
 
-    Args { holder, profile, pane_id, program, args: extra_args, cwd, client_id, cursor_shape, scrollback }
+    Args { holder, profile, pane_id, program, args: extra_args, cwd, client_id, cursor_shape, scrollback, cell_pixel_size }
 }
 
 fn main() {
@@ -139,7 +159,16 @@ fn main() {
     let result = if args.holder {
         server::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
     } else {
-        relay::run(&args.profile, &args.pane_id, args.program, args.args, args.cwd, args.cursor_shape, args.scrollback)
+        relay::run(
+            &args.profile,
+            &args.pane_id,
+            args.program,
+            args.args,
+            args.cwd,
+            args.cursor_shape,
+            args.scrollback,
+            args.cell_pixel_size,
+        )
     };
 
     if let Err(err) = result {

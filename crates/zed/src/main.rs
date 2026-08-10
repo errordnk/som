@@ -628,12 +628,7 @@ pub(crate) async fn restore_or_create_workspace(
 }
 
 fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
-    [
-        paths::config_dir(),
-        paths::database_dir(),
-        paths::logs_dir(),
-        paths::temp_dir(),
-    ]
+    [paths::config_dir(), paths::logs_dir(), paths::temp_dir()]
     .into_iter()
     .fold(HashMap::default(), |mut errors, path| {
         if let Err(e) = std::fs::create_dir_all(path) {

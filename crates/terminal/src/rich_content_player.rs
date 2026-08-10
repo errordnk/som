@@ -43,7 +43,22 @@ impl RichContentPlayer {
     /// Builds a player from an already-decoded prefix — used both for the
     /// initial creation (see [`refresh_or_create`]) and to reuse the same
     /// struct shape after a later re-decode.
-    fn from_prefix(prefix: rich_content_gif_player::DecodedPrefix, decoded_through: u64) -> Self {
+    fn from_prefix(mut prefix: rich_content_gif_player::DecodedPrefix, decoded_through: u64) -> Self {
+        // `image::Frame`/the `gif` crate's decoder only ever produce RGBA
+        // pixel data, but `gpui::RenderImage` requires BGRA (see that
+        // type's own doc comment) — without this swap, red and blue are
+        // visibly transposed on screen (confirmed live: skin/hair/seat
+        // colors all came out shifted toward blue). Mirrors
+        // `kitty_graphics_store::swap_to_bgra`'s identical per-pixel
+        // `swap(0, 2)`, which Kitty's own PNG-decoding path already needs
+        // for the exact same reason — not duplicated as a shared helper
+        // only because the two modules deliberately don't depend on each
+        // other (see `rich_content_transport`'s module doc comment).
+        for frame in &mut prefix.frames {
+            for pixel in frame.buffer_mut().as_flat_samples_mut().samples.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
         let render_image = Arc::new(RenderImage::new(SmallVec::from_vec(prefix.frames)));
         Self {
             render_image,
@@ -148,6 +163,29 @@ mod tests {
 
     fn giphy_gif_path() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif")
+    }
+
+    /// Builds a tiny (2x1px) single-frame GIF with a known solid red
+    /// pixel and a known solid blue pixel, written to a fresh temp file —
+    /// enough to prove [`RichContentPlayer::from_prefix`]'s RGBA->BGRA
+    /// swap actually happens, without depending on any real GIF fixture's
+    /// specific pixel colors.
+    fn write_two_pixel_gif(name: &str) -> std::path::PathBuf {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+
+        let mut buffer = RgbaImage::new(2, 1);
+        buffer.put_pixel(0, 0, Rgba([255, 0, 0, 255])); // solid red
+        buffer.put_pixel(1, 0, Rgba([0, 0, 255, 255])); // solid blue
+        let frame = Frame::from_parts(buffer, 0, 0, Delay::from_numer_denom_ms(100, 1));
+
+        let path = std::env::temp_dir()
+            .join(format!("som_rich_content_player_test_{name}_{}.gif", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = GifEncoder::new(file);
+        encoder.encode_frame(frame).unwrap();
+        drop(encoder);
+        path
     }
 
     #[test]
@@ -266,5 +304,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         let later = player.current_frame();
         assert_ne!(later, first, "playback must have advanced past the first frame after waiting");
+    }
+
+    #[test]
+    fn from_prefix_converts_rgba_to_bgra() {
+        // Confirmed live (2026-08-10): without this swap, the paint path
+        // showed visibly wrong colors on a real GIF (skin/hair/upholstery
+        // all shifted toward blue) — gpui::RenderImage requires BGRA (see
+        // that type's own doc comment) but image::Frame/the gif decoder
+        // only ever produce RGBA. A synthetic 2-pixel (red, blue) GIF
+        // makes the exact byte-level effect unambiguous: if the swap
+        // works, red's R/B bytes trade places (0xFF,0x00,0x00 ->
+        // 0x00,0x00,0xFF) and blue's do too (0x00,0x00,0xFF ->
+        // 0xFF,0x00,0x00) — anything else means the swap either didn't
+        // run or ran on the wrong bytes.
+        let path = write_two_pixel_gif("bgra_swap");
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        let player = refresh_or_create(None, &path, full_len).expect("tiny fixture must decode fully");
+
+        let bytes = player.render_image().as_bytes(0).expect("frame 0 must have pixel data");
+        assert_eq!(&bytes[0..4], &[0, 0, 255, 255], "solid red RGBA (255,0,0,255) must become BGRA (0,0,255,255)");
+        assert_eq!(&bytes[4..8], &[255, 0, 0, 255], "solid blue RGBA (0,0,255,255) must become BGRA (255,0,0,255)");
+
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -357,7 +357,14 @@ pub enum RelayInput {
     /// paste, anything the user's terminal client sends. Forwarded
     /// byte-for-byte into the real shell's PTY on the HOLDER side.
     Bytes(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    /// `cell_width`/`cell_height` are the REAL font cell size in pixels —
+    /// `0` means "unknown" (e.g. a RELAY too old to send it, or one that
+    /// hasn't extracted a real value out of Som's own resize marker yet —
+    /// see `relay::PIXEL_SIZE_MARKER_PREFIX`'s doc comment for why a RELAY
+    /// can't just ask Windows for this directly). A HOLDER treats `0` as
+    /// "keep whatever it already had" rather than overwriting a real value
+    /// with a placeholder — see `Session::force_resize`'s doc comment.
+    Resize { cols: u16, rows: u16, cell_width: u16, cell_height: u16 },
     /// Explicit "tab closed via UI" — kills the real shell process for
     /// good, as opposed to the RELAY simply disconnecting (which leaves
     /// the HOLDER and its shell running for a later reattach). Mirrors the

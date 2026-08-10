@@ -132,6 +132,7 @@ pub fn run(
     cwd: Option<String>,
     cursor_shape: Option<String>,
     scrollback: Option<usize>,
+    pixel_cell_size: Option<(u16, u16)>,
 ) -> anyhow::Result<()> {
     // See `term_size::enable_raw_input_mode`'s doc comment — without this,
     // Windows's OWN console input layer (`ReadConsoleW`, underneath this
@@ -196,8 +197,27 @@ pub fn run(
     // can't read a real size (falls back to `SessionBounds::default()`'s
     // 80x24) — the HOLDER unconditionally waits for exactly one message
     // here, so this side must unconditionally send exactly one.
+    //
+    // `cell_width`/`cell_height` come from `pixel_cell_size` — Som's own
+    // real font cell size in pixels at the moment it spawned this RELAY,
+    // passed once via `--cell-pixel-size` (see that flag's doc comment in
+    // `main.rs`'s `Args` for why this is a one-time command-line value,
+    // not something updated live for the rest of the session). `(0, 0)`
+    // if unset — a HOLDER treats `0` as "unknown, keep whatever it already
+    // had" (see `RelayInput::Resize`'s doc comment) rather than
+    // overwriting a real value with a placeholder.
     let initial_size = settled_initial_size();
-    send(&connection, &writer, &RelayInput::Resize { cols: initial_size.0, rows: initial_size.1 })?;
+    let (initial_cell_width, initial_cell_height) = pixel_cell_size.unwrap_or((0, 0));
+    send(
+        &connection,
+        &writer,
+        &RelayInput::Resize {
+            cols: initial_size.0,
+            rows: initial_size.1,
+            cell_width: initial_cell_width,
+            cell_height: initial_cell_height,
+        },
+    )?;
 
     let reader_connection = connection.clone();
     // Config for the throwaway `Term` a `Snapshot` is restored onto below —
@@ -299,7 +319,11 @@ pub fn run(
                 continue;
             }
             last_size = (cols, rows);
-            if send(&resize_connection, &resize_writer, &RelayInput::Resize { cols, rows }).is_err() {
+            // `cell_width`/`cell_height` stay `0` ("unknown") for every
+            // resize after the very first one — see `pixel_cell_size`'s
+            // doc comment at this function's top for why this is a
+            // one-time value, not something re-sent live.
+            if send(&resize_connection, &resize_writer, &RelayInput::Resize { cols, rows, cell_width: 0, cell_height: 0 }).is_err() {
                 return; // holder gone — writer_thread/stdin loop will notice too
             }
         }

@@ -137,7 +137,9 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
         // its own startup and needs a fresh SIGWINCH-equivalent to lay
         // itself out correctly for THIS attach, not whatever it happened
         // to see when it first started.
-        RelayInput::Resize { cols, rows } => session.force_resize(SessionBounds::new(cols, rows)),
+        RelayInput::Resize { cols, rows, cell_width, cell_height } => {
+            session.force_resize(SessionBounds::new(cols, rows).with_pixel_size(cell_width, cell_height, None))
+        }
         other => anyhow::bail!("expected an initial Resize as the second message from a relay, got {other:?}"),
     }
 
@@ -184,8 +186,8 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
         let message = read_relay_message(connection)?;
         match message {
             RelayInput::Bytes(bytes) => session.write(bytes),
-            RelayInput::Resize { cols, rows } => {
-                session.resize(SessionBounds::new(cols, rows));
+            RelayInput::Resize { cols, rows, cell_width, cell_height } => {
+                session.resize(SessionBounds::new(cols, rows).with_pixel_size(cell_width, cell_height, None));
             }
             RelayInput::Close => {
                 session.kill();

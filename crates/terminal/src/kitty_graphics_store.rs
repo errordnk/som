@@ -7,18 +7,36 @@
 //! separate concern — see `KITTY_GRAPHICS_PLAN.md` Stage 3 — this module
 //! only owns the data.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gpui::RenderImage;
-use image::{Frame, RgbaImage};
+use image::{Delay, Frame, RgbaImage};
 use smallvec::SmallVec;
 
 use crate::kitty_graphics::{
-    DeleteCommand, ImageFormat, KittyGraphicsCommand, PlaceCommand, TransmissionMedium,
-    TransmitCommand,
+    AnimationCommand, AnimationState, DeleteCommand, FrameCommand, FrameGap, ImageFormat,
+    KittyGraphicsCommand, PlaceCommand, TransmissionMedium, TransmitCommand,
 };
+
+/// Resolves a parsed [`FrameGap`] to the actual [`Delay`] a frame should be
+/// held for — see `FrameGap`'s doc comment for the spec citations behind
+/// each case. `Gapless` (spec: "advance to the next frame immediately") has
+/// no real zero-duration representation that wouldn't also look like "no
+/// delay was specified"; a single millisecond is the shortest delay this
+/// store's `Duration`-based time-check (`DecodedImage::current_frame`)
+/// can meaningfully act on, close enough to "immediate" for any paint rate
+/// GPUI actually runs at.
+fn delay_from_gap(gap: FrameGap) -> Delay {
+    match gap {
+        FrameGap::Default => Delay::from_numer_denom_ms(40, 1),
+        FrameGap::Milliseconds(ms) => Delay::from_numer_denom_ms(ms.max(1), 1),
+        FrameGap::Gapless => Delay::from_numer_denom_ms(1, 1),
+    }
+}
 
 /// Total memory budget for image data held by one terminal's [`ImageStore`],
 /// in bytes of decoded (not base64/PNG-compressed) pixel data.
@@ -34,28 +52,123 @@ const MAX_STORE_BYTES: usize = 320 * 1024 * 1024;
 
 /// One decoded image, GPU-upload-ready and cached as an `Arc` so repeated
 /// paint calls (every frame the image is on screen) never re-decode or
-/// re-copy pixel data — only the first `Transmit` pays that cost.
+/// re-copy pixel data — only the first `Transmit`/`Frame` command pays that
+/// cost.
 ///
-/// Frames beyond the first are only present for animated images (Kitty's
-/// `a=f` frame-append action — not yet implemented, see
-/// `KITTY_GRAPHICS_PLAN.md`'s animation bullet; `RenderImage` already
-/// supports multiple frames — see `gpui::RenderImage::new`'s `SmallVec<[Frame; 1]>`
-/// parameter — specifically so that support, and eventual video support per
-/// the plan's "Дальнейшее расширение" section, can slot in without
-/// restructuring this type).
+/// Frames beyond the first are populated by Kitty's `a=f` frame-append
+/// action (`ImageStore::apply_frame`) — animated images (e.g. a GIF
+/// re-encoded by `crates/somcat`) arrive as one `a=T` base frame followed by
+/// a series of `a=f` frames, each with its own display duration (`z=`,
+/// Kitty's "gap" key). `render_image` itself needs no special handling for
+/// this — `gpui::RenderImage` was already built around a `SmallVec<[Frame; 1]>`
+/// (see `RenderImage::new`) specifically so multi-frame support could slot
+/// in here without restructuring that type.
 pub struct DecodedImage {
     pub render_image: Arc<RenderImage>,
     /// Decoded byte size, summed across all frames — cheaper to track
     /// incrementally than to recompute by walking frames on every quota
     /// check.
     byte_size: usize,
+    /// Animation playback state — `None` for a plain (single-frame or
+    /// not-yet-animating) image. `Cell`-wrapped so a renderer can advance
+    /// playback (`ImageStore::all_placements`/`image` only ever hand out
+    /// shared `&DecodedImage` references — see `terminal_element.rs`'s
+    /// `paint_kitty_placements`, which reads through `Entity<Terminal>::
+    /// read`, not `update`, since painting must not require mutable access
+    /// to terminal state) without needing `&mut self` at paint time.
+    animation: Cell<Option<AnimationPlayback>>,
+}
+
+/// Renamed from the protocol's own `AnimationState` (`kitty_graphics::
+/// AnimationState` — the parsed `s=1`/`s=2`/`s=3` value) to avoid a name
+/// collision: this is the STORE's derived runtime playback state, not a
+/// verbatim copy of the wire value.
+#[derive(Clone, Copy)]
+struct AnimationPlayback {
+    playing: bool,
+    /// Whether reaching the last frame should loop back to the first
+    /// (`kitty_graphics::AnimationState::Running`, `s=3`) or hold there
+    /// waiting for more frames (`::Loading`, `s=2`) — see
+    /// `DecodedImage::current_frame`'s use of this.
+    loop_when_done: bool,
+    current_frame: usize,
+    /// When `current_frame` was last advanced — `None` means "just reset,
+    /// advance on the very next paint check" (mirrors `gpui::elements::img`'s
+    /// `ImgState::last_frame_time`).
+    last_advance: Option<Instant>,
 }
 
 impl DecodedImage {
     fn from_single_frame(buffer: RgbaImage) -> Self {
         let byte_size = buffer.as_raw().len();
         let render_image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
-        Self { render_image, byte_size }
+        Self { render_image, byte_size, animation: Cell::new(None) }
+    }
+
+    /// Frames are stored, but NOT set playing — per spec, `a=f` only
+    /// transmits frame data; playback only actually starts once a
+    /// separate `a=a` (`SetState` with `Loading`/`Running`) arrives. This
+    /// mirrors `ImageStore::apply_animation`'s own call order: finalize
+    /// frames first (this function), then apply the playback state the
+    /// triggering `a=a` command actually carried.
+    fn from_frames(frames: Vec<Frame>) -> Self {
+        let byte_size = frames.iter().map(|f| f.buffer().as_raw().len()).sum();
+        let render_image = Arc::new(RenderImage::new(SmallVec::from_vec(frames)));
+        Self { render_image, byte_size, animation: Cell::new(None) }
+    }
+
+    /// The frame index a renderer should paint right now, advancing
+    /// playback as a side effect if enough time has passed since the last
+    /// frame switch — mirrors `gpui::elements::img`'s `request_layout` time
+    /// check, just triggered from `terminal_element.rs`'s paint pass
+    /// instead of a dedicated layout phase. Always `0` for a non-animated
+    /// (or currently-paused) image.
+    pub fn current_frame(&self) -> usize {
+        let Some(mut state) = self.animation.get() else {
+            return 0;
+        };
+        let frame_count = self.render_image.frame_count();
+        if !state.playing || frame_count <= 1 {
+            return state.current_frame;
+        }
+        // Loading mode (s=2): once the last transmitted frame is reached,
+        // hold there and wait for more frames rather than looping — see
+        // AnimationPlayback::loop_when_done's doc comment.
+        if !state.loop_when_done && state.current_frame == frame_count - 1 {
+            return state.current_frame;
+        }
+
+        let now = Instant::now();
+        match state.last_advance {
+            None => state.last_advance = Some(now),
+            Some(last) => {
+                let elapsed = now - last;
+                let frame_duration = Duration::from(self.render_image.delay(state.current_frame));
+                if elapsed >= frame_duration {
+                    let next_frame = state.current_frame + 1;
+                    state.current_frame = if next_frame >= frame_count {
+                        0 // only reachable when loop_when_done is true
+                    } else {
+                        next_frame
+                    };
+                    // Carry the remainder forward rather than resetting to
+                    // `now` outright, so a frame with an unusually short
+                    // gap doesn't get silently stretched to match however
+                    // infrequently paint happens to run.
+                    state.last_advance = Some(now - (elapsed - frame_duration));
+                }
+            },
+        }
+        self.animation.set(Some(state));
+        state.current_frame
+    }
+
+    /// True while there's more than one frame and playback isn't paused —
+    /// the signal `terminal_element.rs` uses to decide whether to call
+    /// `window.request_animation_frame()` after painting this image, since
+    /// nothing else would otherwise prompt GPUI to repaint on the next tick.
+    pub fn is_animating(&self) -> bool {
+        self.animation.get().is_some_and(|s| s.playing) && self.render_image.frame_count() > 1
     }
 }
 
@@ -104,6 +217,43 @@ struct PendingTransmit {
     payload_base64: String,
 }
 
+/// Animation frames accumulated so far for an image (`a=f` commands),
+/// finalized into a fresh `DecodedImage`/`RenderImage` once building is
+/// done — `RenderImage` has no "append a frame" operation (its `SmallVec`
+/// of `image::Frame`s is fixed at construction, see `RenderImage::new`), so
+/// frames have to collect here first rather than mutating the already-
+/// stored image in place.
+struct PendingFrames {
+    /// The format every `a=f` payload for this image decodes as — Kitty's
+    /// spec allows a frame to override `f=` independently of the base
+    /// image, but this implementation (and its only real sender,
+    /// `crates/somcat`) always reuses the base image's format, so that's
+    /// the only case handled; see `apply_frame`.
+    format: ImageFormat,
+    width: Option<u32>,
+    height: Option<u32>,
+    /// One entry per completed frame so far, in arrival order — the base
+    /// (`a=T`) frame is seeded in here first (see `apply_transmit`) so
+    /// `finish_animation`/further `a=f` commands only ever have to append,
+    /// never special-case "is this the first frame."
+    frames: Vec<image::Frame>,
+    /// Base64 text concatenated across a chunked frame's continuation APC
+    /// strings (`m=1` on a `a=f`) — same accumulate-then-decode-once
+    /// approach as `PendingTransmit::payload_base64`.
+    in_progress_payload: String,
+    /// The `z=` gap from THIS frame's very first chunk, remembered across
+    /// however many continuation chunks follow. Per spec, only the first
+    /// chunk of a multi-chunk `a=f` carries control keys at all —
+    /// continuation and final chunks are bare `m=1;<payload>`/
+    /// `m=0;<payload>`, so `FrameCommand::gap` on THOSE chunks is always
+    /// `FrameGap::Default` (nothing to parse `z=` out of), never the
+    /// sender's real value. Using the last-received chunk's `gap` directly
+    /// (as opposed to this remembered one) would silently discard a real
+    /// `z=` on every chunked frame — confirmed as a real bug found
+    /// alongside the `Transmit`-misrouting fix in `ImageStore::apply`.
+    in_progress_gap: Option<FrameGap>,
+}
+
 /// Per-terminal store of Kitty graphics protocol images and placements.
 pub struct ImageStore {
     images: HashMap<u32, DecodedImage>,
@@ -125,6 +275,29 @@ pub struct ImageStore {
     /// most recent multi-chunk transmission"). `None` when no transmission
     /// is currently in progress.
     active_pending_id: Option<u32>,
+    /// Animation frames accumulated so far per image id — lazily seeded
+    /// (from the already-stored base image, see
+    /// `seed_frames_from_stored_image`) on the FIRST `a=f` command for an
+    /// id, appended to by every `a=f` after that, and consumed once `a=a`
+    /// starts playback (`finish_pending_animation`). See `PendingFrames`'s
+    /// doc comment for why frames can't just be appended onto the
+    /// already-stored `DecodedImage` in place.
+    pending_frames: HashMap<u32, PendingFrames>,
+    /// Mirrors `active_pending_id` but for a chunked `a=f` frame transmission
+    /// in progress — the same "only the first chunk carries `i=`" rule
+    /// applies to frames as to `Transmit`.
+    active_frame_id: Option<u32>,
+    /// `(format, width, height)` a completed `a=T` transmission used to
+    /// decode — remembered per image id so a later `a=f` (which, like a
+    /// Transmit continuation chunk, may omit `f=`/`s=`/`v=` entirely) knows
+    /// how to interpret its own payload without the sender repeating them.
+    image_formats: HashMap<u32, (ImageFormat, Option<u32>, Option<u32>)>,
+    /// The most recently animated image's id — `a=a`'s `i=` key is
+    /// optional (Kitty's own clients often omit it, acting on "whichever
+    /// image was most recently the target of an animation-related
+    /// command"), so this is the fallback `apply_animation` resolves
+    /// against when a command omits `i=`.
+    last_animated_id: Option<u32>,
     total_bytes: usize,
 }
 
@@ -135,6 +308,10 @@ impl Default for ImageStore {
             placements: HashMap::new(),
             pending: HashMap::new(),
             active_pending_id: None,
+            pending_frames: HashMap::new(),
+            active_frame_id: None,
+            image_formats: HashMap::new(),
+            last_animated_id: None,
             total_bytes: 0,
         }
     }
@@ -181,9 +358,39 @@ impl ImageStore {
     /// differ from where it was when the image was transmitted.
     pub fn apply(&mut self, command: KittyGraphicsCommand, cursor: (i32, usize)) {
         match command {
+            // `kitty_graphics::parse_command` can't tell an action-less
+            // continuation chunk (bare `m=1;<payload>`/`m=0;<payload>`,
+            // `a=` entirely absent — legal per spec for ANY multi-chunk
+            // command, not just `a=T`/`a=t`) apart from a genuine `a=t`
+            // continuation: it's deliberately stateless and has no way to
+            // know which multi-chunk transmission is actually in progress,
+            // so it always guesses `Transmit` (see
+            // `TransmitCommand::explicit_action`'s doc comment). This
+            // store DOES track that state, so it's the one place that can
+            // correct the guess: an action-less chunk arriving while an
+            // `a=f` frame transmission is still open belongs to THAT frame,
+            // not to `Transmit`. Without this correction, every animation
+            // frame's continuation chunks silently vanished into
+            // `apply_transmit` (which has no matching `active_pending_id`
+            // for them and just drops the bytes) — confirmed as the actual
+            // cause of a real animated GIF never finishing: `is_animating()`
+            // stayed false forever because `pending_frames` only ever had
+            // each frame's FIRST 4096-byte chunk, never the rest.
+            KittyGraphicsCommand::Transmit(transmit)
+                if !transmit.explicit_action && self.active_frame_id.is_some() =>
+            {
+                self.apply_frame(FrameCommand {
+                    id: transmit.id,
+                    gap: FrameGap::Default,
+                    more_chunks: transmit.more_chunks,
+                    payload_base64: transmit.payload_base64,
+                });
+            },
             KittyGraphicsCommand::Transmit(transmit) => self.apply_transmit(transmit),
             KittyGraphicsCommand::Place(place) => self.apply_place(place, cursor),
             KittyGraphicsCommand::Delete(delete) => self.apply_delete(delete),
+            KittyGraphicsCommand::Frame(frame) => self.apply_frame(frame),
+            KittyGraphicsCommand::Animation(animation) => self.apply_animation(animation),
             // Handled by the caller (`Terminal::process_event`), which owns
             // the PTY write side this store deliberately doesn't have — see
             // `crate::kitty_graphics::query_response`.
@@ -268,7 +475,196 @@ impl ImageStore {
             return;
         };
 
+        // Remembered so a later `a=f` frame for this same id (which per
+        // spec may omit `f=`/`s=`/`v=` entirely, just like a Transmit
+        // continuation chunk) knows how to decode its payload — see
+        // `apply_frame`.
+        self.image_formats.insert(id, (format, width, height));
         self.insert_image(id, DecodedImage::from_single_frame(buffer));
+    }
+
+    fn apply_frame(&mut self, frame: FrameCommand) {
+        let id = match frame.id.or(if frame.more_chunks || self.active_frame_id.is_some() {
+            self.active_frame_id
+        } else {
+            None
+        }) {
+            Some(id) => id,
+            None => return,
+        };
+
+        if !self.pending_frames.contains_key(&id) {
+            let (format, width, height) =
+                self.image_formats.get(&id).copied().unwrap_or((ImageFormat::Rgba, None, None));
+            let frames = self.seed_frames_from_stored_image(id);
+            self.pending_frames.insert(
+                id,
+                PendingFrames {
+                    format,
+                    width,
+                    height,
+                    frames,
+                    in_progress_payload: String::new(),
+                    in_progress_gap: None,
+                },
+            );
+        }
+        let pending = self.pending_frames.get_mut(&id).expect("just inserted above if absent");
+
+        // The very first chunk of a new frame is the only one that can
+        // carry a real `z=` (see `PendingFrames::in_progress_gap`'s doc
+        // comment) — recognized here as "no payload accumulated yet for
+        // this frame", independent of whether that first chunk itself
+        // happens to be chunked further.
+        if pending.in_progress_payload.is_empty() {
+            pending.in_progress_gap = Some(frame.gap);
+        }
+
+        if frame.more_chunks {
+            pending.in_progress_payload.push_str(&frame.payload_base64);
+            self.active_frame_id = Some(id);
+            return;
+        }
+        self.active_frame_id = None;
+
+        let full_base64 = std::mem::take(&mut pending.in_progress_payload) + &frame.payload_base64;
+        let gap = pending.in_progress_gap.take().unwrap_or(frame.gap);
+        let Ok(raw_bytes) = base64::engine::general_purpose::STANDARD.decode(&full_base64) else {
+            log::debug!("kitty graphics: image {id} animation frame had invalid base64 payload, discarding");
+            return;
+        };
+        let Some(buffer) = decode_pixels(pending.format, &raw_bytes, pending.width, pending.height) else {
+            log::debug!(
+                "kitty graphics: image {id} animation frame ({:?}, {} bytes) failed to decode, discarding",
+                pending.format,
+                raw_bytes.len()
+            );
+            return;
+        };
+
+        pending.frames.push(Frame::from_parts(buffer, 0, 0, delay_from_gap(gap)));
+    }
+
+    /// The base image (already decoded and stored via `a=T`) becomes frame
+    /// 0 of the animation the first time an `a=f` command arrives for its
+    /// id — copied out of the already-decoded `RenderImage` rather than
+    /// re-decoding the original transmit payload, since that's long gone
+    /// by the time a frame command shows up.
+    fn seed_frames_from_stored_image(&self, id: u32) -> Vec<Frame> {
+        self.images
+            .get(&id)
+            .and_then(|image| image.render_image.as_bytes(0).map(|bytes| (bytes.to_vec(), image.render_image.size(0))))
+            .map(|(bytes, size)| {
+                let buffer = RgbaImage::from_raw(size.width.0 as u32, size.height.0 as u32, bytes)
+                    .expect("stored RenderImage frame 0 byte length must match its own dimensions");
+                vec![Frame::new(buffer)]
+            })
+            .unwrap_or_default()
+    }
+
+    fn apply_animation(&mut self, animation: AnimationCommand) {
+        match animation {
+            AnimationCommand::SetState { id, state } => {
+                let Some(id) = id.or(self.last_animated_id) else { return };
+                // Both Loading (s=2) and Running (s=3) actually play the
+                // animation (they only differ in what happens once the
+                // last transmitted frame is reached — loop vs wait for
+                // more) — either one is the point at which whatever's
+                // accumulated in `pending_frames` needs to become the real
+                // multi-frame `RenderImage`. Stopped (s=1) never needs
+                // this: a frame-less image was never getting animated in
+                // the first place, and a genuinely mid-animation stop
+                // shouldn't re-finalize (harmless no-op either way, since
+                // `finish_pending_animation` only acts once there ARE
+                // pending frames).
+                if matches!(state, AnimationState::Loading | AnimationState::Running) {
+                    self.finish_pending_animation(id);
+                }
+                if let Some(image) = self.images.get(&id) {
+                    let mut playback = image.animation.get().unwrap_or(AnimationPlayback {
+                        playing: false,
+                        loop_when_done: false,
+                        current_frame: 0,
+                        last_advance: None,
+                    });
+                    playback.playing = !matches!(state, AnimationState::Stopped);
+                    playback.loop_when_done = matches!(state, AnimationState::Running);
+                    if playback.playing {
+                        playback.last_advance = None;
+                    }
+                    image.animation.set(Some(playback));
+                }
+            },
+            AnimationCommand::SetCurrentFrame { id, frame } => {
+                let Some(id) = id.or(self.last_animated_id) else { return };
+                self.finish_pending_animation(id);
+                if let Some(image) = self.images.get(&id) {
+                    let mut playback = image.animation.get().unwrap_or(AnimationPlayback {
+                        playing: false,
+                        loop_when_done: false,
+                        current_frame: 0,
+                        last_advance: None,
+                    });
+                    // 1-indexed per spec; out-of-range clamps to the last
+                    // frame rather than panicking/wrapping unexpectedly.
+                    let count = image.render_image.frame_count();
+                    playback.current_frame = (frame.max(1) as usize - 1).min(count.saturating_sub(1));
+                    playback.last_advance = None;
+                    image.animation.set(Some(playback));
+                }
+            },
+            AnimationCommand::SetFrameGap { id, frame, gap } => {
+                let Some(id) = id.or(self.last_animated_id) else { return };
+                // The root frame (frame 1) is the one case this can target
+                // BEFORE any a=f ever arrived (the base a=T image has no
+                // gap-setting z= of its own — see FrameCommand's doc
+                // comment) — seed pending_frames from the stored image if
+                // it isn't already in progress, same as apply_frame does,
+                // so `a=a,i=N,r=1,z=<gap>` sent right after `a=T` (before
+                // any real animation frame) has a frame 1 to set the gap
+                // on.
+                if !self.pending_frames.contains_key(&id) {
+                    let (format, width, height) =
+                        self.image_formats.get(&id).copied().unwrap_or((ImageFormat::Rgba, None, None));
+                    let frames = self.seed_frames_from_stored_image(id);
+                    if frames.is_empty() {
+                        return;
+                    }
+                    self.pending_frames.insert(
+                        id,
+                        PendingFrames {
+                            format,
+                            width,
+                            height,
+                            frames,
+                            in_progress_payload: String::new(),
+                            in_progress_gap: None,
+                        },
+                    );
+                }
+                let Some(pending) = self.pending_frames.get_mut(&id) else { return };
+                let Some(index) = (frame.max(1) as usize).checked_sub(1) else { return };
+                if let Some(existing) = pending.frames.get_mut(index) {
+                    let buffer = existing.buffer().clone();
+                    *existing = Frame::from_parts(buffer, 0, 0, delay_from_gap(gap));
+                }
+            },
+        }
+    }
+
+    /// Finalizes whatever frames have accumulated in `pending_frames` for
+    /// `id` into a brand new `DecodedImage`, replacing the single-frame one
+    /// `a=T` originally stored — a no-op if no `a=f` commands ever arrived
+    /// for this id (the common, non-animated case).
+    fn finish_pending_animation(&mut self, id: u32) {
+        let Some(pending) = self.pending_frames.remove(&id) else { return };
+        if pending.frames.len() < 2 {
+            // Only the seeded base frame, no real animation frames landed —
+            // leave the existing single-frame image alone.
+            return;
+        }
+        self.last_animated_id = Some(id);
+        self.insert_image(id, DecodedImage::from_frames(pending.frames));
     }
 
     fn insert_image(&mut self, id: u32, image: DecodedImage) {
@@ -793,5 +1189,246 @@ mod tests {
         store.apply(transmit_command(b"Ga=d,d=p,i=1,p=1"), (0, 0));
         assert!(store.placement(1, 1).is_none());
         assert!(store.image(1).is_some(), "lowercase d=p must never free image data");
+    }
+
+    /// One 1x1 raw-RGBA pixel, base64-encoded — used as an animation frame
+    /// payload since raw RGBA needs no PNG container, just `s=1,v=1`
+    /// dimensions carried alongside it (see `decode_pixels`'s raw-format
+    /// path).
+    fn rgba_pixel_base64(r: u8, g: u8, b: u8) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([r, g, b, 255])
+    }
+
+    #[test]
+    fn animation_frame_appended_and_started_produces_multi_frame_image() {
+        let mut store = ImageStore::new();
+        // Base image (frame 0): opaque red.
+        let base = rgba_pixel_base64(255, 0, 0);
+        store.apply(transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{base}").as_bytes()), (0, 0));
+        assert_eq!(store.image(1).unwrap().render_image.frame_count(), 1);
+
+        // One extra animation frame: opaque green, 50ms gap.
+        let green = rgba_pixel_base64(0, 255, 0);
+        store.apply(transmit_command(format!("Ga=f,i=1,z=50;{green}").as_bytes()), (0, 0));
+        // Not finalized into the RenderImage until a=a runs playback.
+        assert_eq!(store.image(1).unwrap().render_image.frame_count(), 1);
+
+        // s=3: run normally (loop) — see kitty_graphics::AnimationState's
+        // doc comment for why s=1 (which used to be misread as "start"
+        // here) actually means stop.
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+        let image = store.image(1).expect("image must still be present after animation starts");
+        assert_eq!(image.render_image.frame_count(), 2, "base frame + one a=f frame");
+        assert!(image.is_animating(), "s=3 must start looping playback");
+
+        // Frame 0 is the original red pixel, frame 1 the appended green one.
+        assert_eq!(&image.render_image.as_bytes(0).unwrap()[0..4], &[0, 0, 255, 255], "red -> BGRA");
+        assert_eq!(&image.render_image.as_bytes(1).unwrap()[0..4], &[0, 255, 0, 255], "green -> BGRA");
+    }
+
+    #[test]
+    fn animation_bare_a_with_no_s_c_or_r_is_a_no_op_and_never_finalizes_frames() {
+        // Regression guard for the exact bug that made animation appear
+        // completely non-functional in a real client test: a prior,
+        // unverified implementation treated bare "a=a" (no s=) as "start",
+        // when per spec it's a no-op (s defaults to 0, "don't change
+        // state") — frames must stay pending, never becoming visible.
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=50;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        // Bare a=a (no s=/c=/r=) must fail to parse as a command at all
+        // (see kitty_graphics::tests::parse_animation_bare_with_no_s_c_or_r_is_a_no_op),
+        // so there is nothing to feed into `apply` here in the first
+        // place — this test documents that expectation from the store's
+        // side: nothing must have changed.
+        assert_eq!(store.image(1).unwrap().render_image.frame_count(), 1, "frame must still be pending");
+        assert!(!store.image(1).unwrap().is_animating());
+    }
+
+    #[test]
+    fn animation_s1_stops_not_starts() {
+        // The exact inversion bug: s=1 must STOP, never start, playback.
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=50;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=1"), (0, 0));
+        // s=1 alone never even has pending frames to finalize (only
+        // Loading/Running do that) — the image must still be the
+        // single-frame original, definitely not animating.
+        assert_eq!(store.image(1).unwrap().render_image.frame_count(), 1);
+        assert!(!store.image(1).unwrap().is_animating());
+    }
+
+    #[test]
+    fn animation_s2_loading_mode_holds_on_last_frame_instead_of_looping() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=1;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=2"), (0, 0));
+        let image = store.image(1).unwrap();
+        assert_eq!(image.render_image.frame_count(), 2, "s=2 must also finalize pending frames");
+        assert!(image.is_animating());
+
+        // The very first current_frame() call after playback starts only
+        // establishes the elapsed-time baseline (last_advance was None) —
+        // it doesn't itself advance the frame, mirroring
+        // gpui::elements::img's own ImgState::last_frame_time behavior.
+        assert_eq!(image.current_frame(), 0);
+
+        // Advance past frame 0's 1ms gap — must land on frame 1 (the
+        // last frame) and then STAY there rather than wrapping back to 0,
+        // since loading mode never loops.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(image.current_frame(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(image.current_frame(), 1, "loading mode must hold on the last frame, not loop");
+    }
+
+    #[test]
+    fn animation_multiple_frames_preserve_order_and_gap() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=30;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=70;{}", rgba_pixel_base64(0, 0, 255)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+
+        let image = store.image(1).unwrap();
+        assert_eq!(image.render_image.frame_count(), 3);
+        assert_eq!(&image.render_image.as_bytes(2).unwrap()[0..4], &[255, 0, 0, 255], "blue -> BGRA");
+        assert_eq!(
+            std::time::Duration::from(image.render_image.delay(1)),
+            std::time::Duration::from_millis(30)
+        );
+        assert_eq!(
+            std::time::Duration::from(image.render_image.delay(2)),
+            std::time::Duration::from_millis(70)
+        );
+    }
+
+    #[test]
+    fn animation_root_frame_gap_set_via_r1_and_z_before_any_a_f() {
+        // The ONLY way to give the root frame (from a=T, which has its own
+        // unrelated z= meaning z-index) a nonzero gap — spec's own
+        // example is a=a,i=N,r=1,z=<gap>, usable even before any a=f frame
+        // has arrived (this seeds pending_frames from the stored image,
+        // see apply_animation's SetFrameGap arm).
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,r=1,z=48"), (0, 0));
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=10;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+
+        let image = store.image(1).unwrap();
+        assert_eq!(image.render_image.frame_count(), 2);
+        assert_eq!(
+            std::time::Duration::from(image.render_image.delay(0)),
+            std::time::Duration::from_millis(48),
+            "root frame's gap must be settable even though a=T's own z= means something else"
+        );
+    }
+
+    #[test]
+    fn single_frame_image_never_animates() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=100,i=1;{TINY_PNG_BASE64}").as_bytes()),
+            (0, 0),
+        );
+        let image = store.image(1).unwrap();
+        assert!(!image.is_animating());
+        assert_eq!(image.current_frame(), 0);
+    }
+
+    #[test]
+    fn animation_stop_pauses_on_current_frame() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=10;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+        assert!(store.image(1).unwrap().is_animating());
+
+        store.apply(transmit_command(b"Ga=a,i=1,s=1"), (0, 0));
+        assert!(!store.image(1).unwrap().is_animating(), "s=1 must stop playback");
+    }
+
+    #[test]
+    fn animation_set_current_frame_via_c_jumps_without_resuming_playback() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(
+            transmit_command(format!("Ga=f,i=1,z=10;{}", rgba_pixel_base64(0, 255, 0)).as_bytes()),
+            (0, 0),
+        );
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+        store.apply(transmit_command(b"Ga=a,i=1,s=1"), (0, 0)); // stop first
+
+        // c=2 -> jump to frame index 1 (1-indexed in the protocol).
+        store.apply(transmit_command(b"Ga=a,i=1,c=2"), (0, 0));
+        let image = store.image(1).unwrap();
+        assert!(!image.is_animating(), "set-current-frame must not resume playback on its own");
+        assert_eq!(image.current_frame(), 1);
+    }
+
+    #[test]
+    fn chunked_animation_frame_concatenates_before_decoding() {
+        let mut store = ImageStore::new();
+        store.apply(
+            transmit_command(format!("Ga=T,f=32,s=1,v=1,i=1;{}", rgba_pixel_base64(255, 0, 0)).as_bytes()),
+            (0, 0),
+        );
+
+        let green = rgba_pixel_base64(0, 255, 0);
+        let half = green.len() / 2;
+        let (first_half, second_half) = green.split_at(half);
+        store.apply(transmit_command(format!("Ga=f,i=1,m=1;{first_half}").as_bytes()), (0, 0));
+        store.apply(transmit_command(format!("Ga=f,m=0;{second_half}").as_bytes()), (0, 0));
+
+        store.apply(transmit_command(b"Ga=a,i=1,s=3"), (0, 0));
+        let image = store.image(1).unwrap();
+        assert_eq!(image.render_image.frame_count(), 2);
+        assert_eq!(&image.render_image.as_bytes(1).unwrap()[0..4], &[0, 255, 0, 255]);
     }
 }

@@ -119,6 +119,7 @@ impl TerminalPanel {
             let terminal_settings = TerminalSettings::get_global(cx);
             let cursor_shape = terminal_settings.cursor_shape;
             let scrollback = terminal_settings.max_scroll_history_lines;
+            let cell_pixel_size = approximate_cell_pixel_size(terminal_settings);
             // Drives the titlebar's drag-zone spinner (see `workspace::
             // SomRestoreActivity`'s doc comment) for a new tab's deploy
             // check + terminal creation, same as `restore_som_tabs` already
@@ -160,7 +161,7 @@ impl TerminalPanel {
                         }
                     }
 
-                    let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback) {
+                    let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size) {
                         Ok(pair) => pair,
                         Err(err) => {
                             log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
@@ -650,13 +651,13 @@ impl TerminalPanel {
                             }
                         }
 
-                        let (cursor_shape, scrollback) = window_handle
+                        let (cursor_shape, scrollback, cell_pixel_size) = window_handle
                             .update(cx, |_, _, cx| {
                                 let settings = TerminalSettings::get_global(cx);
-                                (settings.cursor_shape, settings.max_scroll_history_lines)
+                                (settings.cursor_shape, settings.max_scroll_history_lines, approximate_cell_pixel_size(settings))
                             })
-                            .unwrap_or((CursorShape::default(), None));
-                        let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback)?;
+                            .unwrap_or((CursorShape::default(), None, None));
+                        let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size)?;
                         let created = window_handle.update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
                                 let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
@@ -1018,6 +1019,37 @@ fn classify_remote(program: &str) -> RemoteKind {
     }
 }
 
+/// A ROUGH estimate of the terminal's real font cell size in pixels, from
+/// `TerminalSettings` alone — NOT the exact figure `TerminalElement`
+/// actually renders with (that only exists after a real GPUI layout pass,
+/// which hasn't happened yet at the point a `tmux: true` tab is being
+/// created). Used to seed a `tmux: true` local RELAY's `--cell-pixel-size`
+/// flag (see `wrap_command_args`) — good enough to stop a HOLDER's `\x1b
+/// [16t` ("report cell pixel size") answer from being the previous
+/// hardcoded `1x1` (which made `yazi`'s own image-scaling logic downscale
+/// every image to a handful of pixels before Som ever saw it — see
+/// `som_tmux::bounds::SessionBounds::cell_width`'s doc comment for the
+/// full history), without the complexity/regression risk of threading a
+/// live value through from the real render (that approach was tried and
+/// reverted — see `project_som_tmux` memory).
+///
+/// `cell_height` uses `TerminalLineHeight::value()` (the exact multiplier
+/// `TerminalElement` itself applies to font size). `cell_width` uses the
+/// standard monospace advance-width heuristic (~0.6× the font's em size) —
+/// no real text-shaping happens here, so this is necessarily approximate;
+/// it exists to get `yazi`'s downscale target roughly right, not to be
+/// pixel-perfect.
+fn approximate_cell_pixel_size(settings: &TerminalSettings) -> Option<(u16, u16)> {
+    let font_size = settings.font_size.unwrap_or(gpui::px(14.));
+    let font_size = f32::from(font_size);
+    let line_height = font_size * settings.line_height.value();
+    let cell_width = font_size * 0.6;
+    if line_height <= 0. || cell_width <= 0. {
+        return None;
+    }
+    Some((cell_width.round() as u16, line_height.round() as u16))
+}
+
 /// Serializes Som's own `CursorShape` setting into the plain string
 /// `som-tmux` parses back out (`crate::session::parse_cursor_shape`
 /// in that crate, deliberately NOT sharing this enum type — see that
@@ -1051,17 +1083,24 @@ fn cursor_shape_arg(shape: CursorShape) -> &'static str {
 /// through explicitly to the server (which owns the actual `Term` these
 /// configure now) rather than left for it to guess/default; see
 /// `cursor_shape_arg`'s doc comment.
+///
+/// `cell_pixel_size` is `RemoteKind::Local`-only (see `wrap_command_args`'s
+/// doc comment for why) — silently ignored for `Ssh`/`Wsl` since the HOLDER
+/// there runs on a different machine, rendering nothing itself, where
+/// Som's own local font metrics have no meaning.
 fn tmux_wrapped_shell(
     profile: &workspace::TabProfile,
     pane_id: &str,
     cursor_shape: CursorShape,
     scrollback: Option<usize>,
+    cell_pixel_size: Option<(u16, u16)>,
 ) -> anyhow::Result<(String, Vec<String>)> {
     let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
     match classify_remote(&program) {
         RemoteKind::Local => {
             let server_path = som_tmux_binary_path()?;
-            let wrapped_args = wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback);
+            let wrapped_args =
+                wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback, cell_pixel_size);
             Ok((server_path.to_string_lossy().to_string(), wrapped_args))
         }
         kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
@@ -1089,6 +1128,7 @@ fn wrap_command_args(
     args: Vec<String>,
     cursor_shape: CursorShape,
     scrollback: Option<usize>,
+    cell_pixel_size: Option<(u16, u16)>,
 ) -> Vec<String> {
     let mut wrapped_args = vec![profile_name.to_string(), pane_id.to_string(), program];
     wrapped_args.extend(args);
@@ -1097,6 +1137,10 @@ fn wrap_command_args(
     if let Some(scrollback) = scrollback {
         wrapped_args.push("--scrollback".to_string());
         wrapped_args.push(scrollback.to_string());
+    }
+    if let Some((cell_width, cell_height)) = cell_pixel_size {
+        wrapped_args.push("--cell-pixel-size".to_string());
+        wrapped_args.push(format!("{cell_width};{cell_height}"));
     }
     wrapped_args
 }
@@ -1884,7 +1928,8 @@ mod tmux_shell_wrapping_tests {
 
     #[test]
     fn wraps_a_simple_program_with_no_args() {
-        let args = wrap_command_args("dnk", "pane-uuid-1", "pwsh.exe".to_string(), vec![], CursorShape::Block, None);
+        let args =
+            wrap_command_args("dnk", "pane-uuid-1", "pwsh.exe".to_string(), vec![], CursorShape::Block, None, None);
         assert_eq!(args, vec!["dnk", "pane-uuid-1", "pwsh.exe", "--cursor-shape", "block"]);
     }
 
@@ -1901,6 +1946,7 @@ mod tmux_shell_wrapping_tests {
             "wsl".to_string(),
             vec!["--cd".to_string(), "~".to_string()],
             CursorShape::Block,
+            None,
             None,
         );
         assert_eq!(args, vec!["wsl", "pane-uuid-2", "wsl", "--cd", "~", "--cursor-shape", "block"]);
@@ -1919,6 +1965,7 @@ mod tmux_shell_wrapping_tests {
             vec![],
             CursorShape::Block,
             None,
+            None,
         );
         assert_eq!(
             args,
@@ -1935,11 +1982,26 @@ mod tmux_shell_wrapping_tests {
             vec![],
             CursorShape::Underline,
             Some(10000),
+            None,
         );
         assert_eq!(
             args,
             vec!["dnk", "pane-uuid-6", "pwsh.exe", "--cursor-shape", "underline", "--scrollback", "10000"]
         );
+    }
+
+    #[test]
+    fn appends_cell_pixel_size_flag_when_set() {
+        let args = wrap_command_args(
+            "dnk",
+            "pane-uuid-7",
+            "pwsh.exe".to_string(),
+            vec![],
+            CursorShape::Block,
+            None,
+            Some((9, 18)),
+        );
+        assert_eq!(args, vec!["dnk", "pane-uuid-7", "pwsh.exe", "--cursor-shape", "block", "--cell-pixel-size", "9;18"]);
     }
 
     #[test]
@@ -2144,6 +2206,7 @@ mod tmux_shell_wrapping_tests {
             vec![],
             CursorShape::Underline,
             Some(10000),
+            None,
         );
         let shell = Shell::WithArguments {
             program: "C:\\som\\som-tmux.exe".to_string(),

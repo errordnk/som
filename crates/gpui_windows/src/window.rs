@@ -883,22 +883,14 @@ impl PlatformWindow for WindowsWindow {
         // of its own (unlike `Context::refresh_windows`, which only takes
         // effect once something ELSE causes the platform to actually poll
         // for a native repaint).
-        let path = std::env::temp_dir().join("som_paint_diag.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            use std::io::Write as _;
-            let _ = writeln!(f, "[{:?}] force_redraw: posting WM_GPUI_FORCE_UPDATE_WINDOW to hwnd={:?}", std::time::Instant::now(), self.0.hwnd);
-        }
         unsafe {
-            let result = PostMessageW(
+            PostMessageW(
                 Some(self.0.hwnd),
                 WM_GPUI_FORCE_UPDATE_WINDOW,
                 WPARAM(self.0.validation_number),
                 LPARAM(0),
-            );
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                use std::io::Write as _;
-                let _ = writeln!(f, "[{:?}] force_redraw: PostMessageW result={result:?}", std::time::Instant::now());
-            }
+            )
+            .log_err();
         }
     }
 

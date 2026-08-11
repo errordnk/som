@@ -1,16 +1,12 @@
 //! Cross-platform console raw-mode setup, deliberately hand-rolled instead
-//! of depending on `crossterm` — see this crate's root doc comment for
-//! why: `crossterm`'s own Windows implementation (confirmed by reading its
-//! source directly, see `project_kitty_graphics_protocol` memory) never
-//! sets `ENABLE_VIRTUAL_TERMINAL_INPUT`, without which the Windows console
-//! does not deliver raw VT/escape byte sequences to a reading process's
-//! stdin at all — exactly the bug this tool exists to route around.
+//! of depending on `crossterm` — `crossterm`'s own Windows implementation
+//! never sets `ENABLE_VIRTUAL_TERMINAL_INPUT`, without which the Windows
+//! console does not deliver raw VT/escape byte sequences to a reading
+//! process's stdin at all — exactly the bug this module exists to route
+//! around, needed to read Som's `CSI 16 t` cell-size-in-pixels reply.
 //!
 //! Returns an RAII guard so the original mode is always restored on drop,
-//! even if the caller exits via an early `return`/`?` — mirrors the same
-//! pattern `crates/terminal/src/bin/kitty_probe.rs` uses, just packaged as
-//! a proper guard type here since `somcat` is a real user-facing tool, not
-//! a throwaway test binary.
+//! even if the caller exits via an early `return`/`?`.
 
 pub struct RawModeGuard {
     #[cfg(unix)]
@@ -49,30 +45,38 @@ pub fn enable() -> RawModeGuard {
     use windows::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
         ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
-        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetConsoleOutputCP,
     };
     unsafe {
         let input_handle = GetStdHandle(STD_INPUT_HANDLE).expect("failed to get stdin handle");
         let mut original = Default::default();
         GetConsoleMode(input_handle, &mut original).expect("failed to get console input mode");
 
-        // See this module's doc comment: ENABLE_VIRTUAL_TERMINAL_INPUT is
-        // the one flag crossterm's own Windows raw-mode setup omits, and
-        // is required for a terminal-response's raw escape bytes to reach
-        // this process's stdin instead of being consumed/translated by
-        // the console's own input parser.
+        // ENABLE_VIRTUAL_TERMINAL_INPUT is required for a terminal-response's
+        // raw escape bytes to reach this process's stdin instead of being
+        // consumed/translated by the console's own input parser.
         let raw = (original.0 & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0))
             | ENABLE_VIRTUAL_TERMINAL_INPUT.0;
         SetConsoleMode(input_handle, windows::Win32::System::Console::CONSOLE_MODE(raw))
             .expect("failed to set raw console input mode");
 
-        // Also ensure the OUTPUT side interprets ANSI/VT escape sequences
-        // (cursor movement, SGR colors) rather than treating them as
-        // literal text — legacy `cmd.exe` consoles don't have this on by
-        // default. Best-effort: some hosts (older Windows builds) don't
-        // support this at all, which isn't fatal to Kitty graphics output
-        // itself (that's parsed by whatever real terminal is hosting this
-        // process, not by this console mode flag).
+        // The console's active output codepage reinterprets every byte
+        // `somcat` writes before ConPTY forwards it on — this is what
+        // `rich_content_transport`'s base91 payload encoding was built to
+        // route around entirely (see that module's doc comment), but the
+        // Unicode-placeholder grid text (`print_placeholder_grid`) is real
+        // multi-byte UTF-8 (a private-use astral codepoint plus combining
+        // diacritics), not base91-safe ASCII — without forcing the output
+        // codepage to UTF-8 (65001) here, a non-UTF-8 active codepage
+        // (confirmed live: CP866) transliterates those bytes into garbage,
+        // rendering as a wall of visible mojibake instead of an invisible
+        // placeholder block with the image painted over it.
+        let _ = SetConsoleOutputCP(65001);
+
+        // Also ensure the OUTPUT side interprets ANSI/VT escape sequences —
+        // legacy `cmd.exe` consoles don't have this on by default. Best-
+        // effort: some hosts (older Windows builds) don't support this at
+        // all, which isn't fatal.
         if let Ok(output_handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
             let mut out_mode = Default::default();
             if GetConsoleMode(output_handle, &mut out_mode).is_ok() {
@@ -97,40 +101,6 @@ fn restore(guard: &RawModeGuard) {
             let _ = SetConsoleMode(handle, CONSOLE_MODE(guard.original));
         }
     }
-}
-
-/// Sets `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout only, without
-/// touching stdin's console mode at all — for callers (Som's own
-/// rich-content `--stream` mode, see `main.rs`) that never read stdin, so
-/// `full::enable()`'s `GetStdHandle(STD_INPUT_HANDLE)` +
-/// `GetConsoleMode`/`SetConsoleMode` sequence would be pure risk (it's
-/// what previously failed with "The handle is invalid" when this
-/// function's caller had no real console input handle to query) for zero
-/// benefit. No RAII guard/restore — a `--stream` invocation always exits
-/// right after finishing the transfer, there's no interactive session
-/// afterward whose console mode this could leave in a surprising state.
-#[cfg(windows)]
-pub fn enable_output_vt_processing() {
-    use windows::Win32::System::Console::{
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleMode,
-    };
-    unsafe {
-        if let Ok(output_handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
-            let mut out_mode = Default::default();
-            if GetConsoleMode(output_handle, &mut out_mode).is_ok() {
-                let _ = SetConsoleMode(
-                    output_handle,
-                    windows::Win32::System::Console::CONSOLE_MODE(out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0),
-                );
-            }
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub fn enable_output_vt_processing() {
-    // Unix terminals already interpret VT escape sequences without any
-    // opt-in console mode flag — nothing to do here.
 }
 
 #[cfg(not(any(unix, windows)))]

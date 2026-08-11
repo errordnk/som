@@ -1,32 +1,32 @@
 # Som Rich Protocol (SRP)
 
-Собственный бинарный протокол Som для передачи медиа/rich-контента через PTY — независимый от Kitty Graphics Protocol, который остаётся нетронутым для совместимости со сторонними клиентами (yazi и т.п.).
+Собственный бинарный протокол Som для передачи медиа/rich-контента через PTY. Раньше сосуществовал с реализацией Kitty Graphics Protocol; Kitty был полностью вырезан из кодовой базы (см. секцию "Kitty Graphics Protocol вырезан" ниже) — SRP теперь единственный способ показать изображение в терминале Som, `somcat` — эталонный клиент.
 
 Этот документ фиксирует все значимые архитектурные и технические решения по ходу реализации — не туториал, а рабочий журнал решений с обоснованием "почему", чтобы не терять контекст между сессиями.
 
-**Статус: транспорт И paint-путь полностью работают end-to-end через реальный ConPTY, включая живое визуальное подтверждение с правильными размерами И цветами.** Ключевой бенчмарк `bench_rich_content_stream_progressive_playback_starts_before_transfer_completes` — первый частичный декод GIF происходит примерно через 230-450мс после старта передачи (пока процесс-отправитель ещё работает), полное завершение (все 47 кадров) — примерно через 2 секунды для 980KB файла. Три раунда живого AutoIt-теста (2026-08-10, с явного разрешения и в присутствии пользователя) последовательно подтвердили и исправили: (1) анимация видна на экране, (2) natural-size footprint даёт реальный размер вместо 1×1 клетки, (3) RGBA→BGRA конверсия даёт правильные цвета вместо синеватого искажения.
+**Статус: транспорт И paint-путь полностью работают end-to-end через реальный ConPTY, включая живое визуальное подтверждение с правильными размерами И цветами.** Ключевой бенчмарк `bench_rich_content_stream_progressive_playback_starts_before_transfer_completes` — первый частичный декод GIF происходит примерно через 230-450мс после старта передачи (пока процесс-отправитель ещё работает), полное завершение (все 47 кадров) — примерно через 2 секунды для 980KB файла. Paint-путь с тех пор переписан на unicode-placeholder-grid архитектуру (см. "Paint-путь v2" ниже) — картинка представлена как реальный текстовый блок в гриде терминала, поэтому scroll/clear/history терминала работают "бесплатно", без anchor-математики.
 
-## Зачем свой протокол, а не Kitty
+## Зачем свой протокол, а не Kitty (историческое обоснование)
 
-Измерено: Kitty-путь (PNG-перекодирование каждого кадра + base64 через APC) для 47-кадрового GIF 256×256 даёт 5.3MB трафика — многосекундные паузы, неприемлемо для анимации, тем более для аудио/видео 4K60 в будущем. Причина — Kitty обязан оставаться 7-бит-safe (base64), потому что таков стандарт, которому он следует ради совместимости со сторонними клиентами.
+Измерено на момент принятия решения: Kitty-путь (PNG-перекодирование каждого кадра + base64 через APC) для 47-кадрового GIF 256×256 давал 5.3MB трафика — многосекундные паузы, неприемлемо для анимации, тем более для аудио/видео 4K60 в будущем. Причина — Kitty обязан оставаться 7-бит-safe (base64), потому что таков стандарт, которому он следует ради совместимости со сторонними клиентами.
 
-У SRP нет такого обязательства — свой протокол, свой клиент, свой вьюер. Решено: **полностью отдельная система**, не переиспользующая ни транспорт, ни хранилище (`ImageStore`), ни paint-путь Kitty — они физически делят только один и тот же PTY-канал (разные marker-байты).
+У SRP нет такого обязательства — свой протокол, свой клиент, свой вьюер. Решено: **полностью отдельная система**, не переиспользующая ни транспорт, ни хранилище, ни paint-путь Kitty — на момент этого решения они физически делили только один и тот же PTY-канал (разные marker-байты). Позже (см. "Kitty Graphics Protocol вырезан") Kitty был убран целиком, так что вопрос сосуществования больше не актуален — но исходное обоснование независимого транспорта остаётся верным описанием того, почему SRP был спроектирован с нуля, а не как расширение Kitty.
 
 ## Модель передачи: progressive file copy
 
-Клиент (`somcat --stream <file>`) копирует РЕАЛЬНЫЙ файл побайтово, без перекодирования кадров, chunk-за-chunk, в локальный кэш-файл на машине, где физически работает Som. Плеер начинает декодирование/показ до того, как файл докачан целиком — принципиальное отличие от старого Kitty-animation-пути, где decode ждал полного `a=T`.
+Клиент (`somcat <file>`) копирует РЕАЛЬНЫЙ файл побайтово, без перекодирования кадров, chunk-за-chunk, в локальный кэш-файл на машине, где физически работает Som. Плеер начинает декодирование/показ до того, как файл докачан целиком.
 
-Транспорт живёт целиком внутри PTY (никаких новых TCP/UDP портов, никаких сокетов в обход PTY) — работает через существующий SSH-канал (порт 22) без дополнительной инфраструктуры, включая som-tmux relay "бесплатно" (som-tmux уже прозрачно релеит любые APC-байты — см. `kitty_replay.rs`).
+Транспорт живёт целиком внутри PTY (никаких новых TCP/UDP портов, никаких сокетов в обход PTY) — работает через существующий SSH-канал (порт 22) без дополнительной инфраструктуры, включая som-tmux relay "бесплатно" (som-tmux уже прозрачно релеит любые APC-байты, а также любой другой PTY-вывод — никакой SRP-специфичной логики на стороне relay не требуется).
 
 ## VTE-патч: полный 8-бит APC
 
 **Файл:** `errordnk/vte` (форк, локальный клон `C:\home\dnk\vte-fork-work`), коммит `649d0a6`. `errordnk/alacritty` обновлён на новый vte-rev, коммит `c9f86ad4`. `som`'s `Cargo.toml:151` — `rev = "c9f86ad4"`.
 
-Оригинальный (непатченый) `advance_apc_string` пропускал только `0x00-0x17,0x19,0x1C-0x7E` (7-бит ASCII минус `0x18,0x1A,0x1B`) — весь диапазон `0x80-0xFF` молча терялся, `0x9C` (8-bit ST) обрывал строку, `0x7F` (DEL) молча терялся. Это и вынуждало Kitty на base64.
+Оригинальный (непатченый) `advance_apc_string` пропускал только `0x00-0x17,0x19,0x1C-0x7E` (7-бит ASCII минус `0x18,0x1A,0x1B`) — весь диапазон `0x80-0xFF` молча терялся, `0x9C` (8-bit ST) обрывал строку, `0x7F` (DEL) молча терялся.
 
 **Патч**: `advance_apc_string` теперь пропускает через `apc_put` ЛЮБОЙ байт кроме `0x1B` (единственный terminator, как и раньше — `ESC \`). `0x18/0x1A` (CAN/SUB — историческая VT100 семантика "оператор прерывает застрявшую escape-последовательность вручную") тоже разрешены как данные — для протокола, где отправитель это программа, а не человек за клавиатурой, этот класс сигналов не нужен. `0x9C` (8-bit ST) убран как терминатор — SRP всегда использует 7-битный `ESC \`.
 
-Риск патча минимален: изменение изолировано в одной маленькой функции, вызываемой только в состоянии `State::ApcString` — весь остальной парсинг (CSI/OSC/Escape/Ground) не затронут. Kitty-протокол тоже не задет: он никогда не эмитит байты из вновь разблокированного диапазона (base64-алфавит — чистый ASCII).
+Риск патча минимален: изменение изолировано в одной маленькой функции, вызываемой только в состоянии `State::ApcString` — весь остальной парсинг (CSI/OSC/Escape/Ground) не затронут.
 
 **Важная оговорка, найденная позже**: этот патч решает проблему только для парсера ВНУТРИ Som (VTE), но НЕ решает проблему на уровне самой Windows-консоли — см. секцию "КРИТИЧНО: реальный ConPTY реинтерпретирует сырые байты через кодовую страницу" ниже. Обе проблемы независимы; патч VTE был необходим, но не достаточен.
 
@@ -50,7 +50,7 @@ Windows ConPTY — это НЕ прозрачный байтовый pipe для
 
 Это системное поведение Windows-консоли, находящееся полностью вне контроля `alacritty_terminal`/патченого VTE-парсера. Единственный надёжный способ обойти его — никогда не помещать байт `>= 0x80` (и вообще ничего, что кодовая страница могла бы реинтерпретировать) на wire.
 
-Забавное следствие: получается, что Kitty Graphics Protocol использует base64 не ТОЛЬКО из-за исторического 7-битного ограничения VTE-парсеров (что мы изначально предполагали и патчили) — это ограничение оказалось необходимым ещё и для выживания через саму Windows-консоль, причём патч VTE тут не помогает вообще.
+Забавное следствие: получается, что base64/подобные text-safe кодировки нужны терминальным графическим протоколам не ТОЛЬКО из-за исторического 7-битного ограничения VTE-парсеров (что мы изначально предполагали и патчили) — это ограничение оказалось необходимым ещё и для выживания через саму Windows-консоль, причём патч VTE тут не помогает вообще.
 
 ### Выбор алфавита кодирования: base64 → base85 → base91
 
@@ -124,25 +124,23 @@ Windows ConPTY — это НЕ прозрачный байтовый pipe для
 
 **Корень**: `std::io::Stdout` на Windows оборачивает handle в `LineWriter`, который флашит внутренний userspace-буфер только до последнего увиденного `\n` (0x0A). Бинарный/закодированный SRP-конверт почти никогда не содержит настоящий `\n` (тем более после перехода на base91 — алфавит вообще не включает `0x0A`). `write_all()` сам по себе возвращал `Ok` (данные просто копились в буфере), но explicit `.flush()` СРАЗУ ПОСЛЕ него блокировался навсегда на первом же чанке (113 байт) — воспроизводилось стабильно 100% раз.
 
-Kitty-путь (`send_chunked`/`print!`) никогда не сталкивался с этим: base64-текст, `println!()` между изображениями — реальные `\n`-байты частые, `LineWriter` флашится сам без явного вызова.
-
 **Решение**: `write_raw_stdout()` — на Windows пишет напрямую через `WriteFile` (Win32 API) на `STD_OUTPUT_HANDLE`, полностью обходя `std::io::Stdout`/`LineWriter`. На Unix обычный `write_all` (там `LineWriter`-проблемы для pipe/pty-таргета нет).
 
 **Файл:** `crates/somcat/src/main.rs`, функция `write_raw_stdout`.
 
-## Клиентский режим: somcat --stream
+## Клиентский режим: somcat
 
-`somcat --stream <file>` — отдельный от Kitty-пути код в `main()`, не требует `raw_mode::enable()` полностью (нет query/negotiation — SRP не optional-with-fallback внешний стандарт), но требует `raw_mode::enable_output_vt_processing()` (устанавливает `ENABLE_VIRTUAL_TERMINAL_PROCESSING` только на output-handle, не трогая stdin — старый `enable()` падал с "handle is invalid" при отсутствии реального stdin TTY).
+`somcat <file>` (или явно `somcat --srp <file>`) — не требует `raw_mode::enable()` полностью (нет query/negotiation — SRP не optional-with-fallback внешний стандарт), но требует `raw_mode::enable_output_vt_processing()` (устанавливает `ENABLE_VIRTUAL_TERMINAL_PROCESSING` только на output-handle, не трогая stdin — вариант, трогающий stdin, падал с "handle is invalid" при отсутствии реального stdin TTY).
 
 Content-type определяется по расширению файла (`.gif` → `ContentType::Gif`, остальное пока не реализовано).
 
-`gif_metadata()` в `crates/somcat/src/main.rs` извлекает `ContentMetadata::Image` перед стримингом: ширина/высота через `ImageDecoder::dimensions()` (читает только фиксированный logical screen descriptor, не декодирует ни одного кадра), `is_animated` — быстрым байтовым сканом сырых байт файла на наличие ВТОРОГО Image Descriptor блока (`0x2C`) вместо полного декодирования всех кадров через `AnimationDecoder::into_frames()` (то, что уже делает Kitty-путь для перекодирования в PNG, но было бы расточительно только ради подсчёта кадров на большом файле). Не строгий GIF-парсер (не проходит extension-блоки байт-в-байт), но `0x2C` не может легитимно встретиться как байт данных до первого настоящего Image Descriptor в реалистичных GIF-файлах, так что это надёжная эвристика.
+`gif_metadata()` в `crates/somcat/src/main.rs` извлекает `ContentMetadata::Image` перед стримингом: ширина/высота через `ImageDecoder::dimensions()` (читает только фиксированный logical screen descriptor, не декодирует ни одного кадра), `is_animated` — быстрым байтовым сканом сырых байт файла на наличие ВТОРОГО Image Descriptor блока (`0x2C`) вместо полного декодирования всех кадров через `AnimationDecoder::into_frames()` (было бы расточительно только ради подсчёта кадров на большом файле). Не строгий GIF-парсер (не проходит extension-блоки байт-в-байт), но `0x2C` не может легитимно встретиться как байт данных до первого настоящего Image Descriptor в реалистичных GIF-файлах, так что это надёжная эвристика.
 
 ## Серверная сторона
 
 - `crates/terminal/src/rich_content_cache.rs` — `RichContentCache`: progressive on-disk writer с watermark-трекингом (`contiguous_len`), поддержка out-of-order чанков через `pending_ranges`. Путь кэша: `paths::config_dir().join("media_cache")` в production, `std::env::temp_dir()` в тестах (`paths::config_dir()` — process-global `OnceLock`, не test-aware).
 - `crates/terminal/src/rich_content_gif_player.rs` — `try_decode_progressive`: инкрементальный GIF-декод по мере роста файла. **Важная находка**: `gif` crate's `DecodingError::UnexpectedEof` НЕ оборачивает `std::io::Error` (`source()` возвращает `None`) — приходится матчить по тексту "Unexpected End of File", не по типу ошибки.
-- Роутинг в `Terminal::process_event` (`crates/terminal/src/terminal.rs`): проверка `bytes.first() == Some(rich_content_transport::MARKER)` перед Kitty-парсингом.
+- Роутинг в `Terminal::process_event` (`crates/terminal/src/terminal.rs`): проверка `bytes.first() == Some(rich_content_transport::MARKER)` — единственная интерпретация APC-строк, которую Som сейчас реализует (после удаления Kitty).
 
 ## Ключевой диагностический паттерн: изоляция транспорта от реального ConPTY
 
@@ -168,43 +166,44 @@ Content-type определяется по расширению файла (`.gi
 
 Весь набор `terminal`-крейта (кроме pre-existing, не связанных с SRP падений в `terminal_hyperlinks`, не менявшихся в этой работе, и редкого флейкового `test_nul_byte_signals_tmux_relay_to_close_for_good` — som-tmux relay timing, тоже не связан с SRP) + весь набор `terminal_view` + `somcat` — зелёные.
 
-## Paint-путь (реализовано)
+## Paint-путь v1 (anchor/cursor-relative) — заменён, историческая справка
 
-`crates/terminal/src/rich_content_player.rs` — `RichContentPlayer`: paint-ready decode-состояние (аналог `kitty_graphics_store::DecodedImage` — тот же `Arc<RenderImage>` + `Cell`-based animation playback), но управляется передекодированием растущего кэш-файла (`rich_content_gif_player::try_decode_progressive`), а не накоплением Kitty `a=f`-команд. `refresh_or_create` — ре-декодирует только если `contiguous_len` выросла с последнего декода (проверено тестом на identity-равенство `Arc`-указателя — доказывает, что переиспользование, а не слепое передекодирование на каждый вызов).
+Первая рабочая версия анкорила placement к позиции курсора в момент первого чанка (`CacheEntry::anchor: (i32, usize)`, тот же паттерн, что Kitty's cursor-relative `a=p` placement), с paint-математикой, компенсирующей рассинхронизацию anchor'а от `Grid::history_size()` дельты. Живым тестом (2026-08-10) подтверждено: анимация видна, natural-size footprint корректен, RGBA→BGRA конверсия даёт правильные цвета — но пользователь отверг сам ПОДХОД: "какими-то кривыми хаками добиваться сдвига курсора, инпута и прочего скролла, нужно чтобы в основе своей терминал воспринимал картинку как блок текста". Три требования (clear прячет картинку, курсор после картинки, плавный скролл) требовали bespoke-математики поверх anchor'а вместо использования уже существующего текстового механизма терминала — решено переписать целиком на unicode-placeholder-grid архитектуру (см. ниже), той же самой, что Kitty Stage 4 уже использовал для СВОЕГО unicode-placeholder режима.
 
-`crates/terminal/src/rich_content_cache.rs` — `CacheEntry` получил новое поле `anchor: (i32, usize)`, записываемое ОДИН РАЗ при первом чанке новой пары `(session_id, file_id)`. **Важное архитектурное решение**: у SRP нет отдельной Place-команды (`a=p` у Kitty) — протокол пока умеет только слать чанки данных без явной команды позиционирования. Anchor = позиция курсора в момент первого чанка (тот же `apc_cursor`, что `process_event`'s `ApcString`-обработчик уже получает от `alacritty_terminal`, используется идентично Kitty's cursor-relative placement модели, просто определяется неявно первым чанком вместо явной команды).
+## Paint-путь v2 (unicode-placeholder grid) — текущая реализация
 
-`Terminal::rich_content_placements(&self) -> Vec<((i32, usize), Arc<RenderImage>, usize, bool)>` — новый метод, `&self` (не `&mut self`) несмотря на внутренний refresh состояния: `rich_content_players: RefCell<HashMap<...>>` на `Terminal`, тот же паттерн, что `kitty_graphics_store::DecodedImage`'s `animation: Cell<...>` уже использует и по той же причине — paint-проход имеет только `Entity::read`-доступ к `Terminal` (см. `paint_kitty_placements`'s доккомментарий: `Entity::update` изнутри активного paint-вызова уже пробовали и откатили, ломало даже самый первый кадр).
+Картинка представлена как N×M реальных ячеек терминального грида, каждая содержит специальный placeholder-символ (`U+10EEEE`) плюс 1-2 комбинирующие диакритики, кодирующие row/column этой ячейки внутри placement'а (297-элементная таблица `ROWCOLUMN_DIACRITICS`, `crates/terminal/src/kitty_graphics_placeholder.rs` — общий модуль, изначально написанный для Kitty Stage 4, переиспользуется SRP как есть). `(session_id, file_id)` кодируется в fg/underline-цвет ячейки (`\x1b[38;2;r;g;bm`/`\x1b[58;2;r;g;bm`), 24-битная RGB-кодировка `u32`.
 
-`crates/terminal_view/src/terminal_element.rs` — `paint_rich_content_placements`, вызывается рядом с (не вместо) `paint_kitty_placements`, переиспользует ту же самую grid→pixel математику (`kitty_placement_bounds`) — оба протокола одинаково анкорят placement к grid-ячейке. Общий с Kitty троттлинг `force_redraw`/`request_animation_frame` (тот же `any_kitty_animating`-флаг, тот же `Terminal::kitty_force_redraw_due`-таймер — специально НЕ заведён отдельный таймер, чтобы не удваивать эффективную частоту форсированных redraw).
+**Ключевое отличие от anchor-подхода**: эти ячейки печатаются через ОБЫЧНЫЙ VTE-путь (как реальный текст), то есть `Term`'s grid трактует их как настоящий контент — scroll/clear/курсор работают через уже существующий, ничем не модифицированный механизм терминала, без anchor/history_size математики вообще. `clear` прячет картинку просто потому что она — часть очищенного текста; курсор естественным образом оказывается после напечатанного блока; скролл двигает картинку вместе с текстом, потому что это и есть текст.
 
-**Проверено визуально живым AutoIt-тестом** (2026-08-10, пользователь явно разрешил и присутствовал — см. `feedback_autoit_focus_check` память для общего запрета на автономный AutoIt без наблюдения; это был исключительный, явно разрешённый случай): запустили Som, ввели `somcat --stream C:\home\dnk\som\giphy.gif` в реальный терминал, сделали burst-скриншоты. Подтверждено — реальный декодированный кадр GIF-анимации виден на экране, с заметной сменой кадров между скриншотами. Абсолютный путь к файлу обязателен — рабочая директория нового терминала не `C:\home\dnk\som`, а домашняя `~`, относительный путь `giphy.gif` даёт `reading giphy.gif: The system cannot find the file specified.`.
+`Terminal::print_rich_content_placeholder_grid` (`crates/terminal/src/terminal.rs`) — при завершении SRP-стрима (`contiguous_len >= total_size`, гейт `RichContentCache::mark_placeholder_grid_printed_if_first_time`, чтобы сработать ровно один раз) генерирует и печатает через `self.write_output()` текстовый блок N×M placeholder-ячеек, вычисляя N/M из `ContentMetadata::Image::width_px`/`height_px` и текущих `cell_width`/`line_height`.
 
-### Natural-size footprint (реализовано после первого живого теста)
+`Terminal::rich_content_placements() -> Vec<(u32, u32, Arc<RenderImage>, usize, bool)>` — `(session_id, file_id, render_image, current_frame, is_animating)`, БЕЗ anchor вообще.
 
-Первая рабочая версия paint-пути всегда рисовала фиксированный 1×1-клеточный footprint — живой AutoIt-тест подтвердил, что анимация видна и работает, но в неправдоподобно маленьком размере. Правильное решение — вычислять реальный footprint из натуральных пиксельных размеров.
+`paint_rich_content_placements` (`crates/terminal_view/src/terminal_element.rs`) сканирует `terminal.last_content().cells`, декодирует `(session_id, file_id)` через `kitty_graphics_placeholder::decode_placeholder_cell`, группирует соседние ячейки с одинаковым id в bounding box (`CellGroupBounds`, одна картинка на группу — `paint_image` не поддерживает sub-region/crop), находит соответствующий decoded frame и рисует его с сохранением aspect ratio.
 
-`natural_cell_span(image_size: Size<DevicePixels>, cell_width: Pixels, line_height: Pixels) -> (u32, u32)` в `terminal_element.rs` — чистая функция (без `Window`/`App`-зависимости, как и `kitty_placement_bounds`, специально ради unit-тестируемости), делит пиксельные размеры декодированного кадра (`RenderImage::size(0)`) на текущие метрики ячейки, округляя ВВЕРХ (`ceil`, не round/floor — частичная последняя ячейка всё равно нужна целиком, иначе край изображения будет обрезан). `cell_width`/`line_height` берутся из `RenderImage::size()` (device pixels) напрямую как то же самое число `Pixels`, без пересчёта через scale_factor — тот же уровень приближения, что уже использует остальная grid-математика этого файла для `cell_width`/`line_height` (см. `kitty_placement_bounds`), и результат всё равно растянутая под сетку картинка, не пиксель-в-пиксель маппинг.
+`CacheEntry` (`rich_content_cache.rs`) больше не хранит `anchor`/`anchor_history_size` — единственное оставшееся состояние: `placeholder_grid_printed: bool`.
 
-`paint_rich_content_placements` вызывает `natural_cell_span(render_image.size(0), ...)` и передаёт результат в `kitty_placement_bounds` как явные `columns`/`rows` (вместо `None`/`None`, которые давали дефолтный 1×1).
+## Kitty Graphics Protocol вырезан (2026-08-10)
 
-**Важное разграничение с `Chunk::metadata`'s `ContentMetadata::Image::width_px`/`height_px`**: `natural_cell_span` берёт размер из УЖЕ ДЕКОДИРОВАННОГО кадра (`RenderImage`), не из заголовка протокола — оба источника размера существуют параллельно и намеренно не объединены в один: `ContentMetadata`'s поля нужны получателю ДО того, как первый кадр успел декодироваться (например, для будущего резервирования места в layout'е до появления пикселей), тогда как `natural_cell_span` работает уже постфактум декодирования, что пока полностью покрывает нужды paint-пути — единого источника правды намеренно нет, `ContentMetadata` пока не используется в самой paint-математике.
+После перехода SRP на placeholder-grid архитектуру обе paint-функции (Kitty и SRP) оказались сканирующими ОДИН И ТОТ ЖЕ grid в поисках placeholder-текста — без протокольного разделителя между ними, только числовое id-пространство, которое могло совпасть (подтверждённый живой баг: `kitty placeholders: no stored image for id N` для реальных SRP session_id — картинка не отображалась вообще). Вместо патча коллизии решено вырезать Kitty из Som целиком — планировался отдельный addon для yazi поверх SRP, а не поддержка стороннего протокола внутри Som.
 
-4 unit-теста на `natural_cell_span` (округление вверх, точное кратное число не округляется лишний раз, минимум 1 клетка для крошечного изображения, реалистичный размер giphy.gif-фикстуры) в `terminal_element.rs`'s тестовом модуле.
+Удалено: `crates/terminal/src/kitty_graphics.rs`, `kitty_graphics_store.rs`, `bin/kitty_probe.rs`; Kitty-ветка `ApcString`-обработчика в `terminal.rs`; `Terminal::kitty_images`/`kitty_image`/`kitty_placements`; `paint_kitty_placements`/`paint_kitty_unicode_placeholders`/`kitty_placement_bounds` в `terminal_element.rs`; весь `--kitty`-путь в `somcat` (query/transmit/animate/PNG-encode функции, `raw_mode::enable()`/`RawModeGuard`); `crates/som_tmux/src/kitty_replay.rs` и его использования в `session.rs`/`server.rs`; `KITTY_GRAPHICS_PLAN.md`.
 
-### КРИТИЧНО: RGBA→BGRA конверсия (найдено после natural-size живого теста)
+**Что осталось общим**: `crates/terminal/src/kitty_graphics_placeholder.rs` (кодирование/декодирование unicode-placeholder ячеек — механизм, не Kitty-специфичная семантика, теперь используется только SRP) и его тесты в `som_tmux/src/redraw.rs` (переименован `redraw_preserves_kitty_placeholder_diacritics_and_underline_color` → `redraw_preserves_placeholder_diacritics_and_underline_color`).
 
-Второй раунд живого AutoIt-теста (после natural-size фикса) показал анимацию в правильном размере, но с явно неверными цветами — кожа/волосы/обивка сиденья все сдвинуты в синий. Причина: `gpui::RenderImage` требует BGRA-порядок байт (задокументировано прямо в doc comment типа, `crates/gpui/src/assets.rs:42`), а `image::Frame`/gif-декодер отдают только RGBA. `RichContentPlayer::from_prefix` строил `RenderImage` прямо из декодированных кадров без конверсии — красный и синий каналы поменялись местами на экране.
+`somcat` CLI: без флага или с явным `--srp` — единственный путь теперь (флаг `--srp` — просто синоним дефолта для тех, кто не хочет полагаться на implicit default).
 
-Kitty-путь уже решал ровно эту же проблему — `kitty_graphics_store::swap_to_bgra` (построчный `pixel.swap(0, 2)`) применяется к каждому PNG-декодированному кадру перед тем, как он попадает в `RenderImage`. Тот же самый swap теперь применяется в `RichContentPlayer::from_prefix` к каждому кадру `DecodedPrefix` перед созданием `RenderImage` — не вынесено в общий helper между модулями, потому что `rich_content_transport`/`kitty_graphics` намеренно не имеют зависимости друг от друга.
+### КРИТИЧНО: RGBA→BGRA конверсия
+
+`gpui::RenderImage` требует BGRA-порядок байт (задокументировано прямо в doc comment типа, `crates/gpui/src/assets.rs:42`), а `image::Frame`/gif-декодер отдают только RGBA. `RichContentPlayer::from_prefix` применяет построчный swap (`pixel.swap(0, 2)`) к каждому кадру `DecodedPrefix` перед созданием `RenderImage` — без этого шага цвета выходят с переставленными красным/синим каналами (подтверждено живым тестом: кожа/волосы/обивка сиденья все сдвинуты в синий).
 
 Тест `from_prefix_converts_rgba_to_bgra` — синтетический 2-пиксельный GIF (сплошной красный + сплошной синий, построенный через `image::codecs::gif::GifEncoder` прямо в тесте, не зависит от конкретных цветов `giphy.gif`-фикстуры), проверяет точный побайтовый результат: RGBA `(255,0,0,255)` → BGRA `(0,0,255,255)` и наоборот.
 
-**Файл:** `crates/terminal/src/rich_content_player.rs`, коммит `66e1f0c`.
+**Файл:** `crates/terminal/src/rich_content_player.rs`.
 
 ## Следующие нереализованные этапы (вне текущего прогресса)
 
 - Аудио: symphonia (декодирование) + `cpal` (воспроизведение, уже в зависимостях) поверх того же конверта с `content_type=Audio`, метаданные уже спроектированы (`ContentMetadata::Audio`).
 - Markdown: `crates/markdown/src/markdown.rs` (уже существующий GPUI-виджет из Zed) как overlay поверх терминального грида.
 - Видео (mp4/mkv/webm) и PDF — отдельные, более крупные этапы. Метаданные для видео уже спроектированы (`ContentMetadata::Video`/`VideoCodec`), но не используются никаким реальным декодером.
-- SRP-эквивалент Kitty's `a=p`/z-index — если понадобится явное управление позицией/слоями плейсмента отдельно от неявного anchor-при-первом-чанке и natural-size footprint.

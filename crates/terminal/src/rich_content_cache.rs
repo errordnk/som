@@ -40,14 +40,10 @@ struct CacheEntry {
     /// correctness shouldn't depend on that assumption holding for every
     /// future client.
     pending_ranges: Vec<(u64, u64)>,
-    /// (line, column) the cursor was at when the first chunk for this
-    /// file arrived — this protocol has no separate Place command the way
-    /// Kitty's does (see `rich_content_transport`'s module doc comment on
-    /// why: SRP only has chunk-of-data envelopes), so "wherever the
-    /// client's cursor was when it started streaming" is the anchor,
-    /// mirroring Kitty's own cursor-relative placement model but decided
-    /// implicitly by first-chunk arrival instead of an explicit command.
-    anchor: (i32, usize),
+    content_type: ContentType,
+    /// `0` means the sender never filled it in — same "unknown, don't
+    /// guess" convention `Chunk::total_size` itself documents.
+    total_size: u64,
 }
 
 /// Per-terminal-session store of in-progress and completed rich-content
@@ -76,6 +72,8 @@ impl RichContentCache {
             ContentType::Audio => "audio",
             ContentType::Markdown => "md",
             ContentType::Video => "video",
+            ContentType::Jpeg => "jpg",
+            ContentType::Png => "png",
         }
     }
 
@@ -91,10 +89,7 @@ impl RichContentCache {
     /// write shouldn't take down the whole terminal session; the caller
     /// decides whether to drop the chunk and continue or surface the
     /// error further.
-    ///
-    /// `cursor` is only used the FIRST time this `(session_id, file_id)`
-    /// pair is seen — see [`CacheEntry::anchor`]'s doc comment.
-    pub fn apply_chunk(&mut self, chunk: &Chunk, cursor: (i32, usize)) -> std::io::Result<u64> {
+    pub fn apply_chunk(&mut self, chunk: &Chunk) -> std::io::Result<u64> {
         let key = (chunk.session_id, chunk.file_id);
         if !self.entries.contains_key(&key) {
             std::fs::create_dir_all(&self.cache_dir)?;
@@ -107,7 +102,14 @@ impl RichContentCache {
             let file = OpenOptions::new().create(true).write(true).truncate(true).read(true).open(&path)?;
             self.entries.insert(
                 key,
-                CacheEntry { file, path, contiguous_len: 0, pending_ranges: Vec::new(), anchor: cursor },
+                CacheEntry {
+                    file,
+                    path,
+                    contiguous_len: 0,
+                    pending_ranges: Vec::new(),
+                    content_type: chunk.content_type,
+                    total_size: chunk.total_size,
+                },
             );
         }
         let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
@@ -153,10 +155,17 @@ impl RichContentCache {
         self.entries.get(&(session_id, file_id)).map(|e| e.path.as_path())
     }
 
-    /// The (line, column) cursor position captured when the first chunk
-    /// for this file arrived — see [`CacheEntry::anchor`]'s doc comment.
-    pub fn anchor(&self, session_id: u32, file_id: u32) -> Option<(i32, usize)> {
-        self.entries.get(&(session_id, file_id)).map(|e| e.anchor)
+    /// The `ContentType` the first chunk for this id declared — decoding
+    /// strategy (progressive GIF vs wait-for-complete-file static image)
+    /// depends on it, see `rich_content_player::refresh_or_create`.
+    pub fn content_type(&self, session_id: u32, file_id: u32) -> Option<ContentType> {
+        self.entries.get(&(session_id, file_id)).map(|e| e.content_type)
+    }
+
+    /// The `total_size` the first chunk for this id declared (`0` if the
+    /// sender never filled it in).
+    pub fn total_size(&self, session_id: u32, file_id: u32) -> u64 {
+        self.entries.get(&(session_id, file_id)).map(|e| e.total_size).unwrap_or(0)
     }
 
     /// Every `(session_id, file_id)` pair with at least one chunk applied
@@ -208,9 +217,9 @@ mod tests {
         let dir = temp_cache_dir("sequential");
         let mut cache = RichContentCache::new(dir.clone());
 
-        let len1 = cache.apply_chunk(&chunk(1, 1, 0, b"hello "), (0, 0)).unwrap();
+        let len1 = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
         assert_eq!(len1, 6);
-        let len2 = cache.apply_chunk(&chunk(1, 1, 6, b"world"), (0, 0)).unwrap();
+        let len2 = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
         assert_eq!(len2, 11);
 
         let path = cache.path(1, 1).unwrap().to_path_buf();
@@ -229,12 +238,12 @@ mod tests {
         // Chunk 2 (offset 6) arrives before chunk 1 (offset 0) — write
         // succeeds, but the watermark must stay at 0 since bytes 0..6
         // are still missing.
-        let len_after_second = cache.apply_chunk(&chunk(1, 1, 6, b"world"), (0, 0)).unwrap();
+        let len_after_second = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
         assert_eq!(len_after_second, 0, "watermark must not advance past a gap");
 
         // Now the gap-filling chunk arrives — watermark should jump all
         // the way to the end, absorbing the already-written pending range.
-        let len_after_first = cache.apply_chunk(&chunk(1, 1, 0, b"hello "), (0, 0)).unwrap();
+        let len_after_first = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
         assert_eq!(len_after_first, 11, "watermark must absorb the pending range once the gap closes");
 
         let path = cache.path(1, 1).unwrap().to_path_buf();
@@ -249,9 +258,9 @@ mod tests {
         let dir = temp_cache_dir("separate_entries");
         let mut cache = RichContentCache::new(dir.clone());
 
-        cache.apply_chunk(&chunk(1, 1, 0, b"first"), (0, 0)).unwrap();
-        cache.apply_chunk(&chunk(2, 1, 0, b"second-session"), (0, 0)).unwrap();
-        cache.apply_chunk(&chunk(1, 2, 0, b"second-file"), (0, 0)).unwrap();
+        cache.apply_chunk(&chunk(1, 1, 0, b"first")).unwrap();
+        cache.apply_chunk(&chunk(2, 1, 0, b"second-session")).unwrap();
+        cache.apply_chunk(&chunk(1, 2, 0, b"second-file")).unwrap();
 
         assert_eq!(cache.contiguous_len(1, 1), 5);
         assert_eq!(cache.contiguous_len(2, 1), 14);
@@ -276,13 +285,13 @@ mod tests {
         let dir = temp_cache_dir("retransmit");
         let mut cache = RichContentCache::new(dir.clone());
 
-        cache.apply_chunk(&chunk(1, 1, 0, b"hello world"), (0, 0)).unwrap();
+        cache.apply_chunk(&chunk(1, 1, 0, b"hello world")).unwrap();
         assert_eq!(cache.contiguous_len(1, 1), 11);
 
         // Re-apply the first half again (offset 0, shorter payload) —
         // watermark must not regress even though this chunk's own
         // `chunk_end` (6) is less than the current watermark (11).
-        let len = cache.apply_chunk(&chunk(1, 1, 0, b"hello "), (0, 0)).unwrap();
+        let len = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
         assert_eq!(len, 11, "watermark must never move backward on a retransmit");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -292,7 +301,7 @@ mod tests {
     fn extension_matches_content_type() {
         let dir = temp_cache_dir("extension");
         let mut cache = RichContentCache::new(dir.clone());
-        cache.apply_chunk(&chunk(1, 1, 0, b"x"), (0, 0)).unwrap();
+        cache.apply_chunk(&chunk(1, 1, 0, b"x")).unwrap();
         let path = cache.path(1, 1).unwrap();
         assert_eq!(path.extension().unwrap(), "gif");
         std::fs::remove_dir_all(&dir).ok();

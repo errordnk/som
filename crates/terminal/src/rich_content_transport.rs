@@ -284,6 +284,12 @@ pub enum ContentType {
     Audio = 1,
     Markdown = 2,
     Video = 3,
+    /// Static (non-animated) raster formats — unlike `Gif`, these have no
+    /// progressive/streaming decode story in the `image` crate (no partial-
+    /// prefix decoding), so the receiving side waits for the full file
+    /// before attempting to decode either.
+    Jpeg = 4,
+    Png = 5,
 }
 
 impl ContentType {
@@ -293,6 +299,8 @@ impl ContentType {
             1 => Some(Self::Audio),
             2 => Some(Self::Markdown),
             3 => Some(Self::Video),
+            4 => Some(Self::Jpeg),
+            5 => Some(Self::Png),
             _ => None,
         }
     }

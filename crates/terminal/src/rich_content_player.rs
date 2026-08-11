@@ -19,6 +19,8 @@ use gpui::RenderImage;
 use smallvec::SmallVec;
 
 use crate::rich_content_gif_player;
+use crate::rich_content_static_image_player;
+use crate::rich_content_transport::ContentType;
 
 /// One rich-content file's paint-ready state: the most recently decoded
 /// frames (cached — re-decoding on every paint call would be wasteful,
@@ -130,6 +132,8 @@ pub fn refresh_or_create(
     existing: Option<RichContentPlayer>,
     path: &std::path::Path,
     contiguous_len: u64,
+    content_type: ContentType,
+    total_size: u64,
 ) -> Option<RichContentPlayer> {
     if let Some(player) = &existing {
         // Already fully decoded and nothing new has arrived — reuse as-is
@@ -144,7 +148,24 @@ pub fn refresh_or_create(
         }
     }
 
-    match rich_content_gif_player::try_decode_progressive(path, contiguous_len) {
+    let decoded = match content_type {
+        ContentType::Gif => rich_content_gif_player::try_decode_progressive(path, contiguous_len),
+        // JPEG/PNG have no progressive-prefix decode story in the `image`
+        // crate (see `rich_content_static_image_player`'s module doc
+        // comment) — wait for the whole file rather than attempting (and
+        // failing) a decode on every chunk arrival.
+        ContentType::Jpeg | ContentType::Png => {
+            if total_size == 0 || contiguous_len < total_size {
+                Ok(None)
+            } else {
+                rich_content_static_image_player::decode_complete(path).map(Some)
+            }
+        },
+        // Not an image format at all — nothing for this player to decode.
+        ContentType::Audio | ContentType::Markdown | ContentType::Video => Ok(None),
+    };
+
+    match decoded {
         Ok(Some(prefix)) => Some(RichContentPlayer::from_prefix(prefix, contiguous_len)),
         // Not enough data yet, or a real decode error — either way, no
         // usable player. A genuine format error (not just "too early")
@@ -191,7 +212,8 @@ mod tests {
     #[test]
     fn refresh_or_create_returns_none_before_any_frame_is_decodable() {
         let path = giphy_gif_path();
-        let player = refresh_or_create(None, &path, 4);
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        let player = refresh_or_create(None, &path, 4, ContentType::Gif, full_len);
         assert!(player.is_none(), "a handful of header bytes must not produce a player yet");
     }
 
@@ -199,7 +221,7 @@ mod tests {
     fn refresh_or_create_produces_a_player_once_a_frame_is_available() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len / 2);
+        let player = refresh_or_create(None, &path, full_len / 2, ContentType::Gif, full_len);
         let player = player.expect("half the file should decode at least one frame");
         assert!(player.render_image().frame_count() > 0);
     }
@@ -208,7 +230,7 @@ mod tests {
     fn refresh_reuses_existing_player_when_contiguous_len_has_not_grown() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let first = refresh_or_create(None, &path, full_len / 2).unwrap();
+        let first = refresh_or_create(None, &path, full_len / 2, ContentType::Gif, full_len).unwrap();
         let first_frame_count = first.render_image().frame_count();
         let first_ptr = Arc::as_ptr(first.render_image());
 
@@ -216,7 +238,7 @@ mod tests {
         // re-decode (proven by pointer identity, not just frame count
         // equality, which a fresh decode of the same bytes would also
         // satisfy).
-        let second = refresh_or_create(Some(first), &path, full_len / 2).unwrap();
+        let second = refresh_or_create(Some(first), &path, full_len / 2, ContentType::Gif, full_len).unwrap();
         assert_eq!(Arc::as_ptr(second.render_image()), first_ptr, "must reuse the cached Arc, not re-decode");
         assert_eq!(second.render_image().frame_count(), first_frame_count);
     }
@@ -225,10 +247,10 @@ mod tests {
     fn refresh_decodes_more_frames_once_contiguous_len_grows() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let first = refresh_or_create(None, &path, full_len / 4).unwrap();
+        let first = refresh_or_create(None, &path, full_len / 4, ContentType::Gif, full_len).unwrap();
         let first_frame_count = first.render_image().frame_count();
 
-        let second = refresh_or_create(Some(first), &path, full_len / 2).unwrap();
+        let second = refresh_or_create(Some(first), &path, full_len / 2, ContentType::Gif, full_len).unwrap();
         assert!(
             second.render_image().frame_count() >= first_frame_count,
             "more available bytes must never decode fewer frames"
@@ -239,7 +261,7 @@ mod tests {
     fn refresh_reaches_all_frames_once_contiguous_len_covers_the_whole_file() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len).unwrap();
+        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
         assert_eq!(player.render_image().frame_count(), 47, "giphy.gif fixture is known to have 47 frames");
         assert!(player.complete);
     }
@@ -248,13 +270,14 @@ mod tests {
     fn complete_player_is_not_re_decoded_even_if_contiguous_len_grows_further() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let complete = refresh_or_create(None, &path, full_len).unwrap();
+        let complete = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
         let ptr = Arc::as_ptr(complete.render_image());
 
         // Passing a larger contiguous_len than the file's own length
         // (simulating a stale/retransmitted watermark) must not trigger
         // another decode attempt once already complete.
-        let still = refresh_or_create(Some(complete), &path, full_len + 1000).unwrap();
+        let still =
+            refresh_or_create(Some(complete), &path, full_len + 1000, ContentType::Gif, full_len).unwrap();
         assert_eq!(Arc::as_ptr(still.render_image()), ptr, "a complete player must never be re-decoded");
     }
 
@@ -268,7 +291,7 @@ mod tests {
         let full_len = std::fs::metadata(&path).unwrap().len();
         let mut available = 64u64;
         let player = loop {
-            if let Some(player) = refresh_or_create(None, &path, available) {
+            if let Some(player) = refresh_or_create(None, &path, available, ContentType::Gif, full_len) {
                 break player;
             }
             available += 64;
@@ -283,7 +306,7 @@ mod tests {
     fn multi_frame_player_is_animating() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len).unwrap();
+        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
         assert!(player.is_animating(), "the full 47-frame giphy.gif must report as animating");
     }
 
@@ -291,7 +314,7 @@ mod tests {
     fn current_frame_advances_past_the_first_frame_delay() {
         let path = giphy_gif_path();
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len).unwrap();
+        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
 
         let first = player.current_frame();
         assert_eq!(first, 0, "playback must start on frame 0");
@@ -320,7 +343,8 @@ mod tests {
         // run or ran on the wrong bytes.
         let path = write_two_pixel_gif("bgra_swap");
         let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len).expect("tiny fixture must decode fully");
+        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len)
+            .expect("tiny fixture must decode fully");
 
         let bytes = player.render_image().as_bytes(0).expect("frame 0 must have pixel data");
         assert_eq!(&bytes[0..4], &[0, 0, 255, 255], "solid red RGBA (255,0,0,255) must become BGRA (0,0,255,255)");

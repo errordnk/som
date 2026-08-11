@@ -10,7 +10,6 @@ name = "somcat"
 path = "src/main.rs"
 
 [dependencies]
-base64.workspace = true
 image.workspace = true
 terminal.workspace = true
 

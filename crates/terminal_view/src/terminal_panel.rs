@@ -958,6 +958,35 @@ impl TerminalPanel {
                 }
             }
 
+            // `window.focus()` only sets GPUI's own logical focus target — it
+            // does NOT make the OS actually deliver keyboard input to this
+            // window. That's a separate, independently-async path: real OS
+            // activation (`PlatformWindow::activate`, see
+            // `gpui_windows::window::WindowsWindow::activate`) spawns its own
+            // background task (`SetActiveWindow`/`SetFocus` plus a synthetic-
+            // keypress workaround for a real Windows quirk) that races
+            // against this restore task with no ordering guarantee between
+            // them. Calling `som_focus_pane_by_index` before the OS has
+            // actually activated the window is a real, intermittently-
+            // reproducing bug (confirmed live: "Som window opens with a tab
+            // but no input focus, not always") — GPUI ends up with the right
+            // element logically focused, but the OS never routed real
+            // keystrokes there because activation hadn't landed yet. Wait
+            // for `window.is_window_active()` first (same bounded-poll shape
+            // as the `ActivateItem` wait above) so the focus call happens
+            // only once the OS side has actually caught up; if activation
+            // never lands within the timeout (e.g. Som started minimized/in
+            // the background on purpose), fall through and focus anyway —
+            // better than never focusing at all.
+            for _ in 0..50 {
+                let active =
+                    window_handle.update(cx, |_, window, _cx| window.is_window_active()).unwrap_or(false);
+                if active {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_millis(5)).await;
+            }
+
             window_handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {

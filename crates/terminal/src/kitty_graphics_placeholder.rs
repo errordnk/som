@@ -1,22 +1,19 @@
-//! Kitty terminal graphics protocol's "Unicode placeholders" mode (`U=1`).
-//!
-//! Spec: <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>.
-//! Unlike the classic cursor-relative placement mode (`KITTY_GRAPHICS_PLAN.md`
-//! Stage 3, `crate::kitty_graphics_store`), this mode doesn't anchor an
-//! image to a pixel/cell position tracked separately from the grid — the
-//! image's position/size IS encoded directly into ordinary text cells,
-//! written as a special placeholder character (`U+10EEEE`) whose
-//! foreground color holds the image id and whose combining diacritics
-//! (from a fixed 297-entry Unicode table, see [`ROWCOLUMN_DIACRITICS`])
-//! encode which row/column of the placement each individual cell
-//! represents.
+//! Unicode-placeholder cell encoding, originally specified by the Kitty
+//! terminal graphics protocol's "Unicode placeholders" mode (`U=1`,
+//! <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>)
+//! and reused as-is by Som's own rich-content protocol
+//! (`crate::rich_content_transport`/`Terminal::print_rich_content_placeholder_grid`).
+//! This mode doesn't anchor an image to a pixel/cell position tracked
+//! separately from the grid — the image's position/size IS encoded
+//! directly into ordinary text cells, written as a special placeholder
+//! character (`U+10EEEE`) whose foreground color holds an id and whose
+//! combining diacritics (from a fixed 297-entry Unicode table, see
+//! [`ROWCOLUMN_DIACRITICS`]) encode which row/column of the placement each
+//! individual cell represents.
 //!
 //! This module only handles the ENCODING/DECODING of that representation —
 //! it doesn't touch the terminal grid itself (writing placeholder cells is
-//! `Term`'s job, same as writing any other character) or track which
-//! program-of-record decided to use this mode over cursor-relative
-//! placement (that's the `U=1` control key on the original `Place`
-//! command, parsed in `crate::kitty_graphics`).
+//! `Term`'s job, same as writing any other character).
 
 /// The base placeholder character every unicode-placeholder-mode cell uses.
 /// A bare `U+10EEEE` with no diacritics represents row 0, column 0 of
@@ -33,9 +30,7 @@ pub const PLACEHOLDER_CHAR: char = '\u{10EEEE}';
 /// Downloaded directly from
 /// <https://sw.kovidgoyal.net/kitty/_downloads/f0a0de9ec8d9ff4456206db8e0814937/rowcolumn-diacritics.txt>
 /// and mechanically extracted (not hand-transcribed — a table this size is
-/// exactly the kind of thing a single wrong character silently breaks; see
-/// `kitty_graphics_store`'s TINY_PNG_BASE64 doc comment for the same lesson
-/// learned the hard way with a hand-typed PNG earlier in this project).
+/// exactly the kind of thing a single wrong character silently breaks).
 pub const ROWCOLUMN_DIACRITICS: [char; 297] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}',
     '\u{033F}', '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}',
@@ -136,9 +131,7 @@ fn diacritic_index(c: char) -> Option<usize> {
 pub struct PlaceholderCell {
     pub image_id: u32,
     /// `None` when no distinct underline color was set on the cell — per
-    /// spec this means placement id 0, i.e. "the only/default placement"
-    /// (same convention `crate::kitty_graphics_store::ImageStore` already
-    /// uses for its cursor-relative placements).
+    /// spec this means placement id 0, i.e. "the only/default placement".
     pub placement_id: u32,
     pub row: u32,
     pub column: u32,
@@ -156,14 +149,12 @@ pub struct PlaceholderCell {
 ///
 /// Colors are taken as plain `(u8, u8, u8)` rather than
 /// `alacritty_terminal::vte::ansi::Color`/`Rgb` so this module stays free of
-/// an `alacritty_terminal` dependency, matching `kitty_graphics_store`'s
-/// `PlacementInfo::anchor: (i32, usize)` precedent — the caller (which
-/// already depends on `alacritty_terminal` to read the grid in the first
-/// place) is responsible for resolving a cell's `Color` enum (`Named`/
-/// `Indexed`/`Spec`) down to concrete RGB bytes before calling this
-/// function; `Named`/`Indexed` colors resolve through the terminal's
-/// active color palette, which this module has no access to and no need to
-/// know about.
+/// an `alacritty_terminal` dependency — the caller (which already depends
+/// on `alacritty_terminal` to read the grid in the first place) is
+/// responsible for resolving a cell's `Color` enum (`Named`/`Indexed`/
+/// `Spec`) down to concrete RGB bytes before calling this function;
+/// `Named`/`Indexed` colors resolve through the terminal's active color
+/// palette, which this module has no access to and no need to know about.
 ///
 /// Per spec, the image id is the foreground color's 24-bit RGB value
 /// interpreted as a big-endian `u32` (`r << 16 | g << 8 | b`) when using

@@ -34,13 +34,13 @@ use std::io::Write;
 /// CellExtra>>` this diff doesn't need in full, same reasoning as
 /// `protocol::ProtocolCell` — see that type's doc comment), except for
 /// `zerowidth`/`underline_color`, which — unlike `hyperlink` — this diff DOES
-/// need: Kitty terminal graphics protocol's Unicode-placeholder-mode cells
+/// need: Som's rich-content protocol's Unicode-placeholder-mode cells
 /// (`crates/terminal/src/kitty_graphics_placeholder.rs`) are encoded
 /// entirely as an ordinary base char (`U+10EEEE`) plus combining diacritics
 /// in `zerowidth` plus an `underline_color` distinct from `fg` — dropping
 /// either here would silently corrupt every placeholder cell's row/column/
-/// placement-id on the very first redraw after a resize, alt-screen swap,
-/// or reconnect (all of which force a full repaint through this same path).
+/// id on the very first redraw after a resize, alt-screen swap, or
+/// reconnect (all of which force a full repaint through this same path).
 #[derive(Clone, PartialEq)]
 struct PaintedCell {
     c: char,
@@ -446,10 +446,10 @@ impl Redrawer {
         // SGR 58/59 (underline color) — reset above (SGR 0) already cleared
         // any previously-set underline color, so `None` needs no explicit
         // action here; only a real `Some` needs emitting. True-color/
-        // indexed-underline-color are the two forms Kitty's own Unicode-
-        // placeholder-mode encoding actually uses (placement id via
-        // underline color, see kitty_graphics_placeholder's doc comment),
-        // so both are supported even though Named isn't a meaningful
+        // indexed-underline-color are the two forms the Unicode-placeholder-
+        // mode encoding actually uses (file id via underline color, see
+        // kitty_graphics_placeholder's doc comment), so both are supported
+        // even though Named isn't a meaningful
         // underline color in practice.
         if let Some(color) = underline_color {
             match color {
@@ -1053,18 +1053,21 @@ mod tests {
         );
     }
 
-    /// A Kitty Unicode-placeholder-mode cell (KITTY_GRAPHICS_PLAN.md Stage
-    /// 4/6) is a base char (`U+10EEEE`) plus zero-width combining diacritics
-    /// (row/column) plus a distinct underline color (placement id) on top of
-    /// a true-color foreground (image id). None of those three pieces are
-    /// ordinary `fg`/`bg`/`flags` — before `PaintedCell` tracked
-    /// `zerowidth`/`underline_color`, `redraw` would have emitted the base
-    /// char with its true-color fg (matching the pre-existing `write_fg`
-    /// path) but silently dropped the diacritics AND the underline color,
-    /// corrupting every placeholder cell's encoded row/column/placement-id
-    /// on the very first resize/alt-screen-swap/reconnect redraw.
+    /// A Unicode-placeholder-mode cell (see
+    /// `crates/terminal/src/kitty_graphics_placeholder.rs`'s doc comment —
+    /// the encoding Som's own rich-content protocol uses to represent image
+    /// placements as real grid text) is a base char (`U+10EEEE`) plus
+    /// zero-width combining diacritics (row/column) plus a distinct
+    /// underline color (file id) on top of a true-color foreground (session
+    /// id). None of those three pieces are ordinary `fg`/`bg`/`flags` —
+    /// before `PaintedCell` tracked `zerowidth`/`underline_color`, `redraw`
+    /// would have emitted the base char with its true-color fg (matching
+    /// the pre-existing `write_fg` path) but silently dropped the
+    /// diacritics AND the underline color, corrupting every placeholder
+    /// cell's encoded row/column/id on the very first
+    /// resize/alt-screen-swap/reconnect redraw.
     #[test]
-    fn redraw_preserves_kitty_placeholder_diacritics_and_underline_color() {
+    fn redraw_preserves_placeholder_diacritics_and_underline_color() {
         let bounds = SessionBounds::new(80, 24);
         let mut term = Term::new(Config::default(), &bounds, VoidListener);
         let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();

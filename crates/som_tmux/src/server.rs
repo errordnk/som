@@ -155,19 +155,6 @@ fn handle_relay(connection: PipeConnection, session: &Arc<Session>) -> anyhow::R
     let raw_bytes_rx = session.subscribe_raw_bytes();
     send(&connection, &writer, &HolderOutput::Snapshot(session.snapshot()))?;
 
-    // Replays any still-relevant Kitty graphics `Transmit` APC bytes right
-    // after the snapshot, before the live byte stream starts — see
-    // `crate::kitty_replay`'s doc comment for why `Snapshot`/`TermState`
-    // alone can't carry this (a HOLDER's headless `Term` never decodes
-    // images, only forwards their raw bytes). Sent as an ordinary
-    // `HolderOutput::Bytes` message: the RELAY doesn't need to know or care
-    // this is a "replay" rather than live output — it feeds either through
-    // the exact same real `ansi::Processor::advance` path.
-    let kitty_replay_bytes = session.kitty_replay_bytes();
-    if !kitty_replay_bytes.is_empty() {
-        send(&connection, &writer, &HolderOutput::Bytes(kitty_replay_bytes))?;
-    }
-
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_forwarder(connection.clone(), writer.clone(), session.clone(), raw_bytes_rx, stop.clone());
 

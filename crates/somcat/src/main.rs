@@ -133,6 +133,58 @@ fn query_cell_size_px() -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+/// Sends `CSI 18 t` ("report text area size in characters") and waits for
+/// the terminal's `CSI 8 ; lines ; cols t` reply — same request/response
+/// shape as [`query_cell_size_px`], just asking for the grid's own
+/// dimensions instead of a single cell's pixel size.
+///
+/// This is why a placeholder grid can't be sized from `width_px`/`cell_width`
+/// alone: an image's pixel dimensions are physical file pixels, while
+/// `cell_width`/`cell_height` (from `CSI 16 t`) are GPUI's logical (DIP)
+/// pixels — unrelated units once a monitor's DPI scale isn't 1.0. Dividing
+/// one by the other can produce a `columns` count wider than the terminal
+/// actually has, which the real terminal then silently wraps mid-grid,
+/// scrambling every cell's row/column coordinates. Clamping against the
+/// terminal's own reported character grid size sidesteps the unit mismatch
+/// entirely, regardless of what it turns out to be.
+fn query_cell_count() -> Option<(u32, u32)> {
+    print!("\x1b[18t");
+    std::io::Write::flush(&mut std::io::stdout()).ok()?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(1) => {
+                    buf.push(byte[0]);
+                    if buf.last() == Some(&b't') || buf.len() >= 64 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = tx.send(buf);
+    });
+
+    let buf = rx.recv_timeout(std::time::Duration::from_millis(800)).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // Expected shape: `ESC [ 8 ; <lines> ; <cols> t`.
+    let start = text.find("\x1b[8;")?;
+    let rest = &text[start + 4..];
+    let end = rest.find('t')?;
+    let mut parts = rest[..end].split(';');
+    let lines: u32 = parts.next()?.parse().ok()?;
+    let cols: u32 = parts.next()?.parse().ok()?;
+    if cols == 0 || lines == 0 {
+        return None;
+    }
+    Some((cols, lines))
+}
+
 /// Foreground carries session_id, underline color carries file_id — same
 /// split Kitty's own encoding uses for (image_id, placement_id), mirrored
 /// from `crates/terminal/src/terminal.rs`'s private `id_to_rgb` (kept as a
@@ -162,9 +214,47 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
         return Ok(());
     };
 
-    let columns = width_px.div_ceil(cell_width).max(1).min(297);
-    let rows = height_px.div_ceil(cell_height).max(1).min(297);
+    let mut columns = width_px.div_ceil(cell_width).max(1).min(297);
+    let mut rows = height_px.div_ceil(cell_height).max(1).min(297);
 
+    // `columns`/`rows` above assume the image's pixel dimensions and the
+    // terminal cell's pixel dimensions share the same unit — true at DPI
+    // scale 1.0, false on a scaled (e.g. 4K) display where `cell_width`
+    // came back in GPUI's logical pixels while `width_px` is the image
+    // file's physical pixel count. When that mismatch makes the grid wider
+    // than the terminal actually is, the real terminal wraps it mid-row,
+    // scrambling every placeholder cell's decoded (row, column). Query the
+    // terminal's own character grid size and scale the whole placement
+    // down (preserving aspect ratio) to fit both axes, rather than
+    // trusting the pixel-based math alone. Height is clamped to
+    // `terminal_rows - 1`, not `terminal_rows`, so a placement always
+    // leaves at least one real row free below it for the shell's next
+    // prompt — a placement that filled the screen edge-to-edge would push
+    // that prompt out of view entirely until the user scrolled, which
+    // defeats the whole point of printing it inline.
+    if let Some((terminal_columns, terminal_rows)) = query_cell_count() {
+        if columns > terminal_columns {
+            let scale = terminal_columns as f64 / columns as f64;
+            columns = terminal_columns.max(1);
+            rows = ((rows as f64 * scale).floor() as u32).max(1);
+        }
+        let max_rows = terminal_rows.saturating_sub(1).max(1);
+        if rows > max_rows {
+            let scale = max_rows as f64 / rows as f64;
+            rows = max_rows;
+            columns = ((columns as f64 * scale).floor() as u32).max(1);
+        }
+    }
+
+    // Hard `\r\n` between rows: the terminal's own soft-wrap reflow always
+    // re-wraps to ITS current width, not the image's — it can't hold a
+    // placement at a narrower width while the window is wider, which would
+    // stretch the image past its real aspect ratio. Som instead actively
+    // re-derives and rewrites this grid's cells in place on every resize
+    // (see `Terminal::resync_rich_content_placements`), so staying with
+    // explicit row boundaries here keeps the on-screen shape predictable
+    // between resizes rather than relying on wrap behavior this protocol
+    // doesn't want.
     let mut text = String::new();
     let (sr, sg, sb) = id_to_rgb(session_id);
     let (fr, fg, fb) = id_to_rgb(file_id);

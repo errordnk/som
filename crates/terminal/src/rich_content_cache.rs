@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use crate::rich_content_transport::{Chunk, ContentType};
+use crate::rich_content_transport::{Chunk, ContentMetadata, ContentType};
 
 /// One file's progressive-write state: the open handle plus how many
 /// bytes starting from offset 0 are known to be present with no gaps.
@@ -44,6 +44,18 @@ struct CacheEntry {
     /// `0` means the sender never filled it in — same "unknown, don't
     /// guess" convention `Chunk::total_size` itself documents.
     total_size: u64,
+    /// The widest placeholder-cell column decoded from any paint pass so
+    /// far — see [`RichContentCache::record_max_column_seen`] for why this
+    /// needs to persist across paint calls rather than being recomputed
+    /// from whatever's on screen right now.
+    max_column_seen: std::cell::Cell<u32>,
+    /// The image's natural decoded pixel dimensions, from the first
+    /// chunk's `ContentMetadata::Image` (`None` for non-image content
+    /// types, or if a sender ever left width/height as `0` = unknown).
+    /// Needed to re-derive the placeholder grid's column/row count when
+    /// the terminal's cell size changes (window resize, font size change)
+    /// — see `Terminal::resync_rich_content_placements`.
+    image_size_px: Option<(u32, u32)>,
 }
 
 /// Per-terminal-session store of in-progress and completed rich-content
@@ -109,6 +121,13 @@ impl RichContentCache {
                     pending_ranges: Vec::new(),
                     content_type: chunk.content_type,
                     total_size: chunk.total_size,
+                    max_column_seen: std::cell::Cell::new(0),
+                    image_size_px: match chunk.metadata {
+                        ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
+                            Some((width_px, height_px))
+                        },
+                        _ => None,
+                    },
                 },
             );
         }
@@ -181,6 +200,51 @@ impl RichContentCache {
     /// safe to read.
     pub fn contiguous_len(&self, session_id: u32, file_id: u32) -> u64 {
         self.entries.get(&(session_id, file_id)).map(|e| e.contiguous_len).unwrap_or(0)
+    }
+
+    /// Records that a placeholder cell at `column` (0-based, within the
+    /// image) was decoded as visible during a paint pass, growing the
+    /// entry's remembered maximum if this is wider than anything seen
+    /// before. Never shrinks — the placement's true column count is
+    /// whatever the sending client's grid actually was, and a narrower
+    /// SUBSET of columns happening to be on screen right now (e.g. only
+    /// the image's left edge is visible after a horizontal-adjacent split
+    /// resize) must not un-learn a wider count already observed. `&self`
+    /// (not `&mut self`) because paint runs through a `&Terminal` borrow —
+    /// see [`CacheEntry::max_column_seen`]'s `Cell` for why interior
+    /// mutability is needed here.
+    pub fn record_max_column_seen(&self, session_id: u32, file_id: u32, column: u32) {
+        if let Some(entry) = self.entries.get(&(session_id, file_id)) {
+            let current = entry.max_column_seen.get();
+            if column > current {
+                entry.max_column_seen.set(column);
+            }
+        }
+    }
+
+    /// The widest column index ([`Self::record_max_column_seen`]) observed
+    /// for this placement across every paint pass so far — `None` if
+    /// nothing's been recorded yet (id unknown, or no paint has happened).
+    pub fn max_column_seen(&self, session_id: u32, file_id: u32) -> Option<u32> {
+        self.entries.get(&(session_id, file_id)).map(|e| e.max_column_seen.get())
+    }
+
+    /// The image's natural pixel dimensions, if known — see
+    /// [`CacheEntry::image_size_px`]'s doc comment.
+    pub fn image_size_px(&self, session_id: u32, file_id: u32) -> Option<(u32, u32)> {
+        self.entries.get(&(session_id, file_id))?.image_size_px
+    }
+
+    /// Overwrites the remembered max-column-seen for a placement — used
+    /// after actively re-deriving and rewriting a placement's grid cells
+    /// on resize (see `Terminal::resync_rich_content_placements`), where
+    /// the OLD `max_column_seen` value (from before the resize) would
+    /// otherwise keep the paint path anchored to the stale column count
+    /// via [`Self::record_max_column_seen`]'s monotonic-growth-only rule.
+    pub fn reset_max_column_seen(&self, session_id: u32, file_id: u32, column: u32) {
+        if let Some(entry) = self.entries.get(&(session_id, file_id)) {
+            entry.max_column_seen.set(column);
+        }
     }
 }
 

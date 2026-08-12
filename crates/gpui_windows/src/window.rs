@@ -859,6 +859,10 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd == unsafe { GetActiveWindow() }
     }
 
+    fn is_foreground_window(&self) -> bool {
+        self.0.hwnd == unsafe { GetForegroundWindow() }
+    }
+
     fn is_hovered(&self) -> bool {
         self.state.hovered.get()
     }

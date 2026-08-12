@@ -5737,7 +5737,20 @@ impl Workspace {
         };
         let Some(target) = target else { return };
         self.set_active_pane(&target, window, cx);
-        target.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+        // `pane.focus_handle(cx)` (used here previously) is the `Pane`
+        // element's OWN focus handle — a plain click never actually
+        // focuses that; it focuses the active item's (e.g.
+        // `TerminalView`'s) SEPARATE handle instead, which is the one
+        // `TerminalElement`'s cursor-shape check (`focused` field) reads.
+        // Focusing the pane's own handle left `TerminalView::focus_handle.
+        // is_focused()` false, rendering a hollow cursor and dropping
+        // keystrokes despite the OS having real window focus — confirmed
+        // live ("Som window opens with a tab but no input focus,"
+        // resolved instantly by a single click). `focus_active_item`
+        // mirrors what every other focus-restoring path in this file
+        // (`activate_item`, `split`) already does: focus the ITEM, not the
+        // pane shell around it.
+        target.update(cx, |pane, cx| pane.focus_active_item(window, cx));
     }
 
     /// Resyncs `som_active_tab_index` to the main pane's actual

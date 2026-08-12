@@ -963,25 +963,33 @@ impl TerminalPanel {
             // window. That's a separate, independently-async path: real OS
             // activation (`PlatformWindow::activate`, see
             // `gpui_windows::window::WindowsWindow::activate`) spawns its own
-            // background task (`SetActiveWindow`/`SetFocus` plus a synthetic-
-            // keypress workaround for a real Windows quirk) that races
-            // against this restore task with no ordering guarantee between
-            // them. Calling `som_focus_pane_by_index` before the OS has
-            // actually activated the window is a real, intermittently-
-            // reproducing bug (confirmed live: "Som window opens with a tab
-            // but no input focus, not always") — GPUI ends up with the right
-            // element logically focused, but the OS never routed real
-            // keystrokes there because activation hadn't landed yet. Wait
-            // for `window.is_window_active()` first (same bounded-poll shape
-            // as the `ActivateItem` wait above) so the focus call happens
-            // only once the OS side has actually caught up; if activation
-            // never lands within the timeout (e.g. Som started minimized/in
-            // the background on purpose), fall through and focus anyway —
-            // better than never focusing at all.
+            // background task (`SetActiveWindow`/`SetFocus`, a synthetic-
+            // keypress workaround for a real Windows quirk, THEN
+            // `SetForegroundWindow` last) that races against this restore
+            // task with no ordering guarantee between them. Calling
+            // `som_focus_pane_by_index` before the OS has actually finished
+            // activating the window is a real, intermittently-reproducing
+            // bug (confirmed live multiple times: "Som window opens with a
+            // tab but no input focus, not always") — GPUI ends up with the
+            // right element logically focused, but the OS never routed real
+            // keystrokes there because activation hadn't landed yet.
+            //
+            // Poll `window.is_window_foreground()` (NOT `is_window_active()`)
+            // — `is_window_active` reflects `WM_ACTIVATE`, which Windows can
+            // deliver as soon as `SetActiveWindow` runs, well before the
+            // LATER `SetForegroundWindow` call in `activate()` actually wins
+            // the real foreground/input-focus race against other processes.
+            // A poll on `is_window_active` was confirmed live to still miss
+            // the bug (focus lost again after this fix first shipped) —
+            // `is_window_foreground` checks `GetForegroundWindow() == hwnd`
+            // directly, which is what `SetForegroundWindow` itself settles.
+            // If activation never lands within the timeout (e.g. Som started
+            // minimized/in the background on purpose), fall through and
+            // focus anyway — better than never focusing at all.
             for _ in 0..50 {
-                let active =
-                    window_handle.update(cx, |_, window, _cx| window.is_window_active()).unwrap_or(false);
-                if active {
+                let foreground =
+                    window_handle.update(cx, |_, window, _cx| window.is_window_foreground()).unwrap_or(false);
+                if foreground {
                     break;
                 }
                 cx.background_executor().timer(std::time::Duration::from_millis(5)).await;

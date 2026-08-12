@@ -1751,7 +1751,6 @@ fn paint_rich_content_placements(
     // in-image offset lets every visible cell agree on the same absolute
     // origin regardless of how much of the image is currently clipped.
     let mut origins: std::collections::HashMap<(u32, u32), (i32, i32)> = std::collections::HashMap::new();
-    let mut max_columns: std::collections::HashMap<(u32, u32), i32> = std::collections::HashMap::new();
 
     for indexed_cell in &terminal.last_content().cells {
         let fg_rgb = match indexed_cell.cell.fg {
@@ -1783,12 +1782,16 @@ fn paint_rich_content_placements(
         // Every visible cell of the same placement must derive the exact
         // same origin (they're all offsets from the same top-left corner)
         // — any one of them is equally authoritative, so the first cell
-        // seen for a given id wins; only the widest observed column extent
-        // needs accumulating (columns are always fully visible, so this
-        // recovers the true column count even before every column's cell
-        // has been scanned).
+        // seen for a given id wins.
         origins.entry(key).or_insert((origin_line, origin_column));
-        max_columns.entry(key).and_modify(|m| *m = (*m).max(cell_col_in_image as i32)).or_insert(cell_col_in_image as i32);
+        // The placement's real column count can't be recomputed from the
+        // image's own pixel size at paint time (see
+        // `Terminal::record_rich_content_max_column_seen`'s doc comment):
+        // remember the widest column any paint pass has actually decoded,
+        // persisted on the cache entry so a later paint where the image is
+        // only partially visible (scrolled, or a narrower split) doesn't
+        // shrink it back down.
+        terminal.record_rich_content_max_column_seen(session_id, file_id, cell_col_in_image);
     }
 
     if origins.is_empty() {
@@ -1810,15 +1813,28 @@ fn paint_rich_content_placements(
 
         let display_line = origin_line + layout.display_offset as i32;
         let num_lines = layout.dimensions.num_lines() as i32;
-        let columns = max_columns.get(&key).copied().unwrap_or(0) + 1;
 
-        let full_width = cell_width * columns as f32;
+        // The placement's on-screen width is however many columns the
+        // SENDING client's grid actually had (recorded via
+        // `record_rich_content_max_column_seen` as cells are scanned
+        // above), never recomputed from the image's raw pixel size divided
+        // by `cell_width` — those two are different units (the image's
+        // physical file pixels vs GPUI's logical/DIP pixels), and dividing
+        // one by the other silently produces the wrong column count
+        // whenever the display's DPI scale isn't 1.0. Falls back to the
+        // pixel-based estimate only on the very first paint, before any
+        // placeholder cell has been scanned yet.
         let image_size = render_image.size(0);
-        let full_height = if image_size.width.0 > 0 && image_size.height.0 > 0 {
-            let scale = f32::from(full_width) / image_size.width.0 as f32;
-            px(image_size.height.0 as f32 * scale)
+        let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
+            let columns = match terminal.rich_content_max_column_seen(session_id, file_id) {
+                Some(max_column) => (max_column + 1) as f32,
+                None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
+            };
+            let width = cell_width * columns;
+            let scale = f32::from(width) / image_size.width.0 as f32;
+            (width, px(image_size.height.0 as f32 * scale))
         } else {
-            line_height * columns as f32
+            (cell_width, line_height)
         };
         let size = gpui::size(full_width, full_height);
 

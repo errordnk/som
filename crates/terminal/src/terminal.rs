@@ -1359,7 +1359,26 @@ impl Terminal {
                     pty_tx.0.send(Msg::Resize(new_bounds.into())).ok();
                 }
 
-                term.resize(new_bounds);
+                // `reflow = false`: alacritty's built-in reflow (which
+                // `Term::resize`'s default enables) splits any grid row
+                // wider than the new column count into two rows BEFORE
+                // this function's own resync below ever runs — SRP's
+                // placeholder grids are exactly such wide, deliberately
+                // unwrapped rows (one per pixel-row of the image), so
+                // reflow silently grew the image's row count and
+                // `history_size` inside alacritty itself on every narrow
+                // resize, desyncing `resync_rich_content_placements`'s
+                // tracked origin from the actual grid — confirmed live as
+                // the image progressively sliding into scrollback
+                // (`origin_line` growing more negative every resize step)
+                // and, after enough steps, the cursor being walked to a
+                // negative `Line`, panicking on the NEXT resize inside
+                // alacritty's own `Grid::resize` (`self.lines -
+                // cursor.point.line.0 as usize` underflowing). See
+                // `Term::resize_with_reflow`'s doc comment (patched fork,
+                // `errordnk/alacritty`) for the full tradeoff.
+                term.resize_with_reflow(new_bounds, false);
+                self.resync_rich_content_placements(term, new_bounds.cell_width, new_bounds.line_height);
                 // If there are matches we need to emit a wake up event to
                 // invalidate the matches and recalculate their locations
                 // in the new terminal layout
@@ -1750,6 +1769,490 @@ impl Terminal {
             out.push((session_id, file_id, render_image, current_frame, is_animating));
         }
         out
+    }
+
+    /// See [`crate::rich_content_cache::RichContentCache::record_max_column_seen`].
+    pub fn record_rich_content_max_column_seen(&self, session_id: u32, file_id: u32, column: u32) {
+        self.rich_content_cache.record_max_column_seen(session_id, file_id, column);
+    }
+
+    /// Re-derives and rewrites, IN PLACE, every rich-content placeholder
+    /// grid currently on screen so it matches the new cell pixel size
+    /// (window resize, font size change, or a `lineHeight`/`padding`
+    /// settings change — anything that changes `cell_width`/`line_height`
+    /// takes this same `InternalEvent::Resize` path). Only rewrites the
+    /// diacritics that encode each cell's (row, column) plus whatever
+    /// plain grid CONTENT needs to move to make/close room (via
+    /// `Grid::scroll_up`, the exact same mechanism ordinary scrolled text
+    /// output already relies on) — never the placeholder character
+    /// itself, never `term.grid_mut().cursor` directly, never any escape
+    /// sequence sent anywhere.
+    ///
+    /// The cursor restriction is load-bearing, not just tidiness: the real
+    /// child process behind the PTY (the shell) keeps its own, entirely
+    /// separate model of where its cursor is, and is NEVER informed when
+    /// this function edits the grid directly — ConPTY's API has no
+    /// "shift my internal buffer's cursor row" operation, only resize
+    /// (columns/rows). An earlier version of this function DID patch
+    /// `cursor.point.line` directly to visually pin the prompt right after
+    /// a resized image — this made the on-screen cursor glyph land in the
+    /// correct spot immediately after a resize, but desynced Som's local
+    /// idea of the cursor from the shell's own the moment the shell itself
+    /// printed anything (e.g. echoing a keystroke): the shell wrote
+    /// relative to ITS row, not Som's patched one, so typed characters
+    /// visibly appeared on a different row than the cursor glyph —
+    /// confirmed live, with the error compounding across repeated
+    /// resizes as the two models drifted further apart on every growth/
+    /// shrink cycle. This is deliberately NOT done by re-sending text
+    /// through `write_output`/the PTY either: that path has the identical
+    /// problem (see SRP_PROTOCOL.md's "Печать грида переехала из Som в
+    /// somcat" section for the exact symptom that caused). Leaving the
+    /// cursor wherever the real shell already believes it is means the
+    /// prompt won't always visually snap to sit exactly below a freshly
+    /// resized image — but it will never desync from what the shell
+    /// itself is about to print next.
+    ///
+    /// Scope, deliberately limited (see SRP_PROTOCOL.md's "Пересчёт
+    /// placement'ов при ресайзе окна/шрифта" section for the full
+    /// reasoning):
+    /// - Column count can shrink OR grow. Growth writes into whatever
+    ///   cells are to the right of the old bounding box — this CAN
+    ///   overwrite unrelated content that happened to share those rows (no
+    ///   equivalent of "insert columns" exists for the horizontal
+    ///   direction, unlike rows below).
+    /// - Row count can also shrink OR grow — shrinking removes the extra
+    ///   rows and pulls everything below the image up to close the gap;
+    ///   growing inserts new rows and pushes everything below the image
+    ///   down, via a manual row-by-row copy (see the inline comments
+    ///   further down this function for why neither `Grid::scroll_up` nor
+    ///   `scroll_down` alone can do this without moving the image itself
+    ///   or losing content). Row growth is only attempted when the
+    ///   placement starts on the currently visible screen
+    ///   (`origin_line >= 0`) — a placement already partway into
+    ///   scrollback is left at its old row count instead, since safely
+    ///   inserting rows at an arbitrary point inside scrollback would need
+    ///   much more involved buffer surgery than this function does.
+    ///
+    /// The scan itself covers the WHOLE buffer (scrollback included, not
+    /// just the currently visible screen) — confirmed live that scanning
+    /// only the viewport left cells still in scrollback with their OLD
+    /// (pre-resize) diacritics, so scrolling to reveal them fed the paint
+    /// path's `record_rich_content_max_column_seen` (monotonic, never
+    /// shrinks) a stale, wider column count than this function had just
+    /// narrowed things to — the on-screen image visibly jumped in size on
+    /// every scroll after a resize until this was widened.
+    fn resync_rich_content_placements(
+        &self,
+        term: &mut Term<ZedListener>,
+        cell_width: gpui::Pixels,
+        line_height: gpui::Pixels,
+    ) {
+        use kitty_graphics_placeholder::{PLACEHOLDER_CHAR, PlaceholderCell, decode_placeholder_cell, encode_cell};
+
+        let terminal_columns = term.columns() as u32;
+        let terminal_lines = term.screen_lines() as u32;
+        if terminal_columns == 0 || terminal_lines == 0 {
+            return;
+        }
+
+        // Scan the ENTIRE buffer (scrollback included), not just the
+        // currently visible screen. A placement can straddle the
+        // scrollback/viewport boundary (e.g. the window was scrolled up
+        // when the resize happened), and every cell of the same group
+        // MUST end up carrying consistent diacritics — rewriting only
+        // whatever was on screen at the moment of resize left cells still
+        // in scrollback with their OLD (pre-resize) row/column encoding,
+        // so scrolling to reveal them fed the paint path's
+        // `record_rich_content_max_column_seen` (monotonic, never
+        // shrinks) a stale, wider column count than what this function
+        // just narrowed things to — confirmed live as the image's on-
+        // screen size visibly jumping every time the user scrolled after
+        // a resize.
+        let top = term.topmost_line().0;
+        let bottom = term.bottommost_line().0;
+        let columns = term.columns();
+
+        // Keyed by (session_id, file_id, origin_line, origin_column) — NOT
+        // just (session_id, file_id). The same image printed twice (e.g.
+        // once, then again after the terminal was resized in between)
+        // produces two physically separate blocks of placeholder cells
+        // that happen to share the same id; every cell decodes its own
+        // (row, column) OFFSET within its block, so two cells from
+        // DIFFERENT blocks can easily decode to the same (row, column)
+        // (both blocks' top-left corners decode as (0, 0)). Keying only
+        // on id merged both blocks' cells into one incoherent group whose
+        // `cells` mixed points from two unrelated screen locations —
+        // confirmed live as a crash when resizing after printing the same
+        // image twice, and reproduced in
+        // `test_resize_growth_with_two_placement_groups_of_same_image_does_not_panic`.
+        // Each cell's own (line - row, column - column) is exact and
+        // cheap to compute up front, unlike a flood-fill over grid
+        // adjacency, and correctly separates two blocks even if they sit
+        // right next to each other with no gap.
+        let mut groups: std::collections::HashMap<(u32, u32, i32, i32), (u32, u32, Vec<(AlacPoint, u32, u32)>)> =
+            std::collections::HashMap::new();
+
+        for line_idx in top..=bottom {
+            let line = Line(line_idx);
+            for col_idx in 0..columns {
+                let point = AlacPoint::new(line, Column(col_idx));
+                let cell = &term.grid()[point];
+                if cell.c != PLACEHOLDER_CHAR {
+                    continue;
+                }
+                let fg_rgb = match cell.fg {
+                    alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                    _ => continue,
+                };
+                let underline_rgb = match cell.underline_color() {
+                    Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                    Some(_) => continue,
+                    None => None,
+                };
+                let diacritics = cell.zerowidth().unwrap_or(&[]);
+                let Some(PlaceholderCell { image_id: session_id, placement_id: file_id, row, column }) =
+                    decode_placeholder_cell(cell.c, fg_rgb, underline_rgb, diacritics)
+                else {
+                    continue;
+                };
+
+                let origin_line = line_idx - row as i32;
+                let origin_column = col_idx as i32 - column as i32;
+                let entry = groups
+                    .entry((session_id, file_id, origin_line, origin_column))
+                    .or_insert((0, 0, Vec::new()));
+                entry.0 = entry.0.max(row);
+                entry.1 = entry.1.max(column);
+                entry.2.push((point, row, column));
+            }
+        }
+
+        // Groups shrinking vertically are handled top-to-bottom, and each
+        // one's row-deletion shifts every line below it up — later
+        // groups' `origin_line` (computed fresh from THIS pass's own
+        // scan, before any shifting) would go stale after an earlier
+        // group's shift, so placements are sorted here to process from
+        // the top of the buffer down, matching the order shifts actually
+        // happen in.
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by_key(|(_, (_, _, cells))| cells.iter().map(|(p, r, _)| p.line.0 - *r as i32).min());
+
+        // Accumulates every `shift` applied by an EARLIER (higher on
+        // screen, processed first per the sort above) group's row-growth
+        // `scroll_up` of the whole screen. All of `groups`' cell
+        // coordinates were captured in ONE scan before this loop started —
+        // an earlier group's `scroll_up` physically moves every row on
+        // screen, including a later, not-yet-processed group's cells, so
+        // without correcting for it here, a later group's `origin_line`
+        // would be computed from stale (pre-shift) coordinates. Confirmed
+        // live as a crash (`Grid::compute_index`'s `requested.0 <
+        // visible_lines` assertion) in
+        // `test_resize_growth_with_two_placement_groups_of_same_image_does_not_panic`
+        // once two same-id groups both needed row growth in the same
+        // resize pass.
+        let mut accumulated_shift = 0i32;
+
+        for ((session_id, file_id, _, _), (old_max_row, old_max_column, cells)) in groups {
+            let Some((width_px, height_px)) = self.rich_content_cache.image_size_px(session_id, file_id) else {
+                continue;
+            };
+            if f32::from(cell_width) <= 0.0 || f32::from(line_height) <= 0.0 {
+                continue;
+            }
+
+            let old_columns = old_max_column + 1;
+            let old_rows = old_max_row + 1;
+            let cells: Vec<_> = cells
+                .into_iter()
+                .map(|(point, row, column)| {
+                    (AlacPoint::new(Line(point.line.0 - accumulated_shift), point.column), row, column)
+                })
+                .collect();
+            // The placement's absolute top line — every cell's grid line
+            // minus its own decoded row must agree (same reasoning as the
+            // paint path's origin math), so the first cell is equally
+            // authoritative.
+            let Some(&(first_point, first_row, _)) = cells.first() else { continue };
+            let origin_line = first_point.line.0 - first_row as i32;
+
+            let mut new_columns = (width_px as f32 / f32::from(cell_width)).ceil().max(1.0) as u32;
+            let mut new_rows = (height_px as f32 / f32::from(line_height)).ceil().max(1.0) as u32;
+
+            // Never wider than the terminal itself (same reasoning as
+            // `somcat::print_placeholder_grid`'s clamp — a grid wider than
+            // the terminal gets silently wrapped mid-row by the terminal,
+            // scrambling every cell's decoded position), scaling height
+            // down to preserve aspect ratio if clamped.
+            if new_columns > terminal_columns {
+                let scale = terminal_columns as f32 / new_columns as f32;
+                new_columns = terminal_columns.max(1);
+                new_rows = ((new_rows as f32 * scale).floor() as u32).max(1);
+            }
+
+            // Also never taller than the SCREEN, counting from wherever
+            // this placement actually starts — a placement must always
+            // leave at least one real row free for whatever comes after
+            // it (the shell's next prompt), never fill all the way to
+            // `bottommost_line()`. Using a flat `terminal_lines - 1` here
+            // (as if every placement started at `Line(0)`) undercounted
+            // how tall a placement starting further down the screen
+            // (`origin_line > 0`, the common case — e.g. the shell's own
+            // banner/output printed before the image) is actually allowed
+            // to grow: `origin_line + new_rows` could still land exactly
+            // on `bottommost_line()`, leaving the "room for a prompt"
+            // guarantee only true for placements starting at the very top
+            // — confirmed live as the prompt ending up hidden BEHIND the
+            // image (cursor stuck inside the placement's own row range)
+            // once the image grew enough to reach the screen edge from a
+            // nonzero starting row. A placement already in scrollback
+            // (`origin_line < 0`) is left using the flat bound, since row
+            // growth isn't attempted there anyway (see the `origin_line >=
+            // 0` guard further down).
+            let max_rows = if origin_line >= 0 {
+                (terminal_lines as i32 - origin_line - 1).max(1) as u32
+            } else {
+                terminal_lines.saturating_sub(1).max(1)
+            };
+            if new_rows > max_rows {
+                let scale = max_rows as f32 / new_rows as f32;
+                new_rows = max_rows;
+                new_columns = ((new_columns as f32 * scale).floor() as u32).max(1);
+            }
+            // Column growth writes into whatever cells are to the right of
+            // the old bounding box — accepted risk of overwriting unrelated
+            // content that happened to share those rows (no equivalent of
+            // "insert columns" exists the way row insertion below works
+            // for the vertical direction).
+            let _ = old_columns;
+
+            // Row growth needs actual new lines inserted into the grid —
+            // `new_rows` cells beyond `old_rows` didn't exist in `cells`
+            // at all (they were never part of the placement before this
+            // resize). Neither `Grid::scroll_up` nor `scroll_down` alone
+            // can do this without ALSO moving the image itself or losing
+            // whatever's below it (every region-based rotation touches
+            // its whole region, not just content below one specific
+            // point) — done here as a manual, row-by-row copy instead:
+            // read every row from the old bottom edge down to the
+            // buffer's end, write it back `inserted_rows` further down
+            // (iterating from the BOTTOM up so a row is never overwritten
+            // before it's been read), leaving the freed rows blank for
+            // the placement's new cells to fill in below. Only attempted
+            // when the placement starts on the visible screen
+            // (`origin_line >= 0`) — a placement already partway into
+            // scrollback would need the same treatment applied there too,
+            // which this doesn't handle (see SRP_PROTOCOL.md).
+            let inserted_rows = new_rows.saturating_sub(old_rows);
+            // Every remaining use of `origin_line`/`cells` below this point
+            // must agree with whatever the grid ACTUALLY looks like right
+            // now — `scroll_up` (used to make room for growth) shifts
+            // EVERY row on screen, including the image's own, so both are
+            // corrected here once, up front, rather than threading a
+            // "did we already shift" flag through the rest of this
+            // function.
+            let mut origin_line = origin_line;
+            let mut cells = cells;
+            if inserted_rows > 0 && origin_line >= 0 {
+                let bottom = term.bottommost_line().0;
+                let old_bottom = origin_line + old_rows as i32;
+                // Only shift the screen up by however many rows are
+                // ACTUALLY missing below the image's old bottom edge — not
+                // unconditionally by `inserted_rows`. A tall, mostly-empty
+                // screen already has spare rows below the image; shifting
+                // the whole screen up into scrollback in that case is
+                // needless churn that also pushed the image further into
+                // scrollback than necessary. Only the shortfall — whatever
+                // doesn't fit in the existing spare rows — needs to make
+                // room via `Grid::scroll_up` with `region.start == 0`
+                // (which grows `history_size`, bounded by
+                // `MAX_SCROLL_HISTORY_LINES`, the same mechanism ordinary
+                // text printing already relies on — nothing is lost, it
+                // safely becomes scrollback).
+                let spare_rows_below = (bottom - old_bottom + 1).max(0);
+                let shift = inserted_rows.saturating_sub(spare_rows_below as u32);
+                if shift > 0 {
+                    term.grid_mut().scroll_up(&(Line(0)..Line(bottom + 1)), shift as usize);
+                    origin_line -= shift as i32;
+                    cells = cells
+                        .into_iter()
+                        .map(|(point, row, column)| {
+                            (AlacPoint::new(Line(point.line.0 - shift as i32), point.column), row, column)
+                        })
+                        .collect();
+                    accumulated_shift += shift as i32;
+                    // Deliberately NOT touching `term.grid_mut().cursor`
+                    // anywhere in this function — see the doc comment
+                    // above `resync_rich_content_placements` for why. This
+                    // `scroll_up` call is safe regardless: it moves grid
+                    // CONTENT the same way a normal full screen of output
+                    // scrolling would, which the real shell already
+                    // expects and handles on its own (it's watching the
+                    // PTY's SIGWINCH-driven column/row count, not
+                    // Som-internal placement bookkeeping).
+                }
+                let old_bottom = old_bottom - shift as i32;
+                let new_bottom = origin_line + new_rows as i32;
+                // How far the row-by-row copy below actually needs to move
+                // content: the distance from the image's (already
+                // screen-shift-corrected) old bottom edge to its new one —
+                // NOT `inserted_rows` directly. Those two coincide only
+                // when `shift == inserted_rows` (screen had no spare rows
+                // at all); whenever the screen had SOME spare room below
+                // the image, `shift < inserted_rows`, and copying by the
+                // full `inserted_rows` would push content past
+                // `bottommost_line()` needlessly — confirmed live as a
+                // panic inside alacritty's own `Grid`
+                // (`compute_index`'s `requested.0 < visible_lines`
+                // assertion) once `shift` stopped always equaling
+                // `inserted_rows`.
+                let copy_distance = new_bottom - old_bottom;
+                let mut line = bottom;
+                while line >= old_bottom {
+                    let target = line + copy_distance;
+                    // Content at a `target` beyond `bottom` was already
+                    // pushed into scrollback by the `scroll_up` above (if
+                    // any) — nothing left on screen at `line` worth
+                    // copying to a `target` that doesn't exist. Without
+                    // this guard, `target` can exceed `bottom`, and
+                    // indexing the grid at a nonexistent line panics —
+                    // confirmed live as a real crash on a large resize.
+                    if target <= bottom {
+                        let row = term.grid()[Line(line)].clone();
+                        term.grid_mut()[Line(target)] = row;
+                    }
+                    line -= 1;
+                }
+                // The freed rows (immediately below the image's OLD
+                // bottom edge) must be blanked — otherwise they'd still
+                // hold whatever content used to be there before being
+                // copied further down above.
+                let template = term.grid().cursor.template.clone();
+                for line in old_bottom..(old_bottom + copy_distance) {
+                    term.grid_mut()[Line(line)].reset(&template);
+                }
+            } else if inserted_rows > 0 {
+                // Placement starts in scrollback — row growth not
+                // attempted here (see doc comment above), clamp back down
+                // to what already existed.
+                new_rows = old_rows;
+            }
+
+            // A cell's own color (fg for session_id, underline for
+            // file_id) is what identifies the placement's id — reused
+            // below when synthesizing brand-new cells for grown rows/
+            // columns that didn't exist in `cells` at all (nothing to
+            // read an old cell's color back from for those).
+            let Some((sample_point, ..)) = cells.first().copied() else { continue };
+            let sample_cell = term.grid()[sample_point].clone();
+
+            for (point, row, column) in &cells {
+                let (point, row, column) = (*point, *row, *column);
+                // `point` is still valid here even after the row-insertion
+                // pass above: that pass only ever shifted rows AT OR BELOW
+                // the image's OLD bottom edge (`old_bottom`) — cells
+                // belonging to the image itself (`row < old_rows`) sit
+                // strictly above that line and were never touched by it.
+                if row >= new_rows || column >= new_columns {
+                    // Outside the new, shrunk bounding box — blank it so no
+                    // stale placeholder cell lingers past the image's new
+                    // extent.
+                    term.grid_mut()[point] = Cell::default();
+                    continue;
+                }
+                let Some([_, row_diacritic, col_diacritic]) = encode_cell(row, column) else { continue };
+                // `Cell` has no "clear just the zerowidth diacritics"
+                // method (`CellExtra`'s fields are private, and
+                // `clear_wide` also resets `c`/flags, which must stay
+                // untouched here) — rebuild a fresh `Cell` carrying over
+                // `c`/`fg`/`bg`/`flags`/underline color from the existing
+                // one, with only the two diacritics freshly pushed.
+                let old_cell = term.grid()[point].clone();
+                let mut cell = Cell { c: old_cell.c, fg: old_cell.fg, bg: old_cell.bg, flags: old_cell.flags, extra: None };
+                cell.set_underline_color(old_cell.underline_color());
+                cell.push_zerowidth(row_diacritic);
+                cell.push_zerowidth(col_diacritic);
+                term.grid_mut()[point] = cell;
+            }
+
+            // New rows/columns beyond the OLD bounding box weren't in
+            // `cells` at all — write brand-new placeholder cells for
+            // them, reusing `sample_cell`'s color (the placement's id)
+            // and character attributes.
+            for row in 0..new_rows {
+                for column in 0..new_columns {
+                    if row < old_rows && column < old_columns {
+                        continue; // Already handled above.
+                    }
+                    let Some([placeholder_char, row_diacritic, col_diacritic]) = encode_cell(row, column) else {
+                        continue;
+                    };
+                    let point = AlacPoint::new(Line(origin_line + row as i32), Column(column as usize));
+                    let mut cell = Cell {
+                        c: placeholder_char,
+                        fg: sample_cell.fg,
+                        bg: sample_cell.bg,
+                        flags: sample_cell.flags,
+                        extra: None,
+                    };
+                    cell.set_underline_color(sample_cell.underline_color());
+                    cell.push_zerowidth(row_diacritic);
+                    cell.push_zerowidth(col_diacritic);
+                    term.grid_mut()[point] = cell;
+                }
+            }
+
+            self.rich_content_cache.reset_max_column_seen(session_id, file_id, new_columns.saturating_sub(1));
+
+            // Height shrank — close the gap the removed rows would
+            // otherwise leave behind (blank space between the image and
+            // whatever was printed after it, e.g. the next prompt),
+            // exactly like a real terminal's own `DL` (delete lines)
+            // control function: shift everything below the image's new,
+            // shorter extent up by the number of rows removed. Uses
+            // `Grid::scroll_up` directly (not the `Handler::delete_lines`
+            // trait method, which anchors its region to the CURSOR's
+            // current line — wrong here, since resize can run with the
+            // cursor anywhere, e.g. still sitting at the shell's prompt
+            // well below the image) — the region is anchored to the
+            // image's own new bottom edge instead. `saturating_sub`
+            // because `new_rows` can now be LARGER than `old_rows` (row
+            // growth, handled separately below) — this branch is simply a
+            // no-op in that case.
+            let removed_rows = old_rows.saturating_sub(new_rows);
+            if removed_rows > 0 {
+                let region_start = Line(origin_line + new_rows as i32);
+                let region_end = Line(term.bottommost_line().0 + 1);
+                if region_start < region_end {
+                    term.grid_mut().scroll_up(&(region_start..region_end), removed_rows as usize);
+                    // Deliberately NOT touching `term.grid_mut().cursor`
+                    // here — see the doc comment above
+                    // `resync_rich_content_placements` for why: the real
+                    // child process behind the PTY keeps its own,
+                    // completely separate idea of where the cursor is,
+                    // and never learns about this direct grid edit.
+                    // Patching Som's local `cursor.point` to "compensate"
+                    // made the VISIBLE cursor land in the right spot right
+                    // after a resize, but the moment the shell itself
+                    // printed anything (e.g. echoing a keystroke), it did
+                    // so relative to ITS OWN cursor row — which this
+                    // function had silently moved out from under it —
+                    // confirmed live as typed characters appearing on a
+                    // different row than the visible cursor, with the
+                    // error compounding across repeated resizes as the
+                    // two models drifted further apart. Only touching the
+                    // GRID CONTENT here (the same `scroll_up` a normal
+                    // full screen of scrolled text output already relies
+                    // on) keeps the picture-is-just-text invariant
+                    // intact; the cursor now stays wherever the real
+                    // shell already believes it is.
+                }
+            }
+        }
+    }
+
+    /// See [`crate::rich_content_cache::RichContentCache::max_column_seen`].
+    pub fn rich_content_max_column_seen(&self, session_id: u32, file_id: u32) -> Option<u32> {
+        self.rich_content_cache.max_column_seen(session_id, file_id)
     }
 
     pub fn total_lines(&self) -> usize {
@@ -3159,7 +3662,7 @@ mod tests {
     use collections::HashMap;
     use gpui::{
         Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-        Point, TestAppContext, bounds, point, size,
+        Point, TestAppContext, VisualContext, bounds, point, size,
     };
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
@@ -3968,6 +4471,1350 @@ mod tests {
                 .display_iter
                 .any(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR);
             assert!(!has_placeholder, "clear must erase placeholder cells exactly like any other text");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_shrinks_placeholder_grid_to_match_new_cell_size(cx: &mut TestAppContext) {
+        // Reproduces the resize/font-size-change scenario from
+        // SRP_PROTOCOL.md's "Незавершённое: пересчёт placement'ов при
+        // ресайзе окна/шрифта" section: a placeholder grid printed for one
+        // `cell_width`/`line_height` must be re-derived (diacritics
+        // rewritten in place, never the placeholder character or cursor
+        // moved) when the terminal's cell pixel size changes, so the
+        // on-screen image keeps its real aspect ratio instead of staying
+        // frozen at whatever column/row count the original print happened
+        // to use. `set_size` only QUEUES an `InternalEvent::Resize` — the
+        // resync this test exercises only actually runs inside `sync()`
+        // (called every real paint), which needs a real `Window`, hence
+        // `cx.add_empty_window()` instead of the display-only builder
+        // most other tests in this file use.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A 90x30px image at a 9x10px cell size occupies exactly 10
+        // columns x 3 rows. Ids kept within 24 bits — the placeholder
+        // grid encodes (session_id, file_id) in a cell's fg/underline
+        // 24-bit RGB color (see `kitty_graphics_placeholder`'s module doc
+        // comment), so a wider id would silently lose its top byte on
+        // decode, same as the real bug this exact shape caught in
+        // `somcat` earlier in this session.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Png,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 90,
+                height_px: 30,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(9.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        // Print the same placeholder grid `somcat` would for a 90x30px
+        // image at a 9x10px cell (10 columns x 3 rows), with nothing
+        // printed after it — the scope this function documents.
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        for row in 0..3u32 {
+            for column in 0..10u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            if row < 2 {
+                placeholder_text.push_str("\r\n");
+            }
+        }
+        placeholder_text.push_str("\x1b[0m\r\n");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            let placeholder_count = term
+                .renderable_content()
+                .display_iter
+                .filter(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR)
+                .count();
+            assert_eq!(placeholder_count, 30, "10x3 grid must have printed all 30 cells before resize");
+        });
+
+        // Double the cell width (9px -> 18px), leaving line_height
+        // unchanged: the SAME 90px-wide image now needs only 5 columns
+        // instead of 10, but still 3 rows (30px tall / unchanged 10px
+        // line_height) — `set_size` + `sync` with a coarser grid triggers
+        // the resync.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(18.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+
+            let mut decoded_row_columns: Vec<(u32, u32)> = Vec::new();
+            for indexed in term.renderable_content().display_iter {
+                if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                    continue;
+                }
+                let fg_rgb = match indexed.cell.fg {
+                    alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                    _ => continue,
+                };
+                let underline_rgb = match indexed.cell.underline_color() {
+                    Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                    _ => None,
+                };
+                let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                if let Some(kitty_graphics_placeholder::PlaceholderCell { row, column, .. }) =
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                {
+                    decoded_row_columns.push((row, column));
+                }
+            }
+
+            let max_row = decoded_row_columns.iter().map(|(r, _)| *r).max().unwrap_or(0);
+            let max_column = decoded_row_columns.iter().map(|(_, c)| *c).max().unwrap_or(0);
+            assert_eq!(max_column, 4, "5 columns (0..=4) expected after doubling cell width for a 90px-wide image");
+            assert_eq!(max_row, 2, "still 3 rows (0..=2) — line_height didn't change, so row count shouldn't either");
+
+            // Cells beyond the new, shrunk bounding box must be blanked,
+            // not left with stale placeholder characters from the old
+            // (wider) grid.
+            let leftover_placeholder_count = term
+                .renderable_content()
+                .display_iter
+                .filter(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR)
+                .count();
+            assert_eq!(leftover_placeholder_count, 15, "5 columns x 3 rows = 15 cells, no stale cells beyond that");
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let new_max = terminal.rich_content_max_column_seen(session_id, file_id);
+            assert_eq!(new_max, Some(4), "max_column_seen must be reset to the new, smaller column count, not left stale");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_shrinking_placeholder_grid_height_pulls_up_content_printed_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real bug reported live after the width-only resize
+        // fix above: shrinking a placement's ROW count left the removed
+        // rows as dead blank space between the image and whatever was
+        // printed after it (the shell's next prompt), because the old
+        // fix only blanked the leftover cells in place instead of
+        // actually closing the gap. `resync_rich_content_placements`
+        // must additionally shift everything printed after the image up
+        // by however many rows were removed — exactly like a real
+        // terminal's own delete-lines (`DL`) escape sequence would.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A 90x60px image at a 9x10px cell occupies 10 columns x 6 rows.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Png,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 90,
+                height_px: 60,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(9.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        // Print the 10x6 placeholder grid, then a real prompt line right
+        // after it — the exact shape of the live bug report ("между
+        // картинкой и приглашением получается большое свободное место").
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        for row in 0..6u32 {
+            for column in 0..10u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            placeholder_text.push_str("\r\n");
+        }
+        placeholder_text.push_str("\x1b[0m~ >> ");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            term.grid().cursor.point.line.0
+        });
+        assert_eq!(prompt_line_before_resize, 6, "prompt must land immediately after the 6-row image, before resize");
+
+        // Triple line_height (10px -> 30px), leaving cell_width unchanged:
+        // the SAME 60px-tall image now needs only 2 rows instead of 6 —
+        // the 4 removed rows' worth of blank space must NOT appear
+        // between the image and the prompt.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(30.),
+                px(9.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+
+            let max_row = term
+                .renderable_content()
+                .display_iter
+                .filter_map(|indexed| {
+                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                        return None;
+                    }
+                    let fg_rgb = match indexed.cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => return None,
+                    };
+                    let underline_rgb = match indexed.cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        _ => None,
+                    };
+                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                    .map(|d| d.row)
+                })
+                .max();
+            assert_eq!(max_row, Some(1), "2 rows (0..=1) expected — 60px tall / 30px line_height");
+
+            // The real, live-reported symptom: the prompt's own printed
+            // text must be pulled up to sit immediately after the SHRUNK
+            // image, not left where it was printed (which would leave a
+            // gap of blank rows where the removed image rows used to be).
+            // Checking the actual grid content here, not
+            // `term.grid().cursor.point` — `resync_rich_content_
+            // placements` deliberately never touches the cursor directly
+            // (see that function's doc comment: the real shell behind the
+            // PTY has its own separate cursor model a direct grid edit
+            // can't inform, so patching it just desyncs the two the
+            // moment the shell itself prints anything).
+            let prompt_line = (term.topmost_line().0..=term.bottommost_line().0)
+                .find(|&line_idx| term.grid()[Line(line_idx)][Column(0)].c == '~');
+            assert_eq!(
+                prompt_line,
+                Some(2),
+                "the prompt's own printed text must be pulled up to immediately follow the now-2-row image, no gap left behind"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_growing_placeholder_grid_height_pushes_down_content_printed_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        // The inverse of the shrink test above — growing a placement's row
+        // count (window/font made LARGER, not smaller) must INSERT new
+        // rows and push whatever was printed after the image (the prompt)
+        // further down, without losing or overwriting it. Uses
+        // `Grid`'s row-by-row copy path in `resync_rich_content_placements`
+        // (there's no ready-made `Grid::scroll_up`/`scroll_down` call that
+        // does this alone — see that function's inline comment for why).
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A 90x60px image at an 18x30px cell occupies 5 columns x 2 rows.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Png,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 90,
+                height_px: 60,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(30.),
+                px(18.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        // Print the 5x2 placeholder grid, then a real prompt line right
+        // after it.
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        for row in 0..2u32 {
+            for column in 0..5u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            placeholder_text.push_str("\r\n");
+        }
+        placeholder_text.push_str("\x1b[0m~ >> ");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            term.grid().cursor.point.line.0
+        });
+        assert_eq!(prompt_line_before_resize, 2, "prompt must land immediately after the 2-row image, before resize");
+
+        // Shrink line_height by a third (30px -> 10px), leaving cell_width
+        // unchanged: the SAME 60px-tall image now needs 6 rows instead of
+        // 2 — the 4 new rows must push the prompt down, not overwrite it
+        // or leave it in the middle of the image.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(18.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+
+            let max_row = term
+                .renderable_content()
+                .display_iter
+                .filter_map(|indexed| {
+                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                        return None;
+                    }
+                    let fg_rgb = match indexed.cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => return None,
+                    };
+                    let underline_rgb = match indexed.cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        _ => None,
+                    };
+                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                    .map(|d| d.row)
+                })
+                .max();
+            assert_eq!(max_row, Some(5), "6 rows (0..=5) expected — 60px tall / 10px line_height");
+
+            // `resync_rich_content_placements` deliberately never touches
+            // `term.grid_mut().cursor` (see that function's doc comment —
+            // the real shell behind the PTY has its own, separate cursor
+            // model that direct grid edits can't inform, so patching
+            // Som's local cursor to "compensate" only desyncs the two the
+            // moment the shell itself prints anything). What DOES need to
+            // hold: the row-by-row copy must have physically carried the
+            // prompt's own printed characters down along with everything
+            // else below the image's old bottom edge, landing them
+            // immediately after the image's new (taller) extent — not
+            // left in the middle of the grown image, not lost, not
+            // stuck at their old row leaving a gap.
+            let term_locked = term;
+            let prompt_line = (term_locked.topmost_line().0..=term_locked.bottommost_line().0)
+                .find(|&line_idx| term_locked.grid()[Line(line_idx)][Column(0)].c == '~');
+            assert_eq!(
+                prompt_line,
+                Some(6),
+                "the prompt's own printed text must have been carried down to immediately follow the now-6-row image"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_growing_placeholder_grid_height_past_screen_bottom_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real crash reported live: growing a placement's row
+        // count on a SMALL screen, where the growth pushes rows past the
+        // bottom of the visible screen, panicked (`Grid` indexed at a
+        // nonexistent line) instead of safely scrolling the overflow into
+        // history — confirmed via the log ending abruptly right after the
+        // `Resizing:`/`New num_cols...` trace lines, with no further
+        // output, on a real resize-to-maximized-window action after
+        // showing an image. This test deliberately uses a screen just
+        // tall enough for the image's OLD size but not its NEW (grown)
+        // size, so the insertion path's row-by-row copy must push
+        // overflowing rows into scrollback rather than write past
+        // `bottommost_line()`.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A 90x60px image at an 18x30px cell occupies 5 columns x 2 rows —
+        // a 5-line-tall screen (3 rows spare below the image) is enough
+        // for the OLD size but not the NEW one below.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Png,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 90,
+                height_px: 60,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(30.),
+                px(18.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(150.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        for row in 0..2u32 {
+            for column in 0..5u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            placeholder_text.push_str("\r\n");
+        }
+        placeholder_text.push_str("\x1b[0m~ >> ");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        // Shrink line_height a lot (30px -> 5px): the SAME 60px-tall image
+        // now needs 12 rows instead of 2 — 10 new rows on a screen that's
+        // only 5 lines tall, which used to overflow the row-by-row copy's
+        // write target past `bottommost_line()` and panic. Success here is
+        // simply that this call returns without crashing.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(5.),
+                px(18.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(150.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_growth_with_two_placement_groups_of_same_image_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real crash reported live: the SAME image printed
+        // twice at two different terminal widths (once while the window
+        // was wide, then again after the user manually shrank it) leaves
+        // TWO placeholder-cell groups on screen simultaneously sharing the
+        // same (session_id, file_id) — decoded as two separate entries in
+        // `resync_rich_content_placements`'s `groups` map purely because
+        // their grid positions/decoded (row, column) differ, not because
+        // decoding is wrong. Growing the terminal again afterward crashed:
+        // the first group processed (topmost by `origin_line`) can insert
+        // rows via `Grid::scroll_up`, which shifts the WHOLE visible
+        // screen — including any later, not-yet-processed group's cells,
+        // whose coordinates were captured once in the initial scan and
+        // never refreshed. Success here is simply that resizing after
+        // both prints completes without panicking.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Png,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 90,
+                height_px: 60,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        let placeholder_text = |rows: u32, columns: u32| {
+            let mut text = String::new();
+            let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+            let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+            text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+            for row in 0..rows {
+                for column in 0..columns {
+                    if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                        text.extend(cell);
+                    }
+                }
+                text.push_str("\r\n");
+            }
+            text.push_str("\x1b[0m");
+            text
+        };
+
+        // First print: 8px-wide cells, ~888px wide terminal (matches the
+        // real crash's cell_width=8/first Resizing bounds), image fits at
+        // its natural 5x2 grid.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(15.6),
+                px(8.),
+                Bounds { origin: Point::default(), size: Size { width: px(888.), height: px(624.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text(2, 5).as_bytes(), cx);
+            terminal.write_output(b"~ >> first\r\n", cx);
+        });
+        window.run_until_parked();
+
+        // Print the SAME image again — creates a brand-new group on
+        // screen (below the prompt) sharing the same session_id/file_id
+        // as the first, already-printed one now sitting higher up.
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text(2, 5).as_bytes(), cx);
+            terminal.write_output(b"~ >> second\r\n", cx);
+        });
+        window.run_until_parked();
+
+        // Grow the terminal back in several small, single-column steps,
+        // mirroring a real mouse-drag resize (which fires one resize
+        // event per pixel of movement, not one event for the whole
+        // gesture) — must not panic at any step, regardless of which of
+        // the two same-id groups gets processed first.
+        for width_px in [888, 897, 905, 912, 921, 928, 936] {
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(TerminalBounds::new(
+                    px(15.6),
+                    px(8.),
+                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(624.) } },
+                ));
+                terminal.sync(window, cx);
+            });
+            window.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn test_resize_shrinking_terminal_width_in_many_small_steps_keeps_prompt_immediately_after_image(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real bug reported live: a wide image shown on a
+        // large window, then the window narrowed by DRAGGING (which fires
+        // one resize event per pixel of movement, not one for the whole
+        // gesture — same as the growth-side regression test above) opened
+        // up a large, growing gap between the image's new (shorter, since
+        // narrowing a wide image scales its row count down via the
+        // aspect-ratio-preserving clamp) bottom edge and the prompt
+        // printed after it, instead of the prompt following it up.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A wide 1920x1080px image (same aspect ratio as the real
+        // giphy.gif frame that triggered the live report) at an 8x15.6px
+        // cell — matches the real crash log's numbers from earlier in
+        // this session.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Jpeg,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 1920,
+                height_px: 1080,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(15.6),
+                px(8.),
+                Bounds { origin: Point::default(), size: Size { width: px(1800.), height: px(1200.) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        // Print the placeholder grid at the terminal's initial, wide
+        // column count (clamped, same math `somcat` uses), then a prompt
+        // right after it.
+        let initial_columns = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            terminal.term.lock().columns() as u32
+        });
+        let natural_columns = (1920f32 / 8.0).ceil() as u32;
+        let natural_rows = (1080f32 / 15.6).ceil() as u32;
+        let (columns, rows) = if natural_columns > initial_columns {
+            let scale = initial_columns as f32 / natural_columns as f32;
+            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
+        } else {
+            (natural_columns, natural_rows)
+        };
+
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        for row in 0..rows {
+            for column in 0..columns {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            placeholder_text.push_str("\r\n");
+        }
+        placeholder_text.push_str("\x1b[0m~ >> ");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            terminal.term.lock().grid().cursor.point.line.0
+        });
+        assert_eq!(
+            prompt_line_before_resize, rows as i32,
+            "prompt must land immediately after the {rows}-row image, before any resize"
+        );
+
+        // Narrow the window in several small, single-column steps,
+        // mirroring a real mouse-drag resize — after EVERY step, the
+        // prompt (cursor) must remain immediately after the image's
+        // current row count, never leaving a gap.
+        let mut width_px = 1800;
+        while width_px > 900 {
+            width_px -= 8;
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(TerminalBounds::new(
+                    px(15.6),
+                    px(8.),
+                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(1200.) } },
+                ));
+                terminal.sync(window, cx);
+            });
+            window.run_until_parked();
+        }
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            let max_row = term
+                .renderable_content()
+                .display_iter
+                .filter_map(|indexed| {
+                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                        return None;
+                    }
+                    let fg_rgb = match indexed.cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => return None,
+                    };
+                    let underline_rgb = match indexed.cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        _ => None,
+                    };
+                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                    .map(|d| d.row)
+                })
+                .max();
+            let final_rows = max_row.map(|r| r + 1).unwrap_or(0);
+            // Checking the prompt's own printed text, not
+            // `term.grid().cursor.point` — `resync_rich_content_
+            // placements` deliberately never touches the cursor directly
+            // (see that function's doc comment).
+            let prompt_line = (term.topmost_line().0..=term.bottommost_line().0)
+                .find(|&line_idx| term.grid()[Line(line_idx)][Column(0)].c == '~');
+            assert_eq!(
+                prompt_line,
+                Some(final_rows as i32),
+                "the prompt's own printed text must sit immediately after the image's final row count ({final_rows}) — no gap left behind by the many small resize steps"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_growing_terminal_width_after_image_printed_in_a_small_window_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real crash reported live, with the EXACT order of
+        // events the user described: shrink the window FIRST, THEN show
+        // the image (so it's printed directly into the already-small
+        // window, never having existed at a larger size), THEN grow the
+        // window's width back out by dragging the right edge — panicked
+        // inside alacritty's own `RenderableCursor::new`
+        // (`grid/storage.rs:221`, `requested.0 < visible_lines`) during
+        // the very next `Terminal::sync()`. Root cause: as the terminal's
+        // column count grows, the image's clamped row count scales up
+        // with it (preserving aspect ratio) — on a short-enough screen,
+        // that row count can reach the screen's FULL height, leaving zero
+        // rows free for a prompt below the image. This function's cursor-
+        // pinning logic (`if cursor_at_old_bottom { cursor.line =
+        // new_bottom }`) didn't clamp `new_bottom` to the screen's last
+        // real line, so it happily pointed the cursor at a `Line` one
+        // past the end of the grid. The exact live-reported image
+        // dimensions weren't known precisely (the log only captured cell
+        // counts, not source pixel size), so this sweeps two real
+        // scenarios reported live rather than guessing one combination.
+        for (image_width_px, image_height_px, start_width_px, end_width_px, screen_height_px) in [
+            // Matches an earlier crash log's exact numbers: cell_width=8,
+            // line_height=15.6, 43 visible lines (670.8px tall), starting
+            // at 126 columns (1008px) and growing past 141 (1128px).
+            (1920, 1080, 1008, 1200, 670.8),
+            // Matches the LATEST live crash report exactly: real
+            // 1920x1080 JPEG, Som snapped to the left/right HALF of a
+            // 1536x864 (logical, 200% DPI scale) primary display via
+            // Win+Left/Right, then dragged wider from there.
+            (1920, 1080, 768, 1536, 864.),
+        ] {
+            let window = cx.add_empty_window();
+            let terminal = window.new(|cx| {
+                TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    PathStyle::local(),
+                )
+                .unwrap()
+                .subscribe(cx)
+            });
+
+            let session_id = 0x0203_04;
+            let file_id = 0x0607_08;
+            let chunk = rich_content_transport::Chunk {
+                content_type: rich_content_transport::ContentType::Jpeg,
+                session_id,
+                file_id,
+                chunk_offset: 0,
+                total_size: 1,
+                metadata: rich_content_transport::ContentMetadata::Image {
+                    width_px: image_width_px,
+                    height_px: image_height_px,
+                    color_bits: 32,
+                    is_animated: false,
+                },
+                payload: vec![0u8],
+            };
+            let mut apc = Vec::new();
+            apc.extend_from_slice(&[0x1B, b'_']);
+            apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+            apc.extend_from_slice(&[0x1B, b'\\']);
+
+            // Start ALREADY small (the window was shrunk before the image
+            // was ever shown).
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(TerminalBounds::new(
+                    px(15.6),
+                    px(8.),
+                    Bounds {
+                        origin: Point::default(),
+                        size: Size { width: px(start_width_px as f32), height: px(screen_height_px) },
+                    },
+                ));
+                terminal.sync(window, cx);
+                terminal.write_output(&apc, cx);
+            });
+            window.run_until_parked();
+
+            let initial_columns = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+                terminal.term.lock().columns() as u32
+            });
+            let natural_columns = (image_width_px as f32 / 8.0).ceil() as u32;
+            let natural_rows = (image_height_px as f32 / 15.6).ceil() as u32;
+            let (columns, rows) = if natural_columns > initial_columns {
+                let scale = initial_columns as f32 / natural_columns as f32;
+                (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
+            } else {
+                (natural_columns, natural_rows)
+            };
+
+            let mut placeholder_text = String::new();
+            let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+            let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+            placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+            for row in 0..rows {
+                for column in 0..columns {
+                    if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                        placeholder_text.extend(cell);
+                    }
+                }
+                placeholder_text.push_str("\r\n");
+            }
+            placeholder_text.push_str("\x1b[0m~ >> ");
+
+            window.update_window_entity(&terminal, |terminal, _window, cx| {
+                terminal.write_output(placeholder_text.as_bytes(), cx);
+            });
+            window.run_until_parked();
+
+            // Grow the width back out in many small (single-pixel) steps,
+            // mirroring a real drag-the-right-edge-wider gesture — this is
+            // the exact sequence that crashed live. Success is simply
+            // that every `sync()` call here completes without panicking,
+            // even through the step(s) where the image's scaled-up row
+            // count reaches (or exceeds) the screen's full height.
+            let mut width_px = start_width_px;
+            while width_px < end_width_px {
+                width_px += 1;
+                window.update_window_entity(&terminal, |terminal, window, cx| {
+                    terminal.set_size(TerminalBounds::new(
+                        px(15.6),
+                        px(8.),
+                        Bounds {
+                            origin: Point::default(),
+                            size: Size { width: px(width_px as f32), height: px(screen_height_px) },
+                        },
+                    ));
+                    terminal.sync(window, cx);
+                });
+                window.run_until_parked();
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_resize_placement_never_grows_taller_than_screen_minus_one_row(cx: &mut TestAppContext) {
+        // Direct assertion of the requirement behind the fix in
+        // `test_resize_growing_terminal_width_after_image_printed_in_a_
+        // small_window_does_not_panic`: a placement must ALWAYS leave at
+        // least one real row free below it for the prompt, on both axes —
+        // never grow to fill the screen edge-to-edge, even when its
+        // width-clamped natural row count (scaled to preserve aspect
+        // ratio) would otherwise reach exactly `screen_lines()`. A short,
+        // wide-aspect-ratio image on a short screen is the case most
+        // likely to hit this: clamping only by column count still lets
+        // the row count reach the full screen height.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        // A 1920x1080px image at an 8x15.6px cell, on a screen only 43
+        // lines tall (670.8px) — matches the real crash numbers. Natural
+        // row count (1080/15.6 ≈ 70) clamped by width alone would still
+        // land at 43 rows (the screen's full height) once the terminal is
+        // wide enough, per the earlier live crash.
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Jpeg,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 1920,
+                height_px: 1080,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(15.6),
+                px(8.),
+                Bounds { origin: Point::default(), size: Size { width: px(1184.), height: px(670.8) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        let (initial_columns, screen_lines) = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            (term.columns() as u32, term.screen_lines() as u32)
+        });
+
+        let mut placeholder_text = String::new();
+        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+        // Print at the terminal's OLD natural clamp — same two-axis clamp
+        // `somcat::print_placeholder_grid` now applies (width first, then
+        // height capped to `screen_lines - 1` so a row is always left for
+        // the prompt) — so `resync_rich_content_placements` has a
+        // `cells`-derived origin/bounding box matching what a real client
+        // would actually send.
+        let natural_columns = (1920f32 / 8.0).ceil() as u32;
+        let natural_rows = (1080f32 / 15.6).ceil() as u32;
+        let (mut columns, mut rows) = if natural_columns > initial_columns {
+            let scale = initial_columns as f32 / natural_columns as f32;
+            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
+        } else {
+            (natural_columns, natural_rows)
+        };
+        let max_rows = screen_lines.saturating_sub(1).max(1);
+        if rows > max_rows {
+            let scale = max_rows as f32 / rows as f32;
+            rows = max_rows;
+            columns = ((columns as f32 * scale).floor() as u32).max(1);
+        }
+        for row in 0..rows {
+            for column in 0..columns {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            placeholder_text.push_str("\r\n");
+        }
+        placeholder_text.push_str("\x1b[0m~ >> ");
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text.as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        // Widen by one more pixel — the exact step that, before this
+        // fix's height clamp, grew the image's row count to precisely
+        // `screen_lines()`.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(15.6),
+                px(8.),
+                Bounds { origin: Point::default(), size: Size { width: px(1185.), height: px(670.8) } },
+            ));
+            terminal.sync(window, cx);
+        });
+        window.run_until_parked();
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            let max_row = term
+                .renderable_content()
+                .display_iter
+                .filter_map(|indexed| {
+                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                        return None;
+                    }
+                    let fg_rgb = match indexed.cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => return None,
+                    };
+                    let underline_rgb = match indexed.cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        _ => None,
+                    };
+                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                    .map(|d| d.row)
+                })
+                .max();
+            let placement_rows = max_row.map(|r| r + 1).unwrap_or(0);
+            assert!(
+                placement_rows < screen_lines,
+                "placement must leave at least one row free for the prompt: placement_rows={placement_rows} screen_lines={screen_lines}"
+            );
+            let cursor_line = term.grid().cursor.point.line.0;
+            assert!(
+                cursor_line < screen_lines as i32,
+                "cursor must stay within the real screen: cursor_line={cursor_line} screen_lines={screen_lines}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resize_prompt_text_follows_image_after_growing_to_fill_screen_then_shrinking(
+        cx: &mut TestAppContext,
+    ) {
+        // Reproduces a real bug shown on video: a small image printed in a
+        // small window, the window WIDENED until the image's (aspect-
+        // ratio-preserving) row count reached the screen's full height,
+        // then narrowed back down over many small steps — the PROMPT TEXT
+        // itself (the literal `~ >>` characters already printed into the
+        // grid, not just the cursor) stayed frozen at its old row while a
+        // separate blinking cursor glyph appeared several rows below it.
+        // Neither `test_resize_shrinking_terminal_width_in_many_small_
+        // steps_keeps_prompt_immediately_after_image` (grows only within
+        // the height clamp, never fills the screen) nor `test_resize_
+        // growing_terminal_width_after_image_printed_in_a_small_window_
+        // does_not_panic` (grows then never shrinks back) cover this
+        // specific grow-to-max-then-shrink sequence.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let session_id = 0x0203_04;
+        let file_id = 0x0607_08;
+        let chunk = rich_content_transport::Chunk {
+            content_type: rich_content_transport::ContentType::Jpeg,
+            session_id,
+            file_id,
+            chunk_offset: 0,
+            total_size: 1,
+            metadata: rich_content_transport::ContentMetadata::Image {
+                width_px: 1920,
+                height_px: 1080,
+                color_bits: 32,
+                is_animated: false,
+            },
+            payload: vec![0u8],
+        };
+        let mut apc = Vec::new();
+        apc.extend_from_slice(&[0x1B, b'_']);
+        apc.extend_from_slice(&rich_content_transport::build_envelope(&chunk));
+        apc.extend_from_slice(&[0x1B, b'\\']);
+
+        // Start small, on a tall-enough screen that the image never has to
+        // clamp by height at its initial (narrow) width.
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(15.6),
+                px(8.),
+                Bounds { origin: Point::default(), size: Size { width: px(400.), height: px(733.2) } },
+            ));
+            terminal.sync(window, cx);
+            terminal.write_output(&apc, cx);
+        });
+        window.run_until_parked();
+
+        let (initial_columns, screen_lines) = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            (term.columns() as u32, term.screen_lines() as u32)
+        });
+
+        let placeholder_text = |columns: u32, rows: u32| {
+            let mut text = String::new();
+            let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
+            let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
+            text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
+            for row in 0..rows {
+                for column in 0..columns {
+                    if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                        text.extend(cell);
+                    }
+                }
+                text.push_str("\r\n");
+            }
+            text.push_str("\x1b[0m~ >> ");
+            text
+        };
+
+        let natural_columns = (1920f32 / 8.0).ceil() as u32;
+        let natural_rows = (1080f32 / 15.6).ceil() as u32;
+        let (mut columns, mut rows) = if natural_columns > initial_columns {
+            let scale = initial_columns as f32 / natural_columns as f32;
+            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
+        } else {
+            (natural_columns, natural_rows)
+        };
+        let max_rows = screen_lines.saturating_sub(1).max(1);
+        if rows > max_rows {
+            let scale = max_rows as f32 / rows as f32;
+            rows = max_rows;
+            columns = ((columns as f32 * scale).floor() as u32).max(1);
+        }
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.write_output(placeholder_text(columns, rows).as_bytes(), cx);
+        });
+        window.run_until_parked();
+
+        // Grow the width in many small (single-pixel) steps until the
+        // image's row count reaches the screen's full height (clamped),
+        // then shrink back down over just as many steps — the exact
+        // sequence shown on video.
+        let mut width_px = 400;
+        while width_px < 2400 {
+            width_px += 4;
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(TerminalBounds::new(
+                    px(15.6),
+                    px(8.),
+                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(733.2) } },
+                ));
+                terminal.sync(window, cx);
+            });
+            window.run_until_parked();
+        }
+        while width_px > 400 {
+            width_px -= 4;
+            window.update_window_entity(&terminal, |terminal, window, cx| {
+                terminal.set_size(TerminalBounds::new(
+                    px(15.6),
+                    px(8.),
+                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(733.2) } },
+                ));
+                terminal.sync(window, cx);
+            });
+            window.run_until_parked();
+        }
+
+        // After all that, the cursor AND the actual printed prompt text
+        // (`~ >> `) must be on the SAME row, immediately after the
+        // image's final (shrunk-back) row count — not desynced, with the
+        // literal characters frozen on some earlier row.
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            let max_row = term
+                .renderable_content()
+                .display_iter
+                .filter_map(|indexed| {
+                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
+                        return None;
+                    }
+                    let fg_rgb = match indexed.cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => return None,
+                    };
+                    let underline_rgb = match indexed.cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        _ => None,
+                    };
+                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
+                    kitty_graphics_placeholder::decode_placeholder_cell(
+                        indexed.cell.c,
+                        fg_rgb,
+                        underline_rgb,
+                        diacritics,
+                    )
+                    .map(|d| d.row)
+                })
+                .max();
+            let final_placement_rows = max_row.map(|r| r + 1).unwrap_or(0);
+            let cursor_line = term.grid().cursor.point.line.0;
+
+            // Find the row the literal `~` prompt character actually sits
+            // on, by scanning the grid directly (not `renderable_content`,
+            // which would just report the cursor's own line back to us).
+            let tilde_line = (term.topmost_line().0..=term.bottommost_line().0).find(|&line_idx| {
+                term.grid()[Line(line_idx)][Column(0)].c == '~'
+            });
+
+            assert_eq!(
+                cursor_line, final_placement_rows as i32,
+                "cursor must sit immediately after the image's final row count ({final_placement_rows})"
+            );
+            assert_eq!(
+                tilde_line,
+                Some(cursor_line),
+                "the actual printed prompt text ('~') must be on the SAME row as the cursor, not frozen on an earlier row from before the resize sequence"
+            );
         });
     }
 

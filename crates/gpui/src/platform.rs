@@ -647,6 +647,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
     fn is_active(&self) -> bool;
+    /// Whether this window currently owns the OS's real keyboard-input
+    /// focus (`GetForegroundWindow() == hwnd` on Windows) — distinct from
+    /// [`Self::is_active`], which on Windows checks `GetActiveWindow()`
+    /// (active within the CALLING thread's context, which can go true
+    /// before the system has actually routed keystrokes here). `activate`
+    /// ends with `SetForegroundWindow`, which is what actually settles
+    /// this; a caller that needs to know "has activation truly landed"
+    /// (see `terminal_view::terminal_panel::restore_som_tabs`'s startup
+    /// focus race) should poll this, not `is_active`. Default mirrors
+    /// `is_active` for platforms where the two concepts coincide.
+    fn is_foreground_window(&self) -> bool {
+        self.is_active()
+    }
     fn is_hovered(&self) -> bool;
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);

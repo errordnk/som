@@ -2289,6 +2289,16 @@ impl Window {
         self.active.get()
     }
 
+    /// Queries the platform layer directly for whether this window currently
+    /// owns real OS keyboard-input focus — see
+    /// [`crate::PlatformWindow::is_foreground_window`]'s doc comment for how
+    /// this differs from [`Self::is_window_active`] (which reflects the last
+    /// `WM_ACTIVATE`-driven callback on Windows, a state that can go true
+    /// before activation has actually finished landing).
+    pub fn is_window_foreground(&self) -> bool {
+        self.platform_window.is_foreground_window()
+    }
+
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
     /// On mac, this is equivalent to `is_window_active`.

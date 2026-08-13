@@ -212,6 +212,7 @@ impl Session {
         // `strip_cr_induced_lf` for the actual fix. Kept anyway: it's a
         // real correctness gap on its own (matches what Som's own regular
         // terminal already does for every shell it spawns).
+        #[cfg(windows)]
         let escape_args = !program.eq_ignore_ascii_case("cmd.exe")
             && !std::path::Path::new(&program)
                 .file_name()

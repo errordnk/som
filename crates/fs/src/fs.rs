@@ -15,6 +15,7 @@ use gpui::Global;
 use gpui::ReadGlobal as _;
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(windows)]
 use util::command::new_command;
 
 #[cfg(unix)]

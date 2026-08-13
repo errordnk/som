@@ -253,6 +253,7 @@ pub struct TitleBar {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     application_menu: Option<Entity<ApplicationMenu>>,
     profiles_menu_handle: PopoverMenuHandle<ui::ContextMenu>,
     tab_strip: Option<Entity<TitlebarTabStrip>>,

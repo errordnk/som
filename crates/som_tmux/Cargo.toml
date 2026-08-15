@@ -7,7 +7,7 @@
 # build X" rather than "som_tmux crate revision Y".
 [package]
 name = "som_tmux"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"

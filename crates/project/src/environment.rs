@@ -125,6 +125,31 @@ impl ProjectEnvironment {
         self.local_directory_environment(&Shell::System, abs_path, cx)
     }
 
+    /// Like [`Self::local_directory_environment`], but drops any cached
+    /// snapshot for `(shell, abs_path)` first, forcing a fresh shell spawn.
+    ///
+    /// `local_directory_environment`'s cache has no TTL or invalidation, so
+    /// once a directory's environment has been captured it is reused for the
+    /// rest of the session — a new terminal tab opened hours later would
+    /// otherwise still see whatever OS env vars were current at the FIRST
+    /// tab's capture, even though a real new `cmd.exe`/PowerShell window
+    /// would pick up changes made via System Properties/`setx` immediately.
+    /// Callers that represent "the user is deliberately starting a new
+    /// shell" (i.e. opening a new terminal tab) should call this instead of
+    /// `local_directory_environment` so each new tab reflects the current
+    /// environment, while unrelated concurrent lookups for the same
+    /// directory (e.g. multiple things resolving the same worktree's env at
+    /// startup) still share a single in-flight capture via the cache.
+    pub fn refresh_directory_environment(
+        &mut self,
+        shell: &Shell,
+        abs_path: Arc<Path>,
+        cx: &mut App,
+    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+        self.local_environments.remove(&(shell.clone(), abs_path.clone()));
+        self.local_directory_environment(shell, abs_path, cx)
+    }
+
     /// Returns the project environment, if possible.
     /// If the project was opened from the CLI, then the inherited CLI environment is returned.
     /// If it wasn't opened from the CLI, and an absolute path is given, then a shell is spawned in

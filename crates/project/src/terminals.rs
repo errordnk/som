@@ -348,6 +348,12 @@ impl Project {
         &self.terminals.local_handles
     }
 
+    /// Resolves the environment for a brand-new terminal tab. Uses
+    /// `refresh_directory_environment` (not `local_directory_environment`)
+    /// so each new tab reflects the OS environment as of *now*, rather than
+    /// silently reusing a snapshot cached from whenever the first terminal
+    /// for this directory happened to be opened — see that method's doc
+    /// comment for why the plain cached lookup is wrong here.
     fn resolve_directory_environment(
         &self,
         shell: &str,
@@ -358,7 +364,7 @@ impl Project {
             let shell = Shell::Program(shell.to_string());
             self.environment
                 .update(cx, |project_env, cx| {
-                    project_env.local_directory_environment(&shell, path.clone(), cx)
+                    project_env.refresh_directory_environment(&shell, path.clone(), cx)
                 })
         } else {
             Task::ready(None).shared()

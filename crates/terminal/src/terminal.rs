@@ -162,6 +162,15 @@ pub enum Event {
     SelectionsChanged,
     NewNavigationTarget(Option<MaybeNavigationTarget>),
     Open(MaybeNavigationTarget),
+    /// An interactive shell (no `task`) exited with a non-zero code before
+    /// the user ever typed anything — almost always a spawn failure (bad
+    /// `$SHELL`, an `ssh`/tmux wrapper binary that couldn't run, a
+    /// connection refused, ...) rather than something the user did. The
+    /// error text is already visible as terminal output (see
+    /// `register_task_finished`'s doc comment for why the tab stays open),
+    /// but nothing else calls it out — this drives a notification so it
+    /// isn't silently missed in a background tab.
+    SpawnFailed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3260,6 +3269,11 @@ impl Terminal {
                 };
                 if should_close {
                     cx.emit(Event::CloseTerminal);
+                } else if let Some(code) = exit_status.and_then(|e| e.code()) {
+                    let title = self.title(false);
+                    cx.emit(Event::SpawnFailed(format!(
+                        "Som: terminal tab \"{title}\" exited immediately (code {code}) — the tab's own output has the full error text"
+                    )));
                 }
                 return;
             }
@@ -4099,12 +4113,14 @@ mod tests {
         completion_check_task.await;
         cx.executor().timer(Duration::from_millis(500)).await;
 
+        let events = all_events.lock();
         assert!(
-            !all_events
-                .lock()
-                .iter()
-                .any(|event| event == &Event::CloseTerminal),
-            "Wrong shell command should update the title but not should not close the terminal to show the error message, but got events: {all_events:?}",
+            !events.iter().any(|event| event == &Event::CloseTerminal),
+            "Wrong shell command should update the title but not should not close the terminal to show the error message, but got events: {events:?}",
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, Event::SpawnFailed(_))),
+            "A spawn failure should emit Event::SpawnFailed so the UI can surface a notification, but got events: {events:?}",
         );
     }
 

@@ -933,6 +933,32 @@ fn subscribe_for_terminal_events(
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
+                Event::SpawnFailed(message) => {
+                    use workspace::notifications::{
+                        NotificationId, simple_message_notification::MessageNotification,
+                    };
+                    let message = message.clone();
+                    terminal_view
+                        .workspace
+                        .update(cx, |workspace, cx| {
+                            let id = NotificationId::Named("som-terminal-spawn-failed".into());
+                            workspace.show_notification(id, cx, move |cx| {
+                                let message2 = message.clone();
+                                let message3 = message.clone();
+                                cx.new(|cx| {
+                                    MessageNotification::new(message2, cx)
+                                        .primary_message("Copy")
+                                        .primary_on_click(move |_window, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                message3.clone(),
+                                            ));
+                                        })
+                                        .show_suppress_button(false)
+                                })
+                            });
+                        })
+                        .ok();
+                }
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
                     cx.emit(SearchEvent::ActiveMatchChanged)

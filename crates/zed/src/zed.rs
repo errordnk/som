@@ -11,7 +11,7 @@ pub use open_listener::{
 pub use open_listener::listen_for_cli_connections;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use gpui::{
-    Action, App, Context, DismissEvent, Focusable, KeyBinding,
+    App, Context, Focusable, KeyBinding,
     PathPromptOptions, PromptLevel, ReadGlobal as _, SharedString,
     Window, WindowHandle, WindowKind, WindowOptions,
     actions, point, px,
@@ -736,15 +736,15 @@ fn show_keymap_file_json_error(
     cx: &mut App,
 ) {
     let message: SharedString =
-        format!("JSON parse error in keymap file. Bindings not reloaded.\n\n{error}").into();
+        format!("Som: JSON parse error in keymap file. Bindings not reloaded.\n\n{error}").into();
     show_app_notification(notification_id, cx, move |cx| {
+        let message2 = message.clone();
+        let message3 = message.clone();
         cx.new(|cx| {
-            MessageNotification::new(message.clone(), cx)
-                .primary_message("Open Keymap File")
-                .primary_icon(IconName::Settings)
-                .primary_on_click(|window, cx| {
-                    window.dispatch_action(zed_actions::OpenKeymapFile.boxed_clone(), cx);
-                    cx.emit(DismissEvent);
+            MessageNotification::new(message2, cx)
+                .primary_message("Copy")
+                .primary_on_click(move |_window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(message3.to_string()));
                 })
         })
     });
@@ -757,13 +757,13 @@ fn show_keymap_file_load_error(
 ) {
     show_app_notification(notification_id, cx, move |cx| {
         let msg = error_message.0.clone();
+        let full_message = format!("Som: invalid keymap file\n{msg}");
+        let full_message2 = full_message.clone();
         cx.new(|cx| {
-            MessageNotification::new(format!("Invalid keymap file\n{msg}"), cx)
-                .primary_message("Open Keymap File")
-                .primary_icon(IconName::Settings)
-                .primary_on_click(|window, cx| {
-                    window.dispatch_action(zed_actions::OpenKeymapFile.boxed_clone(), cx);
-                    cx.emit(DismissEvent);
+            MessageNotification::new(full_message, cx)
+                .primary_message("Copy")
+                .primary_on_click(move |_window, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_message2.clone()));
                 })
         })
     });

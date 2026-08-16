@@ -235,11 +235,20 @@ impl TerminalPanel {
         use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
         let tab_count = cx.try_global::<TabProfiles>().map(|p| p.0.len()).unwrap_or(0);
         let msg = format!(
-            "No profile #{idx} in settings.json's \"tabs\" — only {tab_count} profile(s) configured."
+            "Som: no profile #{idx} in settings.json's \"tabs\" — only {tab_count} profile(s) configured."
         );
         let id = NotificationId::Named(format!("som-missing-profile-{idx}").into());
         workspace.show_notification(id, cx, move |cx| {
-            cx.new(|cx| MessageNotification::new(msg.clone(), cx).show_suppress_button(false))
+            let msg2 = msg.clone();
+            let msg3 = msg.clone();
+            cx.new(|cx| {
+                MessageNotification::new(msg2, cx)
+                    .primary_message("Copy")
+                    .primary_on_click(move |_window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg3.clone()));
+                    })
+                    .show_suppress_button(false)
+            })
         });
     }
 
@@ -1553,6 +1562,7 @@ fn parse_orphaned_holder_pids(ps_output: &str, this_client_id: &str, live_pane_i
 fn show_som_tmux_error(workspace: &mut Workspace, message: String, cx: &mut Context<Workspace>) {
     use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
 
+    let message = format!("Som: {message}");
     let id = NotificationId::Named("som-tmux-deploy-error".into());
     workspace.show_notification(id, cx, move |cx| {
         let message2 = message.clone();

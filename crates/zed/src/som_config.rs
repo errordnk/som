@@ -578,7 +578,7 @@ impl SomConfig {
 
         let show = move |ws: &mut workspace::Workspace, cx: &mut gpui::Context<workspace::Workspace>| {
             let err2 = err.clone();
-            let msg = format!("Invalid settings.json\n{err2}");
+            let msg = format!("Som: invalid settings.json\n{err2}");
             ws.show_notification(id.clone(), cx, move |cx| {
                 let msg2 = msg.clone();
                 let msg3 = msg.clone();

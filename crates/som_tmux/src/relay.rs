@@ -354,6 +354,7 @@ pub fn run(
     // prompt — PSReadLine treats that leftover `\n` as its own "insert
     // newline" keystroke, not as part of the same Enter.
     let mut buf = [0u8; 4096];
+    #[cfg(windows)]
     let mut last_byte_was_cr = false;
     loop {
         let read = match std::io::stdin().read(&mut buf) {
@@ -374,7 +375,18 @@ pub fn run(
             send(&connection, &writer, &RelayInput::Close).ok();
             break;
         }
+        // The CR-induced-LF filter below exists solely for Windows' double
+        // ConPTY normalization (see this loop's doc comment above) — macOS
+        // and Linux PTYs never insert a synthetic `\n` after `\r` on their
+        // input side, so filtering here would just as happily eat a real,
+        // legitimate `\n` a shell/readline genuinely sent right after a
+        // `\r` (observed: swallows Enter, gluing the next line's output
+        // onto the command that was just typed). Only apply it on the one
+        // platform it's actually needed for.
+        #[cfg(windows)]
         let filtered = strip_cr_induced_lf(&buf[..read], &mut last_byte_was_cr);
+        #[cfg(not(windows))]
+        let filtered = buf[..read].to_vec();
         if filtered.is_empty() {
             continue;
         }
@@ -589,7 +601,10 @@ fn spawn_detached_holder(
 /// TWICE across this architecture's two ConPTY layers). `last_byte_was_cr`
 /// is carried across calls (not reset per-chunk) so a `\r`/`\n` split
 /// across two separate `read()` calls — entirely possible depending on how
-/// Som's PTY buffers keystrokes — is still caught.
+/// Som's PTY buffers keystrokes — is still caught. Windows-only at the call
+/// site (see `run()`'s doc comment); kept unconditionally compiled so its
+/// unit tests still build on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn strip_cr_induced_lf(chunk: &[u8], last_byte_was_cr: &mut bool) -> Vec<u8> {
     let mut filtered = Vec::with_capacity(chunk.len());
     for &byte in chunk {
@@ -721,5 +736,59 @@ mod tests {
         let mut last_byte_was_cr = false;
         let out = strip_cr_induced_lf(b"echo write-after-idle-marker\r\n", &mut last_byte_was_cr);
         assert_eq!(out, b"echo write-after-idle-marker\r");
+    }
+
+    /// Reproduces the reported bug: on macOS, a bare Enter keystroke
+    /// arrives from GPUI as a single `\r` byte in ITS OWN `read()` call
+    /// (see `crates/terminal/src/mappings/keys.rs`'s `to_esc_str`, `("enter",
+    /// AlacModifiers::None) => Some("\x0d")` — no `\n` involved at all,
+    /// unlike Windows ConPTY's `\r\n`). Types `ls` one keystroke per
+    /// `read()` (matching how Som's PTY forwards input keystroke-by-
+    /// keystroke, not batched), presses Enter alone (its own `\r`-only
+    /// read), then immediately types more text — modeling the shell's own
+    /// output being read back is out of scope here (this only covers what
+    /// the RELAY forwards to the HOLDER as user input), but if
+    /// `last_byte_was_cr` leaked `true` across the Enter call, the very
+    /// next byte typed would be silently dropped if it happened to be
+    /// `\n` — and, more importantly for this bug, running the filter here
+    /// AT ALL on a platform whose PTY never synthesizes a `\r`-induced
+    /// `\n` on the input side (macOS/Linux) has no way to ever legitimately
+    /// fire; this test documents that a lone `\r` keystroke, repeated many
+    /// times in a row on an empty prompt (exactly what was observed: many
+    /// stray `%` prompts from repeated empty Enters), never gets any byte
+    /// dropped, and that subsequent real text typed right after is passed
+    /// through untouched.
+    #[test]
+    fn keystroke_by_keystroke_enter_never_drops_a_byte_even_when_pressed_many_times_in_a_row() {
+        let mut last_byte_was_cr = false;
+        let mut forwarded = Vec::new();
+
+        // Many bare Enters on an empty prompt, one `\r` per read — the
+        // exact input pattern that produced the repeated lone `%` prompts.
+        for _ in 0..12 {
+            let out = strip_cr_induced_lf(b"\r", &mut last_byte_was_cr);
+            forwarded.extend_from_slice(&out);
+        }
+        assert_eq!(
+            forwarded,
+            b"\r".repeat(12),
+            "every one of the 12 lone-CR Enter presses must be forwarded byte-for-byte, none silently dropped"
+        );
+
+        // Now type "ls" keystroke-by-keystroke, then press Enter — the
+        // command that appeared as "lsApplications Documents..." glued
+        // onto the shell's own output in the reported bug.
+        for &byte in b"ls" {
+            let out = strip_cr_induced_lf(&[byte], &mut last_byte_was_cr);
+            forwarded.extend_from_slice(&out);
+        }
+        let enter_out = strip_cr_induced_lf(b"\r", &mut last_byte_was_cr);
+        forwarded.extend_from_slice(&enter_out);
+
+        assert_eq!(
+            &forwarded[forwarded.len() - 3..],
+            b"ls\r",
+            "typing \"ls\" then Enter must forward exactly those 3 bytes, in order, nothing dropped"
+        );
     }
 }

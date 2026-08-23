@@ -148,6 +148,13 @@ pub fn insert_zed_terminal_env(
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());
+    // Capability signal for programs that want to detect SRP support
+    // specifically (see SRP_INTEGRATION_GUIDE.md), independent of
+    // TERM_PROGRAM (which stays "zed" for compatibility with tools that
+    // already special-case it). Mirrors KITTY_WINDOW_ID's role for Kitty's
+    // graphics protocol: presence alone means "SRP is available here",
+    // matching the pattern documented for third-party integrators.
+    env.insert("SOM_WINDOW_ID".to_string(), std::process::id().to_string());
 }
 
 ///Upward flowing events, for changing the title and such

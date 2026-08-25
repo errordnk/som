@@ -56,6 +56,16 @@ struct CacheEntry {
     /// the terminal's cell size changes (window resize, font size change)
     /// — see `Terminal::resync_rich_content_placements`.
     image_size_px: Option<(u32, u32)>,
+    /// `(sample_rate, channels, bits_per_sample, duration_ms)` from the
+    /// first chunk's `ContentMetadata::Audio` (`None` for non-audio
+    /// content types). `duration_ms` is what lets a paint pass know the
+    /// audio widget's real total length — and thus render an accurate
+    /// seek bar / compute a correct seek target frame — from the very
+    /// first chunk, well before the file (or even a decodable prefix of
+    /// it) has actually arrived. See `rich_content_transport::
+    /// ContentMetadata::Audio`'s own doc comment for where this number
+    /// comes from on the sending side.
+    audio_metadata: Option<(u32, u8, u8, u32)>,
 }
 
 /// Per-terminal-session store of in-progress and completed rich-content
@@ -125,6 +135,12 @@ impl RichContentCache {
                     image_size_px: match chunk.metadata {
                         ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
                             Some((width_px, height_px))
+                        },
+                        _ => None,
+                    },
+                    audio_metadata: match chunk.metadata {
+                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
+                            Some((sample_rate, channels, bits_per_sample, duration_ms))
                         },
                         _ => None,
                     },
@@ -233,6 +249,12 @@ impl RichContentCache {
     /// [`CacheEntry::image_size_px`]'s doc comment.
     pub fn image_size_px(&self, session_id: u32, file_id: u32) -> Option<(u32, u32)> {
         self.entries.get(&(session_id, file_id))?.image_size_px
+    }
+
+    /// `(sample_rate, channels, bits_per_sample, duration_ms)`, if known
+    /// — see [`CacheEntry::audio_metadata`]'s doc comment.
+    pub fn audio_metadata(&self, session_id: u32, file_id: u32) -> Option<(u32, u8, u8, u32)> {
+        self.entries.get(&(session_id, file_id))?.audio_metadata
     }
 
     /// Overwrites the remembered max-column-seen for a placement — used

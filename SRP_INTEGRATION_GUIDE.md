@@ -96,7 +96,7 @@ ESC _ S <header_b91> <SEPARATOR> <payload_b91> ESC \
 | Field | Size | Notes |
 |---|---|---|
 | `version` | 1 byte | Currently always `1`. A receiver seeing any other value should reject the envelope. |
-| `content_type` | 1 byte | `0`=Gif, `1`=Audio (reserved), `2`=Markdown (reserved), `3`=Video (reserved), `4`=Jpeg, `5`=Png |
+| `content_type` | 1 byte | `0`=Gif, `1`=Audio, `2`=Markdown (reserved), `3`=Video (reserved), `4`=Jpeg, `5`=Png |
 | `session_id` | 4 bytes, little-endian | See "Session and file ids" below |
 | `file_id` | 4 bytes, little-endian | See "Session and file ids" below |
 | `chunk_offset` | 8 bytes, little-endian | Byte offset of this chunk's payload within the full file |
@@ -118,14 +118,13 @@ bytes and has no reason to know a wire encoding exists at all.
 `ContentMetadata` is a tagged union: 1 discriminant byte, followed by 17
 bytes of fields, zero-padded to that fixed length for any variant that
 doesn't use all 17 (only the `Video` variant, reserved and not yet wired
-up on Som's receiving end, uses the full 17). If you're only sending
-still/animated images (the only content type any current client speaks),
-you only ever need the `Image` variant:
+up on Som's receiving end, uses the full 17). Images and audio are both
+fully implemented and use the `Image`/`Audio` variants respectively:
 
 | Discriminant | Variant | Fields (in order, all little-endian) |
 |---|---|---|
 | `0` | `Image` | `width_px: u32`, `height_px: u32`, `color_bits: u8`, `is_animated: u8` (0 or 1) — 10 bytes used, 7 bytes zero-padding |
-| `1` | `Audio` (reserved) | `sample_rate: u32`, `channels: u8`, `bits_per_sample: u8` |
+| `1` | `Audio` | `sample_rate: u32`, `channels: u8`, `bits_per_sample: u8` — probe these from the file's header (no full decode needed), Som does the actual decoding |
 | `2` | `Video` (reserved) | `width_px: u32`, `height_px: u32`, `fps_numerator: u32`, `fps_denominator: u32`, `codec: u8` |
 | `3` | `Markdown` (reserved) | no fields |
 
@@ -355,14 +354,32 @@ equivalent of a background worker is, and return control to your own
 caller immediately after the placeholder is on screen — not after the
 worker finishes.
 
-This same shape is what audio/video support will need once
-`ContentType::Audio`/`ContentType::Video` are wired up on Som's
-receiving end (see `SRP_PROTOCOL.md`'s "Следующие нереализованные
-этапы" section) — starting playback from the first buffered samples/
-frames rather than waiting for a whole audio/video file to finish
-transferring is the same "don't block on the full transfer" principle
-this section describes for images, just with a decoder that consumes
-the cache file continuously instead of one that decodes it once.
+This same "don't block your own process on the transfer" principle is
+still the right shape for your client's send loop even for audio, but
+audio's contract is otherwise different from images in one important
+way: **your client does not need to build any playback UI at all.**
+`ContentType::Audio` is fully implemented on Som's receiving end —
+decoding (`symphonia`) and playback (`cpal`) both happen inside Som
+itself, along with an inline play/pause/seek widget Som paints and
+handles clicks for directly. Your client's only job for an audio file is
+to probe its header for `sample_rate`/`channels`/`bits_per_sample` (a
+cheap format-reader probe, not a full decode — see `somcat`'s own
+`audio_metadata()` for a worked example) and stream the raw file bytes,
+exactly like it already does for an image, then exit. No placeholder-
+grid pixel-size math either: audio has no pixel dimensions, so Som's
+widget uses a fixed cell footprint instead — print whatever fixed-size
+Unicode-placeholder grid your client wants to reserve for the widget
+(`somcat` uses 40 columns x 1 row) using the exact same
+`print_placeholder_grid`-style technique described below, just with a
+constant footprint instead of one derived from `width_px`/`height_px`.
+
+This is the OPPOSITE of the "client owns rendering" pattern that's true
+for images/GIF: the reason is architectural, not a style choice — your
+client process might be running on a different machine than the one
+whose speakers should produce sound (e.g. a client running over SSH),
+while Som is guaranteed to be local to whoever's actually listening. A
+future `ContentType::Video` is expected to follow the same
+Som-decodes-and-renders shape for the same reason.
 
 ## Placement: the Unicode-placeholder grid technique
 

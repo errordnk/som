@@ -298,8 +298,28 @@ Content-type определяется по расширению файла (`.gi
 
 **Файл:** `crates/terminal/src/rich_content_player.rs`.
 
+## Аудио (mp3/flac) — реализовано 2026-08-25
+
+**Архитектурное решение**: декодирование (symphonia), воспроизведение (`cpal`) и сам интерактивный виджет (play/pause, seek-бар, elapsed/total время) — ВСЕ живут в Som (`crates/terminal`), не в `somcat`/клиенте.
+
+**Почему не в клиенте (как для картинок было бы естественно предположить)**: конкретный сценарий пользователя — `somcat` может быть запущен на удалённой машине через SSH, в то время как физические колонки подключены к машине, где работает сам Som. Если бы decode+playback жили в `somcat`, звук проигрывался бы (если вообще проигрывался) на удалённой машине, а не там, где сидит пользователь. Som — единственный процесс, гарантированно локальный к пользователю, поэтому воспроизведение обязано быть его ответственностью, а не клиента.
+
+Это единственное существенное отличие аудио-пайплайна от pattern'а картинок ("клиент решает, как рендерить контент, полученный через SRP" — верно для картинок/yazi-интеграции, НЕ верно для аудио).
+
+**Роль `somcat`** (`crates/somcat/src/main.rs`): распознаёт `.mp3`/`.flac` → `ContentType::Audio`, читает только заголовок файла через symphonia'ный probe/format-reader (`audio_metadata()`, без полного декодирования) для заполнения `ContentMetadata::Audio { sample_rate, channels, bits_per_sample }`, стримит байты (`stream_bytes`, тот же путь что и картинки), затем печатает placeholder-грид ФИКСИРОВАННОГО размера (`print_audio_placeholder_grid`, `AUDIO_WIDGET_COLUMNS=40 x AUDIO_WIDGET_ROWS=1`) — в отличие от картинок, у аудио нет пиксельных размеров, из которых можно вывести footprint, поэтому размер зашит константой на стороне отправителя.
+
+**Роль Som**:
+- `crates/terminal/src/rich_content_audio_player.rs` — `decode_whole_file()` декодирует ВЕСЬ файл целиком в плоский interleaved `f32` PCM через symphonia (не progressive-decode как у GIF — mp3/flac не имеют чистой истории "декодируй сколько есть", поэтому паттерн ближе к JPEG/PNG-ветке "жди пока файл полностью не докачается"). `RichContentAudioPlayer::open()` открывает `cpal::default_output_device()` и запускает поток, читающий PCM через `Arc<AtomicU64>` position-курсор — стартует на паузе (не autoplay).
+- `Terminal` получил отдельное поле `rich_content_audio_players: RefCell<HashMap<(u32,u32), RichContentAudioPlayer>>`, ПАРАЛЛЕЛЬНОЕ (не объединённое) с `rich_content_players` — картиночный плеер пересоздаётся заново на каждый paint-refresh, а аудио-плеер владеет живым `cpal::Stream`, чьё время жизни должно охватывать много paint-вызовов, поэтому пересоздавать его нельзя.
+- Новое поле `rich_content_placement_bounds: RefCell<HashMap<(u32,u32), Bounds<Pixels>>>` — раньше НИЧЕГО не сохраняло bounds размещения между paint-вызовами (только локальные переменные внутри одного paint). Нужно для hit-testing кликов вне paint-цикла.
+- `paint_rich_content_placements` (`terminal_view/src/terminal_element.rs`) получила параллельную ветку `paint_rich_content_audio_widget` — рисует quad-фон + play/pause-глиф + seek-бар (progress fill) + время через `ShapedLine::paint`, вместо `window.paint_image`.
+- `Terminal::mouse_down` получил ранний перехват клика (зеркалит существующий hyperlink early-return): клик, попадающий в закэшированные bounds аудио-виджета, обрабатывается ЛОКАЛЬНО (toggle play/pause, либо seek по x-координате внутри бара) и НЕ доходит до forwarding в дочерний (возможно удалённый) процесс.
+- Repaint-driving переиспользует существующий paint→force_redraw→paint self-sustaining loop (`any_rich_content_animating`), в который теперь ORится "хотя бы один аудио-плеер сейчас играет" — независимого таймера в кодовой базе как не было для GIF, так и не появилось для аудио.
+
+**Тесты**: `crates/terminal/src/rich_content_audio_player.rs` — юнит-тесты decode/play/pause/seek на фикстуре `test_fixtures/tone.flac` (реальный `cpal`-девайс открывается по-настоящему, тест грациозно скипается в headless-окружении без устройства). `crates/terminal/src/terminal.rs::test_rich_content_audio_placement_decodes_and_plays_via_a_real_process` — полный end-to-end через реальный `somcat`-процесс + реальный ConPTY + реальный аудио-девайс, подтверждает что playback position реально продвигается после toggle play.
+
 ## Следующие нереализованные этапы (вне текущего прогресса)
 
-- Аудио: symphonia (декодирование) + `cpal` (воспроизведение, уже в зависимостях) поверх того же конверта с `content_type=Audio`, метаданные уже спроектированы (`ContentMetadata::Audio`).
-- Markdown: `crates/markdown/src/markdown.rs` (уже существующий GPUI-виджет из Zed) как overlay поверх терминального грида.
-- Видео (mp4/mkv/webm) и PDF — отдельные, более крупные этапы. Метаданные для видео уже спроектированы (`ContentMetadata::Video`/`VideoCodec`), но не используются никаким реальным декодером.
+- Видео: тот же паттерн, что и аудио (decode-модуль + persistent player map на `Terminal` + paint-path виджет + hit-test hook), подтверждено пользователем как следующий шаг после аудио, всё ещё без markdown-обёртки. Метаданные уже спроектированы (`ContentMetadata::Video`/`VideoCodec`), но не используются никаким реальным декодером.
+- Markdown: `crates/markdown/src/markdown.rs` (уже существующий GPUI-виджет из Zed) как overlay поверх терминального грида — плюс `md://host/path`-схема ссылок, резолвящаяся относительно per-tab document root (`"home"`), как часть самого протокола SRP (не отдельный веб-сервер).
+- PDF — отдельный, более крупный этап.

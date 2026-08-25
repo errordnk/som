@@ -1,5 +1,5 @@
-//! `somcat` — a minimal terminal image viewer for Som. Speaks Som's own
-//! rich-content protocol (`terminal::rich_content_transport`), with no
+//! `somcat` — a minimal terminal image/audio viewer for Som. Speaks Som's
+//! own rich-content protocol (`terminal::rich_content_transport`), with no
 //! dependency on `crossterm` or any other console-mode abstraction library.
 //!
 //! Usage: `somcat <file>` or `somcat --srp <file>` (the flag is an explicit
@@ -77,6 +77,46 @@ fn static_image_metadata(bytes: &[u8]) -> Result<(u32, u32, bool), String> {
         .map_err(|e| e.to_string())?;
     let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
     Ok((width, height, false))
+}
+
+/// Reads just enough of an MP3/FLAC file to describe its PCM shape —
+/// `symphonia`'s probe + format reader parses container/stream headers
+/// without decoding any audio frames. Decoding and playback both happen
+/// on Som's side (it's the only process guaranteed to be local to the
+/// user's speakers, even when this process is running on a remote SSH
+/// host) — `somcat` only needs enough to fill `ContentMetadata::Audio`
+/// accurately before the first chunk goes out, same "metadata travels on
+/// every chunk" pattern used for images.
+fn audio_metadata(path: &str) -> Result<(u32, u8, u8), String> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(extension) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(extension);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &Default::default(), &Default::default())
+        .map_err(|e| format!("probing {path}: {e}"))?;
+
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| format!("{path}: no decodable audio track found"))?;
+
+    let params = &track.codec_params;
+    let sample_rate = params.sample_rate.ok_or_else(|| format!("{path}: unknown sample rate"))?;
+    let channels = params.channels.map(|c| c.count() as u8).ok_or_else(|| format!("{path}: unknown channel count"))?;
+    let bits_per_sample = params.bits_per_sample.map(|b| b as u8).unwrap_or(16);
+
+    Ok((sample_rate, channels, bits_per_sample))
 }
 
 /// Sends `CSI 16 t` ("report cell size in pixels") and waits briefly for
@@ -214,10 +254,32 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
         return Ok(());
     };
 
-    let mut columns = width_px.div_ceil(cell_width).max(1).min(297);
-    let mut rows = height_px.div_ceil(cell_height).max(1).min(297);
+    let columns = width_px.div_ceil(cell_width).max(1).min(297);
+    let rows = height_px.div_ceil(cell_height).max(1).min(297);
+    print_placeholder_grid_with_cell_dims(session_id, file_id, columns, rows)
+}
 
-    // `columns`/`rows` above assume the image's pixel dimensions and the
+/// Prints a placeholder grid of an EXPLICIT `columns`x`rows` cell footprint
+/// — used for audio, which has no pixel dimensions to derive a footprint
+/// from at all (unlike images/GIF). Som paints its own fixed-size
+/// play/pause/seek-bar widget into whatever footprint this placeholder
+/// grid reserves, the same way it paints decoded image pixels into an
+/// image's own reserved footprint — see `paint_rich_content_placements`'s
+/// audio branch in `terminal_element.rs`.
+const AUDIO_WIDGET_COLUMNS: u32 = 40;
+const AUDIO_WIDGET_ROWS: u32 = 1;
+
+fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), String> {
+    print_placeholder_grid_with_cell_dims(session_id, file_id, AUDIO_WIDGET_COLUMNS, AUDIO_WIDGET_ROWS)
+}
+
+fn print_placeholder_grid_with_cell_dims(
+    session_id: u32,
+    file_id: u32,
+    mut columns: u32,
+    mut rows: u32,
+) -> Result<(), String> {
+    // `columns`/`rows` above (for the image caller) assume the image's
     // terminal cell's pixel dimensions share the same unit — true at DPI
     // scale 1.0, false on a scaled (e.g. 4K) display where `cell_width`
     // came back in GPUI's logical pixels while `width_px` is the image
@@ -273,67 +335,45 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
     write_raw_stdout(text.as_bytes())
 }
 
-/// Streams `path` to Som's own binary rich-content protocol
-/// (`terminal::rich_content_transport`) — the file's raw bytes go over the
-/// wire base91-encoded (see that module's doc comment for why), chunk by
-/// chunk, with no re-encoding at all: the receiving side
-/// (`terminal::rich_content_cache`/`rich_content_gif_player`/
-/// `rich_content_static_image_player`) decodes the file format itself. GIF
-/// decodes progressively as chunks arrive; JPEG/PNG (no progressive-prefix
-/// decode story in the `image` crate) wait for the whole file to land.
-///
-/// Content type is inferred from the file extension: `.gif`, `.jpg`/
-/// `.jpeg`, `.png` (audio/markdown/video are reserved `ContentType`
-/// variants, not wired up to any extension yet).
-///
-/// Once the transfer completes, THIS process prints the Unicode-placeholder
-/// grid itself (see `print_placeholder_grid`) — deliberately not Som,
-/// which used to inject this text into its own terminal model out-of-band
-/// after the fact. That out-of-band write never reached the real PTY, so
-/// the actual shell (PowerShell, etc.) never learned the cursor had moved:
-/// its own line editor kept redrawing from its last-known (stale) cursor
-/// position, visibly fighting Som's cursor placement. Printing through
-/// this process's own stdout is ordinary child-process output as far as
-/// the shell and ConPTY are concerned, so there's nothing to reconcile.
-fn stream_file(path: &str) -> Result<(), String> {
-    use terminal::rich_content_transport::{Chunk, ContentMetadata, ContentType, build_envelope, split_into_chunks};
+/// Session/file id pair identifying one SRP transfer on the wire — see
+/// [`new_ids`]'s doc comment for how these are derived and why they're
+/// masked to 24 bits.
+type SrpIds = (u32, u32);
 
-    let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
-    let content_type = match extension.as_deref() {
-        Some("gif") => ContentType::Gif,
-        Some("jpg" | "jpeg") => ContentType::Jpeg,
-        Some("png") => ContentType::Png,
-        Some(other) => {
-            return Err(format!("unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png are supported so far"));
-        },
-        None => return Err("file has no extension, can't infer content type".to_string()),
-    };
-
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
-    let total_size = bytes.len() as u64;
-
-    let (width_px, height_px, is_animated) =
-        if content_type == ContentType::Gif { gif_metadata(&bytes)? } else { static_image_metadata(&bytes)? };
-    // Every pixel this protocol sends is decoded to RGBA before reaching
-    // the wire (see `rich_content_gif_player`/`gpui::RenderImage`'s own
-    // frame buffers) — 32 bits per pixel regardless of the source GIF's
-    // own (typically <=8-bit indexed/palette) on-disk color depth.
-    let metadata = ContentMetadata::Image { width_px, height_px, color_bits: 32, is_animated };
-
-    // session_id and file_id both derived from the current time so two
-    // separate `somcat` invocations rarely collide on the receiving side's
-    // `(session_id, file_id)` cache key. Masked to 24 bits — this process
-    // encodes each id into a placeholder cell's RGB color (`id_to_rgb`
-    // above), which only has 24 bits to work with; an unmasked id here
-    // would silently lose its high byte on the round trip through the
-    // grid, making the id painted next to the image never match the id
-    // this process actually sent.
+/// Derives a fresh `(session_id, file_id)` pair for a new SRP transfer.
+/// Both are time-derived so two separate `somcat` invocations rarely
+/// collide on the receiving side's `(session_id, file_id)` cache key.
+/// Masked to 24 bits — this process encodes each id into a placeholder
+/// cell's RGB color (`id_to_rgb` above) for image placements, which only
+/// has 24 bits to work with; an unmasked id here would silently lose its
+/// high byte on the round trip through the grid. Audio has no placeholder
+/// grid to round-trip through, but reuses the same id shape for
+/// consistency and so the receiving-side cache key format never depends
+/// on content type.
+fn new_ids() -> SrpIds {
     let now_ms =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u32).unwrap_or(1);
     let session_id = (now_ms & 0xFF_FFFF).max(1);
     let file_id = (now_ms.wrapping_mul(2_654_435_761) & 0xFF_FFFF).max(1); // Knuth multiplicative hash, cheap decorrelation from session_id.
+    (session_id, file_id)
+}
 
-    let pieces = split_into_chunks(&bytes, CHUNK_SIZE);
+/// Streams `bytes` to Som's own binary rich-content protocol
+/// (`terminal::rich_content_transport`) — the file's raw bytes go over the
+/// wire base91-encoded (see that module's doc comment for why), chunk by
+/// chunk, with no re-encoding at all. Content-type-agnostic: the caller
+/// picks `content_type`/`metadata`, this function only knows how to chop
+/// bytes into envelopes and write them out.
+fn stream_bytes(
+    bytes: &[u8],
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
+    (session_id, file_id): SrpIds,
+) -> Result<(), String> {
+    use terminal::rich_content_transport::{Chunk, build_envelope, split_into_chunks};
+
+    let total_size = bytes.len() as u64;
+    let pieces = split_into_chunks(bytes, CHUNK_SIZE);
     let mut offset = 0u64;
     for payload in pieces {
         let payload_len = payload.len() as u64;
@@ -349,7 +389,77 @@ fn stream_file(path: &str) -> Result<(), String> {
         write_raw_stdout(&apc)?;
         offset += payload_len;
     }
+    Ok(())
+}
 
+/// Streams `path` to Som over SRP, then prints a placeholder grid
+/// reserving this placement's on-screen footprint — for images/GIF sized
+/// from the file's own pixel dimensions (`print_placeholder_grid`), for
+/// audio a fixed cell footprint (`print_audio_placeholder_grid`) since
+/// audio has no pixel dimensions to derive one from. Either way, Som
+/// decodes the cached bytes and paints into that reserved footprint
+/// itself — a decoded image frame for images/GIF, an inline play/pause/
+/// seek-bar widget for audio — `somcat`'s job ends once the bytes are on
+/// the wire and the footprint is reserved.
+///
+/// Content type is inferred from the file extension: `.gif`, `.jpg`/
+/// `.jpeg`, `.png`, `.mp3`, `.flac` (markdown/video are reserved
+/// `ContentType` variants, not wired up to any extension yet).
+///
+/// For images: THIS process prints the Unicode-placeholder grid itself
+/// — deliberately not Som, which used to inject this text into its own
+/// terminal model out-of-band after the fact. That out-of-band write
+/// never reached the real PTY, so the actual shell (PowerShell, etc.)
+/// never learned the cursor had moved: its own line editor kept
+/// redrawing from its last-known (stale) cursor position, visibly
+/// fighting Som's cursor placement. Printing through this process's own
+/// stdout is ordinary child-process output as far as the shell and
+/// ConPTY are concerned, so there's nothing to reconcile.
+///
+/// For audio: decoding and playback both happen on Som's side, not
+/// here. `somcat` (this process) can be running on a remote SSH host
+/// while Som — and the user's actual speakers — are local; playback has
+/// to happen wherever Som runs, so this process's only audio-specific
+/// work is probing header metadata (`audio_metadata`) to fill
+/// `ContentMetadata::Audio` accurately before the first chunk goes out.
+fn stream_file(path: &str) -> Result<(), String> {
+    use terminal::rich_content_transport::{ContentMetadata, ContentType};
+
+    let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    let content_type = match extension.as_deref() {
+        Some("gif") => ContentType::Gif,
+        Some("jpg" | "jpeg") => ContentType::Jpeg,
+        Some("png") => ContentType::Png,
+        Some("mp3" | "flac") => ContentType::Audio,
+        Some(other) => {
+            return Err(format!(
+                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac are supported so far"
+            ));
+        },
+        None => return Err("file has no extension, can't infer content type".to_string()),
+    };
+
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let ids = new_ids();
+
+    if content_type == ContentType::Audio {
+        let (sample_rate, channels, bits_per_sample) = audio_metadata(path)?;
+        let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample };
+        stream_bytes(&bytes, content_type, metadata, ids)?;
+        let (session_id, file_id) = ids;
+        return print_audio_placeholder_grid(session_id, file_id);
+    }
+
+    let (width_px, height_px, is_animated) =
+        if content_type == ContentType::Gif { gif_metadata(&bytes)? } else { static_image_metadata(&bytes)? };
+    // Every pixel this protocol sends is decoded to RGBA before reaching
+    // the wire (see `rich_content_gif_player`/`gpui::RenderImage`'s own
+    // frame buffers) — 32 bits per pixel regardless of the source GIF's
+    // own (typically <=8-bit indexed/palette) on-disk color depth.
+    let metadata = ContentMetadata::Image { width_px, height_px, color_bits: 32, is_animated };
+    stream_bytes(&bytes, content_type, metadata, ids)?;
+
+    let (session_id, file_id) = ids;
     print_placeholder_grid(session_id, file_id, width_px, height_px)
 }
 

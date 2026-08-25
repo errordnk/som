@@ -1732,75 +1732,118 @@ fn paint_rich_content_placements(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let terminal = terminal.read(cx);
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let mut any_animating = false;
 
-    // For each (session_id, file_id) group, remember the grid position of
-    // whichever visible cell decodes as (row=0, column=0) if one is
-    // currently visible — that's the placement's true top-left origin.
-    // When row=0/column=0 itself has scrolled out of view (the image's top
-    // has scrolled above the viewport), derive the same origin from ANY
-    // other visible cell by subtracting its own decoded (row, column)
-    // offset: `origin_line = cell.line - decoded.row`. This is why each
-    // cell's `PlaceholderCell::row`/`column` (not just its grid position)
-    // matters here — the group's on-screen bounding box (min/max of
-    // whatever cells are CURRENTLY visible) is NOT the placement's real
-    // extent when it's partially scrolled off-screen; only the decoded
-    // in-image offset lets every visible cell agree on the same absolute
-    // origin regardless of how much of the image is currently clipped.
-    let mut origins: std::collections::HashMap<(u32, u32), (i32, i32)> = std::collections::HashMap::new();
+    // Everything needed from `terminal` is collected as OWNED data in
+    // this narrowly scoped block — the borrow from `Entity::read(cx)`
+    // must end before any call below that needs `cx` mutably
+    // (`ShapedLine::paint`, used by the audio widget branch), since
+    // `Entity::read(cx)` ties its returned `&Terminal` to `cx`'s own
+    // borrow for as long as it's alive.
+    let (origins, placements, audio_placements, max_columns_seen) = {
+        let terminal = terminal.read(cx);
 
-    for indexed_cell in &terminal.last_content().cells {
-        let fg_rgb = match indexed_cell.cell.fg {
-            AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-            _ => continue,
-        };
-        let underline_rgb = match indexed_cell.cell.underline_color() {
-            Some(AnsiColor::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-            Some(_) => continue,
-            None => None,
-        };
-        let diacritics = indexed_cell.cell.zerowidth().unwrap_or(&[]);
-        let Some(PlaceholderCell { image_id: session_id, placement_id: file_id, row, column: cell_col_in_image }) =
-            kitty_graphics_placeholder::decode_placeholder_cell(
+        // For each (session_id, file_id) group, remember the grid position
+        // of whichever visible cell decodes as (row=0, column=0) if one is
+        // currently visible — that's the placement's true top-left origin.
+        // When row=0/column=0 itself has scrolled out of view (the image's
+        // top has scrolled above the viewport), derive the same origin
+        // from ANY other visible cell by subtracting its own decoded (row,
+        // column) offset: `origin_line = cell.line - decoded.row`. This is
+        // why each cell's `PlaceholderCell::row`/`column` (not just its
+        // grid position) matters here — the group's on-screen bounding box
+        // (min/max of whatever cells are CURRENTLY visible) is NOT the
+        // placement's real extent when it's partially scrolled off-screen;
+        // only the decoded in-image offset lets every visible cell agree
+        // on the same absolute origin regardless of how much of the image
+        // is currently clipped.
+        let mut origins: std::collections::HashMap<(u32, u32), (i32, i32)> = std::collections::HashMap::new();
+        let mut max_columns_seen: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+
+        for indexed_cell in &terminal.last_content().cells {
+            let fg_rgb = match indexed_cell.cell.fg {
+                AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                _ => continue,
+            };
+            let underline_rgb = match indexed_cell.cell.underline_color() {
+                Some(AnsiColor::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                Some(_) => continue,
+                None => None,
+            };
+            let diacritics = indexed_cell.cell.zerowidth().unwrap_or(&[]);
+            let Some(PlaceholderCell {
+                image_id: session_id,
+                placement_id: file_id,
+                row,
+                column: cell_col_in_image,
+            }) = kitty_graphics_placeholder::decode_placeholder_cell(
                 indexed_cell.cell.c,
                 fg_rgb,
                 underline_rgb,
                 diacritics,
-            )
-        else {
-            continue;
-        };
+            ) else {
+                continue;
+            };
 
-        let key = (session_id, file_id);
-        let grid_line = indexed_cell.point.line.0;
-        let grid_column = indexed_cell.point.column.0 as i32;
-        let origin_line = grid_line - row as i32;
-        let origin_column = grid_column - cell_col_in_image as i32;
-        // Every visible cell of the same placement must derive the exact
-        // same origin (they're all offsets from the same top-left corner)
-        // — any one of them is equally authoritative, so the first cell
-        // seen for a given id wins.
-        origins.entry(key).or_insert((origin_line, origin_column));
-        // The placement's real column count can't be recomputed from the
-        // image's own pixel size at paint time (see
-        // `Terminal::record_rich_content_max_column_seen`'s doc comment):
-        // remember the widest column any paint pass has actually decoded,
-        // persisted on the cache entry so a later paint where the image is
-        // only partially visible (scrolled, or a narrower split) doesn't
-        // shrink it back down.
-        terminal.record_rich_content_max_column_seen(session_id, file_id, cell_col_in_image);
-    }
+            let key = (session_id, file_id);
+            let grid_line = indexed_cell.point.line.0;
+            let grid_column = indexed_cell.point.column.0 as i32;
+            let origin_line = grid_line - row as i32;
+            let origin_column = grid_column - cell_col_in_image as i32;
+            // Every visible cell of the same placement must derive the
+            // exact same origin (they're all offsets from the same
+            // top-left corner) — any one of them is equally authoritative,
+            // so the first cell seen for a given id wins.
+            origins.entry(key).or_insert((origin_line, origin_column));
+            // The placement's real column count can't be recomputed from
+            // the image's own pixel size at paint time (see
+            // `Terminal::record_rich_content_max_column_seen`'s doc
+            // comment): remember the widest column any paint pass has
+            // actually decoded, persisted on the cache entry so a later
+            // paint where the image is only partially visible (scrolled,
+            // or a narrower split) doesn't shrink it back down.
+            terminal.record_rich_content_max_column_seen(session_id, file_id, cell_col_in_image);
+            let entry = max_columns_seen.entry(key).or_insert(0);
+            *entry = (*entry).max(terminal.rich_content_max_column_seen(session_id, file_id).unwrap_or(0));
+        }
+
+        let placements = terminal.rich_content_placements();
+        let audio_placements = terminal.rich_content_audio_placements();
+        (origins, placements, audio_placements, max_columns_seen)
+    };
 
     if origins.is_empty() {
         return false;
     }
 
-    let placements = terminal.rich_content_placements();
     for (key, (origin_line, origin_column)) in origins {
         let (session_id, file_id) = key;
+
+        if let Some((_, _, position_fraction, is_playing, elapsed, duration)) =
+            audio_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
+        {
+            let max_column_seen = max_columns_seen.get(&key).copied();
+            if let Some(bounds) = paint_rich_content_audio_widget(
+                max_column_seen,
+                *position_fraction,
+                *is_playing,
+                *elapsed,
+                *duration,
+                origin,
+                origin_line,
+                origin_column,
+                layout,
+                window,
+                cx,
+            ) {
+                terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
+            }
+            any_animating |= *is_playing;
+            continue;
+        }
+
         let Some((_, _, render_image, current_frame, is_animating)) =
             placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
         else {
@@ -1826,7 +1869,7 @@ fn paint_rich_content_placements(
         // placeholder cell has been scanned yet.
         let image_size = render_image.size(0);
         let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
-            let columns = match terminal.rich_content_max_column_seen(session_id, file_id) {
+            let columns = match max_columns_seen.get(&key).copied() {
                 Some(max_column) => (max_column + 1) as f32,
                 None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
             };
@@ -1853,6 +1896,7 @@ fn paint_rich_content_placements(
             point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
 
         any_animating |= *is_animating;
+        terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, Bounds::new(position, size));
         window
             .paint_image(
                 Bounds::new(position, size),
@@ -1865,6 +1909,110 @@ fn paint_rich_content_placements(
     }
 
     any_animating
+}
+
+/// Paints one audio placement's inline widget — a single-row play/pause
+/// glyph + seek-bar fill + elapsed/total time text, filling exactly the
+/// fixed cell footprint `somcat` reserved via
+/// `print_audio_placeholder_grid` (`AUDIO_WIDGET_COLUMNS`x
+/// `AUDIO_WIDGET_ROWS` in that module — this function trusts whatever
+/// footprint the placeholder cells actually describe, via
+/// `record_rich_content_max_column_seen`, same as the image branch
+/// above, rather than hardcoding the sender's constant here). Unlike an
+/// image, there's no pixel-dimensioned source to size from at all — the
+/// placeholder grid IS the widget's only size signal.
+#[allow(clippy::too_many_arguments)]
+fn paint_rich_content_audio_widget(
+    max_column_seen: Option<u32>,
+    position_fraction: f32,
+    is_playing: bool,
+    elapsed: std::time::Duration,
+    duration: std::time::Duration,
+    origin: Point<Pixels>,
+    origin_line: i32,
+    origin_column: i32,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Bounds<Pixels>> {
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+    let display_line = origin_line + layout.display_offset as i32;
+    let num_lines = layout.dimensions.num_lines() as i32;
+    if display_line < 0 || display_line >= num_lines {
+        return None;
+    }
+
+    let columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
+    let width = cell_width * columns;
+    let position =
+        point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
+    let bounds = Bounds::new(position, gpui::size(width, line_height));
+
+    let widget_bg = gpui::rgba(0x1e1e2eff);
+    let bar_track = gpui::rgba(0x45475aff);
+    let bar_fill = gpui::rgba(0x89b4faff);
+    let text_color = gpui::white();
+
+    window.paint_quad(fill(bounds, widget_bg));
+
+    // Reserve the leftmost cell for a play/pause glyph, a trailing
+    // stretch of cells for "mm:ss / mm:ss", and let the seek bar itself
+    // fill whatever's left in between — matches the layout a normal
+    // media-player widget uses (glyph, then a bar, then a duration
+    // readout), not an arbitrary choice.
+    let glyph = if is_playing { "⏸" } else { "▶" };
+    let time_text = format!("{}/{}", format_duration(elapsed), format_duration(duration));
+
+    let text_style = gpui::TextStyle {
+        color: text_color,
+        font_size: line_height.into(),
+        ..Default::default()
+    };
+    let glyph_run = TextRun { len: glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
+    let glyph_line = window.text_system().shape_line(
+        glyph.to_string().into(),
+        text_style.font_size.to_pixels(window.rem_size()),
+        &[glyph_run],
+        None,
+    );
+    glyph_line.paint(position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+
+    let time_run =
+        TextRun { len: time_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+    let time_line = window.text_system().shape_line(
+        time_text.clone().into(),
+        text_style.font_size.to_pixels(window.rem_size()),
+        &[time_run],
+        None,
+    );
+    let time_position = point(position.x + width - time_line.width, position.y);
+    time_line.paint(time_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+
+    // The seek bar occupies the space between the play/pause glyph and
+    // the time readout — one cell of glyph, one cell of padding on each
+    // side of the bar, the rest of the width minus the time text.
+    let bar_start_x = position.x + cell_width * 2.0;
+    let bar_end_x = time_position.x - cell_width;
+    if bar_end_x > bar_start_x {
+        let bar_bounds = Bounds::new(
+            point(bar_start_x, position.y + line_height * 0.4),
+            gpui::size(bar_end_x - bar_start_x, line_height * 0.2),
+        );
+        window.paint_quad(fill(bar_bounds, bar_track));
+        let fill_width = (bar_end_x - bar_start_x) * position_fraction.clamp(0.0, 1.0);
+        if fill_width > Pixels::ZERO {
+            let fill_bounds = Bounds::new(bar_bounds.origin, gpui::size(fill_width, bar_bounds.size.height));
+            window.paint_quad(fill(fill_bounds, bar_fill));
+        }
+    }
+
+    Some(bounds)
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let total_seconds = d.as_secs();
+    format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
 fn to_highlighted_range_lines(

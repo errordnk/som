@@ -14,8 +14,17 @@ use terminal::kitty_graphics_placeholder;
 
 /// Chunk size for a single APC string's payload — large enough to be
 /// efficient, small enough that no real terminal's escape-sequence parser
-/// chokes on a single control string.
-const CHUNK_SIZE: usize = 4096;
+/// chokes on a single control string. Only Som itself ever parses these
+/// (`somcat`'s SRP output isn't meant for a generic terminal emulator),
+/// so this is tuned for Som's own APC handling rather than a
+/// conservative guess about third-party parsers. Raised from an initial
+/// 4096: at that size, a several-MB audio file meant ~800 separate
+/// `write_raw_stdout` calls (each its own `WriteFile` syscall under
+/// `STDOUT_WRITE_LOCK`) plus ~800 separate APC-parse-and-cache-write
+/// events on Som's side before `somcat` could return and the shell's
+/// prompt came back — a real, measured delay for large files, not
+/// hypothetical.
+const CHUNK_SIZE: usize = 65536;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -163,6 +172,9 @@ fn query_cell_size_px() -> Option<(u32, u32)> {
         loop {
             match stdin.read(&mut byte) {
                 Ok(1) => {
+                    if byte[0] == ETX {
+                        std::process::exit(130);
+                    }
                     buf.push(byte[0]);
                     if buf.last() == Some(&b't') || buf.len() >= 64 {
                         break;
@@ -217,6 +229,9 @@ fn query_cell_count() -> Option<(u32, u32)> {
         loop {
             match stdin.read(&mut byte) {
                 Ok(1) => {
+                    if byte[0] == ETX {
+                        std::process::exit(130);
+                    }
                     buf.push(byte[0]);
                     if buf.last() == Some(&b't') || buf.len() >= 64 {
                         break;
@@ -284,7 +299,7 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
 /// grid reserves, the same way it paints decoded image pixels into an
 /// image's own reserved footprint — see `paint_rich_content_placements`'s
 /// audio branch in `terminal_element.rs`.
-const AUDIO_WIDGET_COLUMNS: u32 = 40;
+const AUDIO_WIDGET_COLUMNS: u32 = 42; // +2 over the play/bar/time layout for a trailing close ("x") glyph plus its padding cell.
 const AUDIO_WIDGET_ROWS: u32 = 1;
 
 fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), String> {
@@ -352,6 +367,19 @@ fn print_placeholder_grid_with_cell_dims(
     text.push_str("\x1b[0m\r\n");
     write_raw_stdout(text.as_bytes())
 }
+
+/// Raw mode (`raw_mode::enable`) clears `ENABLE_PROCESSED_INPUT` on
+/// Windows so escape-sequence replies (`CSI 16 t`, query responses) reach
+/// this process's stdin as raw bytes instead of being intercepted by the
+/// console — but `ENABLE_PROCESSED_INPUT` is also what makes the console
+/// turn a Ctrl+C keypress into a `CTRL_C_EVENT`/SIGINT that would
+/// otherwise kill this process. With it off, Ctrl+C arrives as an
+/// ordinary `0x03` byte on stdin like any other byte, and every stdin-
+/// reading loop here needs to check for it explicitly and exit, or a
+/// user's Ctrl+C while `somcat` is still streaming (or waiting on a
+/// range query) does nothing at all. Unix's raw mode (`cfmakeraw`) has
+/// the same effect (`ISIG` is cleared), so this applies on both.
+const ETX: u8 = 0x03;
 
 /// Session/file id pair identifying one SRP transfer on the wire — see
 /// [`new_ids`]'s doc comment for how these are derived and why they're
@@ -488,6 +516,9 @@ fn spawn_audio_query_responder(
             }
             match std::io::Read::read(&mut stdin, &mut byte) {
                 Ok(1) => {
+                    if byte[0] == ETX {
+                        std::process::exit(130);
+                    }
                     buf.push(byte[0]);
                     // APC terminator `ESC \` — check whether the tail of
                     // `buf` contains a complete `ESC _ Q ... ESC \`

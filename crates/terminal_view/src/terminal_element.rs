@@ -2004,6 +2004,19 @@ fn paint_rich_content_audio_widget(
     );
     glyph_line.paint(position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
 
+    // Close ("x") glyph occupies the trailing cell, with one cell of
+    // padding between it and the time readout — mirrors the leading
+    // play/pause glyph's own cell + padding layout on the opposite end.
+    let close_run = TextRun { len: "x".len(), font: text_style.font(), color: text_color, ..Default::default() };
+    let close_line = window.text_system().shape_line(
+        "x".to_string().into(),
+        text_style.font_size.to_pixels(window.rem_size()),
+        &[close_run],
+        None,
+    );
+    let close_position = point(position.x + width - close_line.width, position.y);
+    close_line.paint(close_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+
     let time_run =
         TextRun { len: time_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
     let time_line = window.text_system().shape_line(
@@ -2012,7 +2025,7 @@ fn paint_rich_content_audio_widget(
         &[time_run],
         None,
     );
-    let time_position = point(position.x + width - time_line.width, position.y);
+    let time_position = point(close_position.x - cell_width - time_line.width, position.y);
     time_line.paint(time_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
 
     // The seek bar occupies the space between the play/pause glyph and

@@ -464,6 +464,7 @@ impl TerminalBuilder {
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
+            rich_content_drag: None,
             #[cfg(windows)]
             shell_program: None,
             activation_script: Vec::new(),
@@ -756,6 +757,7 @@ impl TerminalBuilder {
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
+                rich_content_drag: None,
                 #[cfg(windows)]
                 shell_program,
                 activation_script: activation_script.clone(),
@@ -1018,6 +1020,20 @@ pub struct Terminal {
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
     mouse_down_hyperlink: Option<(String, bool, Match)>,
+    /// Set by `mouse_down` when a click landed inside a rich-content
+    /// widget's bounds (currently only audio play/pause/seek), so
+    /// `mouse_drag`/`mouse_up` can skip terminal text-selection for the
+    /// rest of this click — mirrors `mouse_down_hyperlink`'s identical
+    /// role for hyperlink clicks. Without this, `mouse_move`'s handler
+    /// in `terminal_element.rs` unconditionally calls `mouse_drag`
+    /// whenever the cursor is hovered over the terminal at all (which a
+    /// widget always is, since it's painted inside the terminal grid),
+    /// starting a real text selection even for what the user experiences
+    /// as a single click on the seek bar. `(session_id, file_id)` of the
+    /// widget the click landed in, not just a bool — kept in case a
+    /// future seek-drag needs to know which placement to keep seeking
+    /// as the pointer moves, not just that "some" widget was clicked.
+    rich_content_drag: Option<(u32, u32)>,
     #[cfg(windows)]
     shell_program: Option<String>,
     template: CopyTemplate,
@@ -1951,7 +1967,7 @@ impl Terminal {
     /// the widget's width — close enough to "the seek bar specifically"
     /// for a first cut without needing the exact same bar-vs-time-text
     /// geometry duplicated here.
-    fn handle_rich_content_click(&self, position: gpui::Point<Pixels>) -> bool {
+    fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>) -> bool {
         let cell_width = self.last_content.terminal_bounds.cell_width;
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
             if !self.rich_content_audio_players.borrow().contains_key(&(session_id, file_id)) {
@@ -1960,6 +1976,16 @@ impl Terminal {
             if !bounds.contains(&position) {
                 continue;
             }
+            // Remembered for the rest of this click (`mouse_drag`/
+            // `mouse_up`) — without this, GPUI's own mouse-move handler
+            // (`terminal_element.rs`'s `register_mouse_listeners`) starts
+            // an ordinary terminal text selection on ANY mouse movement
+            // while hovered over the terminal at all, which a widget
+            // always is (it's painted inside the terminal grid) — a
+            // plain click on the seek bar was visibly highlighting text
+            // underneath/around the widget before this field existed to
+            // suppress it, confirmed live.
+            self.rich_content_drag = Some((session_id, file_id));
             let offset_x = position.x - bounds.origin.x;
             if offset_x < cell_width * 2.0 {
                 self.toggle_rich_content_audio_playback(session_id, file_id);
@@ -3018,6 +3044,29 @@ impl Terminal {
         region: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        // A click that started inside a rich-content widget (see
+        // `handle_rich_content_click`) never starts a text selection,
+        // no matter how far the pointer moves afterward — same
+        // "swallow the whole gesture" reasoning as the hyperlink-range
+        // check just below for a different kind of click. If the drag
+        // is still over the seek bar, keep seeking to follow the
+        // pointer (a natural scrub gesture); once it isn't, just do
+        // nothing rather than falling through to selection logic.
+        if let Some((session_id, file_id)) = self.rich_content_drag {
+            if let Some(bounds) = self.rich_content_placement_bounds(session_id, file_id)
+                && bounds.contains(&e.position)
+            {
+                let cell_width = self.last_content.terminal_bounds.cell_width;
+                let offset_x = e.position.x - bounds.origin.x;
+                if offset_x >= cell_width * 2.0 {
+                    let fraction = (f32::from(offset_x) / f32::from(bounds.size.width)).clamp(0.0, 1.0);
+                    self.seek_rich_content_audio_playback(session_id, file_id, fraction);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
         if !self.mouse_mode(e.modifiers.shift) {
             if let Some((.., hyperlink_range)) = &self.mouse_down_hyperlink {
@@ -3163,6 +3212,15 @@ impl Terminal {
     }
 
     pub fn mouse_up(&mut self, e: &MouseUpEvent, cx: &Context<Self>) {
+        // Ends the click started in `handle_rich_content_click` — mirrors
+        // `mouse_down_hyperlink.take()`'s identical cleanup a few lines
+        // below for hyperlink clicks. Consuming it here (not just
+        // reading it) means the NEXT click starts fresh, same as every
+        // other per-click piece of state on this type.
+        if self.rich_content_drag.take().is_some() {
+            return;
+        }
+
         let setting = TerminalSettings::get_global(cx);
 
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;

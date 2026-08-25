@@ -1962,30 +1962,35 @@ fn paint_rich_content_audio_widget(
     // media-player widget uses (glyph, then a bar, then a duration
     // readout), not an arbitrary choice.
     //
-    // Nerd Font (Font Awesome subset) codepoints, not plain Unicode
-    // ▶/⏸ — Som embeds exactly one font, FiraCode Nerd Font
-    // (`assets/fonts/FiraCodeNerdFont-Regular.ttf`), and plain Unicode
-    // U+23F8 (PAUSE) has no glyph in it at all (confirmed via
-    // `ttf-parser`), so it would have fallen back to a missing-glyph box
-    // — using this font's own icon set instead guarantees both glyphs
-    // render, in the terminal's own glyph style, at the same color as
-    // everything else painted here (`text_color`, shared by both).
-    const NF_PLAY: &str = "\u{f04b}"; // nf-fa-play
-    const NF_PAUSE: &str = "\u{f04c}"; // nf-fa-pause
-    let glyph = if is_playing { NF_PAUSE } else { NF_PLAY };
-    let time_text = format!("{}/{}", format_duration(elapsed), format_duration(duration));
-
     // Uses the terminal's own text style (`layout.base_text_style`), not
-    // `TextStyle::default()` — Som embeds exactly one font (FiraCode
-    // Nerd Font) and that's what every other terminal character is
-    // painted with; the time readout is plain digits/`:`/`/`, ordinary
-    // enough to render in any font, but using the terminal's own font
-    // keeps it visually consistent with the play/pause glyph next to it
-    // (same font, same size) rather than whatever GPUI's own default
-    // font happens to be.
+    // `TextStyle::default()` — so both the glyph and the time readout
+    // render in whatever font the user's terminal is actually
+    // configured with (Som embeds FiraCode Nerd Font as the default,
+    // but `terminal_settings.font_family`/`buffer_font.family` can
+    // override that in settings.json), same size/color as everything
+    // else painted here.
     let mut text_style = layout.base_text_style.clone();
     text_style.color = text_color;
     text_style.font_size = line_height.into();
+
+    // Nerd Font (Font Awesome subset) codepoints, not plain Unicode
+    // ▶/⏸ — plain Unicode U+23F8 (PAUSE) has no glyph at all even in
+    // Som's own embedded FiraCode Nerd Font (confirmed via
+    // `ttf-parser`), so it would already fall back to a missing-glyph
+    // box with the DEFAULT font, before a user even touches settings.
+    // But `text_style.font()` here isn't necessarily that embedded
+    // font at all — a user can point `terminal.font_family` (or the
+    // global `buffer_font`) at any installed font, Nerd or not. Query
+    // whether the font actually resolved for THIS paint has real
+    // glyphs for the Nerd Font codepoints before committing to them;
+    // if not, fall back to plain ASCII that renders correctly in any
+    // monospace font at all, rather than painting a guaranteed missing-
+    // glyph box for the whole widget's lifetime.
+    let resolved_font_id = window.text_system().resolve_font(&text_style.font());
+    let has_nerd_font_glyphs = window.text_system().has_glyph_for_char(resolved_font_id, '\u{f04c}');
+    let (nf_play, nf_pause) = if has_nerd_font_glyphs { ("\u{f04b}", "\u{f04c}") } else { (">", "||") };
+    let glyph = if is_playing { nf_pause } else { nf_play };
+    let time_text = format!("{}/{}", format_duration(elapsed), format_duration(duration));
     let glyph_run = TextRun { len: glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
     let glyph_line = window.text_system().shape_line(
         glyph.to_string().into(),

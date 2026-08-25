@@ -165,6 +165,20 @@ impl TextSystem {
         );
     }
 
+    /// Whether `font_id` has an actual glyph for `ch` — `false` means the
+    /// platform text system would render this character as a missing-
+    /// glyph placeholder (a notdef box) rather than anything meaningful.
+    /// Useful before painting a specific codepoint (e.g. a Nerd Font
+    /// icon) whose availability depends entirely on which font a user's
+    /// settings resolved to, not just whether shaping succeeds — shaping
+    /// always "succeeds" even for a missing glyph, it just produces the
+    /// fallback box.
+    pub fn has_glyph_for_char(&self, font_id: FontId, ch: char) -> bool {
+        self.platform_text_system
+            .glyph_for_char(font_id, ch)
+            .is_some()
+    }
+
     /// Get the bounding box for the given font and font size.
     /// A font's bounding box is the smallest rectangle that could enclose all glyphs
     /// in the font. superimposed over one another.

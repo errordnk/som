@@ -484,6 +484,7 @@ impl TerminalBuilder {
             rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
@@ -779,6 +780,7 @@ impl TerminalBuilder {
                 rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
@@ -1073,6 +1075,18 @@ pub struct Terminal {
     /// GIF decoding.
     rich_content_audio_players:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_player::RichContentAudioPlayer>>,
+    /// One [`rich_content_audio_player::AudioTransferProgress`] per
+    /// audio placement, created alongside its `RichContentAudioPlayer`
+    /// entry in `rich_content_audio_players` and updated every time
+    /// `process_event`'s `ApcString` handler applies a chunk for that
+    /// same id — lets the player's background decode thread know how
+    /// many contiguous bytes are available without needing access to
+    /// `rich_content_cache` itself (see that type's own doc comment for
+    /// why a direct reference isn't safe to share with a background
+    /// thread here).
+    rich_content_audio_progress: std::cell::RefCell<
+        std::collections::HashMap<(u32, u32), std::sync::Arc<rich_content_audio_player::AudioTransferProgress>>,
+    >,
     /// Each rich-content placement's on-screen pixel bounds, as last
     /// computed by `terminal_element.rs`'s paint pass — nothing else
     /// persists this (the paint path itself only ever needs it as a
@@ -1344,7 +1358,28 @@ impl Terminal {
                                 chunk.payload.len()
                             );
                             match self.rich_content_cache.apply_chunk(&chunk) {
-                                Ok(_contiguous_len) => {
+                                Ok(contiguous_len) => {
+                                    // Keeps an already-open audio player's
+                                    // background decode thread in sync with
+                                    // how much of the file is now available
+                                    // — see `AudioTransferProgress`'s own
+                                    // doc comment for why this indirection
+                                    // exists instead of the decode thread
+                                    // reading `rich_content_cache` directly.
+                                    // A no-op for every other content type
+                                    // (nothing is ever inserted into this
+                                    // map for them) and for an audio id
+                                    // whose player hasn't been created yet
+                                    // (the first `rich_content_audio_
+                                    // placements` call inserts both the
+                                    // progress tracker and the player
+                                    // together, seeded with an accurate
+                                    // snapshot at that point).
+                                    if let Some(progress) =
+                                        self.rich_content_audio_progress.borrow().get(&(chunk.session_id, chunk.file_id))
+                                    {
+                                        progress.update(contiguous_len, chunk.total_size);
+                                    }
                                     // The Unicode-placeholder grid itself is
                                     // printed by the SENDING client (see
                                     // `somcat::print_placeholder_grid`), not
@@ -1886,16 +1921,25 @@ impl Terminal {
                 let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
                     continue;
                 };
-                let total_size = self.rich_content_cache.total_size(session_id, file_id);
+                // Opened as soon as ANY bytes are cached — no "wait for
+                // the whole file" gate. `RichContentAudioPlayer::open`'s
+                // own background decode thread retries internally until
+                // enough of a prefix exists to probe (see that method's
+                // doc comment); a large/still-streaming file therefore
+                // starts showing a real duration and becomes playable
+                // long before it's fully downloaded, mirroring the same
+                // "start as soon as possible" principle GIF's progressive
+                // decode already uses.
                 let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
-                // Same "wait for the whole file" gate the JPEG/PNG branch
-                // of `rich_content_player::refresh_or_create` uses — no
-                // progressive-prefix decode story exists for mp3/flac
-                // (see `rich_content_audio_player`'s module doc comment).
-                if total_size == 0 || contiguous_len < total_size {
+                if contiguous_len == 0 {
                     continue;
                 }
-                match rich_content_audio_player::RichContentAudioPlayer::open(path) {
+                let path = path.to_path_buf();
+                let total_size = self.rich_content_cache.total_size(session_id, file_id);
+                let progress = std::sync::Arc::new(rich_content_audio_player::AudioTransferProgress::new());
+                progress.update(contiguous_len, total_size);
+                self.rich_content_audio_progress.borrow_mut().insert(key, progress.clone());
+                match rich_content_audio_player::RichContentAudioPlayer::open(path, progress) {
                     Ok(player) => {
                         players.insert(key, player);
                     },
@@ -1911,13 +1955,14 @@ impl Terminal {
                 }
             }
             let player = players.get(&key).expect("just inserted or already present");
+            let duration_ms = self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
             out.push((
                 session_id,
                 file_id,
-                player.position_fraction(),
+                player.position_fraction(duration_ms),
                 player.is_playing(),
                 player.elapsed(),
-                player.duration(),
+                std::time::Duration::from_millis(duration_ms as u64),
             ));
         }
         out
@@ -1937,9 +1982,20 @@ impl Terminal {
 
     /// Seeks the audio placement at `(session_id, file_id)` to `fraction`
     /// (0.0..=1.0) of its total length, if a player is currently open.
+    /// If `fraction` targets a position beyond what's currently decoded,
+    /// this also fires a byte-range query (see
+    /// [`Self::request_audio_byte_range`]) so the client can start
+    /// filling that gap without waiting for the sequential stream to
+    /// reach it naturally — see task #91 (wire seek-past-cached-prefix
+    /// to request_audio_byte_range) for the full range-request wiring;
+    /// today this method only seeks the position marker, playback
+    /// resumes once the background decoder (fed by whatever route)
+    /// produces samples that far.
     pub fn seek_rich_content_audio_playback(&self, session_id: u32, file_id: u32, fraction: f32) {
+        let duration_ms =
+            self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
-            player.seek_to_fraction(fraction);
+            player.seek_to_fraction(fraction, duration_ms);
         }
     }
 

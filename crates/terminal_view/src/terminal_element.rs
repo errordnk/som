@@ -1961,14 +1961,31 @@ fn paint_rich_content_audio_widget(
     // fill whatever's left in between — matches the layout a normal
     // media-player widget uses (glyph, then a bar, then a duration
     // readout), not an arbitrary choice.
-    let glyph = if is_playing { "⏸" } else { "▶" };
+    //
+    // Nerd Font (Font Awesome subset) codepoints, not plain Unicode
+    // ▶/⏸ — Som embeds exactly one font, FiraCode Nerd Font
+    // (`assets/fonts/FiraCodeNerdFont-Regular.ttf`), and plain Unicode
+    // U+23F8 (PAUSE) has no glyph in it at all (confirmed via
+    // `ttf-parser`), so it would have fallen back to a missing-glyph box
+    // — using this font's own icon set instead guarantees both glyphs
+    // render, in the terminal's own glyph style, at the same color as
+    // everything else painted here (`text_color`, shared by both).
+    const NF_PLAY: &str = "\u{f04b}"; // nf-fa-play
+    const NF_PAUSE: &str = "\u{f04c}"; // nf-fa-pause
+    let glyph = if is_playing { NF_PAUSE } else { NF_PLAY };
     let time_text = format!("{}/{}", format_duration(elapsed), format_duration(duration));
 
-    let text_style = gpui::TextStyle {
-        color: text_color,
-        font_size: line_height.into(),
-        ..Default::default()
-    };
+    // Uses the terminal's own text style (`layout.base_text_style`), not
+    // `TextStyle::default()` — Som embeds exactly one font (FiraCode
+    // Nerd Font) and that's what every other terminal character is
+    // painted with; the time readout is plain digits/`:`/`/`, ordinary
+    // enough to render in any font, but using the terminal's own font
+    // keeps it visually consistent with the play/pause glyph next to it
+    // (same font, same size) rather than whatever GPUI's own default
+    // font happens to be.
+    let mut text_style = layout.base_text_style.clone();
+    text_style.color = text_color;
+    text_style.font_size = line_height.into();
     let glyph_run = TextRun { len: glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
     let glyph_line = window.text_system().shape_line(
         glyph.to_string().into(),

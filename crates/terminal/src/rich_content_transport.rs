@@ -379,10 +379,17 @@ pub enum ContentMetadata {
         /// frame.
         is_animated: bool,
     },
-    /// Reserved for [`ContentType::Audio`] — not wired up to any decoder
-    /// yet, but the field shape is settled now so adding real audio
-    /// support later doesn't need another header-format break.
-    Audio { sample_rate: u32, channels: u8, bits_per_sample: u8 },
+    /// [`ContentType::Audio`]'s metadata. `duration_ms` is the whole
+    /// track's real duration, known from the source file's own header
+    /// (e.g. an MP3's Xing/VBRI VBR tag, or a size/bitrate estimate) —
+    /// NOT derived from however many bytes have streamed in so far. This
+    /// is what lets Som show an accurate duration/seek-bar length the
+    /// moment the FIRST chunk arrives, before the rest of a
+    /// multi-gigabyte file has streamed in at all (see
+    /// `SRP_PROTOCOL.md`'s progressive-audio section). `0` means unknown,
+    /// same "unknown, don't guess" convention `Chunk::total_size` and
+    /// `Self::Image`'s `width_px`/`height_px` already use.
+    Audio { sample_rate: u32, channels: u8, bits_per_sample: u8, duration_ms: u32 },
     /// Reserved for [`ContentType::Video`] — same rationale as
     /// [`Self::Audio`]. `fps_numerator`/`fps_denominator` (rather than a
     /// single float or rounded integer fps) mirrors how GIF/video
@@ -448,6 +455,9 @@ pub enum DecodeError {
     UnsupportedVersion(u8),
     /// `content_type` byte didn't match any [`ContentType`] variant.
     UnknownContentType(u8),
+    /// A [`Query`]'s `query_type` byte didn't match any [`QueryType`]
+    /// variant.
+    UnknownQueryType(u8),
     /// The encoded [`ContentMetadata`] had an unrecognized discriminant
     /// tag, or (specifically for [`ContentMetadata::Video`]) an
     /// unrecognized [`VideoCodec`] byte.
@@ -471,6 +481,7 @@ impl fmt::Display for DecodeError {
             Self::InvalidPayloadEncoding => write!(f, "payload base91 encoding is malformed"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported envelope version {v}"),
             Self::UnknownContentType(b) => write!(f, "unknown content type byte {b}"),
+            Self::UnknownQueryType(b) => write!(f, "unknown query type byte {b}"),
             Self::InvalidMetadata => write!(f, "content metadata tag or codec byte is unrecognized"),
             Self::LengthMismatch { declared, actual } => {
                 write!(f, "declared chunk_len {declared} does not match actual payload length {actual}")
@@ -544,10 +555,11 @@ fn encode_metadata(metadata: ContentMetadata) -> [u8; METADATA_ENCODED_LEN] {
             fields[8] = color_bits;
             fields[9] = is_animated as u8;
         },
-        ContentMetadata::Audio { sample_rate, channels, bits_per_sample } => {
+        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
             fields[0..4].copy_from_slice(&sample_rate.to_le_bytes());
             fields[4] = channels;
             fields[5] = bits_per_sample;
+            fields[6..10].copy_from_slice(&duration_ms.to_le_bytes());
         },
         ContentMetadata::Video { width_px, height_px, fps_numerator, fps_denominator, codec } => {
             fields[0..4].copy_from_slice(&width_px.to_le_bytes());
@@ -581,6 +593,7 @@ fn decode_metadata(bytes: &[u8]) -> Option<ContentMetadata> {
             sample_rate: u32::from_le_bytes(fields[0..4].try_into().unwrap()),
             channels: fields[4],
             bits_per_sample: fields[5],
+            duration_ms: u32::from_le_bytes(fields[6..10].try_into().unwrap()),
         }),
         METADATA_TAG_VIDEO => Some(ContentMetadata::Video {
             width_px: u32::from_le_bytes(fields[0..4].try_into().unwrap()),
@@ -689,6 +702,152 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<Chunk, DecodeError> {
 pub fn split_into_chunks(data: &[u8], max_len: usize) -> Vec<Vec<u8>> {
     assert!(max_len > 0, "max_len must be positive");
     data.chunks(max_len).map(|c| c.to_vec()).collect()
+}
+
+/// Leading byte inside the APC string for a Som -> client QUERY — the
+/// opposite direction of every other envelope this module defines. Every
+/// other exchange in this protocol is client -> Som (a chunk of file
+/// data); this is the first (and, deliberately, GENERAL-purpose, not
+/// audio-specific) primitive for Som asking a client for something and
+/// getting a targeted answer back.
+///
+/// Distinct from [`MARKER`] so a receiver routes the two to entirely
+/// different parsers by construction, the same way [`MARKER`] itself is
+/// already distinct from Kitty's own `G` — see this module's doc comment.
+pub const QUERY_MARKER: u8 = b'Q';
+
+/// Reserved for a client's answer to a [`QUERY_MARKER`] query whose
+/// answer ISN'T naturally chunk-shaped (a [`Query::AudioByteRange`]'s
+/// answer, by contrast, is just ordinary [`MARKER`]-tagged [`Chunk`]
+/// envelopes for the requested range — [`RichContentCache`](crate::rich_content_cache::RichContentCache)
+/// already tolerates chunks landing out of sequential order at arbitrary
+/// offsets, so no new response shape was needed for that case). A future
+/// query type whose answer is a small typed value (e.g. a Lua form
+/// submission's result) would use this marker instead. Not built yet —
+/// reserved and documented now so the marker byte space is settled.
+pub const QUERY_RESPONSE_MARKER: u8 = b'R';
+
+/// What a [`Query`] is asking for. Deliberately open-ended — audio byte
+/// ranges are the first concrete consumer of this mechanism, not the
+/// only one it's designed for (a planned future use: a `.md` document's
+/// embedded Lua form submitting to a script running on the remote
+/// machine, needing the same request/response round trip with a
+/// different payload shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum QueryType {
+    /// Ask the client for a specific byte range of a file it's already
+    /// streaming (or has streamed) over this same `(session_id,
+    /// file_id)` — used when Som needs bytes from further into a large
+    /// file than the sequential stream has reached yet (e.g. seeking
+    /// forward in audio playback past what's currently cached). The
+    /// client answers with ordinary [`Chunk`] envelope(s) covering
+    /// `[offset, offset + len)`, not a [`QUERY_RESPONSE_MARKER`] reply.
+    AudioByteRange = 0,
+}
+
+impl QueryType {
+    fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::AudioByteRange),
+            _ => None,
+        }
+    }
+}
+
+/// One query Som sends to a client, asking it to do something and
+/// (eventually) answer back. `request_id` is chosen by the sender and
+/// has no meaning beyond correlating an eventual answer to this specific
+/// request — for [`QueryType::AudioByteRange`], since the answer is
+/// ordinary chunk envelopes (not itself carrying `request_id`), a client
+/// only needs `request_id` if it wants to log/debug which query
+/// triggered which outgoing chunks; Som's own receiving side doesn't
+/// need to match anything up for this query type since the response
+/// lands in the same `(session_id, file_id)` cache slot as the rest of
+/// the file regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Query {
+    pub request_id: u32,
+    pub session_id: u32,
+    pub file_id: u32,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Raw (pre-base91) size of a query's header fields: version(1) +
+/// request_id(4) + query_type(1) + session_id(4) + file_id(4) +
+/// offset(8) + len(8) = 30 bytes. Unlike [`HEADER_FIELDS_LEN`]'s chunk
+/// envelope, a query carries its whole payload inline in this fixed
+/// header — there's no separate base91 payload region or [`SEPARATOR`]
+/// byte, since a query has no arbitrary-length data attached (just fixed
+/// integer fields), matching [`QueryType::AudioByteRange`]'s needs
+/// exactly; a future query type needing a variable-length payload (e.g.
+/// a Lua form's submitted field values) would extend this shape then,
+/// not before it's needed.
+const QUERY_HEADER_FIELDS_LEN: usize = 1 + 4 + 1 + 4 + 4 + 8 + 8;
+
+/// Builds one complete query envelope ready to be wrapped in `ESC _ Q
+/// ... ESC \` and written to a child process's stdin over the PTY (see
+/// `Terminal::write_to_pty`, the same low-level "write bytes to the
+/// child" primitive Som already uses to answer `CSI 16 t`/`CSI 18 t`
+/// size queries FROM a client — this is that same primitive used in the
+/// opposite direction).
+pub fn build_query_envelope(query: &Query) -> Vec<u8> {
+    let mut fields = Vec::with_capacity(QUERY_HEADER_FIELDS_LEN);
+    fields.push(VERSION);
+    fields.extend_from_slice(&query.request_id.to_le_bytes());
+    fields.push(QueryType::AudioByteRange as u8);
+    fields.extend_from_slice(&query.session_id.to_le_bytes());
+    fields.extend_from_slice(&query.file_id.to_le_bytes());
+    fields.extend_from_slice(&query.offset.to_le_bytes());
+    fields.extend_from_slice(&query.len.to_le_bytes());
+    debug_assert_eq!(fields.len(), QUERY_HEADER_FIELDS_LEN);
+
+    let header_b91 = base91_encode(&fields);
+    let mut envelope = Vec::with_capacity(1 + header_b91.len());
+    envelope.push(QUERY_MARKER);
+    envelope.extend_from_slice(&header_b91);
+    envelope
+}
+
+/// Parses one query envelope (the raw APC bytes between `apc_hook` and
+/// `apc_unhook`, same as [`parse_envelope`]) into a [`Query`]. Mirrors
+/// [`parse_envelope`]'s validation order (marker, encoding, version)
+/// but has no payload/CRC region to validate — see
+/// [`QUERY_HEADER_FIELDS_LEN`]'s doc comment for why.
+pub fn parse_query_envelope(bytes: &[u8]) -> Result<Query, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::TooShort);
+    }
+    if bytes[0] != QUERY_MARKER {
+        return Err(DecodeError::WrongMarker);
+    }
+
+    let fields = base91_decode(&bytes[1..]).ok_or(DecodeError::InvalidHeaderEncoding)?;
+    if fields.len() != QUERY_HEADER_FIELDS_LEN {
+        return Err(DecodeError::InvalidHeaderEncoding);
+    }
+
+    if fields[0] != VERSION {
+        return Err(DecodeError::UnsupportedVersion(fields[0]));
+    }
+
+    let mut offset = 1;
+    let request_id = u32::from_le_bytes(fields[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    let _query_type = QueryType::from_u8(fields[offset]).ok_or(DecodeError::UnknownQueryType(fields[offset]))?;
+    offset += 1;
+    let session_id = u32::from_le_bytes(fields[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    let file_id = u32::from_le_bytes(fields[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    let range_offset = u64::from_le_bytes(fields[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let len = u64::from_le_bytes(fields[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    debug_assert_eq!(offset, QUERY_HEADER_FIELDS_LEN);
+
+    Ok(Query { request_id, session_id, file_id, offset: range_offset, len })
 }
 
 #[cfg(test)]
@@ -1002,5 +1161,102 @@ mod tests {
             reassembled.extend_from_slice(&parsed.payload);
         }
         assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn content_metadata_audio_with_duration_round_trips() {
+        let mut chunk = sample_chunk(b"pcm".to_vec());
+        chunk.metadata =
+            ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 208_500 };
+        let envelope = build_envelope(&chunk);
+        let parsed = parse_envelope(&envelope).unwrap();
+        assert_eq!(
+            parsed.metadata,
+            ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 208_500 }
+        );
+    }
+
+    #[test]
+    fn content_metadata_audio_zero_duration_means_unknown() {
+        let mut chunk = sample_chunk(b"pcm".to_vec());
+        chunk.metadata = ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 0 };
+        let envelope = build_envelope(&chunk);
+        let parsed = parse_envelope(&envelope).unwrap();
+        assert_eq!(
+            parsed.metadata,
+            ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 0 }
+        );
+    }
+
+    fn sample_query() -> Query {
+        Query { request_id: 0x1234_5678, session_id: 0xDEAD_BEEF, file_id: 0xC0FF_EE00, offset: 5_000_000, len: 65_536 }
+    }
+
+    #[test]
+    fn query_envelope_round_trips() {
+        let query = sample_query();
+        let envelope = build_query_envelope(&query);
+        let parsed = parse_query_envelope(&envelope).unwrap();
+        assert_eq!(parsed, query);
+    }
+
+    #[test]
+    fn query_envelope_uses_the_query_marker_not_the_chunk_marker() {
+        let envelope = build_query_envelope(&sample_query());
+        assert_eq!(envelope[0], QUERY_MARKER);
+        assert_ne!(envelope[0], MARKER);
+    }
+
+    #[test]
+    fn query_envelope_large_offset_and_len_round_trip() {
+        // A multi-gigabyte file's byte offset/length must survive
+        // intact — this is the whole point of using u64 fields instead
+        // of u32, confirmed with a value that would overflow a u32.
+        let query = Query { request_id: 1, session_id: 1, file_id: 1, offset: 8_000_000_000, len: 4_000_000_000 };
+        let envelope = build_query_envelope(&query);
+        let parsed = parse_query_envelope(&envelope).unwrap();
+        assert_eq!(parsed, query);
+    }
+
+    #[test]
+    fn parse_query_envelope_rejects_chunk_envelope() {
+        // A chunk envelope (marker `S`) must never be mistaken for a
+        // query envelope (marker `Q`), and vice versa (see the
+        // `WrongMarker` case in `parse_envelope`'s own tests) — the two
+        // marker bytes must route to entirely different parsers.
+        let chunk_envelope = build_envelope(&sample_chunk(b"x".to_vec()));
+        assert_eq!(parse_query_envelope(&chunk_envelope), Err(DecodeError::WrongMarker));
+    }
+
+    #[test]
+    fn parse_envelope_rejects_query_envelope() {
+        let query_envelope = build_query_envelope(&sample_query());
+        assert_eq!(parse_envelope(&query_envelope), Err(DecodeError::WrongMarker));
+    }
+
+    #[test]
+    fn query_envelope_wrong_version_is_rejected() {
+        let mut envelope = build_query_envelope(&sample_query());
+        // Re-encode the header with a bumped version byte — same
+        // approach `unsupported_version_is_rejected` uses for chunk
+        // envelopes: decode the base91 header, mutate the raw version
+        // byte, re-encode.
+        let mut fields = base91_decode(&envelope[1..]).unwrap();
+        fields[0] = VERSION + 1;
+        let header_b91 = base91_encode(&fields);
+        envelope.truncate(1);
+        envelope.extend_from_slice(&header_b91);
+        assert_eq!(parse_query_envelope(&envelope), Err(DecodeError::UnsupportedVersion(VERSION + 1)));
+    }
+
+    #[test]
+    fn query_envelope_unknown_query_type_is_rejected() {
+        let mut envelope = build_query_envelope(&sample_query());
+        let mut fields = base91_decode(&envelope[1..]).unwrap();
+        fields[5] = 0xFF; // query_type byte, offset 1 (version) + 4 (request_id)
+        let header_b91 = base91_encode(&fields);
+        envelope.truncate(1);
+        envelope.extend_from_slice(&header_b91);
+        assert_eq!(parse_query_envelope(&envelope), Err(DecodeError::UnknownQueryType(0xFF)));
     }
 }

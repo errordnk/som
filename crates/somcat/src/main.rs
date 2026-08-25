@@ -79,15 +79,26 @@ fn static_image_metadata(bytes: &[u8]) -> Result<(u32, u32, bool), String> {
     Ok((width, height, false))
 }
 
-/// Reads just enough of an MP3/FLAC file to describe its PCM shape —
-/// `symphonia`'s probe + format reader parses container/stream headers
-/// without decoding any audio frames. Decoding and playback both happen
-/// on Som's side (it's the only process guaranteed to be local to the
-/// user's speakers, even when this process is running on a remote SSH
-/// host) — `somcat` only needs enough to fill `ContentMetadata::Audio`
-/// accurately before the first chunk goes out, same "metadata travels on
-/// every chunk" pattern used for images.
-fn audio_metadata(path: &str) -> Result<(u32, u8, u8), String> {
+/// Reads just enough of an MP3/FLAC file to describe its PCM shape AND
+/// its real total duration — `symphonia`'s probe + format reader parses
+/// container/stream headers without decoding any audio frames.
+/// Decoding and playback both happen on Som's side (it's the only
+/// process guaranteed to be local to the user's speakers, even when this
+/// process is running on a remote SSH host) — `somcat` only needs enough
+/// to fill `ContentMetadata::Audio` accurately before the first chunk
+/// goes out, same "metadata travels on every chunk" pattern used for
+/// images.
+///
+/// Duration comes from `CodecParameters::n_frames`/`time_base`, which
+/// `symphonia`'s format readers populate straight from the file's own
+/// header (an MP3's Xing/VBRI VBR tag, or a size/bitrate-based estimate;
+/// a FLAC's STREAMINFO block) — NOT by decoding the file. This is what
+/// lets Som show an accurate duration/seek-bar length from just the
+/// first chunk of a multi-gigabyte file, before the rest has streamed in
+/// at all (see `SRP_PROTOCOL.md`'s progressive-audio section). `0` if
+/// the format reader couldn't determine it, same "unknown" convention
+/// the rest of this protocol's metadata fields use.
+fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
     use symphonia::core::codecs::CODEC_TYPE_NULL;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::probe::Hint;
@@ -115,8 +126,15 @@ fn audio_metadata(path: &str) -> Result<(u32, u8, u8), String> {
     let sample_rate = params.sample_rate.ok_or_else(|| format!("{path}: unknown sample rate"))?;
     let channels = params.channels.map(|c| c.count() as u8).ok_or_else(|| format!("{path}: unknown channel count"))?;
     let bits_per_sample = params.bits_per_sample.map(|b| b as u8).unwrap_or(16);
+    let duration_ms = match (params.n_frames, params.time_base) {
+        (Some(n_frames), Some(time_base)) => {
+            let time = time_base.calc_time(n_frames);
+            (time.seconds.saturating_mul(1000) as u32).saturating_add((time.frac * 1000.0) as u32)
+        },
+        _ => 0,
+    };
 
-    Ok((sample_rate, channels, bits_per_sample))
+    Ok((sample_rate, channels, bits_per_sample, duration_ms))
 }
 
 /// Sends `CSI 16 t` ("report cell size in pixels") and waits briefly for
@@ -368,13 +386,37 @@ fn stream_bytes(
     bytes: &[u8],
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
+    ids: SrpIds,
+) -> Result<(), String> {
+    let total_size = bytes.len() as u64;
+    send_range_chunks(bytes, content_type, metadata, ids, total_size, 0, bytes.len() as u64)
+}
+
+/// Sends `bytes[offset as usize .. (offset + len) as usize]` as one or
+/// more chunk envelopes at their real file offsets — the shared
+/// implementation behind both [`stream_bytes`] (the whole file, offset
+/// 0) and a range-request response (an arbitrary sub-range, see
+/// [`spawn_audio_query_responder`]). `total_size` is the WHOLE file's
+/// size (not `bytes.len()`), since a range response still needs to
+/// declare the file's real total size in every chunk header, same as
+/// the initial sequential stream does.
+fn send_range_chunks(
+    bytes: &[u8],
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
     (session_id, file_id): SrpIds,
+    total_size: u64,
+    range_offset: u64,
+    range_len: u64,
 ) -> Result<(), String> {
     use terminal::rich_content_transport::{Chunk, build_envelope, split_into_chunks};
 
-    let total_size = bytes.len() as u64;
-    let pieces = split_into_chunks(bytes, CHUNK_SIZE);
-    let mut offset = 0u64;
+    let start = range_offset as usize;
+    let end = (range_offset + range_len).min(bytes.len() as u64) as usize;
+    let slice = bytes.get(start..end).ok_or_else(|| format!("range [{start}, {end}) out of bounds"))?;
+
+    let pieces = split_into_chunks(slice, CHUNK_SIZE);
+    let mut offset = range_offset;
     for payload in pieces {
         let payload_len = payload.len() as u64;
         let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, metadata, payload };
@@ -390,6 +432,108 @@ fn stream_bytes(
         offset += payload_len;
     }
     Ok(())
+}
+
+/// Spawns the background thread that services Som's byte-range queries
+/// (`rich_content_transport::Query`/`QUERY_MARKER`) for the rest of this
+/// process's lifetime — see this module's doc comment on
+/// `STDOUT_WRITE_LOCK` for why concurrent writes need synchronization,
+/// and `rich_content_transport::Query`'s own doc comment for why a
+/// range-request's ANSWER is just ordinary chunk envelopes, not a new
+/// reply shape.
+///
+/// Reads stdin one byte at a time looking for `ESC _ Q ... ESC \`
+/// (mirrors `query_cell_size_px`'s own byte-at-a-time stdin read, but
+/// long-lived instead of a single blocking read-with-timeout). Must only
+/// be started AFTER any other stdin reader this process still needs has
+/// already finished (`stream_file`'s audio branch prints the
+/// placeholder grid — which reads Som's own `CSI 16 t`/`CSI 18 t`
+/// cell-size replies off stdin — BEFORE calling this, specifically so
+/// the two never read the same stdin concurrently, which would be
+/// inherently racy).
+///
+/// `bytes` is the SAME in-memory file contents `stream_file` already
+/// read via `std::fs::read` before starting to stream — sharing it
+/// (via `Arc`) rather than opening a second file handle avoids any
+/// file-position contention with a second `Read`/`Seek` user, and
+/// `somcat` already loaded the whole file into memory before this point
+/// regardless.
+///
+/// Returns a `(stop_flag, JoinHandle)` pair. The flag is checked between
+/// stdin reads, but a thread parked in a blocking `read()` call won't
+/// observe it until its next byte arrives — `stream_file` sets the flag
+/// once the main sequential loop finishes but deliberately does NOT
+/// join the handle: `somcat`'s process exits right after the audio
+/// path's caller returns regardless, which tears this thread down along
+/// with it, and there is no further stdin use afterward this needs to
+/// be sequenced against.
+fn spawn_audio_query_responder(
+    bytes: std::sync::Arc<Vec<u8>>,
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
+    ids: SrpIds,
+    total_size: u64,
+) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if stop_for_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            match std::io::Read::read(&mut stdin, &mut byte) {
+                Ok(1) => {
+                    buf.push(byte[0]);
+                    // APC terminator `ESC \` — check whether the tail of
+                    // `buf` contains a complete `ESC _ Q ... ESC \`
+                    // envelope, same start/end markers `stream_bytes`
+                    // itself wraps every chunk in.
+                    if buf.len() >= 2 && buf[buf.len() - 2] == 0x1B && buf[buf.len() - 1] == b'\\' {
+                        if let Some(start) = find_apc_start(&buf) {
+                            let inner = &buf[start + 2..buf.len() - 2];
+                            if inner.first().copied() == Some(terminal::rich_content_transport::QUERY_MARKER)
+                                && let Ok(query) = terminal::rich_content_transport::parse_query_envelope(inner)
+                                && query.session_id == ids.0
+                                && query.file_id == ids.1
+                            {
+                                let _ = send_range_chunks(
+                                    &bytes,
+                                    content_type,
+                                    metadata,
+                                    ids,
+                                    total_size,
+                                    query.offset,
+                                    query.len,
+                                );
+                            }
+                        }
+                        buf.clear();
+                    } else if buf.len() > 8192 {
+                        // No plausible envelope this large — drop
+                        // whatever's accumulated rather than growing
+                        // `buf` forever on unrelated stdin noise.
+                        buf.clear();
+                    }
+                },
+                _ => return,
+            }
+        }
+    });
+    (stop, handle)
+}
+
+/// Finds the start of the LAST `ESC _` (APC start) in `buf`, if any —
+/// used by [`spawn_audio_query_responder`] to locate where a just-
+/// completed envelope (ending at `buf`'s own tail) began, without
+/// needing a full state machine for a byte stream that's overwhelmingly
+/// just one envelope at a time in practice.
+fn find_apc_start(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).rposition(|w| w == [0x1B, b'_'])
 }
 
 /// Streams `path` to Som over SRP, then prints a placeholder grid
@@ -443,11 +587,42 @@ fn stream_file(path: &str) -> Result<(), String> {
     let ids = new_ids();
 
     if content_type == ContentType::Audio {
-        let (sample_rate, channels, bits_per_sample) = audio_metadata(path)?;
-        let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample };
-        stream_bytes(&bytes, content_type, metadata, ids)?;
+        let (sample_rate, channels, bits_per_sample, duration_ms) = audio_metadata(path)?;
+        let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms };
         let (session_id, file_id) = ids;
-        return print_audio_placeholder_grid(session_id, file_id);
+
+        // Placeholder grid FIRST, streaming SECOND — the reverse order
+        // from every other content type. `print_audio_placeholder_grid`
+        // reads Som's `CSI 16 t`/`CSI 18 t` cell-size replies off this
+        // process's own stdin (`query_cell_size_px`/`query_cell_count`),
+        // and so does `spawn_audio_query_responder`'s background thread
+        // once it starts — two things reading the same stdin
+        // concurrently is inherently racy (whichever thread's read call
+        // gets a given byte first wins), so the query responder must not
+        // start until AFTER the grid's own queries have already
+        // completed. The grid's footprint is a fixed cell size (see
+        // `print_audio_placeholder_grid`), not derived from decoded
+        // audio content, so printing it before any bytes have streamed
+        // is correct, not just convenient.
+        print_audio_placeholder_grid(session_id, file_id)?;
+
+        let total_size = bytes.len() as u64;
+        let shared_bytes = std::sync::Arc::new(bytes);
+        let (stop, handle) =
+            spawn_audio_query_responder(shared_bytes.clone(), content_type, metadata, ids, total_size);
+        let result = stream_bytes(&shared_bytes, content_type, metadata, ids);
+        // The responder thread blocks on a stdin read that may never
+        // return on its own (no more queries arriving) — `stop` is
+        // checked between reads, but a thread parked in `read()` won't
+        // observe it until its next byte arrives or the process exits.
+        // Not joining here is deliberate: `main()` returns (and the
+        // process exits) right after this function does for the audio
+        // path, which tears the thread down along with it; there is no
+        // further stdin use after this point for `somcat` to protect
+        // against racing with.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(handle);
+        return result;
     }
 
     let (width_px, height_px, is_animated) =
@@ -483,10 +658,23 @@ fn stream_file(path: &str) -> Result<(), String> {
 /// it out is what actually hung — confirmed directly: `write_all` itself
 /// reliably returned `Ok`, but the very next `.flush()` call never returned
 /// at all, on the very first (113-byte) chunk, every time.
+/// Serializes every `write_raw_stdout` call — needed once audio streams
+/// gained a second writer (the background query-reader thread's range-
+/// response chunks, see `spawn_audio_query_responder`) that runs
+/// CONCURRENTLY with the main thread's own sequential chunk-sending
+/// loop. Without this, two envelopes' bytes could interleave on the
+/// wire (one thread's `WriteFile`/`write_all` call landing partway
+/// through another's), producing bytes neither `parse_envelope` nor
+/// `parse_query_envelope` could ever make sense of — every other content
+/// type (images/GIF) only ever has one writer (the main thread), so this
+/// was never needed before audio's background thread existed.
+static STDOUT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn write_raw_stdout(bytes: &[u8]) -> Result<(), String> {
     use windows::Win32::Storage::FileSystem::WriteFile;
     use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.map_err(|e| e.to_string())?;
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -507,5 +695,6 @@ fn write_raw_stdout(bytes: &[u8]) -> Result<(), String> {
     // Windows' does for a non-console (pipe/pty) target — `write_all`
     // alone is sufficient here.
     use std::io::Write as _;
+    let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     std::io::stdout().write_all(bytes).map_err(|e| e.to_string())
 }

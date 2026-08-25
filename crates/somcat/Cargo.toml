@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 image.workspace = true
 terminal.workspace = true
+symphonia.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

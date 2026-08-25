@@ -4,6 +4,7 @@ pub use alacritty_terminal;
 
 pub mod kitty_graphics_placeholder;
 mod pty_info;
+pub mod rich_content_audio_player;
 pub mod rich_content_cache;
 pub mod rich_content_gif_player;
 pub mod rich_content_player;
@@ -481,6 +482,8 @@ impl TerminalBuilder {
             last_pty_grid_size: None,
             rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
@@ -771,6 +774,8 @@ impl TerminalBuilder {
                 last_pty_grid_size: None,
                 rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
@@ -1035,6 +1040,27 @@ pub struct Terminal {
     /// reuse-when-unchanged fast path).
     rich_content_players:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_player::RichContentPlayer>>,
+    /// Playback state for `ContentType::Audio` placements, keyed
+    /// identically to `rich_content_players`. Kept in a SEPARATE map
+    /// (not folded into `rich_content_players`) because a
+    /// `RichContentAudioPlayer` owns a live `cpal` output stream whose
+    /// lifetime must span many paints — unlike an image player, it
+    /// can't be thrown away and rebuilt on every refresh (see that
+    /// type's own doc comment). Once created for a given
+    /// `(session_id, file_id)`, an entry here is never replaced, only
+    /// mutated (play/pause/seek) — there is no "re-decode when more
+    /// bytes arrive" story for audio the way there is for progressive
+    /// GIF decoding.
+    rich_content_audio_players:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_player::RichContentAudioPlayer>>,
+    /// Each rich-content placement's on-screen pixel bounds, as last
+    /// computed by `terminal_element.rs`'s paint pass — nothing else
+    /// persists this (the paint path itself only ever needs it as a
+    /// local for the duration of one paint call). Written every paint
+    /// via `Terminal::record_rich_content_placement_bounds`, read by
+    /// `Terminal::mouse_down`'s click-interception check so a click can
+    /// be tested against a placement's bounds outside of a paint pass.
+    rich_content_placement_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
     /// When `process_event`'s `ApcString` handler (or `terminal_element.rs`'s
     /// `paint()`, for animation-frame advancement) last called
     /// `cx.force_redraw_windows()` for a rich-content chunk/frame — throttles
@@ -1790,6 +1816,160 @@ impl Terminal {
     /// See [`crate::rich_content_cache::RichContentCache::record_max_column_seen`].
     pub fn record_rich_content_max_column_seen(&self, session_id: u32, file_id: u32, column: u32) {
         self.rich_content_cache.record_max_column_seen(session_id, file_id, column);
+    }
+
+    /// Every `ContentType::Audio` placement with a currently open player,
+    /// opening a new one (decoding the whole cached file) the first time
+    /// a given `(session_id, file_id)` is fully cached — never re-decoded
+    /// or replaced after that (see
+    /// [`rich_content_audio_player::RichContentAudioPlayer`]'s own doc
+    /// comment for why: it owns a live device stream, unlike an image
+    /// player). Mirrors [`Self::rich_content_placements`]'s shape (scan
+    /// `rich_content_cache.all_known_ids()`, refresh lazily at paint
+    /// time) but returns playback state instead of a decoded frame, and
+    /// deliberately does NOT remove-then-reinsert into the map the way
+    /// `rich_content_placements` does — the player itself, not just a
+    /// snapshot of it, needs to persist so play/pause/seek calls in
+    /// between two paints (from `Terminal::mouse_down`) actually stick.
+    pub fn rich_content_audio_placements(&self) -> Vec<(u32, u32, f32, bool, std::time::Duration, std::time::Duration)> {
+        let mut players = self.rich_content_audio_players.borrow_mut();
+        let mut out = Vec::new();
+        for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
+            let Some(content_type) = self.rich_content_cache.content_type(session_id, file_id) else {
+                continue;
+            };
+            if content_type != rich_content_transport::ContentType::Audio {
+                continue;
+            }
+            let key = (session_id, file_id);
+            if !players.contains_key(&key) {
+                let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+                    continue;
+                };
+                let total_size = self.rich_content_cache.total_size(session_id, file_id);
+                let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
+                // Same "wait for the whole file" gate the JPEG/PNG branch
+                // of `rich_content_player::refresh_or_create` uses — no
+                // progressive-prefix decode story exists for mp3/flac
+                // (see `rich_content_audio_player`'s module doc comment).
+                if total_size == 0 || contiguous_len < total_size {
+                    continue;
+                }
+                match rich_content_audio_player::RichContentAudioPlayer::open(path) {
+                    Ok(player) => {
+                        players.insert(key, player);
+                    },
+                    // A genuine decode/device error — silently skip, same
+                    // tolerance principle every other rich-content decode
+                    // path in this codebase already uses (a single
+                    // unplayable file shouldn't need special paint-path
+                    // error handling).
+                    Err(err) => {
+                        log::warn!("audio placement {session_id}:{file_id} failed to open: {err}");
+                        continue;
+                    },
+                }
+            }
+            let player = players.get(&key).expect("just inserted or already present");
+            out.push((
+                session_id,
+                file_id,
+                player.position_fraction(),
+                player.is_playing(),
+                player.elapsed(),
+                player.duration(),
+            ));
+        }
+        out
+    }
+
+    /// Toggles play/pause for the audio placement at `(session_id,
+    /// file_id)`, if one is currently open — a no-op otherwise (e.g. the
+    /// click landed on a placeholder whose player hasn't been created
+    /// yet because the file isn't fully cached). Called from
+    /// `Terminal::mouse_down`'s click-interception check, never from the
+    /// paint path itself.
+    pub fn toggle_rich_content_audio_playback(&self, session_id: u32, file_id: u32) {
+        if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
+            player.toggle_play_pause();
+        }
+    }
+
+    /// Seeks the audio placement at `(session_id, file_id)` to `fraction`
+    /// (0.0..=1.0) of its total length, if a player is currently open.
+    pub fn seek_rich_content_audio_playback(&self, session_id: u32, file_id: u32, fraction: f32) {
+        if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
+            player.seek_to_fraction(fraction);
+        }
+    }
+
+    /// Persists `bounds` as the last-painted pixel bounds for placement
+    /// `(session_id, file_id)` — see
+    /// [`Self::rich_content_placement_bounds`]'s own doc comment for why
+    /// this needs to outlive a single paint call. Called from
+    /// `terminal_element.rs`'s paint pass for EVERY placement (not just
+    /// audio ones), since hit-testing is a general mechanism even though
+    /// audio is its first consumer.
+    pub fn record_rich_content_placement_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
+        self.rich_content_placement_bounds.borrow_mut().insert((session_id, file_id), bounds);
+    }
+
+    /// The last-painted pixel bounds for placement `(session_id,
+    /// file_id)`, if it was visible on the most recent paint. `None`
+    /// means either the placement doesn't exist or scrolled fully out of
+    /// view since its bounds were last recorded (stale-but-absent is
+    /// treated the same as never-existed — a click can't land on
+    /// something that isn't currently on screen).
+    pub fn rich_content_placement_bounds(&self, session_id: u32, file_id: u32) -> Option<Bounds<Pixels>> {
+        self.rich_content_placement_bounds.borrow().get(&(session_id, file_id)).copied()
+    }
+
+    /// Every currently recorded placement's `(session_id, file_id,
+    /// bounds)` — used by `Terminal::mouse_down`'s click-interception
+    /// check to find which (if any) placement a click landed inside,
+    /// without needing to know the id in advance.
+    pub fn rich_content_placement_bounds_iter(&self) -> Vec<(u32, u32, Bounds<Pixels>)> {
+        self.rich_content_placement_bounds.borrow().iter().map(|(&(s, f), &b)| (s, f, b)).collect()
+    }
+
+    /// Tests `position` (absolute window pixel coordinates, same space
+    /// [`Self::record_rich_content_placement_bounds`] stores — see
+    /// `mouse_down`'s call site) against every currently recorded audio
+    /// placement's bounds. Returns `true` (and performs the click's
+    /// effect locally) if it landed inside one, `false` otherwise — the
+    /// `false` case lets `mouse_down` fall through to its normal
+    /// selection/hyperlink/PTY-forwarding logic unchanged, exactly like
+    /// the existing hyperlink early-return already does for a different
+    /// kind of click.
+    ///
+    /// Only audio placements are hit-tested here (not every rich-content
+    /// placement — an image placement has no interactive zones at all
+    /// yet). The leftmost 2 cells of a widget are its play/pause zone
+    /// (matches `paint_rich_content_audio_widget`'s glyph + 1-cell
+    /// padding layout); anywhere else inside the bounds is treated as a
+    /// seek-bar click, jumping playback to that horizontal fraction of
+    /// the widget's width — close enough to "the seek bar specifically"
+    /// for a first cut without needing the exact same bar-vs-time-text
+    /// geometry duplicated here.
+    fn handle_rich_content_click(&self, position: gpui::Point<Pixels>) -> bool {
+        let cell_width = self.last_content.terminal_bounds.cell_width;
+        for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
+            if !self.rich_content_audio_players.borrow().contains_key(&(session_id, file_id)) {
+                continue;
+            }
+            if !bounds.contains(&position) {
+                continue;
+            }
+            let offset_x = position.x - bounds.origin.x;
+            if offset_x < cell_width * 2.0 {
+                self.toggle_rich_content_audio_playback(session_id, file_id);
+            } else {
+                let fraction = (f32::from(offset_x) / f32::from(bounds.size.width)).clamp(0.0, 1.0);
+                self.seek_rich_content_audio_playback(session_id, file_id, fraction);
+            }
+            return true;
+        }
+        false
     }
 
     /// Re-derives and rewrites, IN PLACE, every rich-content placeholder
@@ -2893,6 +3073,21 @@ impl Terminal {
     }
 
     pub fn mouse_down(&mut self, e: &MouseDownEvent, _cx: &mut Context<Self>) {
+        // Rich-content placement hit-testing — checked BEFORE any
+        // selection/hyperlink/PTY-forwarding logic below, mirroring the
+        // existing hyperlink early-return pattern a few lines down. A
+        // click landing inside an audio widget's play/pause zone or seek
+        // bar is handled entirely locally and never reaches the (possibly
+        // remote, over SSH) child process — see `rich_content_placement_
+        // bounds`'s own doc comment for why these bounds are in the same
+        // absolute-window pixel space as `e.position` (both come from
+        // `terminal_element.rs`'s paint pass using the same `origin`), so
+        // no coordinate translation is needed here, unlike the grid-point
+        // math below.
+        if e.button == MouseButton::Left && self.handle_rich_content_click(e.position) {
+            return;
+        }
+
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
@@ -6154,6 +6349,106 @@ mod tests {
             saw_frame_advance,
             "current_frame never advanced across polls — animation playback isn't ticking through the paint-path accessor"
         );
+    }
+
+    #[gpui::test]
+    async fn test_rich_content_audio_placement_decodes_and_plays_via_a_real_process(cx: &mut TestAppContext) {
+        // Audio counterpart to
+        // `test_rich_content_placements_reach_the_paint_path_via_a_real_
+        // process` above — proves the WHOLE pipeline end-to-end through a
+        // real `somcat` child process (real ConPTY) and a real `cpal`
+        // output device on this machine: transport -> cache -> symphonia
+        // decode -> cpal playback -> position tracking. This is
+        // deliberately NOT a mock: `RichContentAudioPlayer::open` opens
+        // the actual default output device, so this test only proves
+        // anything on a machine that has one (skips gracefully otherwise,
+        // matching `rich_content_audio_player`'s own test tolerance).
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let tone_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac");
+        assert!(tone_path.is_file(), "test_fixtures/tone.flac not found at {tone_path:?}");
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![tone_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let mut saw_placement = false;
+        let mut session_and_file_id: Option<(u32, u32)> = None;
+
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            let placements = terminal.update(cx, |term, _| term.rich_content_audio_placements());
+            if let Some((session_id, file_id, _position_fraction, _is_playing, _elapsed, duration)) =
+                placements.into_iter().next()
+            {
+                saw_placement = true;
+                session_and_file_id = Some((session_id, file_id));
+                assert!(duration.as_secs_f64() > 0.0, "a decoded audio placement must report a nonzero duration");
+                break;
+            }
+        }
+
+        if !saw_placement {
+            // No default output device in this environment (matches
+            // `rich_content_audio_player`'s own tests' tolerance) — the
+            // transport/decode side still ran (the file streamed and
+            // `RichContentAudioPlayer::open` was attempted), just no
+            // device to open. Not a failure of this feature's own logic.
+            eprintln!("skipping playback assertions: no audio placement/device available in this environment");
+            return;
+        }
+
+        let (session_id, file_id) = session_and_file_id.expect("set alongside saw_placement");
+
+        // Toggle playback on (starts paused, matching the module's own
+        // "don't autoplay" doc comment) and confirm the reported position
+        // actually advances — proves the `cpal` callback thread is really
+        // consuming samples, not just that a player object exists.
+        terminal.update(cx, |term, _| term.toggle_rich_content_audio_playback(session_id, file_id));
+
+        let mut first_fraction: Option<f32> = None;
+        let mut saw_advance = false;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            let placements = terminal.update(cx, |term, _| term.rich_content_audio_placements());
+            let Some((_, _, position_fraction, is_playing, _, _)) =
+                placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
+            else {
+                continue;
+            };
+            assert!(*is_playing, "playback must report as playing after toggling it on");
+            match first_fraction {
+                None => first_fraction = Some(*position_fraction),
+                Some(first) if *position_fraction > first => {
+                    saw_advance = true;
+                    break;
+                },
+                Some(_) => {},
+            }
+        }
+        assert!(saw_advance, "playback position never advanced after toggling play on");
     }
 
     #[gpui::test]

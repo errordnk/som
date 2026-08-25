@@ -204,6 +204,7 @@ pub enum MaybeNavigationTarget {
 enum InternalEvent {
     Resize(TerminalBounds),
     Clear,
+    ClearRichContentPlacement(u32, u32),
     // FocusNextMatch,
     Scroll(AlacScroll),
     ScrollToAlacPoint(AlacPoint),
@@ -485,6 +486,7 @@ impl TerminalBuilder {
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_audio_dismissed: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
@@ -782,6 +784,7 @@ impl TerminalBuilder {
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_audio_dismissed: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
@@ -1089,6 +1092,15 @@ pub struct Terminal {
     rich_content_audio_progress: std::cell::RefCell<
         std::collections::HashMap<(u32, u32), std::sync::Arc<rich_content_audio_player::AudioTransferProgress>>,
     >,
+    /// Audio placements the user has explicitly closed via the widget's
+    /// close ("x") glyph. `rich_content_audio_placements` skips any id in
+    /// this set — without it, the very next paint would just find the
+    /// same bytes still sitting in `rich_content_cache` and reopen a
+    /// fresh player for it, undoing the close immediately. Never
+    /// cleared: once dismissed, a placement stays dismissed for the rest
+    /// of this `Terminal`'s lifetime (matches "closing" a real media
+    /// player widget, not "pausing" it).
+    rich_content_audio_dismissed: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
     /// Each rich-content placement's on-screen pixel bounds, as last
     /// computed by `terminal_element.rs`'s paint pass — nothing else
     /// persists this (the paint path itself only ever needs it as a
@@ -1312,6 +1324,9 @@ impl Terminal {
             }
             AlacTermEvent::Bell => {
                 cx.emit(Event::Bell);
+            }
+            AlacTermEvent::ClearScreen => {
+                self.close_all_rich_content_audio_playback();
             }
             AlacTermEvent::Exit => self.register_task_finished(None, cx),
             AlacTermEvent::MouseCursorDirty => {
@@ -1545,6 +1560,75 @@ impl Terminal {
                     term.grid_mut().reset_region((new_cursor.line + 1)..);
                 }
 
+                cx.emit(Event::Wakeup);
+            }
+            InternalEvent::ClearRichContentPlacement(session_id, file_id) => {
+                use kitty_graphics_placeholder::{PLACEHOLDER_CHAR, decode_placeholder_cell};
+
+                // Scans the WHOLE buffer (scrollback included), same as
+                // `resync_rich_content_placements` — the widget's row can
+                // be in scrollback at the moment its close glyph is
+                // clicked (nothing stops a placement from having already
+                // scrolled up by then), and leaving a stale blank row
+                // anywhere would still be visible clutter the moment the
+                // user scrolled back to it.
+                let top = term.topmost_line().0;
+                let bottom = term.bottommost_line().0;
+                let columns = term.columns();
+                let mut rows: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+                for line_idx in top..=bottom {
+                    let line = Line(line_idx);
+                    for col_idx in 0..columns {
+                        let point = AlacPoint::new(line, Column(col_idx));
+                        let cell = &term.grid()[point];
+                        if cell.c != PLACEHOLDER_CHAR {
+                            continue;
+                        }
+                        let fg_rgb = match cell.fg {
+                            alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                            _ => continue,
+                        };
+                        let underline_rgb = match cell.underline_color() {
+                            Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                            Some(_) => continue,
+                            None => None,
+                        };
+                        let diacritics = cell.zerowidth().unwrap_or(&[]);
+                        let Some(decoded) = decode_placeholder_cell(cell.c, fg_rgb, underline_rgb, diacritics)
+                        else {
+                            continue;
+                        };
+                        if decoded.image_id == *session_id && decoded.placement_id == *file_id {
+                            rows.insert(line_idx);
+                            break;
+                        }
+                    }
+                }
+
+                // A real line DELETE, not just blanking cells in place —
+                // blanking alone left an empty row exactly where the
+                // widget used to be, confirmed live as clutter the user
+                // asked to have removed outright. For each affected row
+                // (bottom-to-top, so an earlier deletion's upward shift
+                // never invalidates a later row index still queued),
+                // every row below it copies up by one and the buffer's
+                // own bottom-most row is freshly blanked — the same
+                // "shift everything below up, blank what falls off the
+                // end" a real terminal's `DL` (Delete Line) control
+                // performs, just applied directly to the grid since the
+                // cursor isn't necessarily anywhere near this row.
+                for line_idx in rows.into_iter().rev() {
+                    let mut line = line_idx;
+                    while line < bottom {
+                        let next_row = term.grid()[Line(line + 1)].clone();
+                        term.grid_mut()[Line(line)] = next_row;
+                        line += 1;
+                    }
+                    let template = term.grid().cursor.template.clone();
+                    term.grid_mut()[Line(bottom)].reset(&template);
+                }
+
+                self.close_rich_content_audio_playback(*session_id, *file_id);
                 cx.emit(Event::Wakeup);
             }
             InternalEvent::Scroll(scroll) => {
@@ -1928,6 +2012,9 @@ impl Terminal {
                 continue;
             }
             let key = (session_id, file_id);
+            if self.rich_content_audio_dismissed.borrow().contains(&key) {
+                continue;
+            }
             if !players.contains_key(&key) {
                 let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
                     continue;
@@ -1988,6 +2075,46 @@ impl Terminal {
     pub fn toggle_rich_content_audio_playback(&self, session_id: u32, file_id: u32) {
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
             player.toggle_play_pause();
+        }
+    }
+
+    /// Closes the audio placement at `(session_id, file_id)` — dropping
+    /// its `RichContentAudioPlayer` (via `Drop`, stopping playback and
+    /// tearing down its decode thread and `cpal` stream) and marking the
+    /// id dismissed so `rich_content_audio_placements` never reopens it
+    /// from the still-cached bytes on a later paint. Called from
+    /// `Terminal::mouse_down`'s click-interception check when a click
+    /// lands on the widget's trailing close ("x") glyph.
+    pub fn close_rich_content_audio_playback(&self, session_id: u32, file_id: u32) {
+        self.rich_content_audio_dismissed.borrow_mut().insert((session_id, file_id));
+        self.rich_content_audio_players.borrow_mut().remove(&(session_id, file_id));
+        self.rich_content_audio_progress.borrow_mut().remove(&(session_id, file_id));
+    }
+
+    /// Closes every currently open audio player. Called when a real
+    /// `clear`/screen-erase escape sequence has just wiped the grid (see
+    /// call site in `process_event`'s `AlacTermEvent::Wakeup`-adjacent
+    /// handling — NOT called for an ordinary scroll, which also makes a
+    /// placement's placeholder cells leave the current viewport but
+    /// isn't a `clear`: the placement's cells still exist in scrollback,
+    /// just off-screen, and scrolling back up must still find a live,
+    /// still-playing widget there).
+    ///
+    /// A `clear` already makes the WIDGET stop being painted for free
+    /// (`paint_rich_content_placements` only ever paints ids it finds
+    /// live placeholder cells for — no placement-specific handling
+    /// needed there, same as an image placement), but that alone does
+    /// nothing to the player itself: it keeps its `cpal` stream and
+    /// decode thread running, fully audible, with no way left to reach
+    /// it (no widget left anywhere in scrollback to click, since `clear`
+    /// erased the cells for good). This stops and drops every open
+    /// player, same effect as the user clicking each one's close glyph,
+    /// so `clear`ing a tab genuinely silences whatever audio it was
+    /// playing rather than just hiding the controls for it.
+    pub fn close_all_rich_content_audio_playback(&self) {
+        let keys: Vec<(u32, u32)> = self.rich_content_audio_players.borrow().keys().copied().collect();
+        for (session_id, file_id) in keys {
+            self.close_rich_content_audio_playback(session_id, file_id);
         }
     }
 
@@ -2175,8 +2302,26 @@ impl Terminal {
             // plain click on the seek bar was visibly highlighting text
             // underneath/around the widget before this field existed to
             // suppress it, confirmed live.
-            self.rich_content_drag = Some((session_id, file_id));
             let offset_x = position.x - bounds.origin.x;
+            // Trailing cell is the close ("x") glyph's zone — mirrors the
+            // leading 2-cell play/pause zone on the opposite end (see
+            // `paint_rich_content_audio_widget`'s close-glyph layout).
+            // Checked BEFORE setting `rich_content_drag`: closing ends
+            // the interaction outright, there's nothing to drag.
+            if offset_x >= bounds.size.width - cell_width {
+                // Stops playback AND blanks the placement's placeholder
+                // cells (see `InternalEvent::ClearRichContentPlacement`)
+                // — closing must not leave an empty row of blank cells
+                // behind, confirmed as visible clutter live. Pushed as an
+                // event (not called directly) because blanking needs
+                // `&mut Term`, which this method — called from
+                // `mouse_down` — doesn't have; `sync` processes it on
+                // the next paint, same as every other grid mutation
+                // triggered by a click (e.g. `InternalEvent::Clear`).
+                self.events.push_back(InternalEvent::ClearRichContentPlacement(session_id, file_id));
+                return true;
+            }
+            self.rich_content_drag = Some((session_id, file_id));
             if offset_x < cell_width * 2.0 {
                 self.toggle_rich_content_audio_playback(session_id, file_id);
             } else if let Some(fraction) = self.seek_fraction_for_position(session_id, file_id, position) {

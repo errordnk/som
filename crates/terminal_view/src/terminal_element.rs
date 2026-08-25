@@ -1825,7 +1825,7 @@ fn paint_rich_content_placements(
             audio_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
         {
             let max_column_seen = max_columns_seen.get(&key).copied();
-            if let Some(bounds) = paint_rich_content_audio_widget(
+            if let Some((bounds, bar_bounds)) = paint_rich_content_audio_widget(
                 max_column_seen,
                 *position_fraction,
                 *is_playing,
@@ -1838,7 +1838,11 @@ fn paint_rich_content_placements(
                 window,
                 cx,
             ) {
-                terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
+                let terminal = terminal.read(cx);
+                terminal.record_rich_content_placement_bounds(session_id, file_id, bounds);
+                if let Some(bar_bounds) = bar_bounds {
+                    terminal.record_rich_content_seek_bar_bounds(session_id, file_id, bar_bounds);
+                }
             }
             any_animating |= *is_playing;
             continue;
@@ -1934,7 +1938,7 @@ fn paint_rich_content_audio_widget(
     layout: &LayoutState,
     window: &mut Window,
     cx: &mut App,
-) -> Option<Bounds<Pixels>> {
+) -> Option<(Bounds<Pixels>, Option<Bounds<Pixels>>)> {
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let display_line = origin_line + layout.display_offset as i32;
@@ -2013,9 +2017,16 @@ fn paint_rich_content_audio_widget(
 
     // The seek bar occupies the space between the play/pause glyph and
     // the time readout — one cell of glyph, one cell of padding on each
-    // side of the bar, the rest of the width minus the time text.
+    // side of the bar, the rest of the width minus the time text. This
+    // rectangle is deliberately narrower than the whole widget, so it's
+    // returned separately (not just implied by `bounds`) — hit-testing
+    // (`Terminal::seek_fraction_for_position`) needs the bar's OWN
+    // extent to compute a seek fraction; using the full widget width as
+    // the denominator there previously made a click at the bar's visual
+    // midpoint compute a fraction far short of 0.5, confirmed live.
     let bar_start_x = position.x + cell_width * 2.0;
     let bar_end_x = time_position.x - cell_width;
+    let mut bar_bounds_out = None;
     if bar_end_x > bar_start_x {
         let bar_bounds = Bounds::new(
             point(bar_start_x, position.y + line_height * 0.4),
@@ -2027,9 +2038,10 @@ fn paint_rich_content_audio_widget(
             let fill_bounds = Bounds::new(bar_bounds.origin, gpui::size(fill_width, bar_bounds.size.height));
             window.paint_quad(fill(fill_bounds, bar_fill));
         }
+        bar_bounds_out = Some(bar_bounds);
     }
 
-    Some(bounds)
+    Some((bounds, bar_bounds_out))
 }
 
 fn format_duration(d: std::time::Duration) -> String {

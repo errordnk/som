@@ -486,6 +486,7 @@ impl TerminalBuilder {
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            next_query_request_id: std::cell::Cell::new(0),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
@@ -780,6 +781,7 @@ impl TerminalBuilder {
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+                next_query_request_id: std::cell::Cell::new(0),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
@@ -1094,6 +1096,11 @@ pub struct Terminal {
     /// `paint_rich_content_audio_widget`, read outside the paint pass
     /// for hit-testing.
     rich_content_seek_bar_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// Monotonically increasing counter for `request_audio_byte_range`'s
+    /// `Query::request_id` — see that method's own doc comment for why
+    /// correctness doesn't depend on global uniqueness here, just on
+    /// being cheap and non-repeating enough to be useful for logging.
+    next_query_request_id: std::cell::Cell<u32>,
     /// When `process_event`'s `ApcString` handler (or `terminal_element.rs`'s
     /// `paint()`, for animation-frame advancement) last called
     /// `cx.force_redraw_windows()` for a rich-content chunk/frame — throttles
@@ -1934,6 +1941,42 @@ impl Terminal {
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
             player.seek_to_fraction(fraction);
         }
+    }
+
+    /// Asks the SENDING client for a specific byte range of a rich-
+    /// content file it's already streaming (or has streamed) over this
+    /// same `(session_id, file_id)` — used when playback needs bytes
+    /// further into a large file than the sequential stream has reached
+    /// yet (e.g. seeking forward in audio past what's currently cached).
+    ///
+    /// Uses the same low-level `write_to_pty` primitive Som already uses
+    /// to ANSWER a client's own `CSI 16 t`/`CSI 18 t` size queries
+    /// (`process_event`'s `TextAreaSizeRequest` arm) — that's a plain
+    /// "write these bytes to the child process's stdin over the PTY"
+    /// call, direction-agnostic; this is that same primitive used the
+    /// other way around, Som asking the client something instead of
+    /// answering it. See `rich_content_transport::Query`'s own doc
+    /// comment for why the response doesn't need a dedicated reply
+    /// marker: the client answers with ordinary chunk envelopes (the
+    /// same kind `RichContentCache` already accepts out of sequential
+    /// order) for the requested range, not a new envelope shape.
+    ///
+    /// `request_id` is caller-chosen and has no correctness requirement
+    /// here (Som's own audio-range use doesn't need to correlate a
+    /// specific response back to a specific request — the response
+    /// lands in the same cache slot as the rest of the file regardless)
+    /// — a monotonically increasing counter, good enough to be useful
+    /// for logging/debugging without needing to be globally unique.
+    pub fn request_audio_byte_range(&self, session_id: u32, file_id: u32, offset: u64, len: u64) {
+        let request_id = self.next_query_request_id.get();
+        self.next_query_request_id.set(request_id.wrapping_add(1));
+        let query = rich_content_transport::Query { request_id, session_id, file_id, offset, len };
+        let envelope = rich_content_transport::build_query_envelope(&query);
+        let mut apc = Vec::with_capacity(2 + envelope.len() + 2);
+        apc.extend_from_slice(&[0x1B, b'_']); // ESC _
+        apc.extend_from_slice(&envelope);
+        apc.extend_from_slice(&[0x1B, b'\\']); // ESC \
+        self.write_to_pty(apc);
     }
 
     /// Persists `bounds` as the last-painted pixel bounds for placement

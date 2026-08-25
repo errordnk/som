@@ -488,6 +488,7 @@ impl TerminalBuilder {
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
+            rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
@@ -784,6 +785,7 @@ impl TerminalBuilder {
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
+                rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
@@ -1115,6 +1117,15 @@ pub struct Terminal {
     /// correctness doesn't depend on global uniqueness here, just on
     /// being cheap and non-repeating enough to be useful for logging.
     next_query_request_id: std::cell::Cell<u32>,
+    /// The byte offset of the last range query
+    /// `seek_rich_content_audio_playback` fired for each audio
+    /// placement — avoids re-firing an identical (or already-covered)
+    /// query on every single `mouse_drag` event while the user holds a
+    /// seek-bar drag past the cached prefix (which fires many times a
+    /// second while the mouse moves, all landing at roughly the same
+    /// target while the pointer itself isn't moving much frame to
+    /// frame).
+    rich_content_audio_last_range_request: std::cell::RefCell<std::collections::HashMap<(u32, u32), u64>>,
     /// When `process_event`'s `ApcString` handler (or `terminal_element.rs`'s
     /// `paint()`, for animation-frame advancement) last called
     /// `cx.force_redraw_windows()` for a rich-content chunk/frame — throttles
@@ -1980,23 +1991,68 @@ impl Terminal {
         }
     }
 
+    /// How many bytes to ask for at once when a seek lands past what's
+    /// currently cached — large enough to cover several seconds of
+    /// audio at typical bitrates (avoids firing a fresh query for every
+    /// few hundred milliseconds the decode thread consumes) without
+    /// requesting the whole remainder of a multi-gigabyte file in one
+    /// shot (which would just recreate the "wait for a huge transfer"
+    /// problem progressive decode exists to avoid — a further seek
+    /// simply asks again from the new position). 2 MiB comfortably
+    /// covers several seconds even at high-bitrate FLAC.
+    const SEEK_RANGE_REQUEST_LEN: u64 = 2 * 1024 * 1024;
+
     /// Seeks the audio placement at `(session_id, file_id)` to `fraction`
     /// (0.0..=1.0) of its total length, if a player is currently open.
-    /// If `fraction` targets a position beyond what's currently decoded,
-    /// this also fires a byte-range query (see
-    /// [`Self::request_audio_byte_range`]) so the client can start
-    /// filling that gap without waiting for the sequential stream to
-    /// reach it naturally — see task #91 (wire seek-past-cached-prefix
-    /// to request_audio_byte_range) for the full range-request wiring;
-    /// today this method only seeks the position marker, playback
-    /// resumes once the background decoder (fed by whatever route)
-    /// produces samples that far.
+    /// If `fraction` targets a position beyond what's currently cached,
+    /// this also fires a byte-range query ([`Self::request_audio_byte_range`])
+    /// for a window starting there, so the client can start filling that
+    /// gap directly instead of the sequential stream having to reach it
+    /// on its own — critical for a large, still-in-progress transfer,
+    /// where the sequential stream might take a very long time to get
+    /// there naturally. Playback itself doesn't wait for the query's
+    /// answer: the position marker moves immediately, and the `cpal`
+    /// callback simply plays silence until the background decoder (fed
+    /// by whichever route — sequential stream or range response — fills
+    /// the gap first) produces samples that far.
     pub fn seek_rich_content_audio_playback(&self, session_id: u32, file_id: u32, fraction: f32) {
         let duration_ms =
             self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
             player.seek_to_fraction(fraction, duration_ms);
         }
+
+        let total_size = self.rich_content_cache.total_size(session_id, file_id);
+        let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
+        if total_size == 0 {
+            return;
+        }
+        let target_offset = (total_size as f64 * fraction.clamp(0.0, 1.0) as f64) as u64;
+        if target_offset <= contiguous_len {
+            return;
+        }
+
+        let key = (session_id, file_id);
+        let mut last_requests = self.rich_content_audio_last_range_request.borrow_mut();
+        if let Some(&last_offset) = last_requests.get(&key) {
+            // Already covered by the previous request's window — most
+            // relevant while a drag holds roughly still past the cached
+            // prefix, firing many `mouse_drag` events at nearly the same
+            // target.
+            let covered_end = last_offset.saturating_add(Self::SEEK_RANGE_REQUEST_LEN);
+            if target_offset >= last_offset && target_offset < covered_end {
+                return;
+            }
+        }
+        last_requests.insert(key, target_offset);
+        drop(last_requests);
+
+        self.request_audio_byte_range(
+            session_id,
+            file_id,
+            target_offset,
+            Self::SEEK_RANGE_REQUEST_LEN.min(total_size.saturating_sub(target_offset)),
+        );
     }
 
     /// Asks the SENDING client for a specific byte range of a rich-

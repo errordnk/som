@@ -485,6 +485,7 @@ impl TerminalBuilder {
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
             event_loop_task: Task::ready(Ok(())),
@@ -778,6 +779,7 @@ impl TerminalBuilder {
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
                 event_loop_task: Task::ready(Ok(())),
@@ -1077,6 +1079,21 @@ pub struct Terminal {
     /// `Terminal::mouse_down`'s click-interception check so a click can
     /// be tested against a placement's bounds outside of a paint pass.
     rich_content_placement_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// The audio widget's seek-bar bounds specifically — a strict
+    /// sub-rectangle of the corresponding entry in
+    /// `rich_content_placement_bounds` (the bar doesn't span the whole
+    /// widget: it leaves room for the play/pause glyph on the left and
+    /// the elapsed/total time text on the right, both variable-width).
+    /// Click/drag fraction math (`handle_rich_content_click`/
+    /// `mouse_drag`) MUST use this, not the widget's overall bounds —
+    /// dividing by the full widget width previously made a click at the
+    /// bar's visual midpoint compute a fraction far short of 0.5,
+    /// confirmed live (clicking the middle of the bar seeked to roughly
+    /// a third of the way through). Same write/read split as
+    /// `rich_content_placement_bounds`: written every paint by
+    /// `paint_rich_content_audio_widget`, read outside the paint pass
+    /// for hit-testing.
+    rich_content_seek_bar_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
     /// When `process_event`'s `ApcString` handler (or `terminal_element.rs`'s
     /// `paint()`, for animation-frame advancement) last called
     /// `cx.force_redraw_windows()` for a rich-content chunk/frame — throttles
@@ -1940,6 +1957,21 @@ impl Terminal {
         self.rich_content_placement_bounds.borrow().get(&(session_id, file_id)).copied()
     }
 
+    /// Persists `bounds` as the audio widget's actual seek-bar
+    /// rectangle — see [`Self::rich_content_seek_bar_bounds`]'s own doc
+    /// comment for why this is tracked separately from the widget's
+    /// overall bounds.
+    pub fn record_rich_content_seek_bar_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
+        self.rich_content_seek_bar_bounds.borrow_mut().insert((session_id, file_id), bounds);
+    }
+
+    /// The last-painted seek-bar bounds for placement `(session_id,
+    /// file_id)`, if recorded — `None` for a placement that has no
+    /// seek bar at all (not audio) or hasn't painted one yet.
+    pub fn rich_content_seek_bar_bounds(&self, session_id: u32, file_id: u32) -> Option<Bounds<Pixels>> {
+        self.rich_content_seek_bar_bounds.borrow().get(&(session_id, file_id)).copied()
+    }
+
     /// Every currently recorded placement's `(session_id, file_id,
     /// bounds)` — used by `Terminal::mouse_down`'s click-interception
     /// check to find which (if any) placement a click landed inside,
@@ -1962,11 +1994,14 @@ impl Terminal {
     /// placement — an image placement has no interactive zones at all
     /// yet). The leftmost 2 cells of a widget are its play/pause zone
     /// (matches `paint_rich_content_audio_widget`'s glyph + 1-cell
-    /// padding layout); anywhere else inside the bounds is treated as a
-    /// seek-bar click, jumping playback to that horizontal fraction of
-    /// the widget's width — close enough to "the seek bar specifically"
-    /// for a first cut without needing the exact same bar-vs-time-text
-    /// geometry duplicated here.
+    /// padding layout); anywhere else inside the bounds falls through to
+    /// [`Self::rich_content_seek_bar_bounds`] to compute the seek
+    /// fraction from the bar's OWN rectangle, not the whole widget's —
+    /// the bar never spans the full widget width (it leaves room for
+    /// the glyph on the left and the elapsed/total time text on the
+    /// right), so using the widget's width as the fraction's denominator
+    /// under-shot every click: clicking the visual middle of the bar
+    /// seeked to roughly a third of the way through, confirmed live.
     fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>) -> bool {
         let cell_width = self.last_content.terminal_bounds.cell_width;
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
@@ -1989,13 +2024,26 @@ impl Terminal {
             let offset_x = position.x - bounds.origin.x;
             if offset_x < cell_width * 2.0 {
                 self.toggle_rich_content_audio_playback(session_id, file_id);
-            } else {
-                let fraction = (f32::from(offset_x) / f32::from(bounds.size.width)).clamp(0.0, 1.0);
+            } else if let Some(fraction) = self.seek_fraction_for_position(session_id, file_id, position) {
                 self.seek_rich_content_audio_playback(session_id, file_id, fraction);
             }
             return true;
         }
         false
+    }
+
+    /// Computes a seek fraction (0.0..=1.0) from `position`'s horizontal
+    /// offset within the recorded seek-bar bounds for `(session_id,
+    /// file_id)` — shared by `handle_rich_content_click` and
+    /// `mouse_drag` so both use the exact same geometry. `None` if no
+    /// bar bounds have been recorded yet (widget painted this frame for
+    /// the first time, before `record_rich_content_seek_bar_bounds` ran)
+    /// — a click landing before the bar exists just does nothing, rather
+    /// than guessing at a fraction from the wrong rectangle.
+    fn seek_fraction_for_position(&self, session_id: u32, file_id: u32, position: gpui::Point<Pixels>) -> Option<f32> {
+        let bar_bounds = self.rich_content_seek_bar_bounds(session_id, file_id)?;
+        let offset_x = position.x - bar_bounds.origin.x;
+        Some((f32::from(offset_x) / f32::from(bar_bounds.size.width)).clamp(0.0, 1.0))
     }
 
     /// Re-derives and rewrites, IN PLACE, every rich-content placeholder
@@ -3058,8 +3106,9 @@ impl Terminal {
             {
                 let cell_width = self.last_content.terminal_bounds.cell_width;
                 let offset_x = e.position.x - bounds.origin.x;
-                if offset_x >= cell_width * 2.0 {
-                    let fraction = (f32::from(offset_x) / f32::from(bounds.size.width)).clamp(0.0, 1.0);
+                if offset_x >= cell_width * 2.0
+                    && let Some(fraction) = self.seek_fraction_for_position(session_id, file_id, e.position)
+                {
                     self.seek_rich_content_audio_playback(session_id, file_id, fraction);
                     cx.notify();
                 }

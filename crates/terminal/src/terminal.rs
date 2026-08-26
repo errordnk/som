@@ -6859,6 +6859,154 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_yazi_srp_audio_preview_reaches_the_paint_path_via_a_real_process(cx: &mut TestAppContext) {
+        // Third-party-client counterpart to
+        // `test_rich_content_audio_placement_decodes_and_plays_via_a_real_
+        // process` above — proves that a COMPLETELY SEPARATE program (the
+        // `errordnk/yazi` fork's own SRP driver, not `somcat`) can also
+        // drive Som's receiving side correctly, the exact claim
+        // SRP_INTEGRATION_GUIDE.md makes to third-party integrators. Real
+        // `yazi.exe` child process, real ConPTY, no window/focus/screenshot
+        // involved anywhere — `yazi`'s own preview pane prints the SRP
+        // envelope for whatever file is under its cursor as soon as it
+        // starts, so a directory containing exactly one audio file is
+        // enough to trigger it with no keystrokes needed at all.
+        //
+        // This is a headless PTY test in the same family as `pexpect`/
+        // `termlens`/`headless-terminal` (byte-stream in, parsed-state
+        // assertions out, no rendered pixels involved) — chosen
+        // specifically to replace an earlier attempt at this same
+        // verification via AutoIt window-automation, which twice
+        // activated the WRONG window (`[CLASS:Zed Window]` is ambiguous
+        // whenever more than one Zed-derived window is open) before this
+        // test replaced that approach entirely.
+        //
+        // Points at a `yazi.exe` built from the `errordnk/yazi` fork,
+        // NOT part of this workspace's own build — path overridable via
+        // `SOM_TEST_YAZI_PATH` for anyone with a different local
+        // checkout; skips gracefully (not a failure) if no build is
+        // found, since this fork isn't a dependency of Som's own build
+        // and won't exist on a fresh checkout or most CI runs.
+        cx.executor().allow_parking();
+
+        // yazi (unlike `somcat`) redraws its own full-screen TUI with
+        // real ANSI color escapes as it starts up — that exercises
+        // `process_event`'s `ColorRequest`/theme-lookup path
+        // (`theme::GlobalTheme::theme()`), which needs a real theme
+        // global registered. `somcat`'s own equivalent test never hits
+        // this path (it prints nothing but a placeholder grid + APC
+        // envelopes, no colored TUI chrome), so this is genuinely new
+        // for this test, not something the existing `init_test` helper
+        // (Unix-only) was skipped for on Windows without consequence.
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let yazi_path = std::env::var("SOM_TEST_YAZI_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            std::path::PathBuf::from(if cfg!(windows) {
+                r"C:\Users\dnk\AppData\Local\Temp\yazi-fork-work\target\release-windows\yazi.exe"
+            } else {
+                "/tmp/yazi-fork-work/target/release/yazi"
+            })
+        });
+        if !yazi_path.is_file() {
+            eprintln!("skipping: yazi binary not found at {yazi_path:?} (set SOM_TEST_YAZI_PATH to override)");
+            return;
+        }
+
+        let tone_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac");
+        assert!(tone_path.is_file(), "test_fixtures/tone.flac not found at {tone_path:?}");
+
+        // yazi previews whatever file is under its cursor on startup —
+        // an isolated directory containing exactly this one file means
+        // that's always the fixture, no keystrokes needed to select it.
+        let preview_dir = std::env::temp_dir().join("som_yazi_srp_audio_preview_test");
+        std::fs::create_dir_all(&preview_dir).expect("must be able to create the isolated preview directory");
+        let fixture_copy = preview_dir.join("tone.flac");
+        std::fs::copy(&tone_path, &fixture_copy).expect("must be able to copy the fixture into the preview dir");
+
+        // `SOM_WINDOW_ID` is what `audio.lua` (this driver's previewer)
+        // checks before calling `ya.audio_show` at all — see
+        // SRP_INTEGRATION_GUIDE.md's "Detecting that you're running
+        // inside Som" section. A real Som sets this on every spawned
+        // shell; this test's `Shell::WithArguments` path bypasses that
+        // env-populating machinery entirely (it's a raw child process
+        // spawn, not a real interactive shell session), so it has to be
+        // set explicitly here for yazi's own SRP path to ever trigger.
+        let mut env = HashMap::default();
+        env.insert("SOM_WINDOW_ID".to_string(), std::process::id().to_string());
+
+        let (completion_tx, _completion_rx) = async_channel::unbounded();
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    None,
+                    task::Shell::WithArguments {
+                        program: yazi_path.to_string_lossy().into_owned(),
+                        args: vec![preview_dir.to_string_lossy().into_owned()],
+                        title_override: None,
+                    },
+                    env,
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    0,
+                    false,
+                    0,
+                    Some(completion_tx),
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+
+        let mut saw_placement = false;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            let placements = terminal.update(cx, |term, _| term.rich_content_audio_placements());
+            if let Some((.., duration)) = placements.into_iter().next() {
+                saw_placement = true;
+                assert!(
+                    duration.as_secs_f64() > 0.0,
+                    "yazi's SRP audio envelope must carry a nonzero duration_ms, same as somcat's own"
+                );
+                break;
+            }
+        }
+
+        // Quit yazi cleanly before asserting, so a failure doesn't leave
+        // an orphaned child process behind.
+        terminal.update(cx, |term, _| term.input(b"q".to_vec()));
+        cx.run_until_parked();
+
+        assert!(
+            saw_placement,
+            "yazi's SRP driver never produced a decodable audio placement for {fixture_copy:?} — \
+             either the SRP envelope never arrived, or Som's receiving side rejected it"
+        );
+    }
+
+    #[gpui::test]
     async fn test_unrecognized_apc_string_is_silently_ignored(cx: &mut TestAppContext) {
         // Degradation check: APC is a general-purpose escape mechanism —
         // some OTHER program could legitimately use it for something this

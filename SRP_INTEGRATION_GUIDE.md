@@ -124,7 +124,7 @@ fully implemented and use the `Image`/`Audio` variants respectively:
 | Discriminant | Variant | Fields (in order, all little-endian) |
 |---|---|---|
 | `0` | `Image` | `width_px: u32`, `height_px: u32`, `color_bits: u8`, `is_animated: u8` (0 or 1) — 10 bytes used, 7 bytes zero-padding |
-| `1` | `Audio` | `sample_rate: u32`, `channels: u8`, `bits_per_sample: u8` — probe these from the file's header (no full decode needed), Som does the actual decoding |
+| `1` | `Audio` | `sample_rate: u32`, `channels: u8`, `bits_per_sample: u8`, `duration_ms: u32` — probe all four from the file's header (no full decode needed), Som does the actual decoding. `duration_ms` is `0` if unknown. |
 | `2` | `Video` (reserved) | `width_px: u32`, `height_px: u32`, `fps_numerator: u32`, `fps_denominator: u32`, `codec: u8` |
 | `3` | `Markdown` (reserved) | no fields |
 
@@ -135,6 +135,19 @@ JPEG/PNG's own metadata — not anything about compressed file size).
 pixel SRP transmits ends up as RGBA/BGRA on the receiving end regardless
 of the source file's own on-disk color depth). `is_animated` should be
 `1` if the source file has more than one frame.
+
+`duration_ms` is the whole audio track's real duration in milliseconds,
+read straight from the source file's own header (an MP3's Xing/VBRI VBR
+tag, or a size/bitrate-based estimate; a FLAC's STREAMINFO block) — not
+derived from how many bytes have streamed in so far, and not something
+you compute by decoding the file. Every format-probing library capable
+of reading container metadata exposes this without decoding samples
+(Rust's `symphonia`: `CodecParameters::n_frames`/`time_base`, converted
+via `TimeBase::calc_time`). This is what lets Som show an accurate
+duration and a correctly-sized seek bar the moment the FIRST chunk
+arrives, even for a multi-gigabyte file whose transfer will take a long
+time to finish — see "Audio: streamed progressively, not held until
+complete" below.
 
 These fields travel on **every** chunk of a given transmission, not just
 the first — this keeps the envelope format uniform (a receiver never
@@ -362,16 +375,19 @@ way: **your client does not need to build any playback UI at all.**
 decoding (`symphonia`) and playback (`cpal`) both happen inside Som
 itself, along with an inline play/pause/seek widget Som paints and
 handles clicks for directly. Your client's only job for an audio file is
-to probe its header for `sample_rate`/`channels`/`bits_per_sample` (a
-cheap format-reader probe, not a full decode — see `somcat`'s own
-`audio_metadata()` for a worked example) and stream the raw file bytes,
-exactly like it already does for an image, then exit. No placeholder-
-grid pixel-size math either: audio has no pixel dimensions, so Som's
-widget uses a fixed cell footprint instead — print whatever fixed-size
-Unicode-placeholder grid your client wants to reserve for the widget
-(`somcat` uses 40 columns x 1 row) using the exact same
-`print_placeholder_grid`-style technique described below, just with a
-constant footprint instead of one derived from `width_px`/`height_px`.
+to probe its header for `sample_rate`/`channels`/`bits_per_sample`/
+`duration_ms` (a cheap format-reader probe, not a full decode — see
+`somcat`'s own `audio_metadata()` for a worked example) and stream the
+raw file bytes, exactly like it already does for an image, then exit
+(with one addition for large files — see the next section). No
+placeholder-grid pixel-size math either: audio has no pixel dimensions,
+so Som's widget uses a fixed cell footprint instead — print whatever
+fixed-size Unicode-placeholder grid your client wants to reserve for
+the widget (`somcat` uses 42 columns x 1 row — 40 for the play/pause
+glyph, seek bar, and elapsed/total time text, plus 2 more for a
+trailing close glyph) using the exact same `print_placeholder_grid`-
+style technique described below, just with a constant footprint
+instead of one derived from `width_px`/`height_px`.
 
 This is the OPPOSITE of the "client owns rendering" pattern that's true
 for images/GIF: the reason is architectural, not a style choice — your
@@ -380,6 +396,166 @@ whose speakers should produce sound (e.g. a client running over SSH),
 while Som is guaranteed to be local to whoever's actually listening. A
 future `ContentType::Video` is expected to follow the same
 Som-decodes-and-renders shape for the same reason.
+
+### Audio: streamed progressively, not held until complete
+
+A naive audio client would read the whole file, probe its metadata,
+stream it start to finish, then exit — and this works, but only well
+for small files. For anything large (a multi-gigabyte FLAC is not an
+edge case), waiting for the entire sequential transfer to finish before
+Som can play anything, or before a user can seek near the end, defeats
+the purpose of streaming at all. Som's receiving side is built around
+the opposite principle, and expects a well-behaved client to match it:
+
+1. **The widget shows a real duration immediately.** Since
+   `duration_ms` comes from a header probe (not from decoding), Som
+   displays an accurate seek bar length as soon as the first chunk
+   arrives — your client doesn't need to do anything extra for this to
+   work, just make sure `audio_metadata`-style probing runs before the
+   first chunk goes out (same ordering `somcat`'s own `stream_file`
+   already uses).
+2. **Playback starts from whatever prefix is cached**, before the
+   transfer completes. This is entirely Som-side behavior (a
+   background decode thread that retries as more bytes land) — again,
+   nothing your client needs to implement.
+3. **Seeking past the currently-cached prefix requires answering a
+   query.** If a user drags Som's seek bar to a point beyond what's
+   downloaded so far, Som doesn't wait for the sequential stream to
+   reach it — for a multi-gigabyte file that could take a very long
+   time — it sends your client a targeted byte-range request over the
+   PTY and expects an answer. **This is the one piece of extra work a
+   client needs for large-file audio support**, covered in full in the
+   next section ("The query/response channel"). A client that skips
+   this still works correctly for any file that finishes transferring
+   before a user seeks past what's cached — which in practice means
+   most files most of the time — it just won't be able to satisfy a
+   seek past the leading edge of an in-progress transfer.
+
+## The query/response channel
+
+This is the only part of SRP that flows in the opposite direction —
+**Som asking your client for something**, not your client pushing data
+to Som. Every other exchange this guide has described so far is
+client → Som; this section covers Som → client, and how your client
+should answer.
+
+### Why this exists, and why it isn't audio-specific
+
+The concrete, shipped use case today is exactly the byte-range seek
+described above: Som needs bytes from further into a file than the
+sequential stream has reached, and the only way to get them without
+waiting is to ask the client directly, since the client is the one
+holding the file open (possibly on a completely different machine, over
+SSH). But the wire format itself is deliberately general — a typed
+`query_type` byte, not a hardcoded "give me these bytes" shape — because
+a second, unrelated planned use needs the identical request/response
+round trip: a future `.md` document embedding a Lua script that
+executes wherever the document physically lives, with a form submission
+needing to reach that script and bring an answer back. Audio byte
+ranges are the FIRST concrete consumer of this mechanism, not the whole
+design surface. If you're implementing this today, you only need to
+handle `QueryType::AudioByteRange` — but don't assume the marker byte
+will only ever carry that one query type.
+
+### Wire format
+
+A query travels as its own APC string, using a marker byte distinct
+from the ordinary chunk envelope's `S`:
+
+```
+ESC _ Q <header_b91> ESC \
+```
+
+Unlike a chunk envelope, there is **no separator byte and no base91
+payload region** — every field a query carries is a small fixed-width
+integer, so the whole thing fits in one base91-encoded header with
+nothing appended after it:
+
+```text
+[version:      1 byte  = 1]
+[request_id:   4 bytes LE — sender-chosen, no meaning beyond correlating an eventual answer]
+[query_type:   1 byte  — QueryType as u8; 0 = AudioByteRange]
+[session_id:   4 bytes LE]
+[file_id:      4 bytes LE]
+[offset:       8 bytes LE]
+[len:          8 bytes LE]
+```
+
+Total: 1+4+1+4+4+8+8 = **30 bytes**, before base91 encoding. For
+`QueryType::AudioByteRange`, `session_id`/`file_id` identify which
+transfer this query concerns (the same ids your client already assigned
+when it started streaming this file), `offset`/`len` describe the byte
+range being requested from the ORIGINAL file (not from whatever your
+client has sent so far).
+
+A byte distinct from `Q` (`R`, `QUERY_RESPONSE_MARKER`) is reserved for
+a future query type whose answer isn't naturally chunk-shaped (e.g. a
+Lua form submission's result) — not built yet, and `AudioByteRange`
+doesn't use it (see below).
+
+### How to answer an `AudioByteRange` query
+
+**You don't need a new response format.** A byte-range query's answer
+is just ordinary `S`-marked chunk envelope(s) — the exact same shape
+your client already sends for the initial sequential stream — covering
+`[offset, offset + len)` of the file, with `chunk_offset` set to the
+real file offset the range starts at (not offset-from-zero the way the
+initial stream's first chunk is). Som's receiving cache already
+tolerates a chunk landing at an arbitrary, out-of-sequence offset —
+this was already true before byte-range queries existed (needed for
+ordinary out-of-order delivery robustness), so no new receiving-side
+machinery had to be built for this to work; it was simply never
+exercised by a real sender until audio needed it.
+
+Concretely, this means: keep the file open (or reopen it) after the
+initial sequential stream finishes, read `[offset, offset + len)` from
+it directly, and send that slice through the exact same
+chunk-envelope-building code path you already have — just parameterized
+with a non-zero starting offset instead of 0.
+
+### Reading queries off your own stdin
+
+Som writes a query to the same PTY your client's own stdin is attached
+to — the same channel your client's stdout writes go out on, just the
+read side instead. This means:
+
+1. **Your client needs a background reader** that watches its own
+   stdin for `ESC _ Q ... ESC \` envelopes, active for as long as the
+   client wants to keep answering seeks (i.e. as long as it's willing
+   to keep the file open and keep running as a background process after
+   the initial stream finishes — see below).
+2. **This reader must not run concurrently with any other stdin read
+   your client does for the same invocation.** `somcat`'s own client
+   also reads stdin once, synchronously, to answer Som's `CSI 16 t`/
+   `CSI 18 t` cell-geometry queries before it prints the placeholder
+   grid (see "Sizing the placement" below) — the query-reader thread is
+   only started AFTER that finishes, specifically to avoid two readers
+   racing over the same stdin bytes.
+3. **Writes to your own stdout must be serialized** once you have more
+   than one thread capable of producing them — the initial sequential
+   stream (main thread) and a byte-range response (query-reader thread,
+   triggered by an incoming query) can now both want to write at the
+   same time, and two envelopes' bytes interleaving on the wire would
+   produce output neither `parse_envelope` nor `parse_query_envelope`
+   could make sense of. A plain mutex around your actual stdout write
+   call (not around the whole response-building logic — just the final
+   write) is enough; `somcat`'s reference implementation does exactly
+   this (`STDOUT_WRITE_LOCK`).
+4. **Your process needs to still be alive when a seek happens.** If
+   your client exits immediately after the initial sequential stream
+   finishes (the simplest, and for small files entirely correct, shape
+   — see "Audio: streamed progressively" above), there's nothing left
+   to answer a query with; Som simply won't get a response and the seek
+   silently won't fill in past the cached prefix. For a client that
+   wants to support seeking into a large, still-transferring (or even
+   fully-transferred but since exited) file, keep the process running
+   and the file handle open for as long as you're willing to keep
+   answering — `somcat` keeps running until its main sequential stream
+   finishes and then returns normally; it does NOT currently stay alive
+   afterward specifically to answer late queries, so even the reference
+   implementation only covers the "seek during an in-progress transfer"
+   case, not "seek after the client process has already exited." A more
+   ambitious client could choose to stay resident longer.
 
 ## Placement: the Unicode-placeholder grid technique
 

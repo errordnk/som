@@ -1,7 +1,7 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
 //! Minimal standalone animated-GIF viewer — bypasses the entire Kitty
-//! graphics protocol / PTY / ConPTY / som-tmux stack this project's
+//! graphics protocol / PTY / ConPTY / som-srv stack this project's
 //! terminal-based Kitty support goes through, to answer one narrow
 //! question in isolation: does GPUI's own `img()` element actually
 //! animate a multi-frame GIF on this machine at all. Usage:

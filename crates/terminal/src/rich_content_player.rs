@@ -169,9 +169,7 @@ pub fn refresh_or_create(
         Ok(Some(prefix)) => Some(RichContentPlayer::from_prefix(prefix, contiguous_len)),
         // Not enough data yet, or a real decode error — either way, no
         // usable player. A genuine format error (not just "too early")
-        // is silently dropped rather than surfaced: same tolerance
-        // principle `rich_content_transport::parse_envelope` failures
-        // already use in `Terminal::process_event` — a single
+        // is silently dropped rather than surfaced: a single
         // unrecognized/corrupt stream shouldn't need special paint-path
         // error handling, it just never produces a player to paint.
         Ok(None) | Err(_) => existing,

@@ -26,7 +26,7 @@ use crate::Project;
 /// E.g. `C:\Program Files\pwsh.exe` → (`C:\Program Files\pwsh.exe`, [])
 ///      `wsl --cd ~` → (`wsl`, [`--cd`, `~`])
 ///
-/// Public so `som-tmux` client code (`terminal_view::som_tmux_client`) can
+/// Public so `som-srv` client code (`terminal_view::som_tmux_client`) can
 /// turn a `TabProfile::shell` string into the `program`/`args` its
 /// `NewSession` protocol message needs, using the exact same parsing as the
 /// regular (non-tmux) terminal-creation path — rather than duplicating this
@@ -122,7 +122,7 @@ impl Project {
     /// Like `create_terminal_with_shell`, but takes `program`/`args`
     /// directly instead of a single command string to parse — needed by
     /// `tmux:true` profiles (see `project_som_tmux` memory), which
-    /// substitute `som-tmux-server <profile> <program> [args...]` in for
+    /// substitute `som-srv-server <profile> <program> [args...]` in for
     /// the profile's own shell. Round-tripping that substitution through a
     /// single string (build one, hand it to `create_terminal_with_shell`,
     /// have it get re-split by `parse_shell_command`) risks mangling

@@ -1737,14 +1737,16 @@ fn paint_rich_content_placements(
     let mut any_animating = false;
 
     // Everything needed from `terminal` is collected as OWNED data in
-    // this narrowly scoped block — the borrow from `Entity::read(cx)`
-    // must end before any call below that needs `cx` mutably
-    // (`ShapedLine::paint`, used by the audio widget branch), since
-    // `Entity::read(cx)` ties its returned `&Terminal` to `cx`'s own
-    // borrow for as long as it's alive.
-    let (origins, placements, audio_placements, max_columns_seen) = {
-        let terminal = terminal.read(cx);
-
+    // this narrowly scoped `update` call — the borrow it takes on
+    // `terminal` must end before any call below that needs `cx` mutably
+    // (`ShapedLine::paint`, used by the audio widget branch). `update`
+    // (not `read`) is required here because scanning the placeholder
+    // grid also calls `ensure_rich_content_srv_subscription`, which
+    // lazily spawns this placement's `som-srv` progress subscription and
+    // applies any progress already observed to `RichContentCache` — both
+    // need `&mut Terminal`.
+    let (origins, placements, audio_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
+        terminal.update(cx, |terminal, _cx| {
         // For each (session_id, file_id) group, remember the grid position
         // of whichever visible cell decodes as (row=0, column=0) if one is
         // currently visible — that's the placement's true top-left origin.
@@ -1759,8 +1761,20 @@ fn paint_rich_content_placements(
         // only the decoded in-image offset lets every visible cell agree
         // on the same absolute origin regardless of how much of the image
         // is currently clipped.
+        // Every placement seen in the placeholder grid needs a `som-srv`
+        // subscription, regardless of whether `rich_content_cache` has
+        // any bytes for it yet — see `Terminal::
+        // ensure_rich_content_srv_subscription`'s own doc comment for
+        // why this can't wait until AFTER the cache already has an
+        // entry. Done as its own pass (not fused into the loop below)
+        // since `poll_rich_content_srv_subscriptions` needs `&mut
+        // Terminal` and the loop below borrows `terminal.last_content()`
+        // for its whole duration.
+        terminal.poll_rich_content_srv_subscriptions();
+
         let mut origins: std::collections::HashMap<(u32, u32), (i32, i32)> = std::collections::HashMap::new();
         let mut max_columns_seen: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        let mut max_rows_seen: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
 
         for indexed_cell in &terminal.last_content().cells {
             let fg_rgb = match indexed_cell.cell.fg {
@@ -1807,12 +1821,46 @@ fn paint_rich_content_placements(
             terminal.record_rich_content_max_column_seen(session_id, file_id, cell_col_in_image);
             let entry = max_columns_seen.entry(key).or_insert(0);
             *entry = (*entry).max(terminal.rich_content_max_column_seen(session_id, file_id).unwrap_or(0));
+            // Vertical counterpart — see `Terminal::
+            // record_rich_content_max_row_seen`'s doc comment for why the
+            // painted height needs this (the sending client's grid row
+            // count rounds UP from the image's real pixel height, so
+            // deriving height purely from the image's own aspect ratio
+            // leaves a visible gap in the last reserved row).
+            terminal.record_rich_content_max_row_seen(session_id, file_id, row);
+            let row_entry = max_rows_seen.entry(key).or_insert(0);
+            *row_entry = (*row_entry).max(terminal.rich_content_max_row_seen(session_id, file_id).unwrap_or(0));
         }
 
         let placements = terminal.rich_content_placements();
         let audio_placements = terminal.rich_content_audio_placements();
-        (origins, placements, audio_placements, max_columns_seen)
-    };
+        #[cfg(target_os = "windows")]
+        let video_placements = terminal.rich_content_video_placements();
+        #[cfg(not(target_os = "windows"))]
+        let video_placements: Vec<(
+            u32,
+            u32,
+            std::sync::Arc<gpui::RenderImage>,
+            bool,
+            f32,
+            std::time::Duration,
+            std::time::Duration,
+        )> = Vec::new();
+        #[cfg(target_os = "windows")]
+        let pending_image_drops = terminal.take_pending_video_image_drops();
+        #[cfg(not(target_os = "windows"))]
+        let pending_image_drops: Vec<std::sync::Arc<gpui::RenderImage>> = Vec::new();
+        (origins, placements, audio_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops)
+    });
+
+    // Released regardless of whether `origins` turns out empty below —
+    // a video player keeps decoding (and therefore keeps replacing
+    // `last_rendered`) even on a paint pass where its placeholder cells
+    // happen not to be visible, so its drop queue still needs draining
+    // every time this runs, not just when there's a placement to paint.
+    for image in pending_image_drops {
+        cx.drop_image(image, Some(window));
+    }
 
     if origins.is_empty() {
         return false;
@@ -1825,7 +1873,7 @@ fn paint_rich_content_placements(
             audio_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
         {
             let max_column_seen = max_columns_seen.get(&key).copied();
-            if let Some((bounds, bar_bounds)) = paint_rich_content_audio_widget(
+            if let Some((bounds, bar_bounds, stop_bounds)) = paint_rich_content_media_widget(
                 max_column_seen,
                 *position_fraction,
                 *is_playing,
@@ -1843,19 +1891,111 @@ fn paint_rich_content_placements(
                 if let Some(bar_bounds) = bar_bounds {
                     terminal.record_rich_content_seek_bar_bounds(session_id, file_id, bar_bounds);
                 }
+                if let Some(stop_bounds) = stop_bounds {
+                    terminal.record_rich_content_stop_icon_bounds(session_id, file_id, stop_bounds);
+                }
             }
             any_animating |= *is_playing;
             continue;
         }
 
-        let Some((_, _, render_image, current_frame, is_animating)) =
-            placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
-        else {
-            // Placeholder cells reference a file id whose decoded frame
-            // isn't available yet (still decoding) or no longer is
-            // (dropped) — nothing to paint, not an error, same reasoning
-            // as `paint_kitty_unicode_placeholders`'s identical case.
+        // Video: the picture paints through the EXACT SAME `paint_image`
+        // call the image/GIF branch below already uses — a single
+        // always-current frame, `current_frame` fixed at 0 since
+        // `RichContentVideoPlayer::current_frame` already hands back a
+        // freshly built one-frame `RenderImage` rather than an index
+        // into a multi-frame one — but occupies only `max_row_seen`
+        // rows, NOT `max_row_seen + 1`: the placeholder grid's LAST row
+        // is reserved for this placement's control widget (see
+        // `print_video_placeholder_grid`'s own doc comment for why
+        // `somcat` prints one extra row beyond the picture itself), and
+        // gets painted separately below via the SAME
+        // `paint_rich_content_media_widget` audio already uses — one
+        // shared control-row implementation for both content types.
+        let video_match = video_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id);
+        if let Some((_, _, render_image, is_playing, position_fraction, elapsed, duration)) = video_match {
+            let max_column_seen = max_columns_seen.get(&key).copied();
+            let max_row_seen = max_rows_seen.get(&key).copied();
+            let picture_rows = max_row_seen.map(|r| r.max(1) - 1).unwrap_or(0);
+
+            let display_line = origin_line + layout.display_offset as i32;
+            let num_lines = layout.dimensions.num_lines() as i32;
+
+            let image_size = render_image.size(0);
+            let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
+                let columns = match max_column_seen {
+                    Some(max_column) => (max_column + 1) as f32,
+                    None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
+                };
+                let width = cell_width * columns;
+                // `picture_rows` — the last row is the widget's, not the
+                // picture's (see this arm's own doc comment above).
+                let height = line_height * picture_rows.max(1) as f32;
+                (width, height)
+            } else {
+                (cell_width, line_height)
+            };
+            let picture_size = gpui::size(full_width, full_height);
+
+            let row_span = (f32::from(full_height) / f32::from(line_height)).ceil() as i32;
+            if display_line + row_span >= 0 && display_line < num_lines {
+                let picture_position =
+                    point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
+                any_animating |= *is_playing;
+                window
+                    .paint_image(
+                        Bounds::new(picture_position, picture_size),
+                        gpui::Corners::all(Pixels::ZERO),
+                        render_image.clone(),
+                        0,
+                        false,
+                    )
+                    .log_err();
+            }
+
+            // Widget row sits immediately below the picture, at
+            // `origin_line + picture_rows` — `paint_rich_content_media_
+            // widget` computes its own `display_line`/on-screen position
+            // from `origin_line`/`origin_column` the same way the
+            // picture branch above does, just offset down by however
+            // many rows the picture actually occupies.
+            if let Some((bounds, bar_bounds, stop_bounds)) = paint_rich_content_media_widget(
+                max_column_seen,
+                *position_fraction,
+                *is_playing,
+                *elapsed,
+                *duration,
+                origin,
+                origin_line + picture_rows as i32,
+                origin_column,
+                layout,
+                window,
+                cx,
+            ) {
+                let terminal = terminal.read(cx);
+                terminal.record_rich_content_placement_bounds(session_id, file_id, bounds);
+                if let Some(bar_bounds) = bar_bounds {
+                    terminal.record_rich_content_seek_bar_bounds(session_id, file_id, bar_bounds);
+                }
+                if let Some(stop_bounds) = stop_bounds {
+                    terminal.record_rich_content_stop_icon_bounds(session_id, file_id, stop_bounds);
+                }
+            }
             continue;
+        }
+
+        let (render_image, current_frame, is_animating) = {
+            let Some((_, _, render_image, current_frame, is_animating)) =
+                placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
+            else {
+                // Placeholder cells reference a file id whose decoded
+                // frame isn't available yet (still decoding) or no
+                // longer is (dropped) — nothing to paint, not an error,
+                // same reasoning as `paint_kitty_unicode_placeholders`'s
+                // identical case.
+                continue;
+            };
+            (render_image, *current_frame, *is_animating)
         };
 
         let display_line = origin_line + layout.display_offset as i32;
@@ -1871,6 +2011,18 @@ fn paint_rich_content_placements(
         // whenever the display's DPI scale isn't 1.0. Falls back to the
         // pixel-based estimate only on the very first paint, before any
         // placeholder cell has been scanned yet.
+        //
+        // Height is derived the SAME way (from `max_rows_seen`, the
+        // sending client's actual grid row count) rather than from the
+        // image's own aspect ratio — `rows = height_px.div_ceil(cell_
+        // height)` on the sending side rounds UP to a whole number of
+        // cells, so the image's real pixel height essentially never
+        // exactly fills that many rows. Scaling height purely by aspect
+        // (as this used to) left a visible gap of blank terminal
+        // background in the grid's last reserved row, confirmed live as
+        // an extra blank line between an image and the next prompt.
+        // Filling the whole reserved footprint instead — same principle
+        // already applied to width — makes that gap disappear.
         let image_size = render_image.size(0);
         let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
             let columns = match max_columns_seen.get(&key).copied() {
@@ -1878,8 +2030,14 @@ fn paint_rich_content_placements(
                 None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
             };
             let width = cell_width * columns;
-            let scale = f32::from(width) / image_size.width.0 as f32;
-            (width, px(image_size.height.0 as f32 * scale))
+            let height = match max_rows_seen.get(&key).copied() {
+                Some(max_row) => line_height * (max_row + 1) as f32,
+                None => {
+                    let scale = f32::from(width) / image_size.width.0 as f32;
+                    px(image_size.height.0 as f32 * scale)
+                },
+            };
+            (width, height)
         } else {
             (cell_width, line_height)
         };
@@ -1899,14 +2057,14 @@ fn paint_rich_content_placements(
         let position =
             point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
 
-        any_animating |= *is_animating;
+        any_animating |= is_animating;
         terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, Bounds::new(position, size));
         window
             .paint_image(
                 Bounds::new(position, size),
                 gpui::Corners::all(Pixels::ZERO),
                 render_image.clone(),
-                *current_frame,
+                current_frame,
                 false,
             )
             .log_err();
@@ -1915,18 +2073,21 @@ fn paint_rich_content_placements(
     any_animating
 }
 
-/// Paints one audio placement's inline widget — a single-row play/pause
-/// glyph + seek-bar fill + elapsed/total time text, filling exactly the
-/// fixed cell footprint `somcat` reserved via
-/// `print_audio_placeholder_grid` (`AUDIO_WIDGET_COLUMNS`x
-/// `AUDIO_WIDGET_ROWS` in that module — this function trusts whatever
-/// footprint the placeholder cells actually describe, via
-/// `record_rich_content_max_column_seen`, same as the image branch
-/// above, rather than hardcoding the sender's constant here). Unlike an
-/// image, there's no pixel-dimensioned source to size from at all — the
-/// placeholder grid IS the widget's only size signal.
+/// Paints one media placement's (audio OR video) inline control row —
+/// play/pause glyph, current elapsed time, a seek-bar fill, total
+/// duration time, and a stop glyph — filling exactly the cell footprint
+/// the sending client's placeholder grid describes (`somcat`'s
+/// `AUDIO_WIDGET_COLUMNS`x`AUDIO_WIDGET_ROWS` for audio, or the video
+/// picture's own column count plus one extra reserved row for video —
+/// see `print_video_placeholder_grid`'s own doc comment; this function
+/// trusts whatever footprint the placeholder cells actually describe,
+/// via `record_rich_content_max_column_seen`, same as the image branch
+/// above, rather than hardcoding either sender's constant here). Shared
+/// by both content types rather than duplicated — the row's layout and
+/// interaction model (play/pause, seek, stop) doesn't depend on whether
+/// the underlying media is audio or video.
 #[allow(clippy::too_many_arguments)]
-fn paint_rich_content_audio_widget(
+fn paint_rich_content_media_widget(
     max_column_seen: Option<u32>,
     position_fraction: f32,
     is_playing: bool,
@@ -1938,7 +2099,7 @@ fn paint_rich_content_audio_widget(
     layout: &LayoutState,
     window: &mut Window,
     cx: &mut App,
-) -> Option<(Bounds<Pixels>, Option<Bounds<Pixels>>)> {
+) -> Option<(Bounds<Pixels>, Option<Bounds<Pixels>>, Option<Bounds<Pixels>>)> {
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let display_line = origin_line + layout.display_offset as i32;
@@ -1955,90 +2116,165 @@ fn paint_rich_content_audio_widget(
 
     let widget_bg = gpui::rgba(0x1e1e2eff);
     let bar_track = gpui::rgba(0x45475aff);
-    let bar_fill = gpui::rgba(0x89b4faff);
+    let bar_fill = gpui::rgba(0x89dcebff);
     let text_color = gpui::white();
 
     window.paint_quad(fill(bounds, widget_bg));
 
-    // Reserve the leftmost cell for a play/pause glyph, a trailing
-    // stretch of cells for "mm:ss / mm:ss", and let the seek bar itself
-    // fill whatever's left in between — matches the layout a normal
-    // media-player widget uses (glyph, then a bar, then a duration
-    // readout), not an arbitrary choice.
+    // Layout, left to right: play/pause glyph (1 cell) — current time —
+    // padding — seek bar (fills whatever's left) — padding — total
+    // time — padding — stop glyph (1 cell). Matches a normal media-
+    // player control row's element order, not an arbitrary choice.
     //
     // Uses the terminal's own text style (`layout.base_text_style`), not
-    // `TextStyle::default()` — so both the glyph and the time readout
-    // render in whatever font the user's terminal is actually
-    // configured with (Som embeds FiraCode Nerd Font as the default,
-    // but `terminal_settings.font_family`/`buffer_font.family` can
-    // override that in settings.json), same size/color as everything
-    // else painted here.
+    // `TextStyle::default()` — so every glyph/time readout renders in
+    // whatever font the user's terminal is actually configured with
+    // (Som embeds FiraCode Nerd Font as the default, but
+    // `terminal_settings.font_family`/`buffer_font.family` can override
+    // that in settings.json), same size/color as everything else
+    // painted here.
     let mut text_style = layout.base_text_style.clone();
     text_style.color = text_color;
     text_style.font_size = line_height.into();
 
     // Nerd Font (Font Awesome subset) codepoints, not plain Unicode
-    // ▶/⏸ — plain Unicode U+23F8 (PAUSE) has no glyph at all even in
-    // Som's own embedded FiraCode Nerd Font (confirmed via
-    // `ttf-parser`), so it would already fall back to a missing-glyph
-    // box with the DEFAULT font, before a user even touches settings.
-    // But `text_style.font()` here isn't necessarily that embedded
-    // font at all — a user can point `terminal.font_family` (or the
-    // global `buffer_font`) at any installed font, Nerd or not. Query
-    // whether the font actually resolved for THIS paint has real
-    // glyphs for the Nerd Font codepoints before committing to them;
-    // if not, fall back to plain ASCII that renders correctly in any
-    // monospace font at all, rather than painting a guaranteed missing-
-    // glyph box for the whole widget's lifetime.
+    // ▶/⏸/⏹ — plain Unicode has no glyph at all for these even in Som's
+    // own embedded FiraCode Nerd Font (confirmed via `ttf-parser` for
+    // pause), so it would already fall back to a missing-glyph box with
+    // the DEFAULT font, before a user even touches settings. But
+    // `text_style.font()` here isn't necessarily that embedded font at
+    // all — a user can point `terminal.font_family` (or the global
+    // `buffer_font`) at any installed font, Nerd or not. Query whether
+    // the font actually resolved for THIS paint has real glyphs for the
+    // Nerd Font codepoints before committing to them; if not, fall back
+    // to plain ASCII that renders correctly in any monospace font at
+    // all, rather than painting a guaranteed missing-glyph box for the
+    // whole widget's lifetime.
     let resolved_font_id = window.text_system().resolve_font(&text_style.font());
     let has_nerd_font_glyphs = window.text_system().has_glyph_for_char(resolved_font_id, '\u{f04c}');
-    let (nf_play, nf_pause) = if has_nerd_font_glyphs { ("\u{f04b}", "\u{f04c}") } else { (">", "||") };
-    let glyph = if is_playing { nf_pause } else { nf_play };
-    let time_text = format!("{}/{}", format_duration(elapsed), format_duration(duration));
-    let glyph_run = TextRun { len: glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
-    let glyph_line = window.text_system().shape_line(
-        glyph.to_string().into(),
-        text_style.font_size.to_pixels(window.rem_size()),
-        &[glyph_run],
-        None,
-    );
-    glyph_line.paint(position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+    let (nf_play, nf_pause, nf_stop) = if has_nerd_font_glyphs {
+        ("\u{f04b}", "\u{f04c}", "\u{f04d}")
+    } else {
+        (">", "||", "[]")
+    };
 
-    // Close ("x") glyph occupies the trailing cell, with one cell of
-    // padding between it and the time readout — mirrors the leading
-    // play/pause glyph's own cell + padding layout on the opposite end.
-    let close_run = TextRun { len: "x".len(), font: text_style.font(), color: text_color, ..Default::default() };
-    let close_line = window.text_system().shape_line(
-        "x".to_string().into(),
-        text_style.font_size.to_pixels(window.rem_size()),
-        &[close_run],
-        None,
-    );
-    let close_position = point(position.x + width - close_line.width, position.y);
-    close_line.paint(close_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+    let shape_and_paint = |text: &str, at: Point<Pixels>, window: &mut Window, cx: &mut App| -> Pixels {
+        let run = TextRun { len: text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        let line = window.text_system().shape_line(
+            text.to_string().into(),
+            text_style.font_size.to_pixels(window.rem_size()),
+            &[run],
+            None,
+        );
+        line.paint(at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        line.width
+    };
 
-    let time_run =
-        TextRun { len: time_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
-    let time_line = window.text_system().shape_line(
-        time_text.clone().into(),
-        text_style.font_size.to_pixels(window.rem_size()),
-        &[time_run],
-        None,
-    );
-    let time_position = point(close_position.x - cell_width - time_line.width, position.y);
-    time_line.paint(time_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+    // Time readout renders a few points smaller than the play/pause/
+    // stop glyphs (which stay at the row's full `line_height`) — purely
+    // a visual choice (a full-cell-height clock readout looked oversized
+    // next to a slim seek bar), vertically centered within the row by
+    // `paint_time`'s own `y_offset` below. Clamped so it can never go
+    // non-positive on an already-tiny font.
+    let time_font_size: gpui::Pixels = (line_height - gpui::px(4.0)).max(gpui::px(1.0));
 
-    // The seek bar occupies the space between the play/pause glyph and
-    // the time readout — one cell of glyph, one cell of padding on each
-    // side of the bar, the rest of the width minus the time text. This
-    // rectangle is deliberately narrower than the whole widget, so it's
-    // returned separately (not just implied by `bounds`) — hit-testing
-    // (`Terminal::seek_fraction_for_position`) needs the bar's OWN
-    // extent to compute a seek fraction; using the full widget width as
-    // the denominator there previously made a click at the bar's visual
-    // midpoint compute a fraction far short of 0.5, confirmed live.
-    let bar_start_x = position.x + cell_width * 2.0;
-    let bar_end_x = time_position.x - cell_width;
+    // Time readout ALWAYS renders the same 8-character "HH:MM:SS"
+    // template (leading zeros dimmed rather than omitted — see below),
+    // so its shaped width is the same real number of pixels every call
+    // for a given font — this used to instead assume that width equals
+    // `8 * cell_width` exactly, which isn't guaranteed: font metrics at
+    // a given font_size don't have to match the terminal grid's own
+    // cell width, confirmed live as the time text visibly overlapping
+    // the seek bar by roughly one character's width. Measuring the REAL
+    // shaped width once (any duration works, since the character count
+    // is always identical) and reusing that measurement for every
+    // position calculation below removes the assumption entirely —
+    // every element's layout follows from what was ACTUALLY painted,
+    // not from a guess about font metrics.
+    let time_text_width = {
+        let probe_text = format_duration(std::time::Duration::ZERO);
+        let probe_run =
+            TextRun { len: probe_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(probe_text.into(), time_font_size, &[probe_run], None).width
+    };
+    // Leading digits that are still at their "00" zero-state are dimmed
+    // (grey) rather than fully hidden — the fixed "HH:MM:SS" template
+    // stays visually present at all times (so the layout never looks
+    // like it's missing characters), while genuinely significant digits
+    // paint in the normal bright color, same idea a car odometer's dim
+    // leading zeros use.
+    let dim_color: gpui::Hsla = gpui::rgba(0x585b70ff).into();
+    let paint_time = |duration: std::time::Duration, at: Point<Pixels>, window: &mut Window, cx: &mut App| {
+        let text = format_duration(duration);
+        // First index whose digit isn't part of a leading "00" run —
+        // colons are never the first non-zero character themselves, so
+        // scanning digit-by-digit and treating a colon as "still dim if
+        // everything before it was dim" gives the right split point
+        // without needing special-case logic for where the colons fall.
+        let mut first_significant = text.len();
+        for (i, c) in text.char_indices() {
+            if c.is_ascii_digit() && c != '0' {
+                first_significant = i;
+                break;
+            }
+        }
+        let runs = if first_significant == 0 {
+            vec![TextRun { len: text.len(), font: text_style.font(), color: text_color, ..Default::default() }]
+        } else if first_significant >= text.len() {
+            vec![TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() }]
+        } else {
+            vec![
+                TextRun { len: first_significant, font: text_style.font(), color: dim_color, ..Default::default() },
+                TextRun {
+                    len: text.len() - first_significant,
+                    font: text_style.font(),
+                    color: text_color,
+                    ..Default::default()
+                },
+            ]
+        };
+        let line = window.text_system().shape_line(text.into(), time_font_size, &runs, None);
+        // Vertically centered within the row — `time_font_size` is
+        // smaller than `line_height`, so painting at the row's own top
+        // (`at.y` unmodified) would leave it sitting high, not centered.
+        let y_offset = (line_height - time_font_size) / 2.0;
+        line.paint(point(at.x, at.y + y_offset), time_font_size, gpui::TextAlign::Left, None, window, cx).log_err();
+    };
+
+    let play_glyph = if is_playing { nf_pause } else { nf_play };
+    shape_and_paint(play_glyph, position, window, cx);
+
+    // Two cells of padding between the play/pause glyph and the
+    // current-time readout — without it the two visually ran together
+    // (glyph and time text abutting with no gap), confirmed live.
+    let current_time_position = point(position.x + cell_width * 2.0, position.y);
+    paint_time(elapsed, current_time_position, window, cx);
+
+    // Stop glyph anchored to the trailing cell, total time immediately
+    // to its left with two cells of padding — mirrors the leading
+    // play/pause + current-time layout on the opposite end (glyph +
+    // 2-cell pad + 8-cell fixed-width time = 11 cells on each side).
+    let stop_position = point(position.x + width - cell_width, position.y);
+    shape_and_paint(nf_stop, stop_position, window, cx);
+    let stop_bounds = Bounds::new(stop_position, gpui::size(cell_width, line_height));
+
+    let total_time_position = point(stop_position.x - cell_width * 2.0 - time_text_width, position.y);
+    paint_time(duration, total_time_position, window, cx);
+
+    // The seek bar occupies whatever's left between the current-time
+    // readout and the total-time readout, with one cell of padding on
+    // each side. This rectangle is deliberately narrower than the whole
+    // widget, so it's returned separately (not just implied by
+    // `bounds`) — hit-testing (`Terminal::seek_fraction_for_position`)
+    // needs the bar's OWN extent to compute a seek fraction; using the
+    // full widget width as the denominator there previously made a
+    // click at the bar's visual midpoint compute a fraction far short
+    // of 0.5, confirmed live. Both edges anchor to `time_text_width`
+    // (the REAL measured width of the time template — see that
+    // variable's own doc comment), not a cell-count guess, so the bar
+    // never overlaps either time readout regardless of font metrics.
+    let bar_start_x = current_time_position.x + time_text_width + cell_width;
+    let bar_end_x = total_time_position.x - cell_width;
     let mut bar_bounds_out = None;
     if bar_end_x > bar_start_x {
         let bar_bounds = Bounds::new(
@@ -2054,12 +2290,12 @@ fn paint_rich_content_audio_widget(
         bar_bounds_out = Some(bar_bounds);
     }
 
-    Some((bounds, bar_bounds_out))
+    Some((bounds, bar_bounds_out, Some(stop_bounds)))
 }
 
 fn format_duration(d: std::time::Duration) -> String {
     let total_seconds = d.as_secs();
-    format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
+    format!("{:02}:{:02}:{:02}", total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60)
 }
 
 fn to_highlighted_range_lines(

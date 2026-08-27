@@ -14,12 +14,12 @@
 //! using profile 0, no splits, active — `{"tabs": ["0.0"], "active": "0.0"}`.
 //!
 //! Tabs whose profile has `tmux: true` additionally carry their
-//! `som-tmux` pane ids as a third, colon-separated segment:
+//! `som-srv` pane ids as a third, colon-separated segment:
 //! `"x.y:uuid1,uuid2,uuid3"` — one pane id per pane (main first, then splits
 //! in creation order), only ever written for tabs that are actually tmux. A
 //! plain (non-tmux) tab never has this segment at all — it's not "no
 //! sessions", it's "not applicable". Each pane id is a UUID string used as
-//! that pane's `som-tmux` pipe name (see `project_som_tmux` memory,
+//! that pane's `som-srv` pipe name (see `project_som_tmux` memory,
 //! "Обновление 17"/19) — restoring a tab reuses the same id so it
 //! reconnects to the same still-running HOLDER process if one survived,
 //! rather than starting a fresh shell. (Formerly a protocol session id to
@@ -35,7 +35,7 @@ use uuid::Uuid;
 pub struct SomDbTab {
     pub profile_index: usize,
     pub extra_splits: usize,
-    /// One `som-tmux` pane id per live pane (main first, then splits
+    /// One `som-srv` pane id per live pane (main first, then splits
     /// in order), only ever present for tabs whose profile has `tmux:
     /// true`. `None` for a plain (non-tmux) tab — this is NOT "no sessions
     /// to restore", it's "this tab was never tmux in the first place".

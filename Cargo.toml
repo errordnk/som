@@ -34,7 +34,7 @@ members = [
     "crates/settings_json",
     "crates/settings_macros",
     "crates/som_key",
-    "crates/som_tmux",
+    "crates/som_srv",
     "crates/sum_tree",
     "crates/syntax_theme",
     "crates/terminal",
@@ -113,7 +113,7 @@ settings = { path = "crates/settings" }
 settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
-som_tmux = { path = "crates/som_tmux" }
+som_srv = { path = "crates/som_srv" }
 sum_tree = { path = "crates/sum_tree" }
 syntax_theme = { path = "crates/syntax_theme" }
 task = { path = "crates/task" }

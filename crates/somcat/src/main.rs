@@ -1,29 +1,35 @@
-//! `somcat` — a minimal terminal image/audio viewer for Som. Speaks Som's
-//! own rich-content protocol (`terminal::rich_content_transport`), with no
-//! dependency on `crossterm` or any other console-mode abstraction library.
+//! `somcat` — a minimal terminal image/audio viewer for Som.
 //!
 //! Usage: `somcat <file>` or `somcat --srp <file>` (the flag is an explicit
 //! synonym for the default, for anyone who'd rather not rely on an implicit
 //! default).
+//!
+//! Bulk payload bytes and byte-range query/response travel over
+//! `som-srv`'s binary side channel (`srv_channel::SrvChannel`,
+//! `som_srv::protocol::SrvRequest::PutChunk`/`RequestByteRange`) — the
+//! OLD APC/base91-over-PTY transport (`terminal::rich_content_transport`'s
+//! `Chunk`/`build_envelope`/`Query`) has been deleted entirely, no
+//! fallback. The placeholder-grid control handshake (`print_placeholder_
+//! grid`/`print_placeholder_grid_with_cell_dims`) is UNAFFECTED — it never
+//! depended on that machinery, see those functions' own doc comments —
+//! and stays on the PTY, since it's how Som learns a placement exists at
+//! all before any payload bytes arrive.
 mod raw_mode;
+mod srv_channel;
 
 use image::ImageDecoder as _;
 use image::codecs::gif::GifDecoder;
 use std::io::Read as _;
 use terminal::kitty_graphics_placeholder;
 
-/// Chunk size for a single APC string's payload — large enough to be
-/// efficient, small enough that no real terminal's escape-sequence parser
-/// chokes on a single control string. Only Som itself ever parses these
-/// (`somcat`'s SRP output isn't meant for a generic terminal emulator),
-/// so this is tuned for Som's own APC handling rather than a
-/// conservative guess about third-party parsers. Raised from an initial
-/// 4096: at that size, a several-MB audio file meant ~800 separate
-/// `write_raw_stdout` calls (each its own `WriteFile` syscall under
-/// `STDOUT_WRITE_LOCK`) plus ~800 separate APC-parse-and-cache-write
-/// events on Som's side before `somcat` could return and the shell's
-/// prompt came back — a real, measured delay for large files, not
-/// hypothetical.
+/// Chunk size for one piece of a progressive file transfer — large enough
+/// to be efficient, small enough to keep per-piece overhead low.
+/// Unchanged from the old APC-over-PTY transport's own chunk size —
+/// still a reasonable piece size for `som_srv::protocol::SrvRequest::
+/// PutChunk` messages over a real binary side channel, though there's no
+/// longer an escape-sequence-parser or ConPTY codepage concern driving
+/// this number the way there was on the PTY path; revisit if profiling
+/// ever suggests a different size performs better over this transport.
 const CHUNK_SIZE: usize = 65536;
 
 fn main() {
@@ -42,6 +48,28 @@ fn main() {
     // own cell metrics (not Som's) must be the source of the placeholder
     // grid's row/column count.
     let raw_guard = raw_mode::enable();
+
+    // A panic anywhere in `stream_file` (its own code or a dependency's)
+    // would otherwise unwind straight past `raw_guard`'s `Drop` and past
+    // the `Err` handling below without printing anything a user watching
+    // the real terminal would ever see — Rust's default panic handler
+    // writes to stderr too, but by the time the process actually exits,
+    // raw mode may still be disabled correctly (via `Drop`) while the
+    // panic message itself scrolls past faster than it's readable, or
+    // gets swallowed depending on how the parent PTY buffers output right
+    // before the process dies. Installing an explicit hook here, INSIDE
+    // raw mode, guarantees the message is written with a trailing
+    // `\r\n` (raw mode disables the terminal's own newline translation,
+    // so a bare `\n` alone would just carriage-return without advancing
+    // to a new line, visually mangling the message) before anything else
+    // happens — this is the fix for a real reported symptom ("black
+    // screen with instant exit, no visible error") where the actual cause
+    // turned out to be silent/invisible rather than the transport itself
+    // being broken.
+    std::panic::set_hook(Box::new(|info| {
+        eprint!("somcat: panicked: {info}\r\n");
+    }));
+
     let result = stream_file(path);
     drop(raw_guard);
     if let Err(err) = result {
@@ -292,6 +320,28 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
     print_placeholder_grid_with_cell_dims(session_id, file_id, columns, rows)
 }
 
+/// Video counterpart to [`print_placeholder_grid`] — identical column/row
+/// derivation from pixel dimensions, but reserves ONE EXTRA row beyond
+/// the picture itself for Som's play/pause/seek-bar widget (see
+/// `paint_rich_content_placements`'s video branch in `terminal_element.rs`,
+/// which paints the picture into every row this placement has EXCEPT its
+/// last, and the widget into that last row — mirroring how the picture
+/// and the widget are two visually separate things even though they're
+/// one placement on the wire). `print_placeholder_grid_with_cell_dims`'s
+/// own row clamp (`terminal_rows - 1`, leaving room for the shell's next
+/// prompt) still applies on top of this — passing `rows + 1` here means
+/// the clamp effectively reserves room for BOTH the widget row and the
+/// prompt row, not just the prompt.
+fn print_video_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_px: u32) -> Result<(), String> {
+    let Some((cell_width, cell_height)) = query_cell_size_px() else {
+        return Ok(());
+    };
+
+    let columns = width_px.div_ceil(cell_width).max(1).min(297);
+    let picture_rows = height_px.div_ceil(cell_height).max(1).min(296);
+    print_placeholder_grid_with_cell_dims(session_id, file_id, columns, picture_rows + 1)
+}
+
 /// Prints a placeholder grid of an EXPLICIT `columns`x`rows` cell footprint
 /// — used for audio, which has no pixel dimensions to derive a footprint
 /// from at all (unlike images/GIF). Som paints its own fixed-size
@@ -299,8 +349,20 @@ fn print_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, height_p
 /// grid reserves, the same way it paints decoded image pixels into an
 /// image's own reserved footprint — see `paint_rich_content_placements`'s
 /// audio branch in `terminal_element.rs`.
-const AUDIO_WIDGET_COLUMNS: u32 = 42; // +2 over the play/bar/time layout for a trailing close ("x") glyph plus its padding cell.
+const AUDIO_WIDGET_COLUMNS: u32 = 40;
 const AUDIO_WIDGET_ROWS: u32 = 1;
+
+/// Placeholder-grid footprint for a video whose real pixel dimensions
+/// this process never learns (see `stream_file`'s video branch — no
+/// client-side FFmpeg dependency, so no way to probe width/height here).
+/// A 16:9 figure in the same ballpark as common video resolutions
+/// (1280x720) — `print_placeholder_grid` derives columns/rows from this
+/// via the terminal's own cell pixel size, same as it would for a real
+/// image, and Som's paint path scales the actually-decoded frame to fit
+/// whatever footprint results, so this only affects the on-screen aspect
+/// ratio until the terminal is resized, not correctness.
+const VIDEO_PLACEHOLDER_WIDTH_PX: u32 = 1280;
+const VIDEO_PLACEHOLDER_HEIGHT_PX: u32 = 720;
 
 fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), String> {
     print_placeholder_grid_with_cell_dims(session_id, file_id, AUDIO_WIDGET_COLUMNS, AUDIO_WIDGET_ROWS)
@@ -404,31 +466,37 @@ fn new_ids() -> SrpIds {
     (session_id, file_id)
 }
 
-/// Streams `bytes` to Som's own binary rich-content protocol
-/// (`terminal::rich_content_transport`) — the file's raw bytes go over the
-/// wire base91-encoded (see that module's doc comment for why), chunk by
-/// chunk, with no re-encoding at all. Content-type-agnostic: the caller
-/// picks `content_type`/`metadata`, this function only knows how to chop
-/// bytes into envelopes and write them out.
+/// Streams `bytes` to Som's rich-content pipeline over `channel` — the
+/// binary side-channel to `som-srv` (`SrvChannel::connect`), replacing
+/// the old APC/base91-over-PTY transport entirely (see `terminal::
+/// rich_content_transport`'s module doc comment for why that transport
+/// existed and no longer does). Content-type-agnostic: the caller picks
+/// `content_type`/`metadata`, this function only knows how to chop bytes
+/// into pieces and hand them off.
 fn stream_bytes(
+    channel: &srv_channel::SrvChannel,
     bytes: &[u8],
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
     ids: SrpIds,
 ) -> Result<(), String> {
     let total_size = bytes.len() as u64;
-    send_range_chunks(bytes, content_type, metadata, ids, total_size, 0, bytes.len() as u64)
+    send_range_chunks(channel, bytes, content_type, metadata, ids, total_size, 0, bytes.len() as u64)
 }
 
-/// Sends `bytes[offset as usize .. (offset + len) as usize]` as one or
-/// more chunk envelopes at their real file offsets — the shared
-/// implementation behind both [`stream_bytes`] (the whole file, offset
-/// 0) and a range-request response (an arbitrary sub-range, see
-/// [`spawn_audio_query_responder`]). `total_size` is the WHOLE file's
+/// Sends `bytes[offset as usize .. (offset + len) as usize]` as
+/// [`CHUNK_SIZE`]-sized `SrvRequest::PutChunk` messages over `channel` —
+/// the shared implementation behind both [`stream_bytes`] (the whole
+/// file, offset 0) and a range-request response (an arbitrary sub-range,
+/// see [`spawn_byte_range_responder`]). `total_size` is the WHOLE file's
 /// size (not `bytes.len()`), since a range response still needs to
-/// declare the file's real total size in every chunk header, same as
-/// the initial sequential stream does.
+/// declare the file's real total size, same as the initial sequential
+/// stream does. `content_type`/`metadata` travel on every `PutChunk` —
+/// see `som_srv::protocol::SrvRequest::PutChunk`'s own doc comment for
+/// why.
+#[allow(clippy::too_many_arguments)]
 fn send_range_chunks(
+    channel: &srv_channel::SrvChannel,
     bytes: &[u8],
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
@@ -437,65 +505,38 @@ fn send_range_chunks(
     range_offset: u64,
     range_len: u64,
 ) -> Result<(), String> {
-    use terminal::rich_content_transport::{Chunk, build_envelope, split_into_chunks};
-
     let start = range_offset as usize;
     let end = (range_offset + range_len).min(bytes.len() as u64) as usize;
     let slice = bytes.get(start..end).ok_or_else(|| format!("range [{start}, {end}) out of bounds"))?;
 
-    let pieces = split_into_chunks(slice, CHUNK_SIZE);
+    let srv_content_type = srv_channel::to_srv_content_type(content_type);
+    let srv_metadata = srv_channel::to_srv_metadata(metadata);
     let mut offset = range_offset;
-    for payload in pieces {
-        let payload_len = payload.len() as u64;
-        let chunk = Chunk { content_type, session_id, file_id, chunk_offset: offset, total_size, metadata, payload };
-        // `build_envelope` already produces the complete envelope
-        // (marker + header + base91-encoded payload) — this just wraps it
-        // in the APC start/end sequence (`ESC _` ... `ESC \`).
-        let envelope = build_envelope(&chunk);
-        let mut apc = Vec::with_capacity(2 + envelope.len() + 2);
-        apc.extend_from_slice(&[0x1B, b'_']);
-        apc.extend_from_slice(&envelope);
-        apc.extend_from_slice(&[0x1B, b'\\']);
-        write_raw_stdout(&apc)?;
-        offset += payload_len;
+    for piece in slice.chunks(CHUNK_SIZE) {
+        channel.put_chunk(session_id, file_id, offset, piece.to_vec(), total_size, srv_content_type, srv_metadata)?;
+        offset += piece.len() as u64;
     }
     Ok(())
 }
 
-/// Spawns the background thread that services Som's byte-range queries
-/// (`rich_content_transport::Query`/`QUERY_MARKER`) for the rest of this
-/// process's lifetime — see this module's doc comment on
-/// `STDOUT_WRITE_LOCK` for why concurrent writes need synchronization,
-/// and `rich_content_transport::Query`'s own doc comment for why a
-/// range-request's ANSWER is just ordinary chunk envelopes, not a new
-/// reply shape.
+/// Spawns the background thread that services Som's byte-range requests
+/// (`som_srv::protocol::SrvRequest::RequestByteRange`, arriving unsolicited
+/// on `channel` — see `srv_channel::Incoming`'s doc comment for why a
+/// `PutChunk`-sending connection must also expect to read these) for the
+/// rest of this process's lifetime — the direct replacement for the OLD
+/// APC/base91 `Query` mechanism (`ESC _ Q ... ESC \` off stdin), which has
+/// been deleted (see `terminal::rich_content_transport`'s module doc
+/// comment).
 ///
-/// Reads stdin one byte at a time looking for `ESC _ Q ... ESC \`
-/// (mirrors `query_cell_size_px`'s own byte-at-a-time stdin read, but
-/// long-lived instead of a single blocking read-with-timeout). Must only
-/// be started AFTER any other stdin reader this process still needs has
-/// already finished (`stream_file`'s audio branch prints the
-/// placeholder grid — which reads Som's own `CSI 16 t`/`CSI 18 t`
-/// cell-size replies off stdin — BEFORE calling this, specifically so
-/// the two never read the same stdin concurrently, which would be
-/// inherently racy).
-///
-/// `bytes` is the SAME in-memory file contents `stream_file` already
-/// read via `std::fs::read` before starting to stream — sharing it
-/// (via `Arc`) rather than opening a second file handle avoids any
-/// file-position contention with a second `Read`/`Seek` user, and
-/// `somcat` already loaded the whole file into memory before this point
-/// regardless.
-///
-/// Returns a `(stop_flag, JoinHandle)` pair. The flag is checked between
-/// stdin reads, but a thread parked in a blocking `read()` call won't
-/// observe it until its next byte arrives — `stream_file` sets the flag
-/// once the main sequential loop finishes but deliberately does NOT
-/// join the handle: `somcat`'s process exits right after the audio
-/// path's caller returns regardless, which tears this thread down along
-/// with it, and there is no further stdin use afterward this needs to
-/// be sequenced against.
-fn spawn_audio_query_responder(
+/// Returns a `(stop_flag, JoinHandle)` pair — the flag is checked between
+/// reads, but a thread parked in a blocking `read_incoming` call won't
+/// observe it until the daemon sends something or the connection closes;
+/// `stream_file` sets it once the main sequential loop finishes but
+/// deliberately does NOT join the handle, since `somcat`'s process exits
+/// right after the audio/video path's caller returns regardless, which
+/// tears this thread (and its connection) down along with it.
+fn spawn_byte_range_responder(
+    channel: std::sync::Arc<srv_channel::SrvChannel>,
     bytes: std::sync::Arc<Vec<u8>>,
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
@@ -507,64 +548,25 @@ fn spawn_audio_query_responder(
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
     let handle = std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut byte = [0u8; 1];
         loop {
             if stop_for_thread.load(Ordering::Relaxed) {
                 return;
             }
-            match std::io::Read::read(&mut stdin, &mut byte) {
-                Ok(1) => {
-                    if byte[0] == ETX {
-                        std::process::exit(130);
-                    }
-                    buf.push(byte[0]);
-                    // APC terminator `ESC \` — check whether the tail of
-                    // `buf` contains a complete `ESC _ Q ... ESC \`
-                    // envelope, same start/end markers `stream_bytes`
-                    // itself wraps every chunk in.
-                    if buf.len() >= 2 && buf[buf.len() - 2] == 0x1B && buf[buf.len() - 1] == b'\\' {
-                        if let Some(start) = find_apc_start(&buf) {
-                            let inner = &buf[start + 2..buf.len() - 2];
-                            if inner.first().copied() == Some(terminal::rich_content_transport::QUERY_MARKER)
-                                && let Ok(query) = terminal::rich_content_transport::parse_query_envelope(inner)
-                                && query.session_id == ids.0
-                                && query.file_id == ids.1
-                            {
-                                let _ = send_range_chunks(
-                                    &bytes,
-                                    content_type,
-                                    metadata,
-                                    ids,
-                                    total_size,
-                                    query.offset,
-                                    query.len,
-                                );
-                            }
-                        }
-                        buf.clear();
-                    } else if buf.len() > 8192 {
-                        // No plausible envelope this large — drop
-                        // whatever's accumulated rather than growing
-                        // `buf` forever on unrelated stdin noise.
-                        buf.clear();
-                    }
+            match channel.read_incoming() {
+                Ok(srv_channel::Incoming::Request(som_srv::protocol::SrvRequest::RequestByteRange {
+                    session_id,
+                    file_id,
+                    offset,
+                    len,
+                })) if (session_id, file_id) == ids => {
+                    let _ = send_range_chunks(&channel, &bytes, content_type, metadata, ids, total_size, offset, len);
                 },
-                _ => return,
+                Ok(_) => continue, // unrelated/unexpected message — ignore, keep waiting
+                Err(_) => return,  // connection gone
             }
         }
     });
     (stop, handle)
-}
-
-/// Finds the start of the LAST `ESC _` (APC start) in `buf`, if any —
-/// used by [`spawn_audio_query_responder`] to locate where a just-
-/// completed envelope (ending at `buf`'s own tail) began, without
-/// needing a full state machine for a byte stream that's overwhelmingly
-/// just one envelope at a time in practice.
-fn find_apc_start(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).rposition(|w| w == [0x1B, b'_'])
 }
 
 /// Streams `path` to Som over SRP, then prints a placeholder grid
@@ -606,9 +608,10 @@ fn stream_file(path: &str) -> Result<(), String> {
         Some("jpg" | "jpeg") => ContentType::Jpeg,
         Some("png") => ContentType::Png,
         Some("mp3" | "flac") => ContentType::Audio,
+        Some("mp4" | "mkv" | "avi") => ContentType::Video,
         Some(other) => {
             return Err(format!(
-                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac are supported so far"
+                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac/.mp4/.mkv/.avi are supported so far"
             ));
         },
         None => return Err("file has no extension, can't infer content type".to_string()),
@@ -617,40 +620,82 @@ fn stream_file(path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
     let ids = new_ids();
 
+    // One connection to som-srv's binary side channel for this whole
+    // transfer — see `srv_channel::SrvChannel`'s own doc comment for why
+    // this fails hard (not a silent fallback to the old PTY transport,
+    // which no longer exists) if the daemon isn't reachable.
+    let channel = srv_channel::SrvChannel::connect()?;
+
     if content_type == ContentType::Audio {
         let (sample_rate, channels, bits_per_sample, duration_ms) = audio_metadata(path)?;
         let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms };
         let (session_id, file_id) = ids;
 
         // Placeholder grid FIRST, streaming SECOND — the reverse order
-        // from every other content type. `print_audio_placeholder_grid`
-        // reads Som's `CSI 16 t`/`CSI 18 t` cell-size replies off this
-        // process's own stdin (`query_cell_size_px`/`query_cell_count`),
-        // and so does `spawn_audio_query_responder`'s background thread
-        // once it starts — two things reading the same stdin
-        // concurrently is inherently racy (whichever thread's read call
-        // gets a given byte first wins), so the query responder must not
-        // start until AFTER the grid's own queries have already
-        // completed. The grid's footprint is a fixed cell size (see
-        // `print_audio_placeholder_grid`), not derived from decoded
-        // audio content, so printing it before any bytes have streamed
-        // is correct, not just convenient.
+        // from every other content type. Without a placeholder printed
+        // yet, Som has no id to open a player for at all — see the video
+        // branch below for the same reasoning, confirmed live for that
+        // content type; audio adopted the same order first.
         print_audio_placeholder_grid(session_id, file_id)?;
 
         let total_size = bytes.len() as u64;
         let shared_bytes = std::sync::Arc::new(bytes);
+        let shared_channel = std::sync::Arc::new(channel);
         let (stop, handle) =
-            spawn_audio_query_responder(shared_bytes.clone(), content_type, metadata, ids, total_size);
-        let result = stream_bytes(&shared_bytes, content_type, metadata, ids);
-        // The responder thread blocks on a stdin read that may never
-        // return on its own (no more queries arriving) — `stop` is
-        // checked between reads, but a thread parked in `read()` won't
-        // observe it until its next byte arrives or the process exits.
-        // Not joining here is deliberate: `main()` returns (and the
-        // process exits) right after this function does for the audio
-        // path, which tears the thread down along with it; there is no
-        // further stdin use after this point for `somcat` to protect
-        // against racing with.
+            spawn_byte_range_responder(shared_channel.clone(), shared_bytes.clone(), content_type, metadata, ids, total_size);
+        let result = stream_bytes(&shared_channel, &shared_bytes, content_type, metadata, ids);
+        // The responder thread blocks reading `shared_channel` for a
+        // `RequestByteRange` that may never arrive — `stop` is checked
+        // between reads, but a thread parked in a blocking read won't
+        // observe it until the daemon sends something or the connection
+        // closes. Not joining here is deliberate: `main()` returns (and
+        // the process exits) right after this function does for the
+        // audio path, which tears the thread (and its connection) down
+        // along with it.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(handle);
+        return result;
+    }
+
+    if content_type == ContentType::Video {
+        // No client-side FFmpeg dependency (see this module's own
+        // reasoning below) — real width/height/fps/codec aren't known
+        // here at all, only that this IS a video file. Som's paint path
+        // already scales whatever it decodes to fit the placeholder
+        // grid's footprint (same math the image branch below relies on),
+        // so an inaccurate footprint here only affects aspect ratio
+        // until the user resizes, not correctness.
+        let metadata = ContentMetadata::Video {
+            width_px: 0,
+            height_px: 0,
+            fps_numerator: 0,
+            fps_denominator: 0,
+            codec: terminal::rich_content_transport::VideoCodec::Unknown,
+        };
+        let (session_id, file_id) = ids;
+        // Placeholder grid FIRST, streaming SECOND — same reversal from
+        // the image/GIF branch below that audio already uses, for the
+        // same reason: without a placeholder printed yet, Som has no id
+        // to open a `RichContentVideoPlayer` for at all, so its decode
+        // thread (which itself reads progressively off the SAME cache
+        // file this streaming call is still writing into — see
+        // `rich_content_video_player`'s own `GrowingFileStream`) simply
+        // never starts until every last chunk of a potentially very
+        // large file has already gone out over the wire. Confirmed live:
+        // this made playback of a real several-minutes movie clip look
+        // like it "never starts," when transport (not decode, which is
+        // itself fully progressive) was the actual bottleneck.
+        print_video_placeholder_grid(session_id, file_id, VIDEO_PLACEHOLDER_WIDTH_PX, VIDEO_PLACEHOLDER_HEIGHT_PX)?;
+
+        let total_size = bytes.len() as u64;
+        let shared_bytes = std::sync::Arc::new(bytes);
+        let shared_channel = std::sync::Arc::new(channel);
+        // Same keep-alive-and-answer-byte-range-requests shape as audio
+        // above — video seeking needs the same "give me bytes further
+        // into the file than what's arrived sequentially" capability.
+        let (stop, handle) =
+            spawn_byte_range_responder(shared_channel.clone(), shared_bytes.clone(), content_type, metadata, ids, total_size);
+        let result = stream_bytes(&shared_channel, &shared_bytes, content_type, metadata, ids);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(handle);
         return result;
@@ -663,10 +708,25 @@ fn stream_file(path: &str) -> Result<(), String> {
     // frame buffers) — 32 bits per pixel regardless of the source GIF's
     // own (typically <=8-bit indexed/palette) on-disk color depth.
     let metadata = ContentMetadata::Image { width_px, height_px, color_bits: 32, is_animated };
-    stream_bytes(&bytes, content_type, metadata, ids)?;
 
+    // Placeholder grid FIRST, streaming SECOND — same reordering audio/
+    // video already needed and got (see those branches' own comments for
+    // the full reasoning), and for image/GIF specifically not just a
+    // "starts playing sooner" nicety but a correctness requirement now:
+    // `som_srv::srv_cache::SrvCache::subscribe`'s own doc comment states
+    // its progress pushes are only ever delivered to subscribers already
+    // registered at push time (no replay of missed progress) — Som only
+    // ever subscribes once it's seen this placement's id in the
+    // placeholder grid, so printing the grid AFTER already streaming a
+    // small file's every chunk meant every `Progress` push (and thus
+    // every byte of the file, as far as `RichContentCache` could tell)
+    // had already fired with nobody subscribed yet to receive it.
+    // Confirmed the hard way: this exact ordering bug made
+    // `rich_content_placements()` never see a placement at all for a GIF
+    // small enough to finish streaming near-instantly.
     let (session_id, file_id) = ids;
-    print_placeholder_grid(session_id, file_id, width_px, height_px)
+    print_placeholder_grid(session_id, file_id, width_px, height_px)?;
+    stream_bytes(&channel, &bytes, content_type, metadata, ids)
 }
 
 /// Writes `bytes` to stdout bypassing `std::io::Stdout` entirely — see this

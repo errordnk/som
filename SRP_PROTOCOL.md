@@ -1,10 +1,14 @@
 # Som Rich Protocol (SRP)
 
-Собственный бинарный протокол Som для передачи медиа/rich-контента через PTY. Раньше сосуществовал с реализацией Kitty Graphics Protocol; Kitty был полностью вырезан из кодовой базы (см. секцию "Kitty Graphics Protocol вырезан" ниже) — SRP теперь единственный способ показать изображение в терминале Som, `somcat` — эталонный клиент.
+Собственный бинарный протокол Som для передачи медиа/rich-контента. Раньше сосуществовал с реализацией Kitty Graphics Protocol; Kitty был полностью вырезан из кодовой базы (см. секцию "Kitty Graphics Protocol вырезан" ниже) — SRP теперь единственный способ показать изображение в терминале Som, `somcat` — эталонный клиент.
 
 Этот документ фиксирует все значимые архитектурные и технические решения по ходу реализации — не туториал, а рабочий журнал решений с обоснованием "почему", чтобы не терять контекст между сессиями.
 
-**Статус: транспорт И paint-путь полностью работают end-to-end через реальный ConPTY, живьём подтверждены GIF/JPEG/PNG с правильными размерами, цветами, курсором после картинки, корректным clear/scroll и фокусом ввода после старта.** Печать placeholder-грида переехала из Som в `somcat` (клиент печатает через свой реальный stdout, не через `write_output` — устраняет рассинхронизацию курсора с реальным shell'ом), добавлена поддержка JPEG/PNG, исправлена обрезка/сжатие при частичном скролле, реализован активный пересчёт placement'ов при ресайзе окна/шрифта в ОБЕ стороны (рост и сжатие по ширине и высоте, включая вставку/удаление строк с сохранением нижележащего контента) — см. соответствующие секции ниже. **Аудио (mp3/flac) реализовано с прогрессивным декодированием+воспроизведением** (виджет и звук стартуют от того префикса файла, что уже докачан, не после полной докачки — критично для многогигабайтных FLAC), поверх нового общего Som→client query/response-канала (byte-range seek за пределы закэшированного — первый конкретный потребитель, не единственный запланированный); виджет закрываем (крестик реально удаляет placeholder-строку), `clear` останавливает всё играющее в табе аудио — см. "Прогрессивное аудио + общий query/response-канал" ниже.
+**Статус: транспорт И paint-путь полностью работают end-to-end, живьём подтверждены GIF/JPEG/PNG/аудио/видео с правильными размерами, цветами, курсором после картинки, корректным clear/scroll и фокусом ввода после старта.**
+
+**АРХИТЕКТУРНОЕ ИЗМЕНЕНИЕ (2026-08-27, breaking change): весь МЕДИА-PAYLOAD (файл-байты) больше не идёт через PTY вообще.** Раньше payload base91-кодировался и передавался как APC-конверты внутри того же байтового потока, что и обычный терминальный вывод/keystrokes (см. "base91-транспорт — ИСТОРИЯ" ниже — это исторический раздел, оставлен для контекста, но описывает УЖЕ НЕ ДЕЙСТВУЮЩИЙ путь). Теперь payload идёт по отдельному бинарному side-channel к демону `som-srv` (`crates/som_srv`), напрямую от клиента (`somcat`, или любой сторонний SRP-отправитель) к Som — см. "som-srv binary side-channel transport" ниже, это ТЕКУЩАЯ архитектура. PTY по-прежнему несёт ТОЛЬКО маленький control-хендшейк: `print_placeholder_grid`'s unicode-placeholder-grid ячейки (`(session_id, file_id)` + размеры), которые сообщают Som, что placement вообще существует и где его искать — см. "Paint-путь v2" ниже, не изменился. Byte-range seek-запросы (аудио/видео) тоже переехали с PTY-based query/response на тот же `som-srv` side-channel — см. "som-srv binary side-channel transport" ниже, заменяет устаревшую "Часть A" в разделе про прогрессивное аудио.
+
+Печать placeholder-грида переехала из Som в `somcat` (клиент печатает через свой реальный stdout, не через `write_output` — устраняет рассинхронизацию курсора с реальным shell'ом), добавлена поддержка JPEG/PNG, исправлена обрезка/сжатие при частичном скролле, реализован активный пересчёт placement'ов при ресайзе окна/шрифта в ОБЕ стороны (рост и сжатие по ширине и высоте, включая вставку/удаление строк с сохранением нижележащего контента) — см. соответствующие секции ниже. **Аудио (mp3/flac) и видео реализованы с прогрессивным декодированием+воспроизведением** (виджет и звук/кадры стартуют от того префикса файла, что уже докачан, не после полной докачки — критично для многогигабайтных файлов); виджет закрываем (крестик реально удаляет placeholder-строку), `clear` останавливает всё играющее в табе аудио.
 
 ## Зачем свой протокол, а не Kitty (историческое обоснование)
 
@@ -16,9 +20,62 @@
 
 Клиент (`somcat <file>`) копирует РЕАЛЬНЫЙ файл побайтово, без перекодирования кадров, chunk-за-chunk, в локальный кэш-файл на машине, где физически работает Som. Плеер начинает декодирование/показ до того, как файл докачан целиком.
 
-Транспорт живёт целиком внутри PTY (никаких новых TCP/UDP портов, никаких сокетов в обход PTY) — работает через существующий SSH-канал (порт 22) без дополнительной инфраструктуры, включая som-tmux relay "бесплатно" (som-tmux уже прозрачно релеит любые APC-байты, а также любой другой PTY-вывод — никакой SRP-специфичной логики на стороне relay не требуется).
+**Актуально (2026-08-27):** сам payload больше НЕ идёт через PTY — см. "som-srv binary side-channel transport" ниже. Только control-хендшейк (placeholder-grid) остаётся на PTY.
 
-## VTE-патч: полный 8-бит APC
+## som-srv binary side-channel transport (актуальная архитектура, 2026-08-27)
+
+Payload (файл-байты) идёт по отдельному бинарному каналу к общему, host-scoped демону `som-srv` (`crates/som_srv`, тот же процесс, что реализует HOLDER/RELAY tmux-персистентность — `tmux: true/false` — переключает только этот отдельный модуль внутри общего демона, side-channel работает независимо от него). Named pipe на Windows (`\\.\pipe\som-srv`) / Unix domain socket на прочих платформах (`/tmp/som-srv-<uid>.sock`), один демон на машину, а не на pane/tab. PTY продолжает нести ТОЛЬКО control-хендшейк — `print_placeholder_grid` печатает unicode-placeholder ячейки как обычный текст (см. "Paint-путь v2" ниже, не изменился), сообщая Som `(session_id, file_id)` + footprint. Никакого payload на PTY больше нет вообще.
+
+### Протокол (`crates/som_srv/src/protocol.rs`)
+
+```rust
+enum SrvRequest {
+    Handshake(HandshakeInfo),
+    PutChunk { session_id: u32, file_id: u32, offset: u64, data: Vec<u8>, total_size: u64, content_type: ContentType, metadata: ContentMetadata },
+    ListSessions { client_id: Option<String> },
+    KillSession { client_id: Option<String>, pane_id: String },
+    SubscribeProgress { session_id: u32, file_id: u32 },
+    RequestByteRange { session_id: u32, file_id: u32, offset: u64, len: u64 },
+}
+enum SrvResponse {
+    Handshake(HandshakeInfo),
+    Sessions(Vec<SessionInfo>),
+    Killed,
+    Progress { session_id: u32, file_id: u32, contiguous_len: u64, total_size: u64, content_type: ContentType, metadata: ContentMetadata },
+}
+```
+
+`content_type`/`metadata` едут на КАЖДОМ `PutChunk` (не только первом) и ретранслируются на каждом `Progress` — необходимо, потому что `som-srv` (не имеющий доступа к GPUI-зависимому `crates/terminal`) сам решает, каким расширением назвать кэш-файл на диске (`extension_for`, ДОЛЖНА побайтово совпадать с `RichContentCache::extension_for` — расхождение здесь означает, что декодер на Som-стороне физически не находит файл, найдено и исправлено живьём). `ContentType`/`ContentMetadata`/`VideoCodec` — **дублированные** копии типов из `crates/terminal/src/rich_content_transport.rs` в `som_srv::protocol`, с ручными конвертерами в обе стороны (`somcat::srv_channel::to_srv_content_type`/`to_srv_metadata`, `terminal::rich_content_srv_channel::to_terminal_content_type`/`to_terminal_metadata`) — сознательное решение не тянуть GPUI-зависимость в `som_srv`.
+
+Нет отдельного response-варианта для `RequestByteRange` — `som-srv` форвардит его как СЫРОЙ `SrvRequest` (не обёрнутый в `SrvResponse`) обратно тому клиенту, что зарегистрировался как sender для данного `(session_id, file_id)` (`SrvCache::register_sender_route`/`route_byte_range_request`, `server::forward_srv_request`) — тот отвечает обычными `PutChunk`ами на нужном диапазоне. Значит клиент, отправляющий `PutChunk`, должен быть готов ЧИТАТЬ либо `SrvResponse`, либо сырой `SrvRequest` с ОДНОГО И ТОГО ЖЕ соединения — `somcat::srv_channel::Incoming` enum (`Response`/`Request` варианты, `read_any` пробует `SrvResponse` первым, `SrvRequest` вторым) решает это на клиентской стороне.
+
+### Роль каждой стороны
+
+**`somcat`** (`crates/somcat/src/srv_channel.rs`) — `SrvChannel::connect()` подключается к локальному демону (спавнит его, если не запущен — `som_srv::daemon::connect_or_spawn`, ищет бинарник рядом со своим exe через `binary_path_next_to_current_exe`), отправляет `PutChunk` за `PutChunk` вместо base91/APC-кодирования. Для audio/video (нужен seek) держит соединение открытым весь срок жизни процесса и слушает `RequestByteRange` в фоновом потоке (`spawn_byte_range_responder`); для image/GIF (нет seek-семантики) — одноразовая отправка, процесс завершается сразу.
+
+**Порядок операций критичен**: placeholder grid ДОЛЖЕН печататься ПЕРЕД началом стриминга, для ВСЕХ content types без исключения — `SrvCache::subscribe` не делает replay пропущенных `Progress`-пушей автоматически для подписчика, пришедшего позже (митигировано частичным replay текущего watermark при подписке, но полагаться на порядок надёжнее и дешевле, чем на race-condition-tolerant replay). Обратный порядок (стрим сначала, грид потом) для маленького файла означал, что вся передача успевала завершиться ДО того, как Som вообще узнавал о существовании placement'а и успевал подписаться — живой баг, пойманный при первом прогоне end-to-end тестов после этого рефакторинга.
+
+**`som-srv`** (`crates/som_srv/src/srv_cache.rs`) — `SrvCache` пишет каждый `PutChunk` на диск (тот же `{session_id:08x}-{file_id:08x}.<ext>` naming convention и cache dir, что `RichContentCache` использует на Som-стороне — `SrvCache::default_cache_dir()`, читает `SOM_RICH_CONTENT_CACHE_DIR` env var override, нужную для тестов, где Som-сторона использует `temp_dir()`-based путь, а `som-srv` — отдельный скомпилированный бинарник без видимости в `cfg(test)` другого крейта), отслеживает gap-tolerant contiguous-length watermark (тот же алгоритм, что раньше был в `RichContentCache::apply_chunk`), пушит `Progress` каждому подписчику на этот `(session_id, file_id)` при продвижении watermark.
+
+**Som** (`crates/terminal/src/rich_content_srv_channel.rs`) — `spawn_progress_listener(session_id, file_id)` лениво спавнится из `Terminal::ensure_rich_content_srv_subscription`, вызываемой на КАЖДОМ обнаружении placement'а в placeholder grid (`Terminal::poll_rich_content_srv_subscriptions`, сканирует ЖИВОЙ `term.lock().renderable_content()`, не кэшированный `last_content()` — тот обновляется только на реальном paint pass, который headless-тестам недоступен). Спавнит фоновый OS-поток, подключающийся к `som-srv`, отправляющий `SubscribeProgress`, блокирующе читающий `Progress`-пуши в `SrvProgressState` (тот же `Arc`-shared atomics паттерн, что `AudioTransferProgress`/`VideoTransferProgress` уже использовали — НЕ async/`cx.spawn`, обычный OS-поток + shared state, потому что `Terminal`/`RichContentCache` живут только на paint/main потоке). `RichContentCache::record_progress` — read-only альтернатива бывшему `apply_chunk`: открывает кэш-файл на чтение, но НЕ пишет payload сама (`som-srv` уже записал байты на диск) — `RichContentCache` стал чисто метаданным кэшем на Som-стороне для этого пути.
+
+**Важно, легко забыть**: `AudioTransferProgress`/`VideoTransferProgress` (плеерная сторона, отдельная от `SrvProgressState`) должны обновляться (`progress.update(contiguous_len, total_size)`) на КАЖДОЙ итерации `rich_content_audio_placements`/`rich_content_video_placements`, не только при первом открытии плеера — иначе decode-поток блокируется навсегда на устаревшем watermark для любого файла, недокачанного к моменту первого кадра (живой баг для 38MB видео, незаметный для маленького аудио).
+
+### Деплой / spawn-if-not-running
+
+`som_srv::daemon` (публичный модуль в `som_srv`'s lib.rs, НЕ приватная часть бинарника, как `relay`/`server`/`srv_cache`) — `connect_or_spawn(daemon_binary_path)`: пробует подключиться к фиксированному сокету, если не удаётся — спавнит детач-процесс `<daemon_binary_path> --daemon` и ретраит подключение. `binary_path_next_to_current_exe()`: ищет `som-srv(.exe)` рядом с `current_exe()`, с fallback на родительский каталог (нужно для `cargo test` бинарников, живущих в `target/<profile>/deps/`, на уровень глубже реального `target/<profile>/som-srv.exe`). Переиспользуется тремя местами: `relay.rs` (RELAY-процесс, САМ является `som-srv` — передаёт `current_exe()`), `somcat::srv_channel::SrvChannel::connect()`, `terminal::rich_content_srv_channel::connect_and_handshake()` (два последних — НЕ `som-srv`, ищут его рядом со своим exe).
+
+### Тестовое окружение — важные ловушки при живой отладке
+
+`som-srv` — host-scoped daemon, переживает завершение отдельного тестового прогона (тот же процесс переиспользуется следующим `cargo test` вызовом). После пересборки `som-srv.exe`/`somcat.exe` НУЖНО убить старый зависший процесс (`tasklist`/`taskkill` на Windows) — иначе новая сборка не может перезаписать файл (заблокирован запущенным старым процессом), и/или тесты используют устаревшее поведение уже запущенного демона. `SOM_RICH_CONTENT_CACHE_DIR` (см. выше) должна быть установлена ДО первого спавна демона/child-процесса в рамках тестового прогона — `std::process::Command` копирует env родителя НА МОМЕНТ spawn, не по живой ссылке, так что установка переменной уже ПОСЛЕ первого spawn (например, внутри `Terminal`'s собственного конструктора, вызываемого уже после того как `TerminalBuilder::new` создала PTY-child) не долетает до уже запущенных процессов.
+
+Полный список из 6 архитектурных багов, найденных при первом прогоне end-to-end тестов этой архитектуры (grid-print-order race, `subscribe`'s отсутствие replay, `last_content()` vs живой grid, daemon-binary-path fallback, cache-dir env var timing, progress-не-обновлялся-после-первого-кадра) — см. память `project_som_srv_binary_transport` (не дублируется здесь целиком, чтобы не рассинхронизироваться с кодом при будущих правках).
+
+## base91-транспорт для payload — ИСТОРИЯ, БОЛЬШЕ НЕ ДЕЙСТВУЕТ
+
+**Весь этот раздел (до "som-srv binary side-channel transport" ниже) описывает транспорт payload, который был ПОЛНОСТЬЮ УДАЛЁН 2026-08-27** — `base91_encode`/`base91_decode`, `Chunk`, `build_envelope`/`parse_envelope`, `Query`/`QueryType`/`QUERY_MARKER`/`build_query_envelope`/`parse_query_envelope` больше не существуют в кодовой базе (`crates/terminal/src/rich_content_transport.rs` теперь содержит только `ContentType`/`ContentMetadata`, ничего транспортного). Оставлен здесь целиком, потому что диагностика ConPTY-кодопейдж-реинтерпретации (см. ниже) — реальный, дорогой опытом урок про поведение Windows-консоли, актуальный при работе с ЛЮБЫМ будущим PTY-based протоколом в этой кодовой базе, не только SRP. Причина замены — не то, что этот транспорт был неверным (он был byte-perfect и работал), а архитектурная: payload через PTY имел естественный потолок пропускной способности (base91 overhead + APC-парсинг каждого чанка + разделение stdout между control-трафиком и payload), который стал заметен на больших файлах (видео) — см. "som-srv binary side-channel transport" ниже для актуальной архитектуры.
+
+### VTE-патч: полный 8-бит APC
 
 **Файл:** `errordnk/vte` (форк, локальный клон `C:\home\dnk\vte-fork-work`), коммит `649d0a6`. `errordnk/alacritty` обновлён на новый vte-rev, коммит `c9f86ad4`. `som`'s `Cargo.toml:151` — `rev = "c9f86ad4"`.
 
@@ -30,7 +87,7 @@
 
 **Важная оговорка, найденная позже**: этот патч решает проблему только для парсера ВНУТРИ Som (VTE), но НЕ решает проблему на уровне самой Windows-консоли — см. секцию "КРИТИЧНО: реальный ConPTY реинтерпретирует сырые байты через кодовую страницу" ниже. Обе проблемы независимы; патч VTE был необходим, но не достаточен.
 
-## КРИТИЧНО: реальный ConPTY реинтерпретирует сырые байты через кодовую страницу — почему протокол ушёл от raw binary к base91
+### КРИТИЧНО: реальный ConPTY реинтерпретирует сырые байты через кодовую страницу — почему протокол ушёл от raw binary к base91
 
 ### История вопроса
 
@@ -68,7 +125,7 @@ Windows ConPTY — это НЕ прозрачный байтовый pipe для
 
 **Файл:** `crates/terminal/src/rich_content_transport.rs`, константа `BASE91_ALPHABET` (вычисляется программно через `const fn`, не набирается руками — чтобы исключить ошибку ручной транскрипции).
 
-## Формат конверта (актуальный, base91)
+### Формат конверта (base91, ИСТОРИЯ — payload больше НЕ отправляется этим путём)
 
 ```
 [marker:            1 byte  = b'S']
@@ -112,13 +169,13 @@ Windows ConPTY — это НЕ прозрачный байтовый pipe для
 
 Решение: литеральный байт-разделитель `0x20` (пробел) между `header_b91` и `payload_b91`. Он безопасен как разделитель именно потому, что лежит НИЖЕ нижней границы base91-алфавита (`0x21`) — ни при каких обстоятельствах не может встретиться внутри корректно закодированных данных, поэтому `parse_envelope` ищет первое вхождение `0x20` после marker-байта и режет конверт по нему однозначно.
 
-## Почему больше не нужен byte-stuffing (`TrailingByte`) — историческая деталь
+### Почему больше не нужен byte-stuffing (`TrailingByte`) — историческая деталь
 
 **Более ранняя версия протокола** (до перехода на base91) полагалась на raw-binary payload с `0x1B` в качестве единственного запрещённого байта, а после обнаружения ConPTY CRLF-искажения (Windows ConPTY вставляет `\r` перед КАЖДЫМ голым `\n` в выводе дочернего процесса, подтверждено доккомментарием `alacritty_terminal::event_loop::EventLoop::collapse_cr_cr_lf`) — расширила запрет на `0x1B` И `0x0A`, с механизмом `Chunk::trailing_byte: Option<TrailingByte>` (byte-stuffing: опасный байт исключается из `payload`, передаётся отдельным полем заголовка, получатель дописывает его в файл вручную) и функцией `split_into_chunks`, которая резала исходные данные перед каждым таким байтом.
 
 **После перехода на base91-кодирование ВСЕГО payload вся эта машинерия стала не нужна** — раз каждый байт на wire гарантированно принадлежит 91-символьному "безопасному" алфавиту, внутри payload нет и не может быть ни `0x1B`, ни `0x0A`, ни какого-либо другого потенциально опасного байта, независимо от того, что реально лежит в исходном файле. `split_into_chunks` теперь — тривиальная нарезка по фиксированному размеру (`data.chunks(max_len)`), `Chunk` больше не имеет поля `trailing_byte`.
 
-## КРИТИЧНО: std::io::Stdout::flush() виснет на Windows/ConPTY с бинарными данными
+### КРИТИЧНО: std::io::Stdout::flush() виснет на Windows/ConPTY с бинарными данными
 
 **Симптом**: `somcat --stream` намертво зависал в реальном ConPTY-тесте (headless `#[gpui::test]`), но работал мгновенно при простом файловом pipe-редиректе — разница ставила в тупик несколько итераций диагностики.
 
@@ -128,43 +185,41 @@ Windows ConPTY — это НЕ прозрачный байтовый pipe для
 
 **Файл:** `crates/somcat/src/main.rs`, функция `write_raw_stdout`.
 
-## Клиентский режим: somcat
+### Клиентский режим: somcat (ИСТОРИЯ — актуальное описание в "som-srv binary side-channel transport" ниже)
 
-`somcat <file>` (или явно `somcat --srp <file>`) — не требует `raw_mode::enable()` полностью (нет query/negotiation — SRP не optional-with-fallback внешний стандарт), но требует `raw_mode::enable_output_vt_processing()` (устанавливает `ENABLE_VIRTUAL_TERMINAL_PROCESSING` только на output-handle, не трогая stdin — вариант, трогающий stdin, падал с "handle is invalid" при отсутствии реального stdin TTY).
+`somcat <file>` (или явно `somcat --srp <file>`) — не требует `raw_mode::enable()` полностью (нет query/negotiation — SRP не optional-with-fallback внешний стандарт), но требует `raw_mode::enable_output_vt_processing()` (устанавливает `ENABLE_VIRTUAL_TERMINAL_PROCESSING` только на output-handle, не трогая stdin — вариант, трогающий stdin, падал с "handle is invalid" при отсутствии реального stdin TTY). Всё ещё верно сегодня — только описанный ДАЛЬШЕ в этом абзаце способ ОТПРАВКИ payload устарел.
 
-Content-type определяется по расширению файла (`.gif` → `ContentType::Gif`, остальное пока не реализовано).
+Content-type определяется по расширению файла (`.gif`/`.jpg`/`.jpeg`/`.png`/`.mp3`/`.flac`/`.mp4`/`.mkv`/`.avi` — актуальный список, расширен с момента написания этого раздела).
 
-`gif_metadata()` в `crates/somcat/src/main.rs` извлекает `ContentMetadata::Image` перед стримингом: ширина/высота через `ImageDecoder::dimensions()` (читает только фиксированный logical screen descriptor, не декодирует ни одного кадра), `is_animated` — быстрым байтовым сканом сырых байт файла на наличие ВТОРОГО Image Descriptor блока (`0x2C`) вместо полного декодирования всех кадров через `AnimationDecoder::into_frames()` (было бы расточительно только ради подсчёта кадров на большом файле). Не строгий GIF-парсер (не проходит extension-блоки байт-в-байт), но `0x2C` не может легитимно встретиться как байт данных до первого настоящего Image Descriptor в реалистичных GIF-файлах, так что это надёжная эвристика.
+`gif_metadata()` в `crates/somcat/src/main.rs` извлекает `ContentMetadata::Image` перед стримингом: ширина/высота через `ImageDecoder::dimensions()` (читает только фиксированный logical screen descriptor, не декодирует ни одного кадра), `is_animated` — быстрым байтовым сканом сырых байт файла на наличие ВТОРОГО Image Descriptor блока (`0x2C`) вместо полного декодирования всех кадров через `AnimationDecoder::into_frames()` (было бы расточительно только ради подсчёта кадров на большом файле). Не строгий GIF-парсер (не проходит extension-блоки байт-в-байт), но `0x2C` не может легитимно встретиться как байт данных до первого настоящего Image Descriptor в реалистичных GIF-файлах, так что это надёжная эвристика. Этот пункт по-прежнему верен — извлечение метаданных не изменилось, изменился только способ отправки извлечённых байт.
 
-## Серверная сторона
+### Серверная сторона (ИСТОРИЯ — роутинг через APC-маркер устарел)
 
-- `crates/terminal/src/rich_content_cache.rs` — `RichContentCache`: progressive on-disk writer с watermark-трекингом (`contiguous_len`), поддержка out-of-order чанков через `pending_ranges`. Путь кэша: `paths::config_dir().join("media_cache")` в production, `std::env::temp_dir()` в тестах (`paths::config_dir()` — process-global `OnceLock`, не test-aware).
-- `crates/terminal/src/rich_content_gif_player.rs` — `try_decode_progressive`: инкрементальный GIF-декод по мере роста файла. **Важная находка**: `gif` crate's `DecodingError::UnexpectedEof` НЕ оборачивает `std::io::Error` (`source()` возвращает `None`) — приходится матчить по тексту "Unexpected End of File", не по типу ошибки.
-- Роутинг в `Terminal::process_event` (`crates/terminal/src/terminal.rs`): проверка `bytes.first() == Some(rich_content_transport::MARKER)` — единственная интерпретация APC-строк, которую Som сейчас реализует (после удаления Kitty).
+- `crates/terminal/src/rich_content_cache.rs` — `RichContentCache`: progressive on-disk writer с watermark-трекингом (`contiguous_len`), поддержка out-of-order чанков через `pending_ranges`. Путь кэша: `paths::config_dir().join("media_cache")` в production, `std::env::temp_dir()` в тестах (`paths::config_dir()` — process-global `OnceLock`, не test-aware). **Всё ещё актуально** — этот тип продолжает существовать, но с 2026-08-27 стал READ-ONLY кэшем метаданных на Som-стороне (`record_progress`, не `apply_chunk`) — см. "som-srv binary side-channel transport" ниже.
+- `crates/terminal/src/rich_content_gif_player.rs` — `try_decode_progressive`: инкрементальный GIF-декод по мере роста файла. **Важная находка**: `gif` crate's `DecodingError::UnexpectedEof` НЕ оборачивает `std::io::Error` (`source()` возвращает `None`) — приходится матчить по тексту "Unexpected End of File", не по типу ошибки. Всё ещё верно.
+- ~~Роутинг в `Terminal::process_event`: проверка `bytes.first() == Some(rich_content_transport::MARKER)`~~ — **удалено вместе с `MARKER`/APC-парсингом payload целиком**, см. "som-srv binary side-channel transport" ниже.
 
-## Ключевой диагностический паттерн: изоляция транспорта от реального ConPTY
+### Ключевой диагностический паттерн: изоляция транспорта от реального ConPTY (ИСТОРИЯ)
 
-Тест `test_rich_content_many_real_chunks_via_write_output_reconstructs_file_exactly` (`crates/terminal/src/terminal.rs`) — прогоняет ВСЕ реальные чанки настоящего GIF-файла через `Terminal::write_output` НАПРЯМУЮ (прямая инъекция в VTE-парсер, без дочернего процесса, без ConPTY вообще), реконструирует файл с диска и сверяет байт-в-байт с исходником. Выполняется за доли секунды вместо 15-секундного таймаута через реальный процесс.
+Тест `test_rich_content_many_real_chunks_via_write_output_reconstructs_file_exactly` (`crates/terminal/src/terminal.rs`) — прогонял ВСЕ реальные чанки настоящего GIF-файла через `Terminal::write_output` НАПРЯМУЮ (прямая инъекция в VTE-парсер, без дочернего процесса, без ConPTY вообще), реконструировал файл с диска и сверял байт-в-байт с исходником. **Удалён вместе с остальной APC-based payload инфраструктурой** — актуальные end-to-end тесты используют реальный `som-srv`+`somcat` дочерние процессы (см. "som-srv binary side-channel transport" ниже), не прямую VTE-инъекцию, поскольку payload больше не проходит через VTE-парсер вообще.
 
 Этот тест оказался ключевым диагностическим инструментом дважды: сначала подтвердил, что CRLF-искажение `write_output`'s LF→CRLF конвертации ломает бинарный payload (что впоследствии решено переходом на `TrailingByte`, а затем полностью снято переходом на base91), а затем — что после перехода на base91 транспортный уровень абсолютно корректен САМ ПО СЕБЕ, что сузило поиск бага исключительно до реального ConPTY-специфичного поведения (не до логики парсинга/сборки конвертов).
 
-**Важно помнить, если снова возникнет похожая проблема**: `write_output` (прямая инъекция) и реальный дочерний процесс через ConPTY — это ДВА РАЗНЫХ пути с разным поведением на Windows. Тест, "проходящий" через `write_output`, не гарантирует, что тот же самый байтовый поток переживёт реальный ConPTY — именно это разделение и позволило точно локализовать ConPTY-кодовую-страницу-реинтерпретацию как корневую причину, а не искать баг в парсере/протоколе.
+**Важно помнить, если снова возникнет похожая проблема с ЛЮБЫМ будущим PTY-based протоколом**: `write_output` (прямая инъекция) и реальный дочерний процесс через ConPTY — это ДВА РАЗНЫХ пути с разным поведением на Windows. Тест, "проходящий" через `write_output`, не гарантирует, что тот же самый байтовый поток переживёт реальный ConPTY.
 
-## Тесты
+## Тесты (актуальный набор)
 
-`crates/terminal/src/rich_content_transport.rs` — unit-тесты: base91 encode/decode roundtrip (весь диапазон 0x00-0xFF, разные длины входа для покрытия разных веток bit-packing алгоритма), envelope roundtrip, все error-пути (`WrongMarker`/`TooShort`/`InvalidHeaderEncoding`/`InvalidPayloadEncoding`/`UnsupportedVersion`/`UnknownContentType`/`InvalidMetadata`/`LengthMismatch`/`ChecksumMismatch`), `split_into_chunks` property-тест на полном байтовом диапазоне.
-
-`crates/terminal/src/rich_content_cache.rs` — 6 тестов progressive writer (sequential/out-of-order/retransmit чанки, разделение кэш-файлов по session/file id).
+`crates/terminal/src/rich_content_cache.rs` — 6 тестов progressive writer (sequential/out-of-order/retransmit чанки, разделение кэш-файлов по session/file id) + `record_progress`-специфичные тесты (read-only режим).
 
 `crates/terminal/src/rich_content_gif_player.rs` — 7 тестов инкрементального GIF-декода (монотонность роста числа кадров, различение "недостаточно данных" от реальной ошибки формата).
 
 `crates/terminal/src/rich_content_player.rs` — 9 тестов `RichContentPlayer`/`refresh_or_create` (переиспользование через Arc pointer identity, монотонный рост числа кадров, `is_animating`, продвижение `current_frame` во времени).
 
-`crates/terminal/src/terminal.rs` — end-to-end тесты через реальный (патченый) VTE-парсер (`test_rich_content_chunk_reaches_terminal_via_real_vte_parser`, включая байт `0x1B` внутри payload — доказывает, что base91-кодирование делает это не-проблемой), диагностический тест изоляции транспорта от ConPTY (`test_rich_content_many_real_chunks_via_write_output_reconstructs_file_exactly`), ключевой бенчмарк через РЕАЛЬНЫЙ подпроцесс/ConPTY (`bench_rich_content_stream_progressive_playback_starts_before_transfer_completes`) — доказывает саму суть архитектуры: первый частичный декод происходит РАНЬШЕ окончания передачи файла, и `test_rich_content_placements_reach_the_paint_path_via_a_real_process` — проверяет именно то, что `paint_rich_content_placements` реально использует (`Terminal::rich_content_placements()`) через реальный подпроцесс: непустой anchor, непустой `RenderImage`, продвигающийся `current_frame`.
+`crates/terminal/src/terminal.rs` — end-to-end тесты, ВСЕ через реальный `som-srv`+`somcat` дочерний процесс (не прямую VTE-инъекцию, см. предыдущая секция): `bench_rich_content_stream_progressive_playback_starts_before_transfer_completes` — доказывает саму суть архитектуры: первый частичный декод происходит РАНЬШЕ окончания передачи файла; `test_rich_content_placements_reach_the_paint_path_via_a_real_process` (GIF), `test_rich_content_audio_placement_decodes_and_plays_via_a_real_process`, `test_rich_content_video_placement_decodes_via_a_real_process` — каждый проверяет ту же итоговую точку (`Terminal::rich_content_*_placements()`, то, что реально использует paint-путь), но для своего content type, через полный стек `somcat` → `som-srv` daemon → Som's side-channel subscription → `RichContentCache`. Все 4 подтверждены зелёными 2026-08-27 после починки транспорта (см. `project_som_srv_binary_transport` memory для деталей найденных багов).
 
 `crates/terminal_view/src/terminal_element.rs` — 4 unit-теста на `natural_cell_span` (см. ниже).
 
-Весь набор `terminal`-крейта (кроме pre-existing, не связанных с SRP падений в `terminal_hyperlinks`, не менявшихся в этой работе, и редкого флейкового `test_nul_byte_signals_tmux_relay_to_close_for_good` — som-tmux relay timing, тоже не связан с SRP) + весь набор `terminal_view` + `somcat` — зелёные.
+Весь набор `terminal`-крейта (кроме pre-existing, не связанных с SRP падений в `terminal_hyperlinks`, и `test_nul_byte_signals_tmux_relay_to_close_for_good` — существовавшая до этой работы незавершённость `som-srv` shared-daemon рефакторинга, не про SRP) + весь набор `terminal_view` + `somcat` + `som_srv` — зелёные. Пятый rich-content end-to-end тест, `test_yazi_srp_audio_preview_reaches_the_paint_path_via_a_real_process`, **ожидаемо красный** — сторонний `errordnk/yazi` форк ещё не мигрирован на новый транспорт, см. SRP_INTEGRATION_GUIDE.md.
 
 ## Paint-путь v1 (anchor/cursor-relative) — заменён, историческая справка
 
@@ -284,9 +339,9 @@ Content-type определяется по расширению файла (`.gi
 
 После перехода SRP на placeholder-grid архитектуру обе paint-функции (Kitty и SRP) оказались сканирующими ОДИН И ТОТ ЖЕ grid в поисках placeholder-текста — без протокольного разделителя между ними, только числовое id-пространство, которое могло совпасть (подтверждённый живой баг: `kitty placeholders: no stored image for id N` для реальных SRP session_id — картинка не отображалась вообще). Вместо патча коллизии решено вырезать Kitty из Som целиком — планировался отдельный addon для yazi поверх SRP, а не поддержка стороннего протокола внутри Som.
 
-Удалено: `crates/terminal/src/kitty_graphics.rs`, `kitty_graphics_store.rs`, `bin/kitty_probe.rs`; Kitty-ветка `ApcString`-обработчика в `terminal.rs`; `Terminal::kitty_images`/`kitty_image`/`kitty_placements`; `paint_kitty_placements`/`paint_kitty_unicode_placeholders`/`kitty_placement_bounds` в `terminal_element.rs`; весь `--kitty`-путь в `somcat` (query/transmit/animate/PNG-encode функции, `raw_mode::enable()`/`RawModeGuard`); `crates/som_tmux/src/kitty_replay.rs` и его использования в `session.rs`/`server.rs`; `KITTY_GRAPHICS_PLAN.md`.
+Удалено: `crates/terminal/src/kitty_graphics.rs`, `kitty_graphics_store.rs`, `bin/kitty_probe.rs`; Kitty-ветка `ApcString`-обработчика в `terminal.rs`; `Terminal::kitty_images`/`kitty_image`/`kitty_placements`; `paint_kitty_placements`/`paint_kitty_unicode_placeholders`/`kitty_placement_bounds` в `terminal_element.rs`; весь `--kitty`-путь в `somcat` (query/transmit/animate/PNG-encode функции, `raw_mode::enable()`/`RawModeGuard`); `crates/som_srv/src/kitty_replay.rs` и его использования в `session.rs`/`server.rs`; `KITTY_GRAPHICS_PLAN.md`.
 
-**Что осталось общим**: `crates/terminal/src/kitty_graphics_placeholder.rs` (кодирование/декодирование unicode-placeholder ячеек — механизм, не Kitty-специфичная семантика, теперь используется только SRP) и его тесты в `som_tmux/src/redraw.rs` (переименован `redraw_preserves_kitty_placeholder_diacritics_and_underline_color` → `redraw_preserves_placeholder_diacritics_and_underline_color`).
+**Что осталось общим**: `crates/terminal/src/kitty_graphics_placeholder.rs` (кодирование/декодирование unicode-placeholder ячеек — механизм, не Kitty-специфичная семантика, теперь используется только SRP) и его тесты в `som_srv/src/redraw.rs` (переименован `redraw_preserves_kitty_placeholder_diacritics_and_underline_color` → `redraw_preserves_placeholder_diacritics_and_underline_color`).
 
 `somcat` CLI: без флага или с явным `--srp` — единственный путь теперь (флаг `--srp` — просто синоним дефолта для тех, кто не хочет полагаться на implicit default).
 
@@ -322,19 +377,19 @@ Content-type определяется по расширению файла (`.gi
 
 **Триггер пересмотра**: пользователь явно указал на дыру в только что описанной архитектуре — "а если у нас мп3 будет 4гига? или скорее всего flac, а там размеры не маленькие, мы должны начинать проигрывать еще до того как все скачалось". `decode_whole_file()`, ждущий `contiguous_len >= total_size` перед тем как вообще открыть `cpal`-поток, был приемлем только пока файлы маленькие — для реально больших файлов это означало ждать всю передачу целиком прежде чем виджет вообще появится, что противоречит уже принятому для GIF принципу "начинай показывать/играть с того префикса, что уже есть".
 
-### Часть A: общий Som→client query/response-канал
+### Часть A: общий Som→client query/response-канал — ИСТОРИЯ, заменена `som-srv` side-channel (см. ниже)
 
-Решение сиюминутной задачи (докачать недостающий диапазон байт для seek вперёд по ещё не докачанному файлу) потребовало того, чего у SRP раньше не было вообще — канала в ОБРАТНУЮ сторону (Som спрашивает клиента, а не наоборот). Пользователь явно потребовал НЕ делать его завязанным на аудио-range-request специфику: "двунаправленный он нужен не только для range-reqest, много для чего он нужен будет" — и раскрыл будущий мотив: **markdown станет полноценным скриптуемым интерфейсом с формами, где Lua-сценарий выполняется на той же машине, где физически лежит документ, и Som'у нужны ответы оттуда**. Соответственно спроектирован не "аудио-range-request протокол", а **типизированный, request-id-коррелируемый query-примитив**, для которого byte-range-запрос — только первый конкретный потребитель.
+**Весь этот подраздел описывает PTY-based query/response, полностью удалённый 2026-08-27** — `Query`/`QueryType`/`QUERY_MARKER`/`QUERY_RESPONSE_MARKER`/`build_query_envelope`/`parse_query_envelope` больше не существуют в кодовой базе. Оставлен для контекста — само требование (типизированный, двунаправленный, не аудио-специфичный канал; будущий мотив — markdown/Lua-формы) остаётся верным и полностью перенесено на новую реализацию, см. "som-srv binary side-channel transport" ниже, конкретно `SrvRequest::RequestByteRange`/`SrvRequest::SubscribeProgress`.
 
-**Формат** (`crates/terminal/src/rich_content_transport.rs`): новый маркер-байт `QUERY_MARKER = b'Q'` (отличный от `MARKER = b'S'` обычного chunk-конверта — направление трафика меняется, поэтому и маркер другой), зарезервированный (пока не используемый) `QUERY_RESPONSE_MARKER = b'R'` для БУДУЩЕГО случая, когда ответ на запрос НЕ является естественно чанко-подобным (как раз тот самый Lua-форм-сценарий). Заголовок query (30 байт до base91): `version(1) + request_id(4) + query_type(1) + session_id(4) + file_id(4) + offset(8) + len(8)`. В отличие от обычного chunk-конверта, у query НЕТ отдельного payload-региона и SEPARATOR-байта — все поля фиксированной ширины, помещаются целиком в один base91-блок сразу после `QUERY_MARKER`. `QueryType` — enum с единственным пока значением `AudioByteRange = 0`.
+Решение сиюминутной задачи (докачать недостающий диапазон байт для seek вперёд по ещё не докачанному файлу) потребовало того, чего у SRP раньше не было вообще — канала в ОБРАТНУЮ сторону (Som спрашивает клиента, а не наоборот). Пользователь явно потребовал НЕ делать его завязанным на аудио-range-request специфику: "двунаправленный он нужен не только для range-reqest, много для чего он нужен будет" — и раскрыл будущий мотив: **markdown станет полноценным скриптуемым интерфейсом с формами, где Lua-сценарий выполняется на той же машине, где физически лежит документ, и Som'у нужны ответы оттуда**. Соответственно спроектирован не "аудио-range-request протокол", а типизированный, коррелируемый query-примитив, для которого byte-range-запрос — только первый конкретный потребитель. Этот принцип унаследован дословно новой реализацией: `SrvRequest`/`SrvResponse` — тоже общий, типизированный enum, не аудио-специфичный.
 
-**Ключевое архитектурное решение — ответ на `AudioByteRange` НЕ получил нового формата**: `RichContentCache::apply_chunk` УЖЕ умел принимать чанк, приземляющийся не по порядку, на произвольном offset (`pending_ranges: Vec<(u64,u64)>` — чанк пишется на диск по своему реальному offset, но не двигает watermark `contiguous_len`, пока разрыв не закроется) — это было спроектировано для обычной устойчивости к переупорядочиванию при доставке, просто ни разу не было реально востребовано реальным отправителем до этой задачи. Значит ответ на byte-range query — это просто ОБЫЧНЫЙ `S`-маркированный chunk-конверт, "приземляющийся не по порядку", а не новая сущность.
+~~**Формат** (`crates/terminal/src/rich_content_transport.rs`): новый маркер-байт `QUERY_MARKER = b'Q'`...~~ (удалено полностью, см. выше).
 
-**Som-сторона** (`crates/terminal/src/terminal.rs`): `Terminal::request_audio_byte_range(session_id, file_id, offset, len)` строит query-конверт и пишет его через уже существующий `self.write_to_pty(bytes)` — тот же самый низкоуровневый примитив "написать байты в stdin дочернего процесса через PTY", который Som уже использует для ответа на `CSI 16 t`/`CSI 18 t` запросы клиента (`AlacTermEvent::TextAreaSizeRequest`) — просто применённый в обратном направлении. Новых механизмов писать в PTY не понадобилось.
+~~**Ключевое архитектурное решение — ответ на `AudioByteRange` НЕ получил нового формата**: `RichContentCache::apply_chunk` УЖЕ умел принимать чанк, приземляющийся не по порядку...~~ Тот же принцип унаследован новой архитектурой: `SrvCache::put_chunk` (`som-srv`-сторона) тоже gap-tolerant, ответ на `RequestByteRange` — просто обычный `PutChunk` на произвольном offset, не новая сущность.
 
-**`somcat`-сторона** (`crates/somcat/src/main.rs`) — самая concurrency-содержательная часть новой работы: у `somcat` теперь ДОЛГОЖИВУЩИЙ фоновый поток (`spawn_audio_query_responder`), читающий собственный stdin байт за байтом в поиске `ESC _ Q ... ESC \`-конвертов, параллельно основному потоку, шлющему первичный последовательный стрим файла. Это первый случай, когда клиентский процесс читает СВОЙ ЖЕ stdin конкурентно из двух разных мест — уже существовавшие `query_cell_size_px`/`query_cell_count` делали одноразовое блокирующее чтение stdin строго ДО начала стрима, поэтому responder-поток стартует только ПОСЛЕ печати placeholder-грида, чтобы никогда не читать stdin одновременно с этими запросами. На получении валидного query с совпадающими `session_id`/`file_id` — читает нужный диапазон из уже открытого в памяти файла и шлёт его через ту же chunk-отправляющую функцию (`send_range_chunks`, теперь разделённая из бывшей `stream_bytes` на общую реализацию с параметрами `range_offset`/`range_len`), с `chunk_offset`, равным РЕАЛЬНОМУ offset в файле (не offset-от-нуля, как для первого чанка последовательного стрима).
+~~**Som-сторона**: `Terminal::request_audio_byte_range` строит query-конверт и пишет его через `self.write_to_pty(bytes)`~~ — заменено: `Terminal::request_audio_byte_range` теперь вызывает `rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len)`, отправляющую `SrvRequest::RequestByteRange` на короткоживущем `Srv`-kind соединении к демону `som-srv`, НЕ через PTY.
 
-Поскольку теперь ДВА потока (основной последовательный + responder) могут одновременно писать в stdout — `write_raw_stdout` получил `STDOUT_WRITE_LOCK: Mutex<()>`, иначе байты двух конвертов могли перемежаться на wire, что не смог бы распарсить ни `parse_envelope`, ни `parse_query_envelope`. Раньше синхронизация не требовалась вообще — у картинок/GIF никогда не было второго писателя.
+~~**`somcat`-сторона**: `spawn_audio_query_responder`, читающий stdin в поиске `ESC _ Q ... ESC \`-конвертов~~ — заменено: `spawn_byte_range_responder` (`crates/somcat/src/main.rs`) блокирующе читает СВОЁ УЖЕ ОТКРЫТОЕ `Srv`-соединение (то же самое, которым отправлялись исходные `PutChunk`), а не stdin — `som-srv`-демон форвардит `RequestByteRange` этому же клиенту как сырой `SrvRequest` поверх обычно исходящего-only соединения (см. `som_srv::server::forward_srv_request`/`srv_cache::route_byte_range_request`). `write_raw_stdout`'s `STDOUT_WRITE_LOCK` стал не нужен для этого случая — stdout больше не несёт payload вообще, только placeholder-grid control-текст, который никогда не пишется конкурентно из нескольких потоков.
 
 ### Часть B: прогрессивное декодирование+воспроизведение
 
@@ -370,6 +425,7 @@ Content-type определяется по расширению файла (`.gi
 
 ## Следующие нереализованные этапы (вне текущего прогресса)
 
-- Видео: тот же паттерн, что и аудио (decode-модуль + persistent player map на `Terminal` + paint-path виджет + hit-test hook), подтверждено пользователем как следующий шаг после аудио, всё ещё без markdown-обёртки. Метаданные уже спроектированы (`ContentMetadata::Video`/`VideoCodec`), но не используются никаким реальным декодером.
+- ~~Видео~~ — **реализовано** (`rich_content_video_player.rs`, ffmpeg-next декодирование, тот же persistent player map/paint-path/hit-test паттерн, что и аудио) и переведено на `som-srv` binary side-channel вместе с остальными content types, подтверждено живым end-to-end тестом (`test_rich_content_video_placement_decodes_via_a_real_process`) 2026-08-27.
+- **Стороннего клиента `errordnk/yazi` нужно мигрировать на новый транспорт** — его собственный SRP-driver всё ещё отправляет payload по-старому (base91/APC через PTY), которого больше не существует на Som-стороне; см. SRP_INTEGRATION_GUIDE.md для того, что именно изменилось для интеграторов. `test_yazi_srp_audio_preview_reaches_the_paint_path_via_a_real_process` (в `terminal.rs`) остаётся красным до этой миграции — ожидаемо, не регрессия.
 - Markdown: `crates/markdown/src/markdown.rs` (уже существующий GPUI-виджет из Zed) как overlay поверх терминального грида — плюс `md://host/path`-схема ссылок, резолвящаяся относительно per-tab document root (`"home"`), как часть самого протокола SRP (не отдельный веб-сервер).
 - PDF — отдельный, более крупный этап.

@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use crate::rich_content_transport::{Chunk, ContentMetadata, ContentType};
+use crate::rich_content_transport::{ContentMetadata, ContentType};
 
 /// One file's progressive-write state: the open handle plus how many
 /// bytes starting from offset 0 are known to be present with no gaps.
@@ -41,14 +41,19 @@ struct CacheEntry {
     /// future client.
     pending_ranges: Vec<(u64, u64)>,
     content_type: ContentType,
-    /// `0` means the sender never filled it in — same "unknown, don't
-    /// guess" convention `Chunk::total_size` itself documents.
+    /// `0` means the sender never filled it in — "unknown, don't guess",
+    /// not "empty file".
     total_size: u64,
     /// The widest placeholder-cell column decoded from any paint pass so
     /// far — see [`RichContentCache::record_max_column_seen`] for why this
     /// needs to persist across paint calls rather than being recomputed
     /// from whatever's on screen right now.
     max_column_seen: std::cell::Cell<u32>,
+    /// The tallest placeholder-cell row decoded from any paint pass so
+    /// far — same purpose/persistence rationale as `max_column_seen`,
+    /// just the vertical counterpart. See
+    /// [`RichContentCache::record_max_row_seen`].
+    max_row_seen: std::cell::Cell<u32>,
     /// The image's natural decoded pixel dimensions, from the first
     /// chunk's `ContentMetadata::Image` (`None` for non-image content
     /// types, or if a sender ever left width/height as `0` = unknown).
@@ -80,7 +85,7 @@ impl RichContentCache {
     /// `cache_dir` is the directory chunks get written under — callers
     /// pass `paths::config_dir().join("media_cache")` in production (see
     /// `paths::config_dir`'s existing use in
-    /// `crates/som_tmux/src/protocol.rs` for the established pattern of a
+    /// `crates/som_srv/src/protocol.rs` for the established pattern of a
     /// per-purpose subdirectory under the same config root), and a
     /// throwaway `tempdir` in tests so test runs never touch a real
     /// user's `~/.config/som/media_cache/`.
@@ -100,27 +105,47 @@ impl RichContentCache {
     }
 
     /// Applies one chunk: opens (or reuses) the file for
-    /// `(session_id, file_id)`, writes the payload at `chunk_offset`,
+    /// `(session_id, file_id)`, writes `payload` at `chunk_offset`,
     /// advances the contiguous watermark as far as newly-arrived data
     /// allows, and returns the number of contiguous bytes now available
     /// from the start of the file — the caller (a decoder) reads at most
     /// this many bytes and knows they're gap-free.
+    ///
+    /// Takes raw fields rather than a single struct — this used to take
+    /// `&rich_content_transport::Chunk`, but that type (along with the
+    /// whole APC/base91 envelope format it was parsed from) was deleted
+    /// once chunks started arriving via `som-srv`'s binary side channel
+    /// instead of the PTY (see `som_srv::protocol::SrvRequest::PutChunk`,
+    /// which carries the same fields this function now takes directly).
+    /// `content_type`/`metadata` are only consulted the FIRST time a given
+    /// `(session_id, file_id)` is seen (to open the cache file and seed
+    /// per-placement metadata) — a caller applying a later chunk for an
+    /// already-known id can pass whatever it has on hand for those two
+    /// (e.g. the same values as the first chunk), since they're ignored
+    /// once the entry already exists.
     ///
     /// Errors (directory creation failure, seek/write failure) are
     /// returned rather than panicking — a single corrupted/failed chunk
     /// write shouldn't take down the whole terminal session; the caller
     /// decides whether to drop the chunk and continue or surface the
     /// error further.
-    pub fn apply_chunk(&mut self, chunk: &Chunk) -> std::io::Result<u64> {
-        let key = (chunk.session_id, chunk.file_id);
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_chunk(
+        &mut self,
+        content_type: ContentType,
+        session_id: u32,
+        file_id: u32,
+        chunk_offset: u64,
+        total_size: u64,
+        metadata: ContentMetadata,
+        payload: &[u8],
+    ) -> std::io::Result<u64> {
+        let key = (session_id, file_id);
         if !self.entries.contains_key(&key) {
             std::fs::create_dir_all(&self.cache_dir)?;
-            let ext = Self::extension_for(chunk.content_type);
-            let path = self.cache_dir.join(format!(
-                "{session:08x}-{file:08x}.{ext}",
-                session = chunk.session_id,
-                file = chunk.file_id
-            ));
+            let ext = Self::extension_for(content_type);
+            let path =
+                self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
             let file = OpenOptions::new().create(true).write(true).truncate(true).read(true).open(&path)?;
             self.entries.insert(
                 key,
@@ -129,16 +154,17 @@ impl RichContentCache {
                     path,
                     contiguous_len: 0,
                     pending_ranges: Vec::new(),
-                    content_type: chunk.content_type,
-                    total_size: chunk.total_size,
+                    content_type,
+                    total_size,
                     max_column_seen: std::cell::Cell::new(0),
-                    image_size_px: match chunk.metadata {
+                    max_row_seen: std::cell::Cell::new(0),
+                    image_size_px: match metadata {
                         ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
                             Some((width_px, height_px))
                         },
                         _ => None,
                     },
-                    audio_metadata: match chunk.metadata {
+                    audio_metadata: match metadata {
                         ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
                             Some((sample_rate, channels, bits_per_sample, duration_ms))
                         },
@@ -149,11 +175,11 @@ impl RichContentCache {
         }
         let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
 
-        entry.file.seek(SeekFrom::Start(chunk.chunk_offset))?;
-        entry.file.write_all(&chunk.payload)?;
+        entry.file.seek(SeekFrom::Start(chunk_offset))?;
+        entry.file.write_all(payload)?;
 
-        let chunk_end = chunk.chunk_offset + chunk.payload.len() as u64;
-        if chunk.chunk_offset <= entry.contiguous_len {
+        let chunk_end = chunk_offset + payload.len() as u64;
+        if chunk_offset <= entry.contiguous_len {
             // Either exactly at the watermark, or overlapping/behind it
             // (a retransmit of already-seen data) — either way this
             // chunk's own bytes extend (or don't move) the watermark.
@@ -173,10 +199,75 @@ impl RichContentCache {
                 entry.contiguous_len = entry.contiguous_len.max(end.max(offset));
             }
         } else {
-            entry.pending_ranges.push((chunk.chunk_offset, chunk_end));
+            entry.pending_ranges.push((chunk_offset, chunk_end));
         }
 
         Ok(entry.contiguous_len)
+    }
+
+    /// Records a `som_srv::protocol::SrvResponse::Progress` push:
+    /// updates `contiguous_len`/`total_size`/metadata for `(session_id,
+    /// file_id)` WITHOUT writing any payload bytes to disk — `som-srv`
+    /// already wrote those bytes itself, to the same cache directory
+    /// this type points at (see `som_srv::srv_cache::SrvCache::
+    /// default_cache_dir`, which matches `rich_content_cache_dir()` in
+    /// `crates/terminal/src/terminal.rs`), so writing them again here
+    /// would be redundant at best and a race at worst (two independent
+    /// writers to the same file). Opens (read-only) the cache file the
+    /// FIRST time a given `(session_id, file_id)` is seen — same
+    /// lazy-open shape `apply_chunk` uses, just without ever calling
+    /// `write_all`.
+    pub fn record_progress(
+        &mut self,
+        content_type: ContentType,
+        session_id: u32,
+        file_id: u32,
+        contiguous_len: u64,
+        total_size: u64,
+        metadata: ContentMetadata,
+    ) -> std::io::Result<()> {
+        let key = (session_id, file_id);
+        if !self.entries.contains_key(&key) {
+            let ext = Self::extension_for(content_type);
+            let path = self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
+            let file = OpenOptions::new().read(true).open(&path)?;
+            self.entries.insert(
+                key,
+                CacheEntry {
+                    file,
+                    path,
+                    contiguous_len: 0,
+                    pending_ranges: Vec::new(),
+                    content_type,
+                    total_size,
+                    max_column_seen: std::cell::Cell::new(0),
+                    max_row_seen: std::cell::Cell::new(0),
+                    image_size_px: match metadata {
+                        ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
+                            Some((width_px, height_px))
+                        },
+                        _ => None,
+                    },
+                    audio_metadata: match metadata {
+                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
+                            Some((sample_rate, channels, bits_per_sample, duration_ms))
+                        },
+                        _ => None,
+                    },
+                },
+            );
+        }
+        let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
+        // `contiguous_len` only ever moves forward — `som-srv` is the
+        // single source of truth for this value (it tracks the exact
+        // same gap-tolerant watermark `apply_chunk` used to compute
+        // locally), so a later push always reflects at least as much
+        // progress as an earlier one; `max` here is just defense against
+        // a hypothetical out-of-order delivery of `Progress` pushes
+        // themselves, not an expected case.
+        entry.contiguous_len = entry.contiguous_len.max(contiguous_len);
+        entry.total_size = total_size;
+        Ok(())
     }
 
     /// The on-disk path for a given file, if any chunk for it has arrived
@@ -245,6 +336,36 @@ impl RichContentCache {
         self.entries.get(&(session_id, file_id)).map(|e| e.max_column_seen.get())
     }
 
+    /// Vertical counterpart to [`Self::record_max_column_seen`] — records
+    /// that a placeholder cell at `row` (0-based, within the image) was
+    /// decoded as visible during a paint pass, growing the entry's
+    /// remembered maximum if this is taller than anything seen before.
+    /// Needed because the sending client's grid height (`rows =
+    /// height_px.div_ceil(cell_height)`) rounds UP to a whole number of
+    /// cells, so the image's real pixel height essentially never exactly
+    /// fills that many rows — deriving the painted height purely from the
+    /// image's own aspect ratio (as the paint path used to) leaves a
+    /// visible gap of blank terminal background below the image, in the
+    /// LAST row the grid reserved but the image doesn't fully reach.
+    /// Painting to `max_row_seen + 1` rows tall instead makes the image
+    /// fill the exact footprint its own placeholder grid reserved, same
+    /// as it already does horizontally via `max_column_seen`.
+    pub fn record_max_row_seen(&self, session_id: u32, file_id: u32, row: u32) {
+        if let Some(entry) = self.entries.get(&(session_id, file_id)) {
+            let current = entry.max_row_seen.get();
+            if row > current {
+                entry.max_row_seen.set(row);
+            }
+        }
+    }
+
+    /// The tallest row index ([`Self::record_max_row_seen`]) observed for
+    /// this placement across every paint pass so far — `None` if nothing's
+    /// been recorded yet (id unknown, or no paint has happened).
+    pub fn max_row_seen(&self, session_id: u32, file_id: u32) -> Option<u32> {
+        self.entries.get(&(session_id, file_id)).map(|e| e.max_row_seen.get())
+    }
+
     /// The image's natural pixel dimensions, if known — see
     /// [`CacheEntry::image_size_px`]'s doc comment.
     pub fn image_size_px(&self, session_id: u32, file_id: u32) -> Option<(u32, u32)> {
@@ -275,21 +396,27 @@ mod tests {
     use super::*;
     use crate::rich_content_transport::ContentType;
 
-    fn chunk(session_id: u32, file_id: u32, offset: u64, payload: &[u8]) -> Chunk {
-        Chunk {
-            content_type: ContentType::Gif,
+    /// Thin wrapper around [`RichContentCache::apply_chunk`] fixing every
+    /// argument except the four that vary across this module's test cases
+    /// — mirrors the old `Chunk`-struct-building test helper this replaced
+    /// once `apply_chunk` started taking raw fields instead of a
+    /// `rich_content_transport::Chunk` (see that method's own doc comment
+    /// for why).
+    fn apply_test_chunk(cache: &mut RichContentCache, session_id: u32, file_id: u32, offset: u64, payload: &[u8]) -> std::io::Result<u64> {
+        cache.apply_chunk(
+            ContentType::Gif,
             session_id,
             file_id,
-            chunk_offset: offset,
-            total_size: 0,
-            metadata: crate::rich_content_transport::ContentMetadata::Image {
+            offset,
+            0,
+            crate::rich_content_transport::ContentMetadata::Image {
                 width_px: 0,
                 height_px: 0,
                 color_bits: 0,
                 is_animated: false,
             },
-            payload: payload.to_vec(),
-        }
+            payload,
+        )
     }
 
     fn temp_cache_dir(name: &str) -> PathBuf {
@@ -303,9 +430,9 @@ mod tests {
         let dir = temp_cache_dir("sequential");
         let mut cache = RichContentCache::new(dir.clone());
 
-        let len1 = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        let len1 = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
         assert_eq!(len1, 6);
-        let len2 = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
+        let len2 = apply_test_chunk(&mut cache, 1, 1, 6, b"world").unwrap();
         assert_eq!(len2, 11);
 
         let path = cache.path(1, 1).unwrap().to_path_buf();
@@ -324,12 +451,12 @@ mod tests {
         // Chunk 2 (offset 6) arrives before chunk 1 (offset 0) — write
         // succeeds, but the watermark must stay at 0 since bytes 0..6
         // are still missing.
-        let len_after_second = cache.apply_chunk(&chunk(1, 1, 6, b"world")).unwrap();
+        let len_after_second = apply_test_chunk(&mut cache, 1, 1, 6, b"world").unwrap();
         assert_eq!(len_after_second, 0, "watermark must not advance past a gap");
 
         // Now the gap-filling chunk arrives — watermark should jump all
         // the way to the end, absorbing the already-written pending range.
-        let len_after_first = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        let len_after_first = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
         assert_eq!(len_after_first, 11, "watermark must absorb the pending range once the gap closes");
 
         let path = cache.path(1, 1).unwrap().to_path_buf();
@@ -344,9 +471,9 @@ mod tests {
         let dir = temp_cache_dir("separate_entries");
         let mut cache = RichContentCache::new(dir.clone());
 
-        cache.apply_chunk(&chunk(1, 1, 0, b"first")).unwrap();
-        cache.apply_chunk(&chunk(2, 1, 0, b"second-session")).unwrap();
-        cache.apply_chunk(&chunk(1, 2, 0, b"second-file")).unwrap();
+        apply_test_chunk(&mut cache, 1, 1, 0, b"first").unwrap();
+        apply_test_chunk(&mut cache, 2, 1, 0, b"second-session").unwrap();
+        apply_test_chunk(&mut cache, 1, 2, 0, b"second-file").unwrap();
 
         assert_eq!(cache.contiguous_len(1, 1), 5);
         assert_eq!(cache.contiguous_len(2, 1), 14);
@@ -371,13 +498,13 @@ mod tests {
         let dir = temp_cache_dir("retransmit");
         let mut cache = RichContentCache::new(dir.clone());
 
-        cache.apply_chunk(&chunk(1, 1, 0, b"hello world")).unwrap();
+        apply_test_chunk(&mut cache, 1, 1, 0, b"hello world").unwrap();
         assert_eq!(cache.contiguous_len(1, 1), 11);
 
         // Re-apply the first half again (offset 0, shorter payload) —
         // watermark must not regress even though this chunk's own
         // `chunk_end` (6) is less than the current watermark (11).
-        let len = cache.apply_chunk(&chunk(1, 1, 0, b"hello ")).unwrap();
+        let len = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
         assert_eq!(len, 11, "watermark must never move backward on a retransmit");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -387,7 +514,7 @@ mod tests {
     fn extension_matches_content_type() {
         let dir = temp_cache_dir("extension");
         let mut cache = RichContentCache::new(dir.clone());
-        cache.apply_chunk(&chunk(1, 1, 0, b"x")).unwrap();
+        apply_test_chunk(&mut cache, 1, 1, 0, b"x").unwrap();
         let path = cache.path(1, 1).unwrap();
         assert_eq!(path.extension().unwrap(), "gif");
         std::fs::remove_dir_all(&dir).ok();

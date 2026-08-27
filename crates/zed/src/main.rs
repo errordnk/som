@@ -255,7 +255,11 @@ fn main() {
     ztracing::init();
 
     #[cfg(target_os = "windows")]
+    enable_additive_dll_search_directories();
+    #[cfg(target_os = "windows")]
     ensure_conpty_extracted_and_wired();
+    #[cfg(target_os = "windows")]
+    ensure_ffmpeg_extracted_and_wired();
 
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
@@ -777,11 +781,85 @@ fn ensure_conpty_extracted_and_wired() {
         }
     }
 
+    add_dll_search_directory(&conpty_dir, "conpty");
+}
+
+/// Extracts the embedded decode-only FFmpeg shared libs (avcodec/avformat/
+/// avutil/swresample/swscale) to `~/.config/som/ffmpeg/` on first run and
+/// adds that directory to the process's DLL search path, so `ffmpeg-next`'s
+/// FFI calls resolve them without requiring a system FFmpeg install. Mirrors
+/// `ensure_conpty_extracted_and_wired` above — same reasoning, same shape.
+#[cfg(target_os = "windows")]
+fn ensure_ffmpeg_extracted_and_wired() {
+    use gpui::AssetSource;
+
+    let ffmpeg_dir = paths::config_dir().join("ffmpeg");
+    for file_name in
+        ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
+    {
+        let target = ffmpeg_dir.join(file_name);
+        if target.is_file() {
+            continue;
+        }
+        // Embedded as `.dll.zst` (see `assets::Assets`'s own doc comment
+        // on the ffmpeg `#[include]` block for why) — one zstd-decompress
+        // pass turns it back into the real DLL bytes before it's ever
+        // written to disk.
+        let asset_path = format!("ffmpeg/windows-amd/{file_name}.zst");
+        let Some(compressed) = Assets.load(&asset_path).ok().flatten() else {
+            log::error!("missing embedded asset {asset_path:?} — video playback will be unavailable");
+            continue;
+        };
+        let bytes = match assets::decompress_zst(&compressed) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::error!("failed to decompress {asset_path:?}: {err:#} — video playback will be unavailable");
+                continue;
+            },
+        };
+        if let Err(err) = std::fs::create_dir_all(&ffmpeg_dir) {
+            log::error!("failed to create {ffmpeg_dir:?}: {err:#}");
+            continue;
+        }
+        if let Err(err) = std::fs::write(&target, &bytes) {
+            log::error!("failed to write {target:?}: {err:#}");
+        }
+    }
+
+    add_dll_search_directory(&ffmpeg_dir, "ffmpeg");
+}
+
+/// `AddDllDirectory` calls are silently ignored by the loader unless the
+/// process has opted into the "default dirs + explicitly added dirs" search
+/// order via `SetDefaultDllDirectories` first — must run once, before any
+/// `AddDllDirectory` call.
+#[cfg(target_os = "windows")]
+fn enable_additive_dll_search_directories() {
     unsafe {
-        use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+        use windows::Win32::System::LibraryLoader::{
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
+        };
+        if let Err(err) = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) {
+            log::error!(
+                "SetDefaultDllDirectories failed: {err:#} — conpty/ffmpeg extraction dirs may not be honored"
+            );
+        }
+    }
+}
+
+/// Adds `dir` to the process's DLL search path via `AddDllDirectory`
+/// (additive — unlike `SetDllDirectoryW`, which replaces the single
+/// existing user-defined search directory, `AddDllDirectory` can be called
+/// once per extracted-asset directory without one wiping the other out).
+#[cfg(target_os = "windows")]
+fn add_dll_search_directory(dir: &std::path::Path, label: &str) {
+    unsafe {
+        use windows::Win32::System::LibraryLoader::AddDllDirectory;
         use windows::core::HSTRING;
-        if let Err(err) = SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())) {
-            log::error!("SetDllDirectoryW({conpty_dir:?}) failed: {err:#} — terminal may fall back to the system conpty");
+        if AddDllDirectory(&HSTRING::from(dir.as_os_str())).is_null() {
+            log::error!(
+                "AddDllDirectory({dir:?}) failed for {label} — related features may fall back to the system search path"
+            );
         }
     }
 }

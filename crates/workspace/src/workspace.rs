@@ -700,7 +700,7 @@ mod som_restore_activity_tests {
 }
 
 #[cfg(test)]
-mod som_tmux_sessions_tests {
+mod som_srv_sessions_tests {
     use super::*;
     use gpui::TestAppContext;
 
@@ -1551,15 +1551,15 @@ pub struct Workspace {
     /// reconstruct `som_db.json`'s "x.y" tab entries without guessing the
     /// profile back from a possibly-ambiguous or user-renamed tab title.
     som_tab_profile_index: std::collections::HashMap<gpui::EntityId, usize>,
-    /// `som-tmux` pane ids for tmux tabs (main pane + splits, main
+    /// `som-srv` pane ids for tmux tabs (main pane + splits, main
     /// first), keyed by the *main* item's `EntityId` — mirrors
     /// `som_tab_profile_index`. A pane id is just a UUID string used as
-    /// that pane's `som-tmux` pipe name (see `project_som_tmux`
+    /// that pane's `som-srv` pipe name (see `project_som_tmux`
     /// memory, "Обновление 17"/19) — NOT a protocol session id to `Attach`
     /// with anymore (that concept is gone along with the old JSON IPC
     /// protocol). Populated by `terminal_view` right after creating a tmux
     /// tab (it generates the pane id itself before ever invoking
-    /// `som-tmux`), since `workspace` can't name anything
+    /// `som-srv`), since `workspace` can't name anything
     /// tmux-specific itself (dependency points the other way). Read back in
     /// `som_persist_db_json` to fill db.json's `tmux_sessions` field, so a
     /// later launch reuses the same pane id (and thus reconnects to the
@@ -4253,7 +4253,7 @@ impl Workspace {
     }
 
     /// Records `pane_ids` (main pane + splits, main first) as the
-    /// `som-tmux` pane ids backing `item`'s tab, so a later
+    /// `som-srv` pane ids backing `item`'s tab, so a later
     /// `som_persist_db_json` call can write them into db.json's
     /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
     pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, pane_ids: Vec<String>) {
@@ -5847,7 +5847,7 @@ impl Workspace {
     /// the process) triggers NONE of those, so without an explicit quit-time
     /// flush, `db.json` is only ever as fresh as the last such action. This
     /// is the confirmed root cause of a reported bug: a `htop`/`micro`
-    /// process (running in a `som-tmux` HOLDER, which itself
+    /// process (running in a `som-srv` HOLDER, which itself
     /// correctly survives Som closing — see `project_som_tmux` memory) was
     /// started, then Som was closed right away with no other action in
     /// between — `db.json` never got the chance to record that tab's

@@ -13,6 +13,8 @@ path = "src/main.rs"
 image.workspace = true
 terminal.workspace = true
 symphonia.workspace = true
+som_srv.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

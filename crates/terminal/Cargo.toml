@@ -55,9 +55,12 @@ util.workspace = true
 urlencoding.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
+serde_json.workspace = true
+som_srv.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [dev-dependencies]
 dirs.workspace = true

@@ -12,6 +12,18 @@ use rust_embed::RustEmbed;
 #[include = "nord.json"]
 #[include = "fonts/FiraCodeNerdFont-Regular.ttf"]
 #[include = "icons/*.svg"]
+// Stand-in frame the video widget shows in place of the last-played
+// frame once playback is stopped (`RichContentVideoPlayer::stop`) — see
+// that method's own doc comment for why a stopped video can't just clear
+// the picture and fall through to the terminal's normal background: the
+// SAME placeholder cells that hold the picture also carry the video
+// player's own decoded pixels via `paint_image`, with no independent
+// "nothing here" state of their own without changing how placeholder
+// cells are colored more broadly. Showing a fixed image instead sidesteps
+// that entirely — decoded once at startup, reused for every stopped video
+// placement the same way `current_frame()` already reuses a single
+// `Arc<RenderImage>` across repeated paints.
+#[include = "images/dna.png"]
 // Pre-built som-srv binaries for every remote platform Som's `tmux: true`
 // profiles support (Windows amd64, macOS arm64, Linux amd64 — NOT
 // linux-arm, which stays permanently unsupported) — see `som_srv::

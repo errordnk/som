@@ -798,13 +798,21 @@ fn ensure_ffmpeg_extracted_and_wired() {
         ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
     {
         let target = ffmpeg_dir.join(file_name);
-        if target.is_file() {
-            continue;
-        }
         // Embedded as `.dll.zst` (see `assets::Assets`'s own doc comment
         // on the ffmpeg `#[include]` block for why) — one zstd-decompress
         // pass turns it back into the real DLL bytes before it's ever
-        // written to disk.
+        // written to disk. Decompressed unconditionally (not gated behind
+        // `target.is_file()`) so the byte-for-byte comparison below can
+        // catch a stale on-disk copy from an OLDER Som build whose
+        // embedded FFmpeg trim differs (e.g. missing audio decoders) —
+        // an earlier version of this function skipped extraction outright
+        // whenever ANY file already existed at `target`, which silently
+        // kept a stale DLL in place across every later `som.exe` upgrade
+        // until someone manually deleted `~/.config/som/ffmpeg/` —
+        // confirmed live as video audio staying silent for an entire
+        // debugging session despite the newly built DLL correctly
+        // containing the needed decoders, because the STALE one on disk
+        // was still the one actually being loaded.
         let asset_path = format!("ffmpeg/windows-amd/{file_name}.zst");
         let Some(compressed) = Assets.load(&asset_path).ok().flatten() else {
             log::error!("missing embedded asset {asset_path:?} — video playback will be unavailable");
@@ -817,6 +825,11 @@ fn ensure_ffmpeg_extracted_and_wired() {
                 continue;
             },
         };
+        if let Ok(existing) = std::fs::read(&target) {
+            if existing == bytes {
+                continue; // Already up to date — skip the write.
+            }
+        }
         if let Err(err) = std::fs::create_dir_all(&ffmpeg_dir) {
             log::error!("failed to create {ffmpeg_dir:?}: {err:#}");
             continue;

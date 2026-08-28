@@ -2,8 +2,19 @@
 //! files (`.mp4`/`.mkv`/`.avi`) — the video counterpart to
 //! [`crate::rich_content_audio_player`] and [`crate::rich_content_player`].
 //!
-//! v1 is picture-only (no audio track) — mirrors how GIF shipped before
-//! audio existed elsewhere in this protocol.
+//! Includes the embedded audio track, if the container has one and its
+//! codec is one of the four this build's trimmed FFmpeg decodes
+//! (aac/mp3/opus/flac — see `vcpkg-overlays/ffmpeg/portfile.cmake`'s own
+//! `--enable-decoder` list) — decoded on the SAME background thread and
+//! the SAME demux packet stream as the picture (no second `ictx`, no
+//! second thread: `ictx.packets()` already interleaves both stream
+//! types, this module just stopped discarding the audio ones). Video's
+//! own PTS-vs-wall-clock pacing throttle (see below) already paces how
+//! fast this one thread consumes packets, so audio inherits that same
+//! pacing for free — video stays the de facto master clock, no separate
+//! audio clock to keep in sync. Missing/unsupported audio, or no output
+//! device, all fall back to picture-only playback rather than failing
+//! the whole player — sound is an enhancement here, not a requirement.
 //!
 //! Decoding is progressive, driven by a background thread reading
 //! `ffmpeg-next` packets/frames from the SAME on-disk cache file
@@ -11,7 +22,13 @@
 //! same shape as [`crate::rich_content_audio_player::run_decode_loop`].
 //! Unlike audio's growing PCM buffer, a video player only ever needs "the
 //! most recently decoded frame" for paint — so the shared state is a
-//! single latest-frame slot, not an accumulating buffer.
+//! single latest-frame slot, not an accumulating buffer. The embedded
+//! audio track's own buffer ([`SharedAudio`]) is instead a BOUNDED
+//! ring — not `crate::rich_content_audio_player::SharedPcm`'s permanent
+//! ever-growing one — because unlike a standalone audio decoder (which
+//! never seeks), this audio track must be flushed and cleared in
+//! lockstep with every video seek; see [`SharedAudio`]'s own doc comment
+//! for why the permanent-buffer model doesn't fit here.
 //!
 //! Decoding reads through a CUSTOM `AVIOContext`
 //! ([`GrowingFileStream`]/`ffmpeg_next::format::context::StreamIo`), not
@@ -42,14 +59,102 @@
 //! `rich_content_player::RichContentPlayer::current_frame` already uses
 //! for GIF (elapsed-vs-per-frame-delay there, elapsed-vs-PTS here).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use gpui::RenderImage;
 use image::Frame;
 use smallvec::SmallVec;
+
+/// Decoded (and, for the dark variant, color-inverted) once, on first
+/// use, and reused for every stopped video placement from then on — same
+/// one-decode-many-reuses shape as `RichContentVideoPlayer::
+/// current_frame`'s own `last_rendered` cache, just keyed by which
+/// variant is needed instead of nothing, since there are exactly two
+/// such images for the whole process. `is_light` should be true when the
+/// FIXED color the image is about to be painted against (the letterbox
+/// fill — see `RichContentVideoPlayer::stop`'s own doc comment) is
+/// itself light — NOT the overall active theme's polarity, which can
+/// disagree with that one specific painted color. Falls back to `None`
+/// (nothing painted, terminal background shows through) if the embedded
+/// asset is somehow missing or not a decodable image — never a reason to
+/// panic over a purely cosmetic stand-in frame.
+fn stopped_placeholder_frame(is_light: bool) -> Option<image::RgbaImage> {
+    static DARK: std::sync::OnceLock<Option<image::RgbaImage>> = std::sync::OnceLock::new();
+    static LIGHT: std::sync::OnceLock<Option<image::RgbaImage>> = std::sync::OnceLock::new();
+    // The embedded asset itself is black DNA on a light background — the
+    // right image to show against a DARK letterbox fill needs inverting
+    // (black↔white) so it stays legible instead of nearly vanishing into
+    // a background of a similar color; alpha is left untouched since
+    // it's transparency, not part of the drawn artwork's own color
+    // scheme.
+    let cell = if is_light { &LIGHT } else { &DARK };
+    cell.get_or_init(|| {
+        let bytes = assets::Assets::get("images/dna.png")?;
+        let mut image = image::load_from_memory(&bytes.data).ok()?.to_rgba8();
+        // The source asset isn't just the DNA glyph on a transparent
+        // background — it also carries a faint diagonal watermark hatch
+        // pattern at very low alpha (confirmed via direct pixel
+        // inspection: roughly 30% of pixels sit at alpha 1-19 out of
+        // 255, dark RGB ~(45,45,45)). That's invisible against a light
+        // letterbox fill (dark-on-light at near-zero opacity vanishes),
+        // but the SAME low-alpha pixels, after color inversion for a
+        // dark letterbox fill, become light-on-dark — clearly visible as
+        // stray diagonal stripes, confirmed live. Dropping every pixel
+        // below this threshold keeps only the glyph itself (whose
+        // alpha is much higher, confirmed the same way) regardless of
+        // which fill color it's shown against.
+        const HATCH_ALPHA_CUTOFF: u8 = 30;
+        for pixel in image.pixels_mut() {
+            if pixel[3] < HATCH_ALPHA_CUTOFF {
+                pixel[3] = 0;
+            }
+        }
+        if !is_light {
+            for pixel in image.pixels_mut() {
+                pixel[0] = 255 - pixel[0];
+                pixel[1] = 255 - pixel[1];
+                pixel[2] = 255 - pixel[2];
+            }
+        }
+        Some(image)
+    })
+    .clone()
+}
+
+/// Interleaved f32 PCM the decode thread pushes into and the `cpal`
+/// output callback drains from — bounded (see [`AUDIO_BUFFER_MAX_FRAMES`]
+/// below), unlike [`crate::rich_content_audio_player::SharedPcm`]'s
+/// permanent ever-growing `Vec<f32>`. That permanent-buffer model fits a
+/// STANDALONE audio decoder, which never seeks (see this module's own
+/// top-level architecture note on why an embedded video's audio track
+/// can't reuse it as-is): every video seek flushes and clears this
+/// buffer instead (see the seek-handling block in `run_decode_loop`),
+/// so keeping only a modest amount of already-decoded-but-not-yet-played
+/// audio around is both correct (stale pre-seek samples must never
+/// survive a seek) and bounded (a multi-hour movie must not accumulate
+/// unbounded PCM the way the pre-fix GPU-texture leak earlier this
+/// session accumulated frames).
+struct SharedAudio {
+    samples: Mutex<VecDeque<f32>>,
+    sample_rate: AtomicU64,
+    channels: AtomicU64,
+}
+
+/// How many audio FRAMES (one sample per channel counts as one frame) to
+/// keep buffered ahead of playback — chosen as a few seconds' worth at
+/// typical sample rates: enough to absorb ordinary scheduling jitter
+/// between the decode thread and the `cpal` callback without either
+/// side blocking, small enough that memory use stays bounded regardless
+/// of how long the video is. The decode thread stops pushing once the
+/// buffer reaches this size (checked before each frame's worth of
+/// samples is pushed) and naturally catches up once the `cpal` callback
+/// drains it during normal playback.
+const AUDIO_BUFFER_MAX_FRAMES: usize = 4 * 48_000;
 
 /// How much of an in-progress SRP video transfer is available right now —
 /// same shape and reasoning as
@@ -217,6 +322,8 @@ fn run_decode_loop(
     duration_us: Arc<AtomicI64>,
     seek_request: Arc<Mutex<Option<f32>>>,
     playing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    shared_audio: Arc<SharedAudio>,
 ) {
     use ffmpeg_next as ffmpeg;
 
@@ -288,6 +395,98 @@ fn run_decode_loop(
     let Ok(mut decoder) = context_decoder.decoder().video() else {
         return;
     };
+
+    // Audio track — genuinely optional, unlike the video one above: a
+    // video with no embedded sound (`ictx.streams().best(Audio)` returns
+    // `None`), an audio codec not in the four this build supports
+    // (aac/mp3/opus/flac — see `vcpkg-overlays/ffmpeg/portfile.cmake`'s
+    // own `--enable-decoder` list), or no default output audio device on
+    // this machine all fall back to today's picture-only behavior rather
+    // than aborting the whole player — sound is an enhancement here, not
+    // a requirement for video playback to work at all.
+    let audio_stream_index = ictx.streams().best(ffmpeg::media::Type::Audio).map(|input| input.index());
+    let mut audio_decoder = audio_stream_index.and_then(|index| {
+        let input = ictx.stream(index)?;
+        let context_decoder = match ffmpeg::codec::context::Context::from_parameters(input.parameters()) {
+            Ok(context_decoder) => context_decoder,
+            Err(e) => {
+                log::warn!("video's audio decoder context open failed: {e}");
+                return None;
+            },
+        };
+        match context_decoder.decoder().audio() {
+            Ok(decoder) => Some(decoder),
+            Err(e) => {
+                log::warn!("video's audio decoder open failed (unsupported codec?): {e}");
+                None
+            },
+        }
+    });
+    // `cpal`'s output stream needs a concrete sample rate/channel count
+    // up front — resolvable from the decoder's own codec parameters
+    // immediately after opening it (unlike the video decoder's width/
+    // height, which genuinely can be unresolved until the first frame —
+    // see the `scaler` comment below), so the `cpal` stream can be built
+    // right here rather than waiting for the first decoded audio frame.
+    let audio_output = audio_decoder.as_ref().and_then(|decoder| {
+        let channels = decoder.channels();
+        let rate = decoder.rate();
+        if channels == 0 || rate == 0 {
+            log::warn!("video's audio decoder has channels=0 or rate=0 — codec params unresolved, skipping audio");
+            return None;
+        }
+        shared_audio.sample_rate.store(rate as u64, Ordering::Release);
+        shared_audio.channels.store(channels as u64, Ordering::Release);
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            log::warn!("video's audio: no default output audio device");
+            return None;
+        };
+        let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+        let cb_shared = shared_audio.clone();
+        let cb_playing = playing.clone();
+        let stream = match device.build_output_stream(
+            &config,
+            move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                if !cb_playing.load(Ordering::Acquire) {
+                    output.fill(0.0);
+                    return;
+                }
+                let mut samples = cb_shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+                let available = samples.len().min(output.len());
+                for (dst, src) in output[..available].iter_mut().zip(samples.drain(..available)) {
+                    *dst = src;
+                }
+                output[available..].fill(0.0);
+            },
+            |err| log::error!("video's audio cpal output stream error: {err}"),
+            None,
+        ) {
+            Ok(stream) => stream,
+            Err(e) => {
+                log::warn!("video's audio build_output_stream failed: {e}");
+                return None;
+            },
+        };
+        if let Err(e) = stream.play() {
+            log::warn!("video's audio stream.play() failed: {e}");
+            return None;
+        }
+        Some(stream)
+    });
+    // Not read past this point — kept alive only so dropping the decode
+    // loop's local scope (thread exit) tears the device stream down; see
+    // `RichContentAudioPlayer::_stream`'s identical reasoning for why a
+    // `cpal::Stream` handle itself is never otherwise touched.
+    let _audio_output_stream = audio_output;
+    if audio_decoder.is_none() {
+        // No usable audio track — never write into a buffer nothing will
+        // ever drain, and skip decoding audio packets below entirely.
+        shared_audio.sample_rate.store(0, Ordering::Release);
+    }
+    let mut resampler: Option<ffmpeg::software::resampling::context::Context> = None;
+    let mut decoded_audio = ffmpeg::util::frame::audio::Audio::empty();
+    let mut resampled_audio = ffmpeg::util::frame::audio::Audio::empty();
 
     // Built lazily on the first successfully decoded frame, NOT right
     // after opening the decoder — `decoder.format()`/`width()`/`height()`
@@ -403,6 +602,54 @@ fn run_decode_loop(
         }
     };
 
+    // Mirrors `receive_and_store`'s shape for the audio side — no pacing
+    // logic of its own (unlike the video half): audio packets interleave
+    // with video packets in the SAME demux stream this one thread reads
+    // sequentially, so video's own PTS-vs-wall-clock throttle above
+    // already paces how fast this whole loop (and therefore audio
+    // decoding too) advances — see this function's own doc comment on
+    // why video stays the de facto master clock. This closure's only job
+    // is decode + resample + push into the bounded buffer, stopping once
+    // that buffer is full (the `cpal` callback draining it during normal
+    // playback is what makes room for more).
+    let mut receive_and_store_audio = |decoder: &mut ffmpeg::decoder::Audio,
+                                        resampler: &mut Option<ffmpeg::software::resampling::context::Context>| {
+        while decoder.receive_frame(&mut decoded_audio).is_ok() {
+            if decoded_audio.format() == ffmpeg::format::Sample::None || decoded_audio.samples() == 0 {
+                continue;
+            }
+            if shared_audio.samples.lock().unwrap_or_else(|p| p.into_inner()).len() >= AUDIO_BUFFER_MAX_FRAMES {
+                continue; // Buffer's full — drop this frame rather than grow unbounded; playback will catch up.
+            }
+            let channels = decoder.channels();
+            if channels == 0 {
+                continue;
+            }
+            let target_layout = ffmpeg::ChannelLayout::default(channels as i32);
+            let resampler = match resampler {
+                Some(resampler) => resampler,
+                None => {
+                    let Ok(built) = ffmpeg::software::resampling::context::Context::get(
+                        decoded_audio.format(),
+                        decoded_audio.channel_layout(),
+                        decoded_audio.rate(),
+                        ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
+                        target_layout,
+                        decoded_audio.rate(),
+                    ) else {
+                        continue;
+                    };
+                    resampler.insert(built)
+                },
+            };
+            if resampler.run(&decoded_audio, &mut resampled_audio).is_err() {
+                continue;
+            }
+            let samples: &[f32] = resampled_audio.plane(0);
+            shared_audio.samples.lock().unwrap_or_else(|p| p.into_inner()).extend(samples.iter().copied());
+        }
+    };
+
     // No reopen/seek loop needed for the "ran out of currently-written
     // bytes" case here (an earlier version of this function had one) —
     // `ictx.packets().next()` returning `None` while more of the file is
@@ -491,6 +738,18 @@ fn run_decode_loop(
                 let _ = ictx.seek(target_us, ..target_us);
                 decoder.flush();
                 pace_anchor = None;
+                // Audio must be flushed and cleared in lockstep with the
+                // video decoder above — leftover pre-seek samples still
+                // sitting in `shared_audio.samples` would otherwise play
+                // right after the post-seek video frame appears, an
+                // audible desync bug, not just a cosmetic one (see this
+                // module's own architecture note on the bounded-buffer
+                // model for why embedded audio can't reuse standalone
+                // audio's permanent-buffer/never-seeks assumption).
+                if let Some(audio_decoder) = audio_decoder.as_mut() {
+                    audio_decoder.flush();
+                }
+                shared_audio.samples.lock().unwrap_or_else(|p| p.into_inner()).clear();
             }
         }
 
@@ -500,11 +759,66 @@ fn run_decode_loop(
                     receive_and_store(&mut decoder, &mut scaler, &mut pace_anchor);
                 }
             },
+            Some((stream, packet)) if Some(stream.index()) == audio_stream_index => {
+                if let Some(audio_decoder) = audio_decoder.as_mut() {
+                    if audio_decoder.send_packet(&packet).is_ok() {
+                        receive_and_store_audio(audio_decoder, &mut resampler);
+                    }
+                }
+            },
             Some(_) => continue,
             None => {
                 let _ = decoder.send_eof();
                 receive_and_store(&mut decoder, &mut scaler, &mut pace_anchor);
-                return;
+                if let Some(audio_decoder) = audio_decoder.as_mut() {
+                    let _ = audio_decoder.send_eof();
+                    receive_and_store_audio(audio_decoder, &mut resampler);
+                }
+                // Real end of stream — stop advancing wall-clock time.
+                // Without this, `elapsed()`'s playing-branch keeps adding
+                // `started_at.elapsed()` forever after the last frame,
+                // confirmed live as the readout ticking past the video's
+                // own duration indefinitely. Setting `playing` false here
+                // routes `elapsed()` to its paused branch instead, which
+                // freezes on the last decoded frame's own PTS.
+                playing.store(false, Ordering::Release);
+
+                // Do NOT `return` here — an earlier version of this
+                // branch ended the thread outright, which left "play"
+                // (`toggle_play_pause`) and "stop" (seek-to-0) both
+                // silently inert after a video finished: `seek_request`
+                // would be set by the player-side methods, but nothing
+                // was left alive to ever read it, so `elapsed()` kept
+                // computing from the stale `playback_started_at` a
+                // caller-side `toggle_play_pause()` had just written,
+                // growing forever with no new frames ever arriving to
+                // reset it — confirmed live as the readout climbing past
+                // the real duration after pressing play again post-EOF.
+                // `finished` lets `RichContentVideoPlayer::toggle_play_pause`
+                // tell this case apart from an ordinary mid-video pause
+                // (see that method's own doc comment) so a plain play
+                // click after the video ends re-seeks to the start
+                // instead of resuming a decoder that has nothing left to
+                // decode.
+                finished.store(true, Ordering::Release);
+                // Block here the same way the pause-gate above does,
+                // waiting specifically for a seek (a bare `playing=true`
+                // with no seek is exactly the stale-resume case just
+                // described, so it does NOT alone justify falling through
+                // to `ictx.packets().next()`, which would immediately
+                // yield `None` again since the demuxer is still at EOF).
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if seek_request.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                        break;
+                    }
+                    std::thread::sleep(DECODE_RETRY_INTERVAL);
+                }
+                finished.store(false, Ordering::Release);
+                decoder.flush();
+                continue;
             },
         }
     }
@@ -574,6 +888,41 @@ pub struct RichContentVideoPlayer {
     /// for the entire lifetime of the `Terminal`, confirmed live as
     /// multi-gigabyte RSS growth over an hour of continuous playback.
     pending_image_drops: Mutex<Vec<Arc<RenderImage>>>,
+    /// Set by the decode thread while it's blocked at real end-of-stream
+    /// waiting for a seek (see `run_decode_loop`'s EOF branch) — lets
+    /// [`Self::is_finished`] tell "paused mid-video" apart from "nothing
+    /// left to decode without a seek first", so callers (`Terminal::
+    /// toggle_rich_content_video_playback`) know a plain play click needs
+    /// to seek back to the start rather than just flipping `playing`.
+    finished: Arc<AtomicBool>,
+    /// Set by [`Self::stop`], cleared by [`Self::toggle_play_pause`] —
+    /// makes [`Self::current_frame`] substitute `stopped_placeholder_
+    /// frame` for whatever's actually in `shared.slot` (the real last-
+    /// played frame is left untouched underneath, not overwritten, so
+    /// the decode thread's own state stays consistent) instead of that
+    /// real frame. A plain `bool` baked into `shared.slot` at the moment
+    /// `stop` was called would freeze in whichever theme was active
+    /// then — this flag instead lets the SAME stopped state re-resolve
+    /// to whichever theme is active at each individual paint, so
+    /// switching `theme.json` while a video sits stopped updates the
+    /// stand-in image too.
+    stopped: Arc<AtomicBool>,
+    /// Embedded audio track's decoded PCM + format — see [`SharedAudio`]'s
+    /// own doc comment. The actual `cpal::Stream` for this player's audio
+    /// lives INSIDE the decode thread's own local scope (opened once the
+    /// audio decoder's format is known, right after the container opens —
+    /// see `run_decode_loop`), not on this struct, since a `cpal::Stream`
+    /// isn't necessarily `Send` — this field only holds the state that
+    /// crosses the thread boundary (the shared PCM buffer + format), same
+    /// division `shared`/`LatestFrame` already uses for the picture side.
+    /// Not read from outside this struct yet (the decode thread holds its
+    /// own clone of the same `Arc` and is the only current reader/writer)
+    /// — kept here anyway so a future caller (e.g. "does this video have
+    /// audio at all" for UI purposes, via `shared_audio.channels()`) has
+    /// somewhere to read it from without threading a new field through
+    /// `open()` again.
+    #[allow(dead_code)]
+    shared_audio: Arc<SharedAudio>,
 }
 
 impl Drop for RichContentVideoPlayer {
@@ -593,6 +942,12 @@ impl RichContentVideoPlayer {
         let duration_us = Arc::new(AtomicI64::new(0));
         let seek_request = Arc::new(Mutex::new(None));
         let playing = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let shared_audio = Arc::new(SharedAudio {
+            samples: Mutex::new(VecDeque::new()),
+            sample_rate: AtomicU64::new(0),
+            channels: AtomicU64::new(0),
+        });
 
         {
             let shared = shared.clone();
@@ -601,8 +956,21 @@ impl RichContentVideoPlayer {
             let duration_us = duration_us.clone();
             let seek_request = seek_request.clone();
             let playing = playing.clone();
+            let finished = finished.clone();
+            let shared_audio = shared_audio.clone();
             std::thread::spawn(move || {
-                run_decode_loop(path, shared, progress, decode_stop, time_base, duration_us, seek_request, playing)
+                run_decode_loop(
+                    path,
+                    shared,
+                    progress,
+                    decode_stop,
+                    time_base,
+                    duration_us,
+                    seek_request,
+                    playing,
+                    finished,
+                    shared_audio,
+                )
             });
         }
 
@@ -616,6 +984,9 @@ impl RichContentVideoPlayer {
             seek_request,
             last_rendered: Mutex::new(None),
             pending_image_drops: Mutex::new(Vec::new()),
+            finished,
+            stopped: Arc::new(AtomicBool::new(false)),
+            shared_audio,
         }
     }
 
@@ -623,9 +994,33 @@ impl RichContentVideoPlayer {
         self.playing.load(Ordering::Acquire)
     }
 
+    /// True while the decode thread is blocked at real end-of-stream,
+    /// waiting for a seek before it can produce any more frames — see
+    /// `run_decode_loop`'s EOF branch and this struct's own `finished`
+    /// field doc comment.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// True while [`Self::current_frame`] is returning the fixed
+    /// stand-in image instead of a real decoded frame — see [`Self::
+    /// stop`]'s own doc comment. Callers need this alongside the image
+    /// itself because the stand-in has its OWN aspect ratio (the
+    /// `dna.png` asset, not the video's), so it should be letterboxed to
+    /// fit rather than stretched to fill the video's reserved footprint
+    /// the way a real decoded frame correctly is.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     pub fn toggle_play_pause(&self) {
         let now_playing = !self.playing.fetch_xor(true, Ordering::AcqRel);
         if now_playing {
+            // Clears whatever `Self::stop` set — resuming playback after
+            // a stop means the real decoded frame (which the queued seek
+            // back to 0.0 is already bringing in) should show again, not
+            // the stand-in image.
+            self.stopped.store(false, Ordering::Release);
             let current_pts = self.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts).unwrap_or(0);
             *self.playback_started_at.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), current_pts));
         }
@@ -643,42 +1038,34 @@ impl RichContentVideoPlayer {
         if us <= 0 { std::time::Duration::ZERO } else { std::time::Duration::from_micros(us as u64) }
     }
 
-    /// Wall-clock playback position, in the same units `duration()`
-    /// reports — computed from the same PTS-vs-elapsed-time math
-    /// `current_frame()`'s gating already uses, so this always agrees
-    /// with whatever's actually on screen (as opposed to a separately
-    /// tracked position counter that could drift from it).
+    /// Playback position, in the same units `duration()` reports —
+    /// always derived directly from whatever frame's PTS is CURRENTLY in
+    /// `shared.slot` (i.e. whatever `current_frame()` is actually
+    /// returning to be painted right now), not from a separately tracked
+    /// wall-clock counter. An earlier version computed this as "PTS at
+    /// playback start + wall-clock time elapsed since", which could only
+    /// ever be an ESTIMATE of what the decode thread was doing — and
+    /// diverged from the real on-screen frame in more than one way,
+    /// confirmed live: the estimate kept climbing indefinitely past the
+    /// video's own duration once the decode thread had nothing left to
+    /// decode (paused, seeking, or genuinely at end-of-stream) because
+    /// nothing was left to stop the wall-clock half from advancing.
+    /// Reading `shared.slot`'s PTS directly instead makes this number
+    /// physically incapable of disagreeing with the picture on screen —
+    /// whatever is currently displayed, playing, paused, or freshly
+    /// landed after a seek, IS the position, by construction.
     pub fn elapsed(&self) -> std::time::Duration {
-        let (pts, _) = match self.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            Some((_, pts)) => (*pts, ()),
+        if self.stopped.load(Ordering::Acquire) {
+            return std::time::Duration::ZERO;
+        }
+        let pts = match self.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some((_, pts)) => *pts,
             None => return std::time::Duration::ZERO,
         };
-        let started = self.playback_started_at.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((started_at, started_pts)) = *started else { return std::time::Duration::ZERO };
         let num = self.time_base.0.load(Ordering::Acquire).max(0) as f64;
         let den = self.time_base.1.load(Ordering::Acquire).max(1) as f64;
-        if self.is_playing() {
-            // Absolute position = the video-time offset playback most
-            // recently (re)started FROM (`started_pts`, converted to
-            // real seconds), plus however much wall-clock time has
-            // elapsed since then. NOT `started_at.elapsed() +
-            // (pts - started_pts)` — that double-counts the same
-            // interval two different ways (`decoded pts advance` and
-            // `wall-clock elapsed` are two independent measurements of
-            // the SAME quantity, kept roughly in sync by the decode
-            // thread's own PTS-pacing throttle — see `run_decode_loop`'s
-            // doc comment — not two things to add together), which
-            // showed up live as the widget's elapsed time running at
-            // roughly DOUBLE real speed.
-            let started_pts_seconds = if den > 0.0 { started_pts as f64 * num / den } else { 0.0 };
-            std::time::Duration::from_secs_f64(started_pts_seconds + started_at.elapsed().as_secs_f64())
-        } else {
-            // Paused — the last decoded frame's own PTS (converted to
-            // real time) IS the position, same as audio's "seeking while
-            // paused still updates position" ergonomics.
-            let frame_time = if den > 0.0 { pts as f64 * num / den } else { 0.0 };
-            std::time::Duration::from_secs_f64(frame_time.max(0.0))
-        }
+        let frame_time = if den > 0.0 { pts as f64 * num / den } else { 0.0 };
+        std::time::Duration::from_secs_f64(frame_time.max(0.0))
     }
 
     /// Fraction (0.0..=1.0) of `duration()` that `elapsed()` represents —
@@ -723,6 +1110,44 @@ impl RichContentVideoPlayer {
         }
     }
 
+    /// Stops playback and marks this player as showing a fixed stand-in
+    /// image instead of the real last-played frame — unlike
+    /// [`Self::seek_to_fraction`] alone (which `Terminal::
+    /// stop_rich_content_video_playback` used to call directly), this
+    /// makes [`Self::elapsed`] read `00:00:00` immediately rather than
+    /// continuing to show the frame that was on screen when stop was
+    /// pressed — a pressed stop looked visually identical to a plain
+    /// pause, confirmed live, because seeking to 0.0 alone just re-queues
+    /// a decode-thread seek that doesn't actually land (and overwrite
+    /// `shared.slot`) until playback resumes; pausing first left the last
+    /// frame's pixels sitting in `shared.slot`/`last_rendered` the whole
+    /// time in between. An earlier version of this method cleared
+    /// `shared.slot` to `None` instead — abandoned because the
+    /// placeholder grid's picture cells paint their OWN background color
+    /// independent of whatever `current_frame()` returns (see
+    /// `print_placeholder_grid_with_cell_dims` in `somcat`), so `None`
+    /// still left a solid-colored rectangle on screen, just not the
+    /// terminal's own background — confirmed live as a stark black block
+    /// instead of the active theme's real background showing through.
+    /// A LATER version wrote a decoded stand-in image directly into
+    /// `shared.slot` — also abandoned, because that bakes in whichever
+    /// theme was active at the moment `stop` was called, and Som lets the
+    /// user switch `theme.json` at any time, including while a video sits
+    /// stopped. Setting the `stopped` flag instead defers the actual
+    /// image choice to [`Self::current_frame`], which re-resolves it
+    /// against the CURRENTLY active theme on every call — `shared.slot`
+    /// itself is left untouched, so the decode thread's own state stays
+    /// consistent underneath. The queued `seek_request` still makes the
+    /// decode thread actually re-seek so the NEXT play starts decoding
+    /// from the beginning rather than wherever playback happened to stop.
+    pub fn stop(&self, progress: &VideoTransferProgress, request_byte_range: impl FnOnce(u64, u64)) {
+        if self.is_playing() {
+            self.toggle_play_pause();
+        }
+        self.stopped.store(true, Ordering::Release);
+        self.seek_to_fraction(0.0, progress, request_byte_range);
+    }
+
 
     /// The current frame to paint, if the decode thread has produced one
     /// yet. Returns the SAME `Arc<RenderImage>` (same `ImageId`, same
@@ -740,7 +1165,44 @@ impl RichContentVideoPlayer {
     /// of a per-frame delay list. While paused, always returns whatever
     /// the decode thread has produced so far (no PTS gating) — matches
     /// audio's "seeking while paused still updates position" ergonomics.
-    pub fn current_frame(&self) -> Option<Arc<RenderImage>> {
+    ///
+    /// `is_light` should reflect whether the FIXED letterbox fill color
+    /// the stopped-state stand-in image is about to be painted against is
+    /// itself light (passed in fresh on every call, not cached) — see
+    /// `stopped_placeholder_frame`'s own doc comment for why this is
+    /// deliberately NOT the same thing as the active theme's overall
+    /// polarity, and [`Self::stop`]'s own doc comment for why the choice
+    /// is resolved here rather than baked in once when stop was pressed.
+    pub fn current_frame(&self, is_light: bool) -> Option<Arc<RenderImage>> {
+        // A synthetic PTS that can never collide with a real decoded
+        // frame's own (`i64`, so `MIN` is never a legitimate stream
+        // timestamp) — used as `last_rendered`'s cache key for the
+        // stand-in image so switching `theme.json` while stopped (light
+        // vs. dark stand-in are different images, same synthetic PTS)
+        // still invalidates the cache correctly below, the same way a
+        // real new decoded frame's differing PTS would.
+        const STOPPED_PTS: i64 = i64::MIN;
+
+        if self.stopped.load(Ordering::Acquire) {
+            let rgba = stopped_placeholder_frame(is_light)?;
+            let mut cache = self.last_rendered.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((cached_pts, cached_image)) = cache.as_ref() {
+                if *cached_pts == STOPPED_PTS {
+                    return Some(cached_image.clone());
+                }
+            }
+            let mut bgra = rgba;
+            for pixel in bgra.as_flat_samples_mut().samples.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            let frame = Frame::new(bgra);
+            let image = Arc::new(RenderImage::new(SmallVec::from_vec(vec![frame])));
+            if let Some((_, old_image)) = cache.replace((STOPPED_PTS, image.clone())) {
+                self.pending_image_drops.lock().unwrap_or_else(|p| p.into_inner()).push(old_image);
+            }
+            return Some(image);
+        }
+
         let slot = self.shared.slot.lock().unwrap_or_else(|p| p.into_inner());
         let (rgba, pts) = slot.as_ref()?;
         let pts = *pts;
@@ -836,7 +1298,7 @@ mod tests {
     fn decode_thread_populates_a_frame_for_mkv() {
         let Some(player) = open_test_player("sample_1920x1080.mkv") else { return };
         assert!(wait_for_decode(&player), "decode thread never produced a frame for the mkv fixture");
-        let frame = player.current_frame();
+        let frame = player.current_frame(false);
         assert!(frame.is_some(), "current_frame() must return a frame once paused decode has produced one");
     }
 

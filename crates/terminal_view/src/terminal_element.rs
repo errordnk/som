@@ -1711,6 +1711,16 @@ pub fn is_blank(cell: &IndexedCell) -> bool {
     true
 }
 
+/// Background color for the audio/video play/pause/seekbar control widget
+/// (`paint_rich_content_media_widget`) — also used to letterbox/pillarbox
+/// the video-stopped stand-in image (see `paint_rich_content_placements`'s
+/// video branch), so the picture area's padding reads as the same
+/// intentional dark surface the widget row already uses immediately below
+/// it, not a mismatched color.
+fn rich_content_widget_bg() -> gpui::Rgba {
+    gpui::rgba(0x1e1e2eff)
+}
+
 /// Paints Som's own rich-content protocol images/animations
 /// ([`terminal::rich_content_transport`]). SRP placements are real Unicode-
 /// placeholder grid cells (see `Terminal::print_rich_content_placeholder_grid`,
@@ -1745,6 +1755,24 @@ fn paint_rich_content_placements(
     // lazily spawns this placement's `som-srv` progress subscription and
     // applies any progress already observed to `RichContentCache` — both
     // need `&mut Terminal`.
+    // The stopped-video stand-in image (`dna.png`) needs a variant that
+    // actually contrasts against whatever it's painted ON — the letterbox
+    // fill `rich_content_widget_bg()` provides, a FIXED color that
+    // doesn't itself track the active theme. Deriving the choice from
+    // this exact color (not from `theme.appearance().is_light()`) keeps
+    // the two in sync by construction: whatever color the padding is
+    // ACTUALLY painted, the stand-in image is chosen to read against
+    // that same color, not a separate "is the overall theme light"
+    // signal that could disagree with it (e.g. a dark widget background
+    // against an otherwise light theme, or vice versa).
+    let widget_bg_is_light = {
+        let bg = rich_content_widget_bg();
+        // Standard relative-luminance weighting (ITU-R BT.601) — cheap
+        // and good enough for a binary light/dark contrast decision, not
+        // used for anything color-accuracy-sensitive.
+        let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
+        luminance > 0.5
+    };
     let (origins, placements, audio_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
         terminal.update(cx, |terminal, _cx| {
         // For each (session_id, file_id) group, remember the grid position
@@ -1835,16 +1863,17 @@ fn paint_rich_content_placements(
         let placements = terminal.rich_content_placements();
         let audio_placements = terminal.rich_content_audio_placements();
         #[cfg(target_os = "windows")]
-        let video_placements = terminal.rich_content_video_placements();
+        let video_placements = terminal.rich_content_video_placements(widget_bg_is_light);
         #[cfg(not(target_os = "windows"))]
         let video_placements: Vec<(
             u32,
             u32,
-            std::sync::Arc<gpui::RenderImage>,
+            Option<std::sync::Arc<gpui::RenderImage>>,
             bool,
             f32,
             std::time::Duration,
             std::time::Duration,
+            bool,
         )> = Vec::new();
         #[cfg(target_os = "windows")]
         let pending_image_drops = terminal.take_pending_video_image_drops();
@@ -1913,7 +1942,7 @@ fn paint_rich_content_placements(
         // `paint_rich_content_media_widget` audio already uses — one
         // shared control-row implementation for both content types.
         let video_match = video_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id);
-        if let Some((_, _, render_image, is_playing, position_fraction, elapsed, duration)) = video_match {
+        if let Some((_, _, render_image, is_playing, position_fraction, elapsed, duration, is_stopped)) = video_match {
             let max_column_seen = max_columns_seen.get(&key).copied();
             let max_row_seen = max_rows_seen.get(&key).copied();
             let picture_rows = max_row_seen.map(|r| r.max(1) - 1).unwrap_or(0);
@@ -1921,36 +1950,98 @@ fn paint_rich_content_placements(
             let display_line = origin_line + layout.display_offset as i32;
             let num_lines = layout.dimensions.num_lines() as i32;
 
-            let image_size = render_image.size(0);
-            let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
-                let columns = match max_column_seen {
-                    Some(max_column) => (max_column + 1) as f32,
-                    None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
+            // `render_image` is `None` right after `stop` if the `dna.png`
+            // stand-in asset itself failed to load (see
+            // `stopped_placeholder_frame`'s own doc comment) — the
+            // picture is skipped entirely in that case (leaving the
+            // terminal's own background showing through), but the
+            // control widget below still paints unconditionally, so
+            // play/seek remain clickable either way.
+            if let Some(render_image) = render_image {
+                let image_size = render_image.size(0);
+                let (full_width, full_height) = if image_size.width.0 > 0 && image_size.height.0 > 0 {
+                    let columns = match max_column_seen {
+                        Some(max_column) => (max_column + 1) as f32,
+                        None => (image_size.width.0 as f32 / f32::from(cell_width)).ceil().max(1.0),
+                    };
+                    let width = cell_width * columns;
+                    // `picture_rows` — the last row is the widget's, not
+                    // the picture's (see this arm's own doc comment above).
+                    let height = line_height * picture_rows.max(1) as f32;
+                    (width, height)
+                } else {
+                    (cell_width, line_height)
                 };
-                let width = cell_width * columns;
-                // `picture_rows` — the last row is the widget's, not the
-                // picture's (see this arm's own doc comment above).
-                let height = line_height * picture_rows.max(1) as f32;
-                (width, height)
-            } else {
-                (cell_width, line_height)
-            };
-            let picture_size = gpui::size(full_width, full_height);
+                let picture_size = gpui::size(full_width, full_height);
 
-            let row_span = (f32::from(full_height) / f32::from(line_height)).ceil() as i32;
-            if display_line + row_span >= 0 && display_line < num_lines {
-                let picture_position =
-                    point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
-                any_animating |= *is_playing;
-                window
-                    .paint_image(
-                        Bounds::new(picture_position, picture_size),
-                        gpui::Corners::all(Pixels::ZERO),
-                        render_image.clone(),
-                        0,
-                        false,
-                    )
-                    .log_err();
+                let row_span = (f32::from(full_height) / f32::from(line_height)).ceil() as i32;
+                if display_line + row_span >= 0 && display_line < num_lines {
+                    let picture_position = point(
+                        origin.x + origin_column as f32 * cell_width,
+                        origin.y + display_line as f32 * line_height,
+                    );
+                    any_animating |= *is_playing;
+                    let picture_bounds = Bounds::new(picture_position, picture_size);
+                    if *is_stopped {
+                        // The stopped-state stand-in (`dna.png`, roughly
+                        // square) has its OWN aspect ratio, unrelated to
+                        // the video's reserved footprint (commonly 16:9)
+                        // — stretching it to fill that footprint the way
+                        // a real decoded frame correctly does distorted
+                        // it badly, confirmed live. Letterbox/pillarbox
+                        // it instead: fill the reserved area with the
+                        // widget's own background color first (so the
+                        // margins read as intentional padding, not a
+                        // rendering glitch), then paint the image at
+                        // whatever sub-rectangle preserves its real
+                        // width:height ratio, centered within
+                        // `picture_bounds`. Only ever SHRUNK to fit, never
+                        // enlarged past its own native pixel size — if the
+                        // reserved area is bigger than `dna.png`'s actual
+                        // resolution, it shows at that native size,
+                        // centered, with more padding around it, rather
+                        // than being blown up and looking soft/blurry.
+                        window.paint_quad(fill(picture_bounds, rich_content_widget_bg()));
+                        let native_width = px(image_size.width.0 as f32);
+                        let native_height = px(image_size.height.0 as f32);
+                        let image_aspect = image_size.width.0 as f32 / image_size.height.0 as f32;
+                        let box_aspect = f32::from(full_width) / f32::from(full_height);
+                        let (shrink_to_fit_width, shrink_to_fit_height) = if image_aspect > box_aspect {
+                            (full_width, full_width / image_aspect)
+                        } else {
+                            (full_height * image_aspect, full_height)
+                        };
+                        let (fit_width, fit_height) =
+                            if native_width <= full_width && native_height <= full_height {
+                                (native_width, native_height)
+                            } else {
+                                (shrink_to_fit_width, shrink_to_fit_height)
+                            };
+                        let fit_position = point(
+                            picture_position.x + (full_width - fit_width) / 2.0,
+                            picture_position.y + (full_height - fit_height) / 2.0,
+                        );
+                        window
+                            .paint_image(
+                                Bounds::new(fit_position, gpui::size(fit_width, fit_height)),
+                                gpui::Corners::all(Pixels::ZERO),
+                                render_image.clone(),
+                                0,
+                                false,
+                            )
+                            .log_err();
+                    } else {
+                        window
+                            .paint_image(
+                                picture_bounds,
+                                gpui::Corners::all(Pixels::ZERO),
+                                render_image.clone(),
+                                0,
+                                false,
+                            )
+                            .log_err();
+                    }
+                }
             }
 
             // Widget row sits immediately below the picture, at
@@ -2114,7 +2205,7 @@ fn paint_rich_content_media_widget(
         point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
     let bounds = Bounds::new(position, gpui::size(width, line_height));
 
-    let widget_bg = gpui::rgba(0x1e1e2eff);
+    let widget_bg = rich_content_widget_bg();
     let bar_track = gpui::rgba(0x45475aff);
     let bar_fill = gpui::rgba(0x89dcebff);
     let text_color = gpui::white();
@@ -2241,22 +2332,36 @@ fn paint_rich_content_media_widget(
         line.paint(point(at.x, at.y + y_offset), time_font_size, gpui::TextAlign::Left, None, window, cx).log_err();
     };
 
+    // Both glyph widths are measured the same way the time template's
+    // width already is (real shaped width, not an assumed `cell_width`)
+    // — the Nerd Font icons and their ASCII fallback (">" / "[]") don't
+    // shape to the same pixel width as each other, so reserving a flat
+    // `cell_width` on each side made the two sides' padding visibly
+    // uneven (confirmed live: the ASCII stop fallback "[]" is two
+    // characters wide, wider than the single-character ">" play
+    // fallback, so the right side's time readout sat closer to its
+    // glyph than the left side's did). Both sides now pad out from the
+    // glyph's own actual painted edge instead of a guessed one-cell box.
     let play_glyph = if is_playing { nf_pause } else { nf_play };
-    shape_and_paint(play_glyph, position, window, cx);
+    let play_glyph_width = shape_and_paint(play_glyph, position, window, cx);
 
     // Two cells of padding between the play/pause glyph and the
     // current-time readout — without it the two visually ran together
     // (glyph and time text abutting with no gap), confirmed live.
-    let current_time_position = point(position.x + cell_width * 2.0, position.y);
+    let current_time_position = point(position.x + play_glyph_width + cell_width * 2.0, position.y);
     paint_time(elapsed, current_time_position, window, cx);
 
-    // Stop glyph anchored to the trailing cell, total time immediately
-    // to its left with two cells of padding — mirrors the leading
-    // play/pause + current-time layout on the opposite end (glyph +
-    // 2-cell pad + 8-cell fixed-width time = 11 cells on each side).
-    let stop_position = point(position.x + width - cell_width, position.y);
+    // Stop glyph anchored so its right edge lands on the trailing cell,
+    // total time immediately to its left with two cells of padding —
+    // mirrors the leading play/pause + current-time layout on the
+    // opposite end.
+    let stop_glyph_width = {
+        let run = TextRun { len: nf_stop.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(nf_stop.into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None).width
+    };
+    let stop_position = point(position.x + width - cell_width.max(stop_glyph_width), position.y);
     shape_and_paint(nf_stop, stop_position, window, cx);
-    let stop_bounds = Bounds::new(stop_position, gpui::size(cell_width, line_height));
+    let stop_bounds = Bounds::new(stop_position, gpui::size(stop_glyph_width.max(cell_width), line_height));
 
     let total_time_position = point(stop_position.x - cell_width * 2.0 - time_text_width, position.y);
     paint_time(duration, total_time_position, window, cx);

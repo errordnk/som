@@ -2172,10 +2172,7 @@ impl Terminal {
         let players = self.rich_content_video_players.borrow();
         let progress = self.rich_content_video_progress.borrow();
         if let (Some(player), Some(progress)) = (players.get(&key), progress.get(&key)) {
-            if player.is_playing() {
-                player.toggle_play_pause();
-            }
-            player.seek_to_fraction(0.0, progress, |offset, len| {
+            player.stop(progress, |offset, len| {
                 self.request_audio_byte_range(session_id, file_id, offset, len);
             });
         }
@@ -2311,7 +2308,17 @@ impl Terminal {
     #[allow(clippy::type_complexity)]
     pub fn rich_content_video_placements(
         &self,
-    ) -> Vec<(u32, u32, std::sync::Arc<gpui::RenderImage>, bool, f32, std::time::Duration, std::time::Duration)> {
+        // `widget_bg_is_light`: whether the FIXED color the stopped-video
+        // stand-in image is letterboxed against (see `RichContentVideoPlayer::
+        // stop`'s own doc comment) is light — not the overall active
+        // theme's polarity. Deliberately decoupled from `theme.appearance()`:
+        // the letterbox padding color is a constant Som itself paints
+        // (`rich_content_widget_bg()` in `terminal_element.rs`), not
+        // something that currently varies WITH the theme, so the stand-in
+        // image's contrast should track THAT color specifically, wherever
+        // it's computed from.
+        widget_bg_is_light: bool,
+    ) -> Vec<(u32, u32, Option<std::sync::Arc<gpui::RenderImage>>, bool, f32, std::time::Duration, std::time::Duration, bool)> {
         let mut players = self.rich_content_video_players.borrow_mut();
         let mut out = Vec::new();
         for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
@@ -2362,17 +2369,21 @@ impl Terminal {
             if just_opened {
                 player.toggle_play_pause();
             }
-            if let Some(frame) = player.current_frame() {
-                out.push((
-                    session_id,
-                    file_id,
-                    frame,
-                    player.is_playing(),
-                    player.position_fraction(),
-                    player.elapsed(),
-                    player.duration(),
-                ));
-            }
+            // Pushed even with no frame (`current_frame()` returns
+            // `None` right after `RichContentVideoPlayer::stop` clears
+            // the display) — the control widget (play glyph, 00:00:00,
+            // an empty seek bar) still needs to paint so the user can
+            // press play again; only the picture itself disappears.
+            out.push((
+                session_id,
+                file_id,
+                player.current_frame(widget_bg_is_light),
+                player.is_playing(),
+                player.position_fraction(),
+                player.elapsed(),
+                player.duration(),
+                player.is_stopped(),
+            ));
         }
         out
     }
@@ -2383,9 +2394,28 @@ impl Terminal {
     /// reason video's other fields/methods are.
     #[cfg(target_os = "windows")]
     pub fn toggle_rich_content_video_playback(&self, session_id: u32, file_id: u32) {
-        if let Some(player) = self.rich_content_video_players.borrow().get(&(session_id, file_id)) {
+        let key = (session_id, file_id);
+        let players = self.rich_content_video_players.borrow();
+        let Some(player) = players.get(&key) else { return };
+        // The decode thread has nothing left to produce without a seek
+        // first (real end-of-stream reached) — a plain toggle here would
+        // just flip `playing` back to true with no new frames ever
+        // arriving to advance `playback_started_at`'s PTS anchor, which
+        // showed up live as the elapsed-time readout climbing forever
+        // past the video's own duration after clicking play again post-
+        // EOF. Route this case through the same "seek to start" path
+        // `stop_rich_content_video_playback` already uses instead.
+        if player.is_finished() && !player.is_playing() {
+            let progress = self.rich_content_video_progress.borrow();
+            if let Some(progress) = progress.get(&key) {
+                player.seek_to_fraction(0.0, progress, |offset, len| {
+                    self.request_audio_byte_range(session_id, file_id, offset, len);
+                });
+            }
             player.toggle_play_pause();
+            return;
         }
+        player.toggle_play_pause();
     }
 
     /// Seeks the video placement at `(session_id, file_id)` to `fraction`
@@ -6981,8 +7011,8 @@ mod tests {
             // needed in a headless test with no real paint pass.
             terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
 
-            let placements = terminal.update(cx, |term, _| term.rich_content_video_placements());
-            if let Some((session_id, _file_id, render_image, _is_playing, _position_fraction, _elapsed, _duration)) =
+            let placements = terminal.update(cx, |term, _| term.rich_content_video_placements(false));
+            if let Some((session_id, _file_id, Some(render_image), _is_playing, _position_fraction, _elapsed, _duration, _is_stopped)) =
                 placements.into_iter().next()
             {
                 saw_placement = true;

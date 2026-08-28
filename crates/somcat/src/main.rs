@@ -519,25 +519,54 @@ fn send_range_chunks(
     Ok(())
 }
 
-/// Spawns the background thread that services Som's byte-range requests
-/// (`som_srv::protocol::SrvRequest::RequestByteRange`, arriving unsolicited
-/// on `channel` — see `srv_channel::Incoming`'s doc comment for why a
-/// `PutChunk`-sending connection must also expect to read these) for the
-/// rest of this process's lifetime — the direct replacement for the OLD
-/// APC/base91 `Query` mechanism (`ESC _ Q ... ESC \` off stdin), which has
-/// been deleted (see `terminal::rich_content_transport`'s module doc
-/// comment).
-///
-/// Returns a `(stop_flag, JoinHandle)` pair — the flag is checked between
-/// reads, but a thread parked in a blocking `read_incoming` call won't
-/// observe it until the daemon sends something or the connection closes;
-/// `stream_file` sets it once the main sequential loop finishes but
-/// deliberately does NOT join the handle, since `somcat`'s process exits
-/// right after the audio/video path's caller returns regardless, which
-/// tears this thread (and its connection) down along with it.
-fn spawn_byte_range_responder(
+/// Sends `file[range_offset .. range_offset + range_len)` as
+/// [`CHUNK_SIZE`]-sized `SrvRequest::PutChunk` messages over `channel` —
+/// the file-backed counterpart to [`send_range_chunks`], used for video/
+/// audio (see [`stream_file_from_disk`]'s own doc comment for why those
+/// two content types read from disk instead of a fully-materialized
+/// in-memory buffer). `file` is read via `Seek`+`Read` rather than kept
+/// at a running cursor, since range requests (from [`spawn_byte_range_
+/// responder_from_disk`]) can interleave with the sequential send loop
+/// on a SEPARATE thread sharing the same `Mutex<File>`.
+#[allow(clippy::too_many_arguments)]
+fn send_range_chunks_from_disk(
+    channel: &srv_channel::SrvChannel,
+    file: &std::sync::Mutex<std::fs::File>,
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
+    (session_id, file_id): SrpIds,
+    total_size: u64,
+    range_offset: u64,
+    range_len: u64,
+) -> Result<(), String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let range_len = range_len.min(total_size.saturating_sub(range_offset));
+    let srv_content_type = srv_channel::to_srv_content_type(content_type);
+    let srv_metadata = srv_channel::to_srv_metadata(metadata);
+    let mut offset = range_offset;
+    let end = range_offset + range_len;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while offset < end {
+        let piece_len = (end - offset).min(CHUNK_SIZE as u64) as usize;
+        {
+            let mut guard = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.seek(SeekFrom::Start(offset)).map_err(|e| format!("seeking to {offset}: {e}"))?;
+            guard.read_exact(&mut buf[..piece_len]).map_err(|e| format!("reading {piece_len} bytes at {offset}: {e}"))?;
+        }
+        channel.put_chunk(session_id, file_id, offset, buf[..piece_len].to_vec(), total_size, srv_content_type, srv_metadata)?;
+        offset += piece_len as u64;
+    }
+    Ok(())
+}
+
+/// File-backed counterpart to [`spawn_byte_range_responder`] — services
+/// `RequestByteRange` by seeking/reading `file` instead of slicing an
+/// in-memory buffer, so it works correctly once the sequential sender no
+/// longer holds the whole file resident (see [`stream_file_from_disk`]).
+fn spawn_byte_range_responder_from_disk(
     channel: std::sync::Arc<srv_channel::SrvChannel>,
-    bytes: std::sync::Arc<Vec<u8>>,
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
     ids: SrpIds,
@@ -559,14 +588,82 @@ fn spawn_byte_range_responder(
                     offset,
                     len,
                 })) if (session_id, file_id) == ids => {
-                    let _ = send_range_chunks(&channel, &bytes, content_type, metadata, ids, total_size, offset, len);
+                    let _ = send_range_chunks_from_disk(&channel, &file, content_type, metadata, ids, total_size, offset, len);
                 },
-                Ok(_) => continue, // unrelated/unexpected message — ignore, keep waiting
-                Err(_) => return,  // connection gone
+                Ok(_) => continue,
+                Err(_) => return,
             }
         }
     });
     (stop, handle)
+}
+
+/// Streams `path` (a video or audio file) to Som over SRP by reading it
+/// in [`CHUNK_SIZE`]-sized pieces off disk, instead of [`std::fs::read`]-
+/// ing the whole file into memory first — the fix for a real, live-
+/// measured bug: a 15GB movie file used to take ~15 minutes to start
+/// playing in Som, because the OLD `stream_file` read the entire file
+/// into a `Vec<u8>` before a single `PutChunk` went out, and every
+/// downstream stage (`som-srv`'s cache writer, `RichContentCache`,
+/// `Terminal::rich_content_video_placements`'s open gate, `GrowingFileStream`'s
+/// FFmpeg probe) was ALREADY fully progressive and ready to start playing
+/// from the very first byte — the whole-file read was the only actual
+/// bottleneck. `total_size` comes from `std::fs::metadata` (a cheap
+/// `stat`), NOT from a fully-read buffer's length, so it's known
+/// immediately without reading any file content at all.
+///
+/// Images/GIF (`stream_file`'s other branches) deliberately keep the
+/// old `std::fs::read`-into-memory model: they need the whole buffer
+/// anyway for metadata probing (`gif_metadata`/`static_image_metadata`
+/// both operate on an in-memory byte slice) and are typically small
+/// enough that this was never the bottleneck those formats have.
+fn stream_file_from_disk(
+    path: &str,
+    channel: srv_channel::SrvChannel,
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
+    ids: SrpIds,
+) -> Result<(), String> {
+    let total_size = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?.len();
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;
+    let shared_file = std::sync::Arc::new(std::sync::Mutex::new(file));
+    let shared_channel = std::sync::Arc::new(channel);
+
+    let (stop, handle) = spawn_byte_range_responder_from_disk(
+        shared_channel.clone(),
+        shared_file.clone(),
+        content_type,
+        metadata,
+        ids,
+        total_size,
+    );
+
+    // Non-faststart MP4 has its `moov` atom at the end of the file —
+    // FFmpeg's format probe on Som's side (`GrowingFileStream::seek`,
+    // `SeekFrom::End`) blocks until bytes near the true end are on disk,
+    // which the sequential loop below won't reach until nearly the
+    // whole file has streamed in. Firing this range request FIRST (via
+    // the responder thread machinery already used for real seeks) lets
+    // the probe complete promptly regardless of container layout. MKV's
+    // EBML metadata is normally near the front and doesn't need this,
+    // but doing it unconditionally for `.mp4` is simplest and harmless:
+    // the sequential loop below naturally skips re-covering this range
+    // once it catches up (`SrvCache::put_chunk`'s watermark logic is
+    // idempotent for offsets at or before the current watermark).
+    if content_type == terminal::rich_content_transport::ContentType::Video
+        && std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref()
+            == Some("mp4")
+    {
+        const TAIL_FETCH_LEN: u64 = 4 * 1024 * 1024;
+        let tail_offset = total_size.saturating_sub(TAIL_FETCH_LEN);
+        let _ =
+            send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata, ids, total_size, tail_offset, TAIL_FETCH_LEN);
+    }
+
+    let result = send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata, ids, total_size, 0, total_size);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(handle);
+    result
 }
 
 /// Streams `path` to Som over SRP, then prints a placeholder grid
@@ -617,7 +714,6 @@ fn stream_file(path: &str) -> Result<(), String> {
         None => return Err("file has no extension, can't infer content type".to_string()),
     };
 
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
     let ids = new_ids();
 
     // One connection to som-srv's binary side channel for this whole
@@ -638,23 +734,12 @@ fn stream_file(path: &str) -> Result<(), String> {
         // content type; audio adopted the same order first.
         print_audio_placeholder_grid(session_id, file_id)?;
 
-        let total_size = bytes.len() as u64;
-        let shared_bytes = std::sync::Arc::new(bytes);
-        let shared_channel = std::sync::Arc::new(channel);
-        let (stop, handle) =
-            spawn_byte_range_responder(shared_channel.clone(), shared_bytes.clone(), content_type, metadata, ids, total_size);
-        let result = stream_bytes(&shared_channel, &shared_bytes, content_type, metadata, ids);
-        // The responder thread blocks reading `shared_channel` for a
-        // `RequestByteRange` that may never arrive — `stop` is checked
-        // between reads, but a thread parked in a blocking read won't
-        // observe it until the daemon sends something or the connection
-        // closes. Not joining here is deliberate: `main()` returns (and
-        // the process exits) right after this function does for the
-        // audio path, which tears the thread (and its connection) down
-        // along with it.
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(handle);
-        return result;
+        // Streams off disk in bounded chunks rather than reading the
+        // whole file into memory first — see `stream_file_from_disk`'s
+        // own doc comment for why (a real, live-measured ~15-minute
+        // startup delay on a 15GB file, fixed by not materializing the
+        // whole file before the first byte goes out).
+        return stream_file_from_disk(path, channel, content_type, metadata, ids);
     }
 
     if content_type == ContentType::Video {
@@ -687,19 +772,10 @@ fn stream_file(path: &str) -> Result<(), String> {
         // itself fully progressive) was the actual bottleneck.
         print_video_placeholder_grid(session_id, file_id, VIDEO_PLACEHOLDER_WIDTH_PX, VIDEO_PLACEHOLDER_HEIGHT_PX)?;
 
-        let total_size = bytes.len() as u64;
-        let shared_bytes = std::sync::Arc::new(bytes);
-        let shared_channel = std::sync::Arc::new(channel);
-        // Same keep-alive-and-answer-byte-range-requests shape as audio
-        // above — video seeking needs the same "give me bytes further
-        // into the file than what's arrived sequentially" capability.
-        let (stop, handle) =
-            spawn_byte_range_responder(shared_channel.clone(), shared_bytes.clone(), content_type, metadata, ids, total_size);
-        let result = stream_bytes(&shared_channel, &shared_bytes, content_type, metadata, ids);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(handle);
-        return result;
+        return stream_file_from_disk(path, channel, content_type, metadata, ids);
     }
+
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
 
     let (width_px, height_px, is_animated) =
         if content_type == ContentType::Gif { gif_metadata(&bytes)? } else { static_image_metadata(&bytes)? };

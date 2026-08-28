@@ -752,21 +752,28 @@ set(OPTIONS "${OPTIONS} ${OPTIONS_CROSS}")
 # demuxer), mkv/webm (`matroska`), and avi (`avi`) — see `somcat`'s own
 # content-type detection (`crates/somcat/src/main.rs`, `mp4|mkv|avi` ->
 # `ContentType::Video`) for the exact container list — and only ever
-# needs to decode the codecs `rich_content_transport::VideoCodec`
+# needs to decode the picture codecs `rich_content_transport::VideoCodec`
 # actually models (h264/hevc/vp9/av1/mpeg4; `Unknown` has no decoder of
-# its own). `--disable-everything` first, then selectively re-enabling
-# just these demuxers/decoders (their own parsers/dependencies are
-# pulled in automatically by FFmpeg's `configure`-time `select`
-# mechanism, not listed explicitly here) — everything else FFmpeg can
-# decode (theora, prores, vc1, mjpeg, the dozens of legacy codecs, every
-# encoder, avdevice, avfilter, network protocols) never gets compiled at
-# all, not just excluded from linking. This is the actual size-reduction
-# lever `avcodec`'s own bulk comes from (fewer than a dozen decoders
-# compiled in versus FFmpeg's full default catalog of several hundred).
+# its own), PLUS the audio codecs Som's video player also decodes for the
+# embedded audio track (aac/mp3/opus/flac covers AAC-in-MP4, the most
+# common case, plus the usual MKV audio choices; ac3/eac3 added
+# specifically for Dolby Digital / Dolby Digital Plus tracks, common on
+# ripped movie files — see `rich_content_video_player.rs`'s audio-
+# decoder-open call alongside its existing video one). `--disable-
+# everything` first, then selectively re-enabling just these demuxers/
+# decoders (their own parsers/dependencies are pulled in automatically by
+# FFmpeg's `configure`-time `select` mechanism, not listed explicitly
+# here) — everything else FFmpeg can decode (theora, prores, vc1, mjpeg,
+# dts/vorbis and the rest of the audio catalog, the dozens of legacy
+# video codecs, every encoder, avdevice, avfilter, network protocols)
+# never gets compiled at all, not just excluded from linking. This is the
+# actual size-reduction lever `avcodec`'s own bulk comes from (fewer than
+# a dozen decoders compiled in versus FFmpeg's full default catalog of
+# several hundred).
 set(OPTIONS "${OPTIONS} --disable-everything")
 set(OPTIONS "${OPTIONS} --enable-demuxer=mov,matroska,avi")
-set(OPTIONS "${OPTIONS} --enable-decoder=h264,hevc,vp9,av1,mpeg4")
-set(OPTIONS "${OPTIONS} --enable-parser=h264,hevc,vp9,av1,mpeg4video")
+set(OPTIONS "${OPTIONS} --enable-decoder=h264,hevc,vp9,av1,mpeg4,aac,mp3,opus,flac,ac3,eac3")
+set(OPTIONS "${OPTIONS} --enable-parser=h264,hevc,vp9,av1,mpeg4video,aac,mpegaudio,opus,flac,ac3")
 # No --enable-protocol=file: Som's video player never opens a file path
 # through FFmpeg's own I/O layer — it always reads through a custom
 # `AVIOContext` (`GrowingFileStream`, `format::input_from_stream`, see

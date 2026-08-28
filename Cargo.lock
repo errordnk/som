@@ -7892,6 +7892,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "assets",
  "async-channel 2.5.0",
  "base64 0.22.1",
  "collections",

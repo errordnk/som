@@ -27,6 +27,7 @@ doctest = false
 async-channel.workspace = true
 alacritty_terminal.workspace = true
 anyhow.workspace = true
+assets.workspace = true
 base64.workspace = true
 collections.workspace = true
 cpal.workspace = true
@@ -60,7 +61,7 @@ som_srv.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
 
 [dev-dependencies]
 dirs.workspace = true

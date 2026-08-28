@@ -7197,7 +7197,7 @@ dependencies = [
 
 [[package]]
 name = "som"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -7259,7 +7259,7 @@ dependencies = [
 
 [[package]]
 name = "som_srv"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

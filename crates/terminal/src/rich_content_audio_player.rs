@@ -387,6 +387,25 @@ impl RichContentAudioPlayer {
         self.playing.load(Ordering::Acquire)
     }
 
+    /// `true` once decoding has consumed the whole file AND playback has
+    /// caught up to the very end of it (not merely "decoding is done but
+    /// there's still unplayed PCM buffered ahead") — the same "genuinely
+    /// reached the end" signal video's own `is_finished` provides, used
+    /// by `Terminal::rich_content_audio_placements` to trigger an
+    /// automatic stop (freeing this player's resources) the moment
+    /// playback naturally ends, not just when the user clicks the stop
+    /// icon. `duration_ms` mirrors every other method here that needs a
+    /// total-frame count (see [`Self::position_fraction`]'s own doc
+    /// comment for why it's a caller-supplied parameter, not tracked
+    /// internally).
+    pub fn is_finished(&self, duration_ms: u32) -> bool {
+        if !self.shared.decode_finished.load(Ordering::Acquire) {
+            return false;
+        }
+        let total_frames = self.total_frames_for(duration_ms);
+        total_frames > 0 && self.position_frames.load(Ordering::Acquire) >= total_frames
+    }
+
     pub fn toggle_play_pause(&self) {
         self.playing.fetch_xor(true, Ordering::AcqRel);
     }

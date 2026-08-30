@@ -37,6 +37,23 @@ pub enum Incoming {
 
 pub struct SrvChannel {
     connection: PipeConnection,
+    // Guards `PipeConnection::write_message` specifically — `PutChunk`
+    // messages reach this connection from TWO different OS threads: the
+    // main sequential-send loop (`stream_file_from_disk`) AND the
+    // byte-range-responder thread (`spawn_byte_range_responder_from_disk`,
+    // triggered by a real user seek), both calling `put_chunk` on the
+    // SAME `Arc<SrvChannel>`. `write_message` itself does two separate
+    // `write_all` calls (a 4-byte length prefix, then the payload) with
+    // no internal locking — two threads racing here can interleave their
+    // length-prefix and payload bytes on the wire, corrupting BOTH
+    // messages' framing (and everything sent afterward on this
+    // connection, since framing never resynchronizes). Confirmed live as
+    // the actual cause of "seeking does nothing" on a video still
+    // mid-download: the seek's `RequestByteRange` reply raced the
+    // sequential sender's own `PutChunk`s and got silently lost in the
+    // corrupted stream. Reads never race (only the responder thread ever
+    // reads), so only the write path needs this.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl SrvChannel {
@@ -70,7 +87,7 @@ impl SrvChannel {
             other => return Err(format!("expected Handshake as som-srv's first reply, got {other:?}")),
         }
 
-        Ok(Self { connection })
+        Ok(Self { connection, write_lock: std::sync::Mutex::new(()) })
     }
 
     /// Sends one `PutChunk` — fire-and-forget from this side (no
@@ -87,6 +104,7 @@ impl SrvChannel {
         content_type: som_srv::protocol::ContentType,
         metadata: som_srv::protocol::ContentMetadata,
     ) -> Result<(), String> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         send(&self.connection, &SrvRequest::PutChunk { session_id, file_id, offset, data, total_size, content_type, metadata })
     }
 
@@ -140,12 +158,16 @@ pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetada
         M::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
             som_srv::protocol::ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms }
         },
-        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec } => som_srv::protocol::ContentMetadata::Video {
-            width_px,
-            height_px,
-            fps_numerator,
-            fps_denominator,
-            codec: to_srv_video_codec(codec),
+        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec, audio_stream_index, subtitle_stream_index } => {
+            som_srv::protocol::ContentMetadata::Video {
+                width_px,
+                height_px,
+                fps_numerator,
+                fps_denominator,
+                codec: to_srv_video_codec(codec),
+                audio_stream_index,
+                subtitle_stream_index,
+            }
         },
         M::Markdown => som_srv::protocol::ContentMetadata::Markdown,
     }

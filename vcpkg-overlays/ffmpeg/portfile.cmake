@@ -774,6 +774,23 @@ set(OPTIONS "${OPTIONS} --disable-everything")
 set(OPTIONS "${OPTIONS} --enable-demuxer=mov,matroska,avi")
 set(OPTIONS "${OPTIONS} --enable-decoder=h264,hevc,vp9,av1,mpeg4,aac,mp3,opus,flac,ac3,eac3")
 set(OPTIONS "${OPTIONS} --enable-parser=h264,hevc,vp9,av1,mpeg4video,aac,mpegaudio,opus,flac,ac3")
+# `--disable-everything` also disables every hwaccel entry point (a
+# SEPARATE `configure`-time category from `--enable-decoder=` — a plain
+# decoder like `h264` being enabled does NOT imply its D3D11VA/DXVA2/
+# NVDEC-backed hwaccel variant is compiled in too), despite the base
+# D3D11VA/DXVA2/NVDEC device-context API itself already being enabled
+# on Windows (`--enable-d3d11va --enable-dxva2` etc. above, which
+# provides `av_hwdevice_ctx_create` and friends). Confirmed live: with
+# only the decoder enabled, `AVCodecContext::get_format`'s callback
+# never receives `AV_PIX_FMT_D3D11` in its candidate list at all — the
+# codec has no hwaccel wired to it, so hardware decode silently never
+# activates despite `hw_device_ctx` being set correctly on Som's side.
+# Enabling these specific hwaccel/decoder pairs (Som's own picture
+# codec list from the `--enable-decoder=` line above) is what actually
+# lets `get_format` offer `AV_PIX_FMT_D3D11` for h264/hevc/vp9/av1.
+if(VCPKG_TARGET_IS_WINDOWS)
+    set(OPTIONS "${OPTIONS} --enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,vp9_d3d11va,vp9_d3d11va2,av1_d3d11va,av1_d3d11va2")
+endif()
 # No --enable-protocol=file: Som's video player never opens a file path
 # through FFmpeg's own I/O layer — it always reads through a custom
 # `AVIOContext` (`GrowingFileStream`, `format::input_from_stream`, see

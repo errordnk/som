@@ -43,6 +43,12 @@ fn extension_for(content_type: ContentType) -> &'static str {
 struct CacheEntry {
     file: std::fs::File,
     contiguous_len: u64,
+    /// The lowest offset such that everything from here through
+    /// `total_size` has arrived — see `SrvResponse::Progress::
+    /// tail_available_from`'s own doc comment for why this exists
+    /// alongside `contiguous_len` instead of being folded into it.
+    /// Starts at `total_size` (nothing confirmed) and only ever shrinks.
+    tail_available_from: u64,
     total_size: u64,
     content_type: ContentType,
     metadata: ContentMetadata,
@@ -153,7 +159,15 @@ impl SrvCache {
             let file = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
             inner.entries.insert(
                 key,
-                CacheEntry { file, contiguous_len: 0, total_size, content_type, metadata, pending_ranges: Vec::new() },
+                CacheEntry {
+                    file,
+                    contiguous_len: 0,
+                    tail_available_from: total_size,
+                    total_size,
+                    content_type,
+                    metadata,
+                    pending_ranges: Vec::new(),
+                },
             );
         }
 
@@ -166,6 +180,8 @@ impl SrvCache {
 
         let chunk_end = offset + data.len() as u64;
         let watermark_before = entry.contiguous_len;
+        let tail_before = entry.tail_available_from;
+        let pending_before = entry.pending_ranges.clone();
         if offset <= entry.contiguous_len {
             entry.contiguous_len = entry.contiguous_len.max(chunk_end);
             loop {
@@ -178,14 +194,54 @@ impl SrvCache {
         } else {
             entry.pending_ranges.push((offset, chunk_end));
         }
+        // Same gap-tolerant merge as `contiguous_len` above, but growing
+        // BACKWARD from `total_size` instead of forward from 0 — see
+        // `tail_available_from`'s own doc comment for why this needs to
+        // exist independently rather than being derived from
+        // `contiguous_len`. Deliberately NON-destructive (unlike the
+        // front merge above, this loop never calls `pending_ranges.
+        // remove`) — `pending_ranges` is the SAME list the front merge
+        // reads, and a range can be exactly what BOTH watermarks need to
+        // advance through (a chunk that happens to bridge toward the
+        // tail today might just as easily be the missing piece a later,
+        // still-arriving chunk needs to bridge `contiguous_len` through
+        // from the front) — removing it here would make it invisible to
+        // that later front-side merge. Confirmed live as a real bug: an
+        // out-of-order tail chunk's own `put_chunk` call consumed the
+        // pending range a SUBSEQUENT front-filling chunk needed to see,
+        // leaving `contiguous_len` stuck one merge short.
+        if chunk_end >= entry.tail_available_from {
+            entry.tail_available_from = entry.tail_available_from.min(offset);
+            loop {
+                let shrink =
+                    entry.pending_ranges.iter().find(|&&(start, end)| end >= entry.tail_available_from && start < entry.tail_available_from).map(|&(start, _)| start);
+                let Some(start) = shrink else {
+                    break;
+                };
+                entry.tail_available_from = start;
+            }
+        }
 
-        if entry.contiguous_len != watermark_before {
+        if entry.contiguous_len != watermark_before
+            || entry.tail_available_from != tail_before
+            || entry.pending_ranges != pending_before
+        {
             let contiguous_len = entry.contiguous_len;
+            let tail_available_from = entry.tail_available_from;
+            let pending_ranges = entry.pending_ranges.clone();
             let total_size = entry.total_size;
             if let Some(subscribers) = inner.subscribers.get(&key) {
                 for subscriber in subscribers {
-                    let _ =
-                        subscriber(SrvResponse::Progress { session_id, file_id, contiguous_len, total_size, content_type, metadata });
+                    let _ = subscriber(SrvResponse::Progress {
+                        session_id,
+                        file_id,
+                        contiguous_len,
+                        tail_available_from,
+                        pending_ranges: pending_ranges.clone(),
+                        total_size,
+                        content_type,
+                        metadata,
+                    });
                 }
             }
         }
@@ -212,6 +268,8 @@ impl SrvCache {
                 session_id,
                 file_id,
                 contiguous_len: entry.contiguous_len,
+                tail_available_from: entry.tail_available_from,
+                pending_ranges: entry.pending_ranges.clone(),
                 total_size: entry.total_size,
                 content_type: entry.content_type,
                 metadata: entry.metadata,
@@ -354,20 +412,106 @@ mod tests {
                 1,
                 2,
                 Arc::new(move |response| {
+                    // A `Progress` push now fires whenever EITHER
+                    // watermark moves (see `tail_available_from`'s own
+                    // doc comment) — only record a NEW `contiguous_len`
+                    // value here, not every push, so this test can stay
+                    // focused on `contiguous_len`'s own forward-only
+                    // watermark without being tripped up by a push that
+                    // fired purely because `tail_available_from` moved.
                     if let SrvResponse::Progress { contiguous_len, .. } = response {
-                        observed.lock().unwrap().push(contiguous_len);
+                        let mut observed = observed.lock().unwrap();
+                        if observed.last().copied().unwrap_or(0) != contiguous_len {
+                            observed.push(contiguous_len);
+                        }
                     }
                     Ok(())
                 }),
             );
         }
 
-        // Second chunk arrives first — out of order.
+        // Second chunk arrives first — out of order relative to
+        // `contiguous_len` (which only ever grows from 0), though NOT
+        // out of order relative to `tail_available_from` (which grows
+        // from `total_size` backward) — this chunk happens to also be
+        // the file's tail, so a `Progress` push DOES fire, just not one
+        // that advances `contiguous_len`; this test only asserts on
+        // `contiguous_len`, see `put_chunk_tracks_tail_available_from_
+        // independently_of_contiguous_len` for the tail watermark's own
+        // coverage.
         cache.put_chunk(&dir, 1, 2, 5, b"world", 10, ContentType::Gif, test_metadata()).unwrap();
-        assert_eq!(*observed.lock().unwrap(), Vec::<u64>::new(), "an out-of-order chunk must not advance the watermark");
+        assert_eq!(*observed.lock().unwrap(), Vec::<u64>::new(), "an out-of-order chunk must not advance contiguous_len");
 
         cache.put_chunk(&dir, 1, 2, 0, b"hello", 10, ContentType::Gif, test_metadata()).unwrap();
         assert_eq!(*observed.lock().unwrap(), vec![10], "the watermark must jump straight to 10 once the gap is filled");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Companion to `put_chunk_tracks_contiguous_len_across_out_of_order_
+    /// chunks` — covers `tail_available_from`'s own independent
+    /// backward-growing watermark, added for the live-confirmed MKV bug
+    /// (`SrvResponse::Progress::tail_available_from`'s own doc comment
+    /// has the full story): a chunk landing at the file's tail must
+    /// advance `tail_available_from` immediately, even though the exact
+    /// same chunk, being out of order from the FRONT, correctly does
+    /// nothing to `contiguous_len`.
+    #[test]
+    fn put_chunk_tracks_tail_available_from_independently_of_contiguous_len() {
+        let dir = std::env::temp_dir().join(format!("som-srv-cache-test-{}", uuid::Uuid::new_v4()));
+        let cache = SrvCache::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let observed = observed.clone();
+            cache.subscribe(
+                1,
+                2,
+                Arc::new(move |response| {
+                    // Same dedup as the companion test above — a push now
+                    // fires whenever EITHER watermark moves, so only
+                    // record a NEW `tail_available_from` value, not every
+                    // push (the leading chunk below legitimately advances
+                    // `contiguous_len` without touching `tail_available_
+                    // from`, which would otherwise show up here as a
+                    // spurious repeat of the unchanged value).
+                    if let SrvResponse::Progress { tail_available_from, total_size, .. } = response {
+                        let mut observed = observed.lock().unwrap();
+                        if observed.last().copied().unwrap_or(total_size) != tail_available_from {
+                            observed.push(tail_available_from);
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+        }
+
+        // Leading chunk first — advances `contiguous_len` (offset 0),
+        // but doesn't touch the tail (chunk_end=5 != total_size=15), so
+        // `tail_available_from` itself (starting at total_size=15) must
+        // not move.
+        cache.put_chunk(&dir, 1, 2, 0, b"hello", 15, ContentType::Gif, test_metadata()).unwrap();
+        assert_eq!(*observed.lock().unwrap(), Vec::<u64>::new(), "a leading chunk must not advance tail_available_from");
+
+        // Tail chunk arrives NEXT (with a gap still open in the middle,
+        // offset 5..10 unwritten) — offset 10, length 5, chunk_end ==
+        // total_size (15) — must advance tail_available_from to 10
+        // immediately, a sequential send starting from 0 would still be
+        // nowhere near this offset.
+        cache.put_chunk(&dir, 1, 2, 10, b"!!!!!", 15, ContentType::Gif, test_metadata()).unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![10], "a chunk touching the tail must advance tail_available_from immediately");
+
+        // Middle chunk connects the leading and tail chunks already on
+        // disk — since it's contiguous with BOTH `contiguous_len` (which
+        // reaches offset 5) and the tail chunk (which starts at offset
+        // 10), it advances `tail_available_from` down to its own start
+        // (5) directly — there's no gap left in `pending_ranges` to
+        // additionally merge through here, since the earlier tail chunk
+        // already got folded in when IT arrived (see the assertion just
+        // above). (`contiguous_len` itself also reaches 15 here — not
+        // this test's concern, see the companion test.)
+        cache.put_chunk(&dir, 1, 2, 5, b"world", 15, ContentType::Gif, test_metadata()).unwrap();
+        assert_eq!(*observed.lock().unwrap(), vec![10, 5], "tail_available_from must advance to the connecting chunk's own start");
 
         std::fs::remove_dir_all(&dir).ok();
     }

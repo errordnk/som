@@ -33,12 +33,64 @@ use terminal::kitty_graphics_placeholder;
 const CHUNK_SIZE: usize = 65536;
 
 fn main() {
+    // somcat links ffmpeg-next/ffmpeg-sys-next directly (see `video_metadata`
+    // below) — as its own OS process, it needs the same DLL-search-path
+    // wiring `som.exe` does for its embedded video playback, since the two
+    // are independent processes and neither's DLL search path is inherited
+    // by the other.
+    #[cfg(target_os = "windows")]
+    terminal::rich_content_video_player::ensure_ffmpeg_extracted_and_wired();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let explicit_srp = args.first().map(String::as_str) == Some("--srp");
-    let path_arg = if explicit_srp { args.get(1) } else { args.first() };
-    let Some(path) = path_arg else {
-        eprintln!("usage: somcat <file>  (or: somcat --srp <file>)");
+    // `-a <N>` selects which of the container's audio streams to decode,
+    // `-s <N>` which subtitle stream to render (0-based, in the order
+    // FFmpeg's demuxer enumerates each kind) — only meaningful for video
+    // today, since audio-only content (.mp3/.flac) has exactly one
+    // stream to begin with and carries no subtitles at all. Without
+    // `-a`, video always used `ictx.streams().best(Type::Audio)`,
+    // FFmpeg's own "most likely the main track" heuristic — usually
+    // correct, but real multi-track files (commentary tracks, multiple
+    // dub languages) have no way to pick a DIFFERENT one. `-s` has no
+    // such heuristic fallback: subtitles default to OFF (`None`) unless
+    // explicitly requested, matching every other player-widget's own
+    // opt-in convention. Both parsed here (not left to the flags'
+    // position relative to `--srp`/the path) so `somcat -a 1 -s 0 --srp
+    // file.mkv`, `somcat --srp -a 1 file.mkv -s 0`, and every other
+    // ordering all work identically — these are modifier flags, not
+    // positional.
+    let mut audio_stream_index: Option<u32> = None;
+    let mut subtitle_stream_index: Option<u32> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-a" || arg == "-s" {
+            let Some(value) = iter.next() else {
+                eprintln!("usage: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] [--srp] <file>");
+                std::process::exit(2);
+            };
+            let parsed = value.parse::<u32>();
+            match (arg.as_str(), parsed) {
+                ("-a", Ok(index)) => audio_stream_index = Some(index),
+                ("-s", Ok(index)) => subtitle_stream_index = Some(index),
+                (flag, Err(_)) => {
+                    eprintln!("somcat: {flag} expects a non-negative integer stream index, got {value:?}");
+                    std::process::exit(2);
+                },
+                _ => unreachable!(),
+            }
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    let explicit_srp = positional.first().copied() == Some("--srp");
+    let path_arg = if explicit_srp { positional.get(1) } else { positional.first() };
+    let Some(&path) = path_arg else {
+        eprintln!(
+            "usage: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] <file>  \
+             (or: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] --srp <file>)"
+        );
         std::process::exit(2);
     };
 
@@ -70,7 +122,7 @@ fn main() {
         eprint!("somcat: panicked: {info}\r\n");
     }));
 
-    let result = stream_file(path);
+    let result = stream_file(path, audio_stream_index, subtitle_stream_index);
     drop(raw_guard);
     if let Err(err) = result {
         eprintln!("somcat: failed to stream {path}: {err}");
@@ -172,6 +224,78 @@ fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
     };
 
     Ok((sample_rate, channels, bits_per_sample, duration_ms))
+}
+
+/// Probes `path`'s real picture size/frame rate/codec via FFmpeg —
+/// opens the container and reads its header (resolving stream
+/// parameters from the header alone) without decoding a single frame.
+/// `terminal` already links `ffmpeg-next` on Windows (the only platform
+/// with an embedded FFmpeg today — see `crates/assets/src/assets.rs`'s
+/// own doc comment), and `somcat` already depends on `terminal`, so
+/// this needs no new dependency of its own.
+///
+/// Reads through a plain `std::fs::File` wrapped in FFmpeg's custom-
+/// `AVIOContext` path (`StreamIo::from_read_seek` + `input_from_stream`)
+/// rather than the path-based `ffmpeg_next::format::input(path)` — this
+/// build's trimmed FFmpeg deliberately has NO `--enable-protocol=file`
+/// (see `vcpkg-overlays/ffmpeg/portfile.cmake`'s own doc comment: the
+/// video player in `terminal` never opens a path directly either, for
+/// the same reason), so `format::input(path)` fails immediately with
+/// "Protocol not found" — confirmed live via a dedicated unit test
+/// after this exact failure mode showed up as this function silently
+/// never taking effect (the caller's fallback swallowed the error).
+///
+/// Returns `Err` for anything the probe can't resolve (missing/corrupt
+/// header, a codec this build's trimmed FFmpeg doesn't decode, no video
+/// stream at all) — the caller falls back to a fixed placeholder size
+/// exactly as it did before this function existed, not a big deal for a
+/// single unprobeable file.
+#[cfg(windows)]
+fn video_metadata(
+    path: &str,
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<u32>,
+) -> Result<terminal::rich_content_transport::ContentMetadata, String> {
+    use terminal::rich_content_transport::{ContentMetadata, VideoCodec};
+
+    let _ = ffmpeg_next::init();
+    let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;
+    let stream_io = ffmpeg_next::format::context::StreamIo::from_read_seek(file)
+        .map_err(|e| format!("{path}: wrapping file for probing: {e}"))?;
+    let filename = std::path::Path::new(path).file_name().and_then(|n| n.to_str());
+    let ictx = ffmpeg_next::format::input_from_stream(stream_io, filename, None).map_err(|e| format!("probing {path}: {e}"))?;
+    let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).ok_or_else(|| format!("{path}: no video stream found"))?;
+
+    let params = stream.parameters();
+    let context_decoder =
+        ffmpeg_next::codec::context::Context::from_parameters(params).map_err(|e| format!("{path}: reading codec parameters: {e}"))?;
+    let decoder = context_decoder.decoder().video().map_err(|e| format!("{path}: opening decoder for probing: {e}"))?;
+
+    let width_px = decoder.width();
+    let height_px = decoder.height();
+    if width_px == 0 || height_px == 0 {
+        return Err(format!("{path}: decoder reported zero width/height"));
+    }
+
+    let frame_rate = stream.rate();
+    let codec = match decoder.id() {
+        ffmpeg_next::codec::Id::H264 => VideoCodec::H264,
+        ffmpeg_next::codec::Id::HEVC => VideoCodec::H265,
+        ffmpeg_next::codec::Id::VP9 => VideoCodec::Vp9,
+        ffmpeg_next::codec::Id::AV1 => VideoCodec::Av1,
+        ffmpeg_next::codec::Id::MPEG4 => VideoCodec::Mpeg4,
+        _ => VideoCodec::Unknown,
+    };
+
+    Ok(ContentMetadata::Video {
+        width_px,
+        height_px,
+        fps_numerator: frame_rate.numerator().max(0) as u32,
+        fps_denominator: frame_rate.denominator().max(0) as u32,
+        codec,
+        audio_stream_index,
+        subtitle_stream_index,
+    })
 }
 
 /// Sends `CSI 16 t` ("report cell size in pixels") and waits briefly for
@@ -638,22 +762,27 @@ fn stream_file_from_disk(
         total_size,
     );
 
-    // Non-faststart MP4 has its `moov` atom at the end of the file —
-    // FFmpeg's format probe on Som's side (`GrowingFileStream::seek`,
-    // `SeekFrom::End`) blocks until bytes near the true end are on disk,
-    // which the sequential loop below won't reach until nearly the
-    // whole file has streamed in. Firing this range request FIRST (via
-    // the responder thread machinery already used for real seeks) lets
-    // the probe complete promptly regardless of container layout. MKV's
-    // EBML metadata is normally near the front and doesn't need this,
-    // but doing it unconditionally for `.mp4` is simplest and harmless:
-    // the sequential loop below naturally skips re-covering this range
+    // Non-faststart MP4 has its `moov` atom at the end of the file, and
+    // MKV can likewise have its Cues (seek index) element near the end
+    // rather than up front — either way, FFmpeg's format probe on Som's
+    // side (`GrowingFileStream::seek`, `SeekFrom::End`) blocks until
+    // bytes near the true end are on disk, which the sequential loop
+    // below won't reach until nearly the whole file has streamed in.
+    // Confirmed live: a 16GB MKV whose Cues sit near the end took ~20
+    // minutes for the widget to start playing — the sequential send
+    // had to reach ~99% of the file before FFmpeg's probe could
+    // complete, despite MKV's EBML *header* metadata being near the
+    // front (that part was never the issue; the seek-to-end during
+    // indexing was). Originally this fired only for `.mp4`, on the
+    // assumption MKV never needs it — that assumption was wrong.
+    // Firing this range request FIRST (via the responder thread
+    // machinery already used for real seeks) lets the probe complete
+    // promptly regardless of container layout or extension. Doing it
+    // unconditionally for every video is simplest and harmless: the
+    // sequential loop below naturally skips re-covering this range
     // once it catches up (`SrvCache::put_chunk`'s watermark logic is
     // idempotent for offsets at or before the current watermark).
-    if content_type == terminal::rich_content_transport::ContentType::Video
-        && std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref()
-            == Some("mp4")
-    {
+    if content_type == terminal::rich_content_transport::ContentType::Video {
         const TAIL_FETCH_LEN: u64 = 4 * 1024 * 1024;
         let tail_offset = total_size.saturating_sub(TAIL_FETCH_LEN);
         let _ =
@@ -696,7 +825,7 @@ fn stream_file_from_disk(
 /// to happen wherever Som runs, so this process's only audio-specific
 /// work is probing header metadata (`audio_metadata`) to fill
 /// `ContentMetadata::Audio` accurately before the first chunk goes out.
-fn stream_file(path: &str) -> Result<(), String> {
+fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_index: Option<u32>) -> Result<(), String> {
     use terminal::rich_content_transport::{ContentMetadata, ContentType};
 
     let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
@@ -743,19 +872,49 @@ fn stream_file(path: &str) -> Result<(), String> {
     }
 
     if content_type == ContentType::Video {
-        // No client-side FFmpeg dependency (see this module's own
-        // reasoning below) — real width/height/fps/codec aren't known
-        // here at all, only that this IS a video file. Som's paint path
-        // already scales whatever it decodes to fit the placeholder
-        // grid's footprint (same math the image branch below relies on),
-        // so an inaccurate footprint here only affects aspect ratio
-        // until the user resizes, not correctness.
+        // Probed via FFmpeg (this process already links it transitively
+        // through `terminal` on Windows, the only platform with an
+        // embedded FFmpeg today) — reads just enough of the container's
+        // header to learn the real picture size/frame rate/codec, NOT a
+        // full decode. Getting this right matters beyond cosmetics: an
+        // inaccurate placeholder footprint (this used to always be the
+        // fixed 1280x720 fallback below) reserves the WRONG aspect ratio
+        // of terminal cells before a single frame has decoded, and
+        // Som's own paint path never shrinks a placement's reserved
+        // footprint back down once printed — a video narrower than
+        // 16:9 (e.g. cinemascope) left visible letterboxing gaps for
+        // the placement's entire lifetime, confirmed live.
+        #[cfg(windows)]
+        let metadata = video_metadata(path, audio_stream_index, subtitle_stream_index).unwrap_or(ContentMetadata::Video {
+            width_px: 0,
+            height_px: 0,
+            fps_numerator: 0,
+            fps_denominator: 0,
+            codec: terminal::rich_content_transport::VideoCodec::Unknown,
+            audio_stream_index,
+            subtitle_stream_index,
+        });
+        // No FFmpeg on non-Windows builds yet (see `video_metadata`'s own
+        // doc comment) — same fallback as a failed probe on Windows.
+        #[cfg(not(windows))]
         let metadata = ContentMetadata::Video {
             width_px: 0,
             height_px: 0,
             fps_numerator: 0,
             fps_denominator: 0,
             codec: terminal::rich_content_transport::VideoCodec::Unknown,
+            audio_stream_index,
+            subtitle_stream_index,
+        };
+        let (width_px, height_px) = match metadata {
+            ContentMetadata::Video { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
+                (width_px, height_px)
+            },
+            // Probe failed (corrupt header, codec this build's trimmed
+            // FFmpeg doesn't decode, etc.) — same graceful fallback the
+            // rest of this module already uses for a single-file
+            // failure: an inaccurate footprint, not an aborted transfer.
+            _ => (VIDEO_PLACEHOLDER_WIDTH_PX, VIDEO_PLACEHOLDER_HEIGHT_PX),
         };
         let (session_id, file_id) = ids;
         // Placeholder grid FIRST, streaming SECOND — same reversal from
@@ -770,7 +929,7 @@ fn stream_file(path: &str) -> Result<(), String> {
         // this made playback of a real several-minutes movie clip look
         // like it "never starts," when transport (not decode, which is
         // itself fully progressive) was the actual bottleneck.
-        print_video_placeholder_grid(session_id, file_id, VIDEO_PLACEHOLDER_WIDTH_PX, VIDEO_PLACEHOLDER_HEIGHT_PX)?;
+        print_video_placeholder_grid(session_id, file_id, width_px, height_px)?;
 
         return stream_file_from_disk(path, channel, content_type, metadata, ids);
     }
@@ -859,9 +1018,62 @@ fn write_raw_stdout(bytes: &[u8]) -> Result<(), String> {
 #[cfg(unix)]
 fn write_raw_stdout(bytes: &[u8]) -> Result<(), String> {
     // Unix's `Stdout` has no `LineWriter`-buffering surprise the way
-    // Windows' does for a non-console (pipe/pty) target — `write_all`
+    // Windows' does for a non-console (pyt) target — `write_all`
     // alone is sufficient here.
     use std::io::Write as _;
     let _guard = STDOUT_WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     std::io::stdout().write_all(bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// Isolates `video_metadata` from everything else `stream_file` does
+    /// (the `query_cell_size_px` PTY round-trip in particular, which
+    /// blocks forever without a real Som on the other end of stdin/
+    /// stdout — exactly what made this bug hard to reproduce outside a
+    /// real Som window in the first place) — calls it directly against a
+    /// real fixture file with no PTY/Som involved at all.
+    #[test]
+    fn video_metadata_reports_real_dimensions() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample_1920x1080.mp4");
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let metadata = video_metadata(path.to_str().unwrap()).expect("probe should succeed on a real fixture");
+        let terminal::rich_content_transport::ContentMetadata::Video { width_px, height_px, .. } = metadata else {
+            panic!("expected ContentMetadata::Video");
+        };
+        assert_eq!(width_px, 1920, "expected real probed width, not the 1280 fallback");
+        assert_eq!(height_px, 1080, "expected real probed height, not the 720 fallback");
+    }
+
+    /// Confirms the probe reads only the container header (not the
+    /// whole file) even against a real multi-gigabyte movie — this is
+    /// the exact regression the old path-based `format::input(path)`
+    /// version couldn't pass at all (it errored immediately with
+    /// "Protocol not found" rather than being slow, but the underlying
+    /// concern — this must stay a fast, header-only probe — is worth
+    /// asserting explicitly given how easy it'd be for a future change
+    /// to reintroduce a full-file read here).
+    #[test]
+    fn video_metadata_is_fast_on_a_large_real_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Ready.or.Not.2.Here.I.Come.2026.1080p.MA.WEB-DLRip.x264-HiDt_EniaHD.mkv");
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let start = std::time::Instant::now();
+        let metadata = video_metadata(path.to_str().unwrap()).expect("probe should succeed on a real large fixture");
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "probe took {elapsed:?}, expected a fast header-only read");
+        let terminal::rich_content_transport::ContentMetadata::Video { width_px, height_px, .. } = metadata else {
+            panic!("expected ContentMetadata::Video");
+        };
+        assert_eq!(width_px, 1920);
+        assert_eq!(height_px, 804);
+    }
 }

@@ -62,6 +62,13 @@ som_srv.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
+# Direct dependency (not just transitive through ffmpeg-next) — the
+# hwaccel/hw_device_ctx API surface has no safe wrapper in ffmpeg-next
+# at all (confirmed via grep of its source), so setting up D3D11VA
+# hardware decode needs raw FFI against ffmpeg-sys-next's own bindgen-
+# generated bindings (see rich_content_video_player.rs's hwaccel setup
+# for the concrete usage).
+ffmpeg-sys-next = { version = "9", default-features = false }
 
 [dev-dependencies]
 dirs.workspace = true

@@ -71,6 +71,11 @@ struct CacheEntry {
     /// ContentMetadata::Audio`'s own doc comment for where this number
     /// comes from on the sending side.
     audio_metadata: Option<(u32, u8, u8, u32)>,
+    /// From the first chunk's `ContentMetadata::Video::audio_stream_index`
+    /// (`None` for non-video content types, OR a video whose sender
+    /// never set the field — see that field's own doc comment for what
+    /// `None` means to the decoder: "use FFmpeg's own heuristic").
+    video_audio_stream_index: Option<u32>,
 }
 
 /// Per-terminal-session store of in-progress and completed rich-content
@@ -170,6 +175,10 @@ impl RichContentCache {
                         },
                         _ => None,
                     },
+                    video_audio_stream_index: match metadata {
+                        ContentMetadata::Video { audio_stream_index, .. } => audio_stream_index,
+                        _ => None,
+                    },
                 },
             );
         }
@@ -254,6 +263,10 @@ impl RichContentCache {
                         },
                         _ => None,
                     },
+                    video_audio_stream_index: match metadata {
+                        ContentMetadata::Video { audio_stream_index, .. } => audio_stream_index,
+                        _ => None,
+                    },
                 },
             );
         }
@@ -301,6 +314,32 @@ impl RichContentCache {
     /// through some other channel.
     pub fn all_known_ids(&self) -> Vec<(u32, u32)> {
         self.entries.keys().copied().collect()
+    }
+
+    /// Forgets `(session_id, file_id)` entirely — after this call,
+    /// [`Self::all_known_ids`] no longer includes it, and every accessor
+    /// above returns `None`/`0`/empty for it as if no chunk had ever
+    /// arrived. Needed by a real `clear`/screen-erase escape sequence
+    /// (`Terminal::process_event`'s `AlacTermEvent::ClearScreen` handling):
+    /// without this, EVERY placements-lookup method (`rich_content_
+    /// placements`, `rich_content_audio_placements`, `rich_content_video_
+    /// placements`) keeps discovering this id via `all_known_ids` on every
+    /// subsequent paint pass regardless of whether its placeholder cells
+    /// are still visible anywhere — `clear` erasing those cells does NOT
+    /// erase this cache entry, so a player dropped by `clear` (audio's
+    /// `stop_all_rich_content_audio_playback`, video's own teardown in
+    /// `ClearScreen` handling) simply reopens itself (and, for video,
+    /// autoplays) on the very next paint, fully inaudible-widget but
+    /// fully audible — confirmed live as exactly this symptom (video
+    /// stopped, then `clear`, and the video's own audio track started
+    /// playing again with no picture visible anywhere). The underlying
+    /// on-disk cache file is deliberately left alone (not deleted) —
+    /// `som-srv`'s own `SrvCache` is the source of truth for the bytes
+    /// themselves; this only forgets Som's in-memory bookkeeping about
+    /// that same id, mirroring how `clear` already only erases the
+    /// terminal's own grid, not any process actually still running.
+    pub fn remove(&mut self, session_id: u32, file_id: u32) {
+        self.entries.remove(&(session_id, file_id));
     }
 
     /// How many leading bytes of the file are contiguously present and
@@ -376,6 +415,17 @@ impl RichContentCache {
     /// — see [`CacheEntry::audio_metadata`]'s doc comment.
     pub fn audio_metadata(&self, session_id: u32, file_id: u32) -> Option<(u32, u8, u8, u32)> {
         self.entries.get(&(session_id, file_id))?.audio_metadata
+    }
+
+    /// The video's `-a <N>` audio-stream-index override, if the sender
+    /// set one — see [`CacheEntry::video_audio_stream_index`]'s own doc
+    /// comment. `None` at the OUTER `Option` level means no entry exists
+    /// yet for this id at all; `None` at the inner level means an entry
+    /// exists but no override was requested (use FFmpeg's own
+    /// heuristic) — both collapse to the same `None` here since callers
+    /// (`RichContentVideoPlayer::open`) treat them identically.
+    pub fn video_audio_stream_index(&self, session_id: u32, file_id: u32) -> Option<u32> {
+        self.entries.get(&(session_id, file_id))?.video_audio_stream_index
     }
 
     /// Overwrites the remembered max-column-seen for a placement — used

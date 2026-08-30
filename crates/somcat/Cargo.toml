@@ -18,6 +18,13 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+# Probes a video file's real width/height/frame-rate/codec before
+# printing its placeholder grid (`video_metadata` in main.rs) — same
+# embedded FFmpeg `terminal` already links on this platform (see
+# `crates/assets/src/assets.rs`'s own doc comment for why Windows-only
+# today), used directly here rather than through a `terminal`-crate
+# re-export since this is somcat's own probing code, not shared state.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

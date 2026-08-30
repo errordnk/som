@@ -591,6 +591,45 @@ pub enum SrvResponse {
         session_id: u32,
         file_id: u32,
         contiguous_len: u64,
+        /// The lowest offset such that every byte from here through
+        /// `total_size` has arrived — starts at `total_size` (nothing
+        /// confirmed) and shrinks toward 0 as tail bytes land. Lets a
+        /// consumer like `GrowingFileStream` (video decode's custom
+        /// `Seek`/`Read`, `crates/terminal/src/rich_content_video_player.rs`)
+        /// serve a `SeekFrom::End`-derived read from the FILE'S TAIL
+        /// once that region specifically has arrived, without waiting
+        /// for `contiguous_len` to grow all the way there from 0 —
+        /// `contiguous_len` alone can't express "the tail arrived early
+        /// out of order," since it only ever advances from the front.
+        /// Added after a live-confirmed bug: an MKV whose Cues (seek
+        /// index) sit near the end took ~20 minutes to start playing on
+        /// a 16GB file, because the existing speculative tail-fetch
+        /// (`somcat`'s `stream_file_from_disk`) wrote the tail bytes to
+        /// disk successfully, but `GrowingFileStream::read` had no way
+        /// to know they were there — it only trusted `contiguous_len`,
+        /// which doesn't move until the SEQUENTIAL send reaches that
+        /// offset.
+        tail_available_from: u64,
+        /// Out-of-order byte ranges that have arrived but aren't yet
+        /// folded into `contiguous_len` (still growing from the front)
+        /// or `tail_available_from` (still shrinking from the back) —
+        /// e.g. the response to a SEEK into the middle of a still-
+        /// downloading file, which lands nowhere near either the front
+        /// or the tail. Without this, `GrowingFileStream::read`
+        /// (`crates/terminal/src/rich_content_video_player.rs`) had no
+        /// way to know a mid-file seek target had actually arrived, and
+        /// fell back to waiting for the ORDINARY sequential download to
+        /// reach that offset naturally — confirmed live as a real bug:
+        /// seeking became "eventually works, but the wait is
+        /// proportional to how far ahead the seek target is," exactly
+        /// as if the seek's own targeted byte-range fetch had no effect
+        /// at all. Mirrors `SrvCache`'s own internal `pending_ranges`
+        /// field (`crates/som_srv/src/srv_cache.rs`) — same "expected to
+        /// stay small" assumption (a real sender streams mostly in
+        /// order; the only source of entries here is a small number of
+        /// deliberate out-of-order seek/tail fetches, not routine
+        /// reordering).
+        pending_ranges: Vec<(u64, u64)>,
         total_size: u64,
         content_type: ContentType,
         metadata: ContentMetadata,
@@ -634,7 +673,21 @@ pub enum VideoCodec {
 pub enum ContentMetadata {
     Image { width_px: u32, height_px: u32, color_bits: u8, is_animated: bool },
     Audio { sample_rate: u32, channels: u8, bits_per_sample: u8, duration_ms: u32 },
-    Video { width_px: u32, height_px: u32, fps_numerator: u32, fps_denominator: u32, codec: VideoCodec },
+    Video {
+        width_px: u32,
+        height_px: u32,
+        fps_numerator: u32,
+        fps_denominator: u32,
+        codec: VideoCodec,
+        /// Mirrors `crates/terminal/src/rich_content_transport::
+        /// ContentMetadata::Video::audio_stream_index` field-for-field —
+        /// see that field's own doc comment.
+        audio_stream_index: Option<u32>,
+        /// Mirrors `crates/terminal/src/rich_content_transport::
+        /// ContentMetadata::Video::subtitle_stream_index` field-for-field
+        /// — see that field's own doc comment.
+        subtitle_stream_index: Option<u32>,
+    },
     Markdown,
 }
 

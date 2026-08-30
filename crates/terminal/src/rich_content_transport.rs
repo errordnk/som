@@ -158,7 +158,28 @@ pub enum ContentMetadata {
     /// container formats themselves commonly express frame rate as a
     /// rational (e.g. NTSC's 30000/1001), so this doesn't lose precision
     /// converting to/from whatever a real decoder reports.
-    Video { width_px: u32, height_px: u32, fps_numerator: u32, fps_denominator: u32, codec: VideoCodec },
+    Video {
+        width_px: u32,
+        height_px: u32,
+        fps_numerator: u32,
+        fps_denominator: u32,
+        codec: VideoCodec,
+        /// Which of the container's audio streams to decode (0-based, in
+        /// FFmpeg demuxer enumeration order) — `None` means "use FFmpeg's
+        /// own `best()` heuristic," the only behavior before this field
+        /// existed. Set from `somcat`'s `-a <N>` CLI flag for a
+        /// multi-audio-track file (commentary tracks, multiple dub
+        /// languages) where the heuristic doesn't pick the track the user
+        /// actually wants.
+        audio_stream_index: Option<u32>,
+        /// Which of the container's subtitle streams to render, if any —
+        /// `None` (the default) means no subtitles at all, matching
+        /// every other player-widget's own "off unless asked" default.
+        /// Set from `somcat`'s `-s <N>` CLI flag. Unlike `audio_stream_
+        /// index`, there is no "best" heuristic fallback here — subtitles
+        /// are opt-in, never picked automatically.
+        subtitle_stream_index: Option<u32>,
+    },
     /// [`ContentType::Markdown`] carries no geometric/format metadata at
     /// all — plain text, rendered by whatever overlay eventually consumes
     /// it, not sized like a raster image or timed like audio/video.
@@ -179,6 +200,8 @@ mod tests {
             fps_numerator: 30000,
             fps_denominator: 1001,
             codec: VideoCodec::Mpeg4,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
         };
         let markdown = ContentMetadata::Markdown;
 

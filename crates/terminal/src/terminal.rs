@@ -500,6 +500,7 @@ impl TerminalBuilder {
             rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -803,6 +804,7 @@ impl TerminalBuilder {
                 rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1105,6 +1107,23 @@ pub struct Terminal {
     /// GIF decoding.
     rich_content_audio_players:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_player::RichContentAudioPlayer>>,
+    /// `(session_id, file_id)` pairs the user has explicitly clicked
+    /// "stop" on — unlike video's `stop` (which keeps its player alive
+    /// and merely shows a stand-in image), audio's stop tears the
+    /// player down outright (drops its `cpal::Stream`, decode thread,
+    /// and PCM buffer — see `Terminal::stop_rich_content_audio_playback`'s
+    /// own doc comment for why the resource actually needs to be freed,
+    /// not just paused) via `rich_content_audio_players.remove(&key)`.
+    /// This set exists ONLY to suppress `rich_content_audio_placements`'s
+    /// autoplay-on-(re)open for exactly that id on its next paint pass —
+    /// without it, the very next paint would reopen a fresh player and
+    /// immediately autoplay it, which looked like "stop didn't do
+    /// anything" when this was tried the naive way (confirmed live).
+    /// Cleared the moment the user explicitly presses play again
+    /// (`Terminal::toggle_rich_content_audio_playback`), at which point
+    /// a normal reopen-without-autoplay happens and the user's own
+    /// press is what starts it.
+    rich_content_audio_stopped: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
     /// One [`rich_content_audio_player::AudioTransferProgress`] per
     /// audio placement, created alongside its `RichContentAudioPlayer`
     /// entry in `rich_content_audio_players` and updated every time
@@ -1374,6 +1393,8 @@ impl Terminal {
             }
             AlacTermEvent::ClearScreen => {
                 self.stop_all_rich_content_audio_playback();
+                self.rich_content_audio_stopped.borrow_mut().clear();
+                self.rich_content_players.borrow_mut().clear();
                 #[cfg(target_os = "windows")]
                 {
                     // Genuinely tears every open video player down, same
@@ -1383,6 +1404,22 @@ impl Terminal {
                     // doc comment for why `clear` needs the real thing).
                     self.rich_content_video_players.borrow_mut().clear();
                     self.rich_content_video_progress.borrow_mut().clear();
+                }
+                // Forgets every id `RichContentCache` still remembers —
+                // without this, `all_known_ids()` keeps surfacing them on
+                // every subsequent paint pass regardless of the dropped
+                // players above, so `rich_content_placements`/`rich_
+                // content_audio_placements`/`rich_content_video_
+                // placements` simply reopen fresh players (autoplaying,
+                // for audio/video) on the very next paint — confirmed
+                // live: stopping a video, then `clear`, made its audio
+                // track start playing again with no picture visible
+                // anywhere (the placeholder cells were gone, but the
+                // reopened player's `cpal` stream wasn't). See
+                // `RichContentCache::remove`'s own doc comment for the
+                // full reasoning.
+                for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
+                    self.rich_content_cache.remove(session_id, file_id);
                 }
             }
             AlacTermEvent::Exit => self.register_task_finished(None, cx),
@@ -2063,8 +2100,16 @@ impl Terminal {
                         // soon as any frame is decoded" behavior (see
                         // `rich_content_video_placements`), rather than
                         // audio's earlier "starts paused, user must press
-                        // play" convention.
-                        player.toggle_play_pause();
+                        // play" convention. Suppressed for an id the user
+                        // just explicitly stopped (`rich_content_audio_
+                        // stopped`) — otherwise THIS reopen (triggered by
+                        // stop itself dropping the old player) would
+                        // immediately autoplay a fresh one, defeating stop
+                        // entirely (confirmed live as the actual bug this
+                        // set exists to prevent).
+                        if !self.rich_content_audio_stopped.borrow().contains(&key) {
+                            player.toggle_play_pause();
+                        }
                         players.insert(key, player);
                     },
                     // A genuine decode/device error — silently skip, same
@@ -2088,6 +2133,29 @@ impl Terminal {
             }
             let player = players.get(&key).expect("just inserted or already present");
             let duration_ms = self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
+            // Auto-stop on reaching the real end of playback — video
+            // counterpart lives in `rich_content_video_placements`, same
+            // reasoning: don't wait for the user to click stop/play
+            // again before the widget visibly settles into the stopped
+            // state (00:00:00, empty seek bar) and the underlying
+            // resource (`cpal::Stream`, decode thread, PCM buffer) is
+            // actually freed. `player.is_playing()` is already `false`
+            // by the time `is_finished` can be `true` (the `cpal`
+            // callback itself clears `playing` once `decode_finished`
+            // and playback catches up — see `RichContentAudioPlayer::
+            // open`'s output callback), so there's no separate "only
+            // once" guard needed here the way video's `!is_playing()`
+            // check provides: dropping the player removes it from
+            // `players` outright, so this branch simply can't run again
+            // for the same id until a fresh player reopens (paused, at
+            // 0) on the NEXT call to this method.
+            if player.is_finished(duration_ms) {
+                players.remove(&key);
+                self.rich_content_audio_stopped.borrow_mut().insert(key);
+                self.rich_content_audio_progress.borrow_mut().remove(&key);
+                out.push((session_id, file_id, 0.0, false, std::time::Duration::ZERO, std::time::Duration::from_millis(duration_ms as u64)));
+                continue;
+            }
             out.push((
                 session_id,
                 file_id,
@@ -2107,31 +2175,49 @@ impl Terminal {
     /// `Terminal::mouse_down`'s click-interception check, never from the
     /// paint path itself.
     pub fn toggle_rich_content_audio_playback(&self, session_id: u32, file_id: u32) {
+        // An explicit play press un-stops the placement — clears the
+        // suppress-autoplay flag `stop` set, so a NEXT reopen (e.g. after
+        // a future stop) autoplays again as normal; has no effect if the
+        // player wasn't stopped, `remove` on a key that isn't present is
+        // simply a no-op.
+        self.rich_content_audio_stopped.borrow_mut().remove(&(session_id, file_id));
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
             player.toggle_play_pause();
         }
     }
 
-    /// Stops the audio placement at `(session_id, file_id)` — pauses
-    /// playback and resets position to the start, WITHOUT tearing down
-    /// the player (unlike this method's much older behavior, which
-    /// dropped it outright): the widget stays put at 00:00, and a later
-    /// play click resumes on the SAME player rather than reopening a new
-    /// one — nothing auto-restarts on its own the way dropping-and-
-    /// relying-on-`rich_content_audio_placements`'s autoplay-on-open
-    /// used to do (confirmed live as a real bug: clicking stop
-    /// immediately looked like it "kept playing" once the very next
-    /// paint pass reopened and autoplayed a fresh player). Called both
-    /// from `Terminal::mouse_down`'s click-interception check (the
-    /// widget's stop icon) and from `clear` via
-    /// `stop_all_rich_content_audio_playback` below.
+    /// Stops the audio placement at `(session_id, file_id)` — unlike
+    /// video's `stop` (which keeps its player alive and shows a stand-in
+    /// image instead), this actually FREES the audio resource: dropping
+    /// the `RichContentAudioPlayer` entry tears down its `cpal::Stream`
+    /// (silencing the device immediately), its background decode thread
+    /// (via `Drop`'s `decode_stop` flag), and its PCM sample buffer —
+    /// nothing about a stopped audio placement stays resident in memory.
+    /// `rich_content_audio_stopped` records the id so the VERY NEXT
+    /// paint pass's reopen (`rich_content_audio_placements`, which would
+    /// otherwise treat "no player yet" as "never opened" and autoplay a
+    /// fresh one) starts paused at position 0 instead — confirmed live
+    /// as a real bug otherwise: dropping the player without this flag
+    /// made stop look like it "kept playing," since the immediate reopen
+    /// autoplayed right back. The reopened player's own fresh state
+    /// (`position_frames = 0`, `playing = false`) is what the widget
+    /// paints as 00:00:00 elapsed and an empty (not just paused-partway)
+    /// seek bar — no separate "stopped" widget state needed, unlike
+    /// video's dedicated `is_stopped` flag/stand-in image.
+    ///
+    /// Called both from `Terminal::mouse_down`'s click-interception
+    /// check (the widget's stop icon) and from `clear` via
+    /// `stop_all_rich_content_audio_playback` below (which additionally
+    /// clears every id from `rich_content_audio_stopped` too, since a
+    /// `clear` erases the placeholder cells for good — there's no
+    /// widget left to eventually un-stop via a play click, so nothing
+    /// should suppress a WOULD-be-later placement with the same id from
+    /// autoplaying normally).
     pub fn stop_rich_content_audio_playback(&self, session_id: u32, file_id: u32) {
         let key = (session_id, file_id);
-        if let Some(player) = self.rich_content_audio_players.borrow().get(&key) {
-            player.set_playing(false);
-            let duration_ms = self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
-            player.seek_to_fraction(0.0, duration_ms);
-        }
+        self.rich_content_audio_stopped.borrow_mut().insert(key);
+        self.rich_content_audio_players.borrow_mut().remove(&key);
+        self.rich_content_audio_progress.borrow_mut().remove(&key);
     }
 
     /// Tears down every currently open audio player outright (unlike
@@ -2331,6 +2417,21 @@ impl Terminal {
             let key = (session_id, file_id);
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);
+            // `RichContentCache` only tracks `contiguous_len`/`total_size`
+            // (shared with every other content type), not the video-
+            // specific `tail_available_from` watermark — read straight off
+            // this key's `SrvProgressState` instead, same source
+            // `ensure_rich_content_srv_subscription` itself reads from.
+            // Defaults to `total_size` (nothing confirmed from the tail
+            // yet) if no `som-srv` subscription exists yet for this key —
+            // matches `SrvProgressState`'s own pre-first-push default (0)
+            // only in spirit, not value; `total_size` here is deliberately
+            // NOT 0, since 0 would incorrectly mean "even the theoretical
+            // very first byte is tail-confirmed."
+            let tail_available_from =
+                self.rich_content_srv_progress.borrow().get(&key).map(|state| state.tail_available_from()).unwrap_or(total_size);
+            let pending_ranges =
+                self.rich_content_srv_progress.borrow().get(&key).map(|state| state.pending_ranges()).unwrap_or_default();
             let just_opened = !players.contains_key(&key);
             if just_opened {
                 let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
@@ -2341,9 +2442,10 @@ impl Terminal {
                 }
                 let path = path.to_path_buf();
                 let progress = std::sync::Arc::new(rich_content_video_player::VideoTransferProgress::new());
-                progress.update(contiguous_len, total_size);
+                progress.update(contiguous_len, tail_available_from, pending_ranges.clone(), total_size);
                 self.rich_content_video_progress.borrow_mut().insert(key, progress.clone());
-                let player = rich_content_video_player::RichContentVideoPlayer::open(path, progress);
+                let audio_stream_index = self.rich_content_cache.video_audio_stream_index(session_id, file_id);
+                let player = rich_content_video_player::RichContentVideoPlayer::open(path, progress, audio_stream_index);
                 players.insert(key, player);
             } else if let Some(progress) = self.rich_content_video_progress.borrow().get(&key) {
                 // `GrowingFileStream`'s decode thread blocks on THIS
@@ -2355,7 +2457,7 @@ impl Terminal {
                 // video whose FFmpeg codec-parameter probe needs more of
                 // the file than had streamed in by the time the FIRST
                 // frame became visible enough to open a player at all).
-                progress.update(contiguous_len, total_size);
+                progress.update(contiguous_len, tail_available_from, pending_ranges, total_size);
             }
             let player = players.get(&key).expect("just inserted or already present");
             // Autoplay ONLY the very first time this placement's player
@@ -2368,6 +2470,27 @@ impl Terminal {
             // resumed on the very next frame this ran again).
             if just_opened {
                 player.toggle_play_pause();
+            }
+            // Auto-stop on reaching the real end of playback — not just
+            // the passive `is_finished` bookkeeping `toggle_rich_content_
+            // video_playback` already reacted to reactively (only on the
+            // NEXT play click). Checked every paint pass so the widget
+            // visibly settles into the stopped state (00:00:00, empty
+            // seek bar, `dna.png` stand-in) the moment playback actually
+            // reaches the end, not only after the user happens to click
+            // play again. `!player.is_playing()` guards against calling
+            // `stop` on every single paint pass once finished (`stop`
+            // itself is idempotent, but there's no reason to keep
+            // re-queuing a seek every frame) — `run_decode_loop`'s own
+            // EOF handling already flips `playing` to `false` once
+            // `finished` is set, so this fires exactly once per real
+            // end-of-playback.
+            if player.is_finished() && !player.is_playing() && !player.is_stopped()
+                && let Some(progress) = self.rich_content_video_progress.borrow().get(&key)
+            {
+                player.stop(progress, |offset, len| {
+                    self.request_audio_byte_range(session_id, file_id, offset, len);
+                });
             }
             // Pushed even with no frame (`current_frame()` returns
             // `None` right after `RichContentVideoPlayer::stop` clears
@@ -2524,6 +2647,7 @@ impl Terminal {
     /// visual middle of the bar seeked to roughly a third of the way
     /// through, confirmed live.
     fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>) -> bool {
+        log::trace!("handle_rich_content_click: position={position:?}");
         let cell_width = self.last_content.terminal_bounds.cell_width;
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
             let is_audio = self.rich_content_audio_players.borrow().contains_key(&(session_id, file_id));
@@ -2531,6 +2655,7 @@ impl Terminal {
             let is_video = self.rich_content_video_players.borrow().contains_key(&(session_id, file_id));
             #[cfg(not(target_os = "windows"))]
             let is_video = false;
+            log::trace!("placement {session_id:#x}:{file_id:#x} is_audio={is_audio} is_video={is_video} bounds={bounds:?} contains_click={}", bounds.contains(&position));
             if !is_audio && !is_video {
                 continue;
             }
@@ -2593,7 +2718,9 @@ impl Terminal {
     /// — a click landing before the bar exists just does nothing, rather
     /// than guessing at a fraction from the wrong rectangle.
     fn seek_fraction_for_position(&self, session_id: u32, file_id: u32, position: gpui::Point<Pixels>) -> Option<f32> {
-        let bar_bounds = self.rich_content_seek_bar_bounds(session_id, file_id)?;
+        let bar_bounds = self.rich_content_seek_bar_bounds(session_id, file_id);
+        log::trace!("seek_fraction_for_position: session={session_id:#x} file={file_id:#x} bar_bounds={bar_bounds:?}");
+        let bar_bounds = bar_bounds?;
         let offset_x = position.x - bar_bounds.origin.x;
         Some((f32::from(offset_x) / f32::from(bar_bounds.size.width)).clamp(0.0, 1.0))
     }
@@ -3728,6 +3855,12 @@ impl Terminal {
     }
 
     pub fn mouse_down(&mut self, e: &MouseDownEvent, _cx: &mut Context<Self>) {
+        log::trace!(
+            "mouse_down: button={:?} position={:?} window_bounds={:?}",
+            e.button,
+            e.position,
+            self.last_content.terminal_bounds.bounds
+        );
         // Rich-content placement hit-testing — checked BEFORE any
         // selection/hyperlink/PTY-forwarding logic below, mirroring the
         // existing hyperlink early-return pattern a few lines down. A

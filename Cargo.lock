@@ -7228,6 +7228,7 @@ dependencies = [
  "serde_json",
  "session",
  "settings",
+ "terminal",
  "terminal_view",
  "theme",
  "theme_settings",
@@ -7283,6 +7284,7 @@ dependencies = [
 name = "somcat"
 version = "0.1.0"
 dependencies = [
+ "ffmpeg-next",
  "image",
  "libc",
  "serde_json",
@@ -7899,6 +7901,7 @@ dependencies = [
  "cpal",
  "dirs",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "futures",
  "futures-lite 1.13.0",
  "gpui",

@@ -36,6 +36,20 @@ use std::sync::{Mutex, MutexGuard};
 #[derive(Default)]
 pub struct SrvProgressState {
     contiguous_len: AtomicU64,
+    /// See `som_srv::protocol::SrvResponse::Progress::tail_available_from`'s
+    /// own doc comment — defaults to 0 (not `total_size`) until the first
+    /// `Progress` push arrives, same "nothing known yet" convention
+    /// `contiguous_len`'s own 0 default already uses; `total_size()`
+    /// being 0 too until then means [`RichContentVideoPlayer`]'s own
+    /// tail-availability check (`total_size > 0 && tail_available_from
+    /// <= total_size`) can't false-positive on this default pair.
+    tail_available_from: AtomicU64,
+    /// See `som_srv::protocol::SrvResponse::Progress::pending_ranges`'s
+    /// own doc comment — the latest snapshot from the most recent
+    /// `Progress` push, overwritten wholesale on each push (not merged
+    /// locally) since `som-srv` is the single source of truth for this
+    /// list.
+    pending_ranges: Mutex<Vec<(u64, u64)>>,
     total_size: AtomicU64,
     /// Set once, the first time a `Progress` push arrives — `Terminal`
     /// takes this value out (`std::mem::take`) the first time it observes
@@ -52,6 +66,14 @@ pub struct SrvProgressState {
 impl SrvProgressState {
     pub fn contiguous_len(&self) -> u64 {
         self.contiguous_len.load(Ordering::Acquire)
+    }
+
+    pub fn tail_available_from(&self) -> u64 {
+        self.tail_available_from.load(Ordering::Acquire)
+    }
+
+    pub fn pending_ranges(&self) -> Vec<(u64, u64)> {
+        self.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn total_size(&self) -> u64 {
@@ -96,8 +118,16 @@ fn to_terminal_metadata(metadata: som_srv::protocol::ContentMetadata) -> Content
         M::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
             ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms }
         },
-        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec } => {
-            ContentMetadata::Video { width_px, height_px, fps_numerator, fps_denominator, codec: to_terminal_video_codec(codec) }
+        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec, audio_stream_index, subtitle_stream_index } => {
+            ContentMetadata::Video {
+                width_px,
+                height_px,
+                fps_numerator,
+                fps_denominator,
+                codec: to_terminal_video_codec(codec),
+                audio_stream_index,
+                subtitle_stream_index,
+            }
         },
         M::Markdown => ContentMetadata::Markdown,
     }
@@ -155,10 +185,29 @@ pub fn spawn_progress_listener(session_id: u32, file_id: u32) -> Arc<SrvProgress
 /// Best-effort: an error connecting/sending is logged and swallowed, same
 /// as the OLD `Query`-based mechanism's identical tolerance for a request
 /// that just never gets answered.
+///
+/// Spawns the actual connect+send onto its own background thread rather
+/// than doing it inline — this function is called directly from
+/// `Terminal::seek_rich_content_video_playback`/`request_audio_byte_
+/// range`, which are themselves called synchronously from GPUI's mouse-
+/// click dispatch (`Terminal::mouse_down`), on the SAME thread that pumps
+/// the OS message loop and drives every repaint. `PipeConnection::connect`
+/// plus the handshake's `read_message`/`write_message` are blocking OS
+/// I/O with no timeout — confirmed live as a real bug: clicking a video's
+/// seek bar could freeze the ENTIRE window (not just the video, ALL
+/// repaints stopped) for minutes at a time, because the click handler
+/// itself was blocked inside this call, never returning control to GPUI.
+/// Fire-and-forget on a background thread is correct here specifically
+/// because this whole mechanism is already "best-effort" by design (the
+/// caller has no return value to wait for — the answer arrives later as
+/// an ordinary `PutChunk`/`Progress` push on the existing subscription
+/// connection, not as a reply to this call).
 pub fn request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) {
-    if let Err(err) = try_request_byte_range(session_id, file_id, offset, len) {
-        log::debug!("failed to send som-srv RequestByteRange for {session_id:#x}:{file_id:#x}: {err:#}");
-    }
+    std::thread::spawn(move || {
+        if let Err(err) = try_request_byte_range(session_id, file_id, offset, len) {
+            log::debug!("failed to send som-srv RequestByteRange for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
 }
 
 fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) -> anyhow::Result<()> {
@@ -178,10 +227,12 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
         let message = connection.read_message()?;
         let response: SrvResponse = serde_json::from_slice(&message)?;
         match response {
-            SrvResponse::Progress { session_id: response_session, file_id: response_file, contiguous_len, total_size, content_type, metadata }
+            SrvResponse::Progress { session_id: response_session, file_id: response_file, contiguous_len, tail_available_from, pending_ranges, total_size, content_type, metadata }
                 if response_session == session_id && response_file == file_id =>
             {
                 state.contiguous_len.store(contiguous_len, Ordering::Release);
+                state.tail_available_from.store(tail_available_from, Ordering::Release);
+                *state.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()) = pending_ranges;
                 state.total_size.store(total_size, Ordering::Release);
                 let mut guard = state.lock_metadata();
                 if guard.is_none() {

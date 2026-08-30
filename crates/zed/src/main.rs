@@ -259,7 +259,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     ensure_conpty_extracted_and_wired();
     #[cfg(target_os = "windows")]
-    ensure_ffmpeg_extracted_and_wired();
+    terminal::rich_content_video_player::ensure_ffmpeg_extracted_and_wired();
 
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
@@ -782,64 +782,6 @@ fn ensure_conpty_extracted_and_wired() {
     }
 
     add_dll_search_directory(&conpty_dir, "conpty");
-}
-
-/// Extracts the embedded decode-only FFmpeg shared libs (avcodec/avformat/
-/// avutil/swresample/swscale) to `~/.config/som/ffmpeg/` on first run and
-/// adds that directory to the process's DLL search path, so `ffmpeg-next`'s
-/// FFI calls resolve them without requiring a system FFmpeg install. Mirrors
-/// `ensure_conpty_extracted_and_wired` above — same reasoning, same shape.
-#[cfg(target_os = "windows")]
-fn ensure_ffmpeg_extracted_and_wired() {
-    use gpui::AssetSource;
-
-    let ffmpeg_dir = paths::config_dir().join("ffmpeg");
-    for file_name in
-        ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
-    {
-        let target = ffmpeg_dir.join(file_name);
-        // Embedded as `.dll.zst` (see `assets::Assets`'s own doc comment
-        // on the ffmpeg `#[include]` block for why) — one zstd-decompress
-        // pass turns it back into the real DLL bytes before it's ever
-        // written to disk. Decompressed unconditionally (not gated behind
-        // `target.is_file()`) so the byte-for-byte comparison below can
-        // catch a stale on-disk copy from an OLDER Som build whose
-        // embedded FFmpeg trim differs (e.g. missing audio decoders) —
-        // an earlier version of this function skipped extraction outright
-        // whenever ANY file already existed at `target`, which silently
-        // kept a stale DLL in place across every later `som.exe` upgrade
-        // until someone manually deleted `~/.config/som/ffmpeg/` —
-        // confirmed live as video audio staying silent for an entire
-        // debugging session despite the newly built DLL correctly
-        // containing the needed decoders, because the STALE one on disk
-        // was still the one actually being loaded.
-        let asset_path = format!("ffmpeg/windows-amd/{file_name}.zst");
-        let Some(compressed) = Assets.load(&asset_path).ok().flatten() else {
-            log::error!("missing embedded asset {asset_path:?} — video playback will be unavailable");
-            continue;
-        };
-        let bytes = match assets::decompress_zst(&compressed) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                log::error!("failed to decompress {asset_path:?}: {err:#} — video playback will be unavailable");
-                continue;
-            },
-        };
-        if let Ok(existing) = std::fs::read(&target) {
-            if existing == bytes {
-                continue; // Already up to date — skip the write.
-            }
-        }
-        if let Err(err) = std::fs::create_dir_all(&ffmpeg_dir) {
-            log::error!("failed to create {ffmpeg_dir:?}: {err:#}");
-            continue;
-        }
-        if let Err(err) = std::fs::write(&target, &bytes) {
-            log::error!("failed to write {target:?}: {err:#}");
-        }
-    }
-
-    add_dll_search_directory(&ffmpeg_dir, "ffmpeg");
 }
 
 /// `AddDllDirectory` calls are silently ignored by the loader unless the

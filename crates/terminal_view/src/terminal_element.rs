@@ -2031,9 +2031,45 @@ fn paint_rich_content_placements(
                             )
                             .log_err();
                     } else {
+                        // Same shrink-to-fit-but-never-enlarge, aspect-
+                        // ratio-preserving placement the stopped-state
+                        // stand-in above already uses — a real decoded
+                        // frame smaller than its reserved footprint (a
+                        // small source video, or a placement that's just
+                        // wider than the video itself) should show at its
+                        // own native pixel size rather than being blown up
+                        // and looking soft/blurry; only a frame LARGER
+                        // than the footprint gets shrunk, and always with
+                        // its own aspect ratio preserved, never stretched
+                        // to fill a mismatched box. Unlike the stopped-
+                        // state branch, no letterbox fill is painted here
+                        // first — a real frame not covering the whole
+                        // footprint intentionally lets the terminal's own
+                        // background show through the margins, same as it
+                        // always has for a footprint estimated from
+                        // metadata alone before the real frame arrived.
+                        let native_width = px(image_size.width.0 as f32);
+                        let native_height = px(image_size.height.0 as f32);
+                        let image_aspect = image_size.width.0 as f32 / image_size.height.0 as f32;
+                        let box_aspect = f32::from(full_width) / f32::from(full_height);
+                        let (shrink_to_fit_width, shrink_to_fit_height) = if image_aspect > box_aspect {
+                            (full_width, full_width / image_aspect)
+                        } else {
+                            (full_height * image_aspect, full_height)
+                        };
+                        let (fit_width, fit_height) =
+                            if native_width <= full_width && native_height <= full_height {
+                                (native_width, native_height)
+                            } else {
+                                (shrink_to_fit_width, shrink_to_fit_height)
+                            };
+                        let fit_position = point(
+                            picture_position.x + (full_width - fit_width) / 2.0,
+                            picture_position.y + (full_height - fit_height) / 2.0,
+                        );
                         window
                             .paint_image(
-                                picture_bounds,
+                                Bounds::new(fit_position, gpui::size(fit_width, fit_height)),
                                 gpui::Corners::all(Pixels::ZERO),
                                 render_image.clone(),
                                 0,

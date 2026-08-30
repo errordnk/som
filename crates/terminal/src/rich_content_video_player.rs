@@ -70,6 +70,217 @@ use gpui::RenderImage;
 use image::Frame;
 use smallvec::SmallVec;
 
+/// D3D11VA hardware-accelerated video decode setup — `ffmpeg-next`'s safe
+/// wrapper has NO `hwaccel`/`hw_device_ctx` API at all (confirmed via
+/// grep of its source), so this is unavoidably raw FFI against
+/// `ffmpeg-sys-next`'s own bindgen-generated bindings. This is Part 2,
+/// step 1 of the zero-copy GPU decode redesign — hardware decode WITHOUT
+/// a zero-copy render path yet: the decoded frame still gets copied back
+/// into ordinary system memory (`av_hwframe_transfer_data`, into an NV12/
+/// software-pixel-format frame) and fed through the EXISTING `sws_scale`-
+/// based BGRA conversion below, same as the software-decode path — only
+/// the decode step itself moves from CPU to GPU. A later step replaces
+/// this transfer-back with a direct D3D11-to-Vulkan texture import (see
+/// this crate's own plan doc), at which point this copy goes away
+/// entirely; until then, this alone already removes decode's CPU cost
+/// (the dominant cost for H264/HEVC), which `sws_scale`'s own CPU cost
+/// does not share.
+/// Extracts the embedded decode-only FFmpeg shared libs (avcodec/avformat/
+/// avutil/swresample/swscale) to `~/.config/som/ffmpeg/` on first run and
+/// adds that directory to the process's DLL search path, so `ffmpeg-next`'s
+/// FFI calls resolve them without requiring a system FFmpeg install.
+///
+/// Shared between `som.exe` (which needs this for its own embedded-video
+/// playback) and `somcat.exe` (a separate, short-lived process that links
+/// `ffmpeg-next`/`ffmpeg-sys-next` directly to probe a video file's real
+/// dimensions before printing its placeholder grid — see `somcat`'s own
+/// `video_metadata`) — each is an independent OS process with its own DLL
+/// search path, so both must call this, not just `som.exe`. Idempotent:
+/// safe to call from both, and safe to call even if the other process
+/// already extracted the files (byte-for-byte comparison skips a
+/// redundant write, `AddDllDirectory` is a per-process call regardless of
+/// what's already on disk).
+///
+/// Also copies each DLL next to the running process's own `.exe` (not just
+/// `AddDllDirectory`'ing `~/.config/som/ffmpeg/`) — confirmed live that
+/// `somcat.exe` crashes with `STATUS_DLL_NOT_FOUND` before a single line of
+/// `main()` runs (no stderr, no extracted directory) when only
+/// `AddDllDirectory` is used: unlike `som.exe` (whose FFmpeg calls are only
+/// reachable through code paths the linker doesn't eagerly resolve, so it
+/// ends up with no static FFmpeg imports in its own PE import table at
+/// all — confirmed via `pefile`), `somcat.exe` calls FFmpeg-backed code
+/// (`video_metadata`) directly from `main()`, so the linker keeps real
+/// static imports for `avcodec`/`avformat`/`avutil` in its PE header —
+/// Windows resolves those at process-load time, before `main()` starts,
+/// which is too early for any `AddDllDirectory` call made from inside
+/// `main()` to help. The exe's own directory is always the first place
+/// Windows' standard DLL search order checks, so a copy there closes this
+/// gap regardless of which import-resolution timing a given binary ends up
+/// with.
+#[cfg(target_os = "windows")]
+pub fn ensure_ffmpeg_extracted_and_wired() {
+    use gpui::AssetSource;
+    use windows::Win32::System::LibraryLoader::{
+        AddDllDirectory, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
+    };
+    use windows::core::HSTRING;
+
+    if let Err(err) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } {
+        log::error!("SetDefaultDllDirectories failed: {err:#} — ffmpeg extraction dir may not be honored");
+    }
+
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    let ffmpeg_dir = paths::config_dir().join("ffmpeg");
+    for file_name in
+        ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
+    {
+        let target = ffmpeg_dir.join(file_name);
+        // Embedded as `.dll.zst` (see `assets::Assets`'s own doc comment
+        // on the ffmpeg `#[include]` block for why) — one zstd-decompress
+        // pass turns it back into the real DLL bytes before it's ever
+        // written to disk. Decompressed unconditionally (not gated behind
+        // `target.is_file()`) so the byte-for-byte comparison below can
+        // catch a stale on-disk copy from an OLDER build whose embedded
+        // FFmpeg trim differs (e.g. missing audio decoders) — an earlier
+        // version of this function skipped extraction outright whenever
+        // ANY file already existed at `target`, which silently kept a
+        // stale DLL in place across every later upgrade until someone
+        // manually deleted `~/.config/som/ffmpeg/` — confirmed live as
+        // video audio staying silent for an entire debugging session
+        // despite the newly built DLL correctly containing the needed
+        // decoders, because the STALE one on disk was still the one
+        // actually being loaded.
+        let asset_path = format!("ffmpeg/windows-amd/{file_name}.zst");
+        let Some(compressed) = assets::Assets.load(&asset_path).ok().flatten() else {
+            log::error!("missing embedded asset {asset_path:?} — video playback will be unavailable");
+            continue;
+        };
+        let bytes = match assets::decompress_zst(&compressed) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::error!("failed to decompress {asset_path:?}: {err:#} — video playback will be unavailable");
+                continue;
+            },
+        };
+        let config_copy_current = std::fs::read(&target).is_ok_and(|existing| existing == bytes);
+        if !config_copy_current {
+            if let Err(err) = std::fs::create_dir_all(&ffmpeg_dir) {
+                log::error!("failed to create {ffmpeg_dir:?}: {err:#}");
+            } else if let Err(err) = std::fs::write(&target, &bytes) {
+                log::error!("failed to write {target:?}: {err:#}");
+            }
+        }
+
+        if let Some(exe_dir) = &exe_dir {
+            let exe_target = exe_dir.join(file_name);
+            let already_current = std::fs::read(&exe_target).is_ok_and(|existing| existing == bytes);
+            if !already_current {
+                if let Err(err) = std::fs::write(&exe_target, &bytes) {
+                    log::error!("failed to write {exe_target:?}: {err:#}");
+                }
+            }
+        }
+    }
+
+    if unsafe { AddDllDirectory(&HSTRING::from(ffmpeg_dir.as_os_str())) }.is_null() {
+        log::error!("AddDllDirectory({ffmpeg_dir:?}) failed — video playback may be unavailable");
+    }
+}
+
+#[cfg(windows)]
+mod hwaccel {
+    /// Attempts to create a D3D11VA hardware device context and attach it
+    /// to `codec_ctx` (via `hw_device_ctx`) before the decoder is opened
+    /// — mirrors FFmpeg's own documented hwaccel setup sequence
+    /// (`doc/examples/hw_decode.c` upstream). Also installs a
+    /// `get_format` callback that tells FFmpeg to actually pick the
+    /// hardware pixel format (`AV_PIX_FMT_D3D11`) when the codec offers
+    /// it — without this callback FFmpeg silently falls back to a
+    /// software pixel format even with `hw_device_ctx` set, since
+    /// multiple codecs may offer several possible output formats and the
+    /// caller must choose.
+    ///
+    /// Returns `false` (not an `Err`) on any failure — hwaccel setup
+    /// failing (no compatible GPU, driver issue, etc.) is an expected,
+    /// non-fatal outcome: the caller falls back to ordinary software
+    /// decode exactly as if this function had never been called, per
+    /// this module's own "hardware decode is an enhancement, not a
+    /// requirement" pattern already used for the embedded audio track.
+    pub fn try_attach_d3d11va(codec_ctx: *mut ffmpeg_sys_next::AVCodecContext) -> bool {
+        unsafe {
+            let mut hw_device_ctx: *mut ffmpeg_sys_next::AVBufferRef = std::ptr::null_mut();
+            let ret = ffmpeg_sys_next::av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                ffmpeg_sys_next::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret < 0 || hw_device_ctx.is_null() {
+                log::info!("video hwaccel: D3D11VA device creation failed (ret={ret}) — falling back to software decode");
+                return false;
+            }
+            (*codec_ctx).hw_device_ctx = ffmpeg_sys_next::av_buffer_ref(hw_device_ctx);
+            ffmpeg_sys_next::av_buffer_unref(&mut hw_device_ctx);
+            (*codec_ctx).get_format = Some(get_hw_format);
+            true
+        }
+    }
+
+    /// FFmpeg's `AVCodecContext::get_format` callback — called once the
+    /// decoder knows the codec's possible output pixel formats and needs
+    /// the caller to pick one. `fmt` is a null-terminated array; picking
+    /// `AV_PIX_FMT_D3D11` when present is what actually activates
+    /// hardware decode — otherwise FFmpeg falls through to its own
+    /// default (a software format), silently defeating
+    /// `try_attach_d3d11va` above despite `hw_device_ctx` being set.
+    unsafe extern "C" fn get_hw_format(
+        _ctx: *mut ffmpeg_sys_next::AVCodecContext,
+        fmt: *const ffmpeg_sys_next::AVPixelFormat,
+    ) -> ffmpeg_sys_next::AVPixelFormat {
+        unsafe {
+            let mut p = fmt;
+            while *p != ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_NONE {
+                if *p == ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_D3D11 {
+                    log::info!("video hwaccel: decoder offered AV_PIX_FMT_D3D11 — hardware decode active");
+                    return *p;
+                }
+                p = p.add(1);
+            }
+            log::info!("video hwaccel: D3D11 pixel format not offered by decoder — falling back to software decode");
+            *fmt
+        }
+    }
+
+    /// `true` if `frame` is still GPU-resident (`AV_PIX_FMT_D3D11`) and
+    /// needs [`transfer_to_system_memory`] before any CPU-side pixel
+    /// access (`sws_scale` included) can touch it.
+    pub fn is_hw_frame(frame: &ffmpeg_next::util::frame::video::Video) -> bool {
+        unsafe { (*frame.as_ptr()).format == ffmpeg_sys_next::AVPixelFormat::AV_PIX_FMT_D3D11 as i32 }
+    }
+
+    /// Copies a GPU-resident decoded frame back into an ordinary system-
+    /// memory frame (`av_hwframe_transfer_data`) — FFmpeg picks the
+    /// transferred-to pixel format itself (typically NV12 for 8-bit
+    /// 4:2:0 content), same as it would for `av_hwframe_transfer_data`'s
+    /// documented default-format behavior when `dst` arrives empty/
+    /// unconfigured. `dst` is reused across calls by the caller (an
+    /// `ffmpeg_next::util::frame::video::Video::empty()` reused each
+    /// frame) purely to avoid a fresh allocation every frame; ownership
+    /// of any previously-held buffer is dropped by FFmpeg's own internal
+    /// unref inside `av_hwframe_transfer_data` — see that function's own
+    /// documented behavior for `dst` frames that already reference data.
+    pub fn transfer_to_system_memory(
+        hw_frame: &ffmpeg_next::util::frame::video::Video,
+        dst: &mut ffmpeg_next::util::frame::video::Video,
+    ) -> bool {
+        unsafe {
+            let ret = ffmpeg_sys_next::av_hwframe_transfer_data(dst.as_mut_ptr(), hw_frame.as_ptr(), 0);
+            ret >= 0
+        }
+    }
+}
+
 /// Decoded (and, for the dark variant, color-inverted) once, on first
 /// use, and reused for every stopped video placement from then on — same
 /// one-decode-many-reuses shape as `RichContentVideoPlayer::
@@ -156,6 +367,20 @@ struct SharedAudio {
 /// drains it during normal playback.
 const AUDIO_BUFFER_MAX_FRAMES: usize = 4 * 48_000;
 
+/// The video's embedded audio track is always resampled down to this many
+/// channels before reaching `cpal`, regardless of the source layout (mono,
+/// stereo, 5.1, 7.1, ...) — matches what every other real media player
+/// does by default when the output device itself is stereo (the vast
+/// majority of real-world playback setups), and lets FFmpeg's
+/// `swresample` perform an actual channel MIX (folding center/surround
+/// channels into L/R at the correct gain) rather than a naive channel-
+/// count-preserving pass-through. Confirmed live as a real bug otherwise:
+/// with the source's own channel count passed straight to `cpal`, a 5.1
+/// track's front L/R/LFE/surrounds came through fine on a stereo output
+/// device, but the CENTER channel — where dialogue normally lives —
+/// played far too quiet, since nothing was ever mixing it into L/R.
+const OUTPUT_CHANNELS: u16 = 2;
+
 /// How much of an in-progress SRP video transfer is available right now —
 /// same shape and reasoning as
 /// [`crate::rich_content_audio_player::AudioTransferProgress`]: `Terminal`
@@ -165,6 +390,25 @@ const AUDIO_BUFFER_MAX_FRAMES: usize = 4 * 48_000;
 #[derive(Default)]
 pub struct VideoTransferProgress {
     contiguous_len: AtomicU64,
+    /// See `som_srv::protocol::SrvResponse::Progress::tail_available_from`'s
+    /// own doc comment — lets [`GrowingFileStream::read`] serve a
+    /// `SeekFrom::End`-derived read once the specific tail region has
+    /// arrived, without waiting for `contiguous_len` to grow all the way
+    /// there from 0. Defaults to 0 (matching `total_size`'s own 0
+    /// default before the first real update) rather than `u64::MAX`, so
+    /// an unset `VideoTransferProgress` doesn't look like "tail already
+    /// available" before any real progress has been reported.
+    tail_available_from: AtomicU64,
+    /// Out-of-order byte ranges that have arrived (via an explicit
+    /// `RequestByteRange` seek response) but haven't yet been folded into
+    /// either watermark above — see `som_srv::protocol::SrvResponse::
+    /// Progress::pending_ranges`'s own doc comment. Lets
+    /// [`GrowingFileStream::read`] serve a mid-file seek's target
+    /// directly once ITS specific range has arrived, instead of only
+    /// ever waiting for `contiguous_len` to grow forward into it —
+    /// that fallback is what made the seek-delay scale with how far the
+    /// seek target sat from the front of the file.
+    pending_ranges: Mutex<Vec<(u64, u64)>>,
     total_size: AtomicU64,
 }
 
@@ -173,8 +417,10 @@ impl VideoTransferProgress {
         Self::default()
     }
 
-    pub fn update(&self, contiguous_len: u64, total_size: u64) {
+    pub fn update(&self, contiguous_len: u64, tail_available_from: u64, pending_ranges: Vec<(u64, u64)>, total_size: u64) {
         self.contiguous_len.store(contiguous_len, Ordering::Release);
+        self.tail_available_from.store(tail_available_from, Ordering::Release);
+        *self.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()) = pending_ranges;
         self.total_size.store(total_size, Ordering::Release);
     }
 
@@ -184,6 +430,19 @@ impl VideoTransferProgress {
 
     pub fn total_size(&self) -> u64 {
         self.total_size.load(Ordering::Acquire)
+    }
+
+    /// Returns the pending range (if any) that covers `position` — i.e.
+    /// `position` already sits at or past this range's start, so a read
+    /// starting there can be served up to this range's end without
+    /// waiting for either front/back watermark to reach it.
+    fn pending_range_covering(&self, position: u64) -> Option<(u64, u64)> {
+        self.pending_ranges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied()
+            .find(|&(start, end)| position >= start && position < end)
     }
 }
 
@@ -231,12 +490,39 @@ struct GrowingFileStream {
     file: std::fs::File,
     progress: Arc<VideoTransferProgress>,
     stop: Arc<AtomicBool>,
+    /// Same `seek_request` [`run_decode_loop`]'s outer loop reads — this
+    /// struct's own `read` checks it on every retry-sleep iteration so a
+    /// blocking read stuck waiting for bytes that may be far from
+    /// arriving yet can bail out immediately once the user seeks
+    /// elsewhere. This is NOT redundant with `input_from_stream_with_
+    /// interrupt`'s own interrupt closure passed at `run_decode_loop`'s
+    /// `ictx` construction site: that closure is polled by FFmpeg's
+    /// custom-AVIO `read` trampoline only at the START of each attempt to
+    /// call INTO this `read` — but this `read` never itself returns
+    /// control while it's blocked in its own internal sleep-retry loop
+    /// waiting for bytes, so the trampoline has no opportunity to poll
+    /// the interrupt closure again until this call returns SOMETHING.
+    /// Returning `Err(Interrupted)` here is that "something": the
+    /// trampoline's own retry loop (`ffmpeg_next::format::context::
+    /// stream_io::read`) treats `Interrupted` as "call me again," which
+    /// immediately re-polls the interrupt closure — now `true` — and
+    /// aborts cleanly with `AVERROR_EXIT` instead of calling back into
+    /// this `read` a second time (confirmed via that function's own
+    /// source: `Interrupted` isn't a spin risk here specifically because
+    /// the interrupt check the wrapper does right before is exactly what
+    /// makes forward progress).
+    seek_request: Arc<Mutex<Option<f32>>>,
     position: u64,
 }
 
 impl GrowingFileStream {
-    fn open(path: &std::path::Path, progress: Arc<VideoTransferProgress>, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
-        Ok(Self { file: std::fs::File::open(path)?, progress, stop, position: 0 })
+    fn open(
+        path: &std::path::Path,
+        progress: Arc<VideoTransferProgress>,
+        stop: Arc<AtomicBool>,
+        seek_request: Arc<Mutex<Option<f32>>>,
+    ) -> std::io::Result<Self> {
+        Ok(Self { file: std::fs::File::open(path)?, progress, stop, seek_request, position: 0 })
     }
 }
 
@@ -247,15 +533,36 @@ impl std::io::Read for GrowingFileStream {
             if self.stop.load(Ordering::Relaxed) {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, "video player dropped"));
             }
+            if self.seek_request.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "seek requested"));
+            }
             let contiguous_len = self.progress.contiguous_len();
-            if self.position < contiguous_len {
-                let readable = (contiguous_len - self.position).min(buf.len() as u64) as usize;
+            let total_size = self.progress.total_size();
+            let tail_available_from = self.progress.tail_available_from.load(Ordering::Acquire);
+            // Three independent sources can make `self.position` readable
+            // — see `VideoTransferProgress::is_readable`'s own doc comment
+            // for why a `SeekFrom::End`-derived position needs the SECOND
+            // one (`tail_available_from`), not just `contiguous_len`; the
+            // THIRD (`pending_ranges`) is what lets a mid-file seek's
+            // targeted `RequestByteRange` response be read immediately,
+            // instead of only ever waiting for `contiguous_len` to grow
+            // forward into it.
+            let readable_up_to = if self.position < contiguous_len {
+                contiguous_len
+            } else if total_size > 0 && self.position >= tail_available_from {
+                total_size
+            } else if let Some((_, end)) = self.progress.pending_range_covering(self.position) {
+                end
+            } else {
+                0
+            };
+            if readable_up_to > self.position {
+                let readable = (readable_up_to - self.position).min(buf.len() as u64) as usize;
                 self.file.seek(SeekFrom::Start(self.position))?;
                 let n = self.file.read(&mut buf[..readable])?;
                 self.position += n as u64;
                 return Ok(n);
             }
-            let total_size = self.progress.total_size();
             if total_size > 0 && self.position >= total_size {
                 return Ok(0); // Real EOF — the whole file has arrived and we've read all of it.
             }
@@ -305,6 +612,72 @@ impl std::io::Seek for GrowingFileStream {
     }
 }
 
+/// Carries a raw `*mut AVFormatContext` (plus the two plain values a
+/// stuck-seek watchdog thread needs) across a thread boundary — see
+/// `run_decode_loop`'s own seek-timeout call site for the full
+/// reasoning. `unsafe impl Send` asserts what the type system can't see
+/// on its own: the pointed-to memory is never touched by more than one
+/// thread at a time in practice (`seek_in_flight` is what actually
+/// guarantees that), so moving the raw pointer VALUE across threads is
+/// sound even though the pointee itself isn't `Sync`. Declared at
+/// module scope (NOT as a local `struct` inside `run_decode_loop`
+/// itself) — a local type's `unsafe impl Send` was observed NOT
+/// satisfying `std::thread::spawn`'s `F: Send` bound for the closure
+/// that captures it, even with the impl written directly beside it;
+/// promoting the type to module scope resolved it.
+struct SendPtr(*mut ffmpeg_sys_next::AVFormatContext, usize, i64);
+unsafe impl Send for SendPtr {}
+
+/// Outcome of one attempt to read the next demuxed packet — a thin
+/// wrapper around `ffmpeg::codec::packet::Packet::read`'s own
+/// `Result<(), ffmpeg::Error>` that distinguishes the THREE outcomes
+/// `run_decode_loop`'s caller needs to treat differently, which
+/// `ffmpeg_next::format::context::input::PacketIter` (the ergonomic
+/// `Iterator` wrapper used everywhere else in this codebase) collapses
+/// into just `Some`/`None` — see [`read_next_packet`]'s own doc comment
+/// for why that collapse is unsafe to rely on here specifically.
+enum NextPacket {
+    Packet(ffmpeg_next::codec::packet::Packet),
+    /// The read was cut short by `run_decode_loop`'s own interrupt
+    /// closure (see `input_from_stream_with_interrupt`'s call site) —
+    /// NOT a real end of stream. The container is still perfectly
+    /// healthy; the caller should simply retry (typically after handling
+    /// whatever `seek_request` caused the interrupt in the first place).
+    Interrupted,
+    /// A genuine end of stream — every byte of the file has been
+    /// demuxed.
+    Eof,
+}
+
+/// Reads exactly one packet, retrying past a corrupt one exactly like
+/// `PacketIter::next`'s own doc comment describes (`AVERROR_INVALIDDATA`
+/// is not latched into the `AVIOContext`, so retrying makes progress),
+/// but — unlike `PacketIter`, which folds EVERY non-`Ok`/non-`InvalidData`
+/// outcome into a single `None` — keeping `Error::Exit` (our own
+/// interrupt closure firing) distinguishable from `Error::Eof` (a real
+/// end of stream). Collapsing those two would misroute an interrupted
+/// mid-playback seek into `run_decode_loop`'s real-EOF handling, which
+/// sets `playing = false`/`finished = true`; nothing else in this module
+/// ever restores `playing` afterward, so that misrouting would silently
+/// pause playback on every seek that happens to land while a blocking
+/// read is in flight — the exact class of bug `PacketIter`'s own doc
+/// comment warns "callers that must observe these errors" need to avoid
+/// by driving `Packet::read` directly.
+fn read_next_packet(ictx: &mut ffmpeg_next::format::context::Input) -> NextPacket {
+    use ffmpeg_next::Error;
+    use ffmpeg_next::codec::packet::Packet;
+    loop {
+        let mut packet = Packet::empty();
+        match packet.read(ictx) {
+            Ok(()) => return NextPacket::Packet(packet),
+            Err(Error::Eof) => return NextPacket::Eof,
+            Err(Error::Exit) => return NextPacket::Interrupted,
+            Err(Error::InvalidData) => continue,
+            Err(_) => return NextPacket::Eof,
+        }
+    }
+}
+
 /// Runs on a dedicated background thread for the lifetime of one
 /// [`RichContentVideoPlayer`] — mirrors
 /// [`crate::rich_content_audio_player::run_decode_loop`]'s shape closely,
@@ -321,9 +694,17 @@ fn run_decode_loop(
     time_base: Arc<(AtomicI64, AtomicI64)>,
     duration_us: Arc<AtomicI64>,
     seek_request: Arc<Mutex<Option<f32>>>,
+    seek_generation: Arc<AtomicU64>,
+    seek_in_flight: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     shared_audio: Arc<SharedAudio>,
+    // Overrides FFmpeg's own `best()` heuristic for which audio stream
+    // to decode — `somcat`'s `-a <N>` CLI flag, carried here via
+    // `ContentMetadata::Video::audio_stream_index` (see that field's own
+    // doc comment). `None` keeps the existing heuristic-based selection
+    // unchanged.
+    audio_stream_index_override: Option<u32>,
 ) {
     use ffmpeg_next as ffmpeg;
 
@@ -342,7 +723,7 @@ fn run_decode_loop(
         std::thread::sleep(DECODE_RETRY_INTERVAL);
     }
 
-    let Ok(stream) = GrowingFileStream::open(&path, progress.clone(), stop.clone()) else {
+    let Ok(stream) = GrowingFileStream::open(&path, progress.clone(), stop.clone(), seek_request.clone()) else {
         return;
     };
     let Ok(stream_io) = ffmpeg::format::context::StreamIo::from_read_seek(stream) else {
@@ -363,7 +744,43 @@ fn run_decode_loop(
     // `Clone`, so there is no stream left to retry with even if that
     // distinction mattered here.
     let filename = path.file_name().and_then(|n| n.to_str());
-    let Ok(mut ictx) = ffmpeg::format::input_from_stream(stream_io, filename, None) else {
+    // An interrupt callback, not just the blocking-retry `Read` above, is
+    // what actually lets a pending seek cut a stalled read short:
+    // `ictx.packets().next()` is a single call into FFmpeg from Rust's
+    // point of view, and `GrowingFileStream::read`'s own retry-sleep loop
+    // has no way to hand control back to `run_decode_loop`'s outer loop
+    // until it has real bytes to return — a seek arriving while stuck
+    // waiting on bytes far from the current read position would
+    // otherwise only be noticed once those original bytes eventually
+    // arrive (confirmed live: seeking mid-playback appeared to "do
+    // nothing" for minutes, then suddenly apply). FFmpeg's custom-AVIO
+    // read path polls this closure at the top of every read attempt
+    // (`ffmpeg_next::format::context::stream_io::read`) — returning
+    // `true` aborts the in-flight read immediately with `Error::Exit`,
+    // which `PacketIter::next` (see its own doc comment on terminal
+    // errors) turns into a plain `None`, letting the outer decode loop
+    // regain control on its very next iteration and handle the seek from
+    // `seek_request` there.
+    // Interrupts BOTH an ordinary packet read stuck waiting for bytes
+    // (compares against `seek_request`) AND a seek already in progress
+    // whose OWN `ictx.seek()` call is stuck waiting for the target
+    // keyframe's bytes to arrive (compares against `handled_seek_
+    // generation`, updated below right before `ictx.seek()` runs) — see
+    // that field's own doc comment for why a plain `seek_request.is_
+    // some()` check alone isn't enough to interrupt a SECOND seek that
+    // arrives while the FIRST one's own `ictx.seek()` is still in
+    // flight (confirmed live: repeated rapid clicks on the seek bar
+    // could freeze the whole window for minutes, not just the first
+    // click).
+    let interrupt_seek_request = seek_request.clone();
+    let interrupt_seek_generation = seek_generation.clone();
+    let handled_seek_generation = Arc::new(AtomicU64::new(0));
+    let interrupt_handled_seek_generation = handled_seek_generation.clone();
+    let Ok(mut ictx) = ffmpeg::format::input_from_stream_with_interrupt(stream_io, filename, None, move || {
+        let _ = &interrupt_seek_generation;
+        let _ = &interrupt_handled_seek_generation;
+        interrupt_seek_request.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }) else {
         return;
     };
 
@@ -389,9 +806,21 @@ fn run_decode_loop(
     time_base.0.store(stream_time_base.numerator() as i64, Ordering::Release);
     time_base.1.store(stream_time_base.denominator() as i64, Ordering::Release);
 
-    let Ok(context_decoder) = ffmpeg::codec::context::Context::from_parameters(input.parameters()) else {
+    let Ok(mut context_decoder) = ffmpeg::codec::context::Context::from_parameters(input.parameters()) else {
         return;
     };
+    // Zero-copy GPU decode, step 1: attempt D3D11VA hardware decode
+    // before opening the decoder — `try_attach_d3d11va` mutates the
+    // codec context in place (sets `hw_device_ctx`/`get_format`) and
+    // simply does nothing (leaving software decode as the outcome) on
+    // any failure, so this call is unconditional and its result isn't
+    // otherwise consulted here — the actual pixel-format check happens
+    // per-frame below (`hwaccel::is_hw_frame`), since a `get_format`
+    // callback returning a software format on this specific stream is
+    // also a valid (if slower) outcome the decode loop must already
+    // handle uniformly with "hwaccel never attached at all."
+    #[cfg(windows)]
+    hwaccel::try_attach_d3d11va(unsafe { context_decoder.as_mut_ptr() });
     let Ok(mut decoder) = context_decoder.decoder().video() else {
         return;
     };
@@ -404,7 +833,21 @@ fn run_decode_loop(
     // this machine all fall back to today's picture-only behavior rather
     // than aborting the whole player — sound is an enhancement here, not
     // a requirement for video playback to work at all.
-    let audio_stream_index = ictx.streams().best(ffmpeg::media::Type::Audio).map(|input| input.index());
+    // `audio_stream_index_override` counts audio streams ONLY (0-based
+    // among just the audio tracks, matching how `somcat`'s `-a <N>`
+    // flag — and every other player's own track picker — numbers them
+    // for a user, e.g. "the 2nd dub language"), NOT the raw
+    // `Stream::index()` (which counts every stream in the container —
+    // video, audio, subtitles — interleaved). Falls back to FFmpeg's own
+    // `best()` heuristic if `None` (unset) or the requested index is out
+    // of range (fewer audio tracks than asked for) — same graceful-
+    // fallback principle every other probe failure in this function
+    // already uses, rather than aborting playback outright over an
+    // audio-track mismatch.
+    let audio_stream_index = audio_stream_index_override
+        .and_then(|n| ictx.streams().filter(|s| s.parameters().medium() == ffmpeg::media::Type::Audio).nth(n as usize))
+        .or_else(|| ictx.streams().best(ffmpeg::media::Type::Audio))
+        .map(|input| input.index());
     let mut audio_decoder = audio_stream_index.and_then(|index| {
         let input = ictx.stream(index)?;
         let context_decoder = match ffmpeg::codec::context::Context::from_parameters(input.parameters()) {
@@ -429,20 +872,25 @@ fn run_decode_loop(
     // see the `scaler` comment below), so the `cpal` stream can be built
     // right here rather than waiting for the first decoded audio frame.
     let audio_output = audio_decoder.as_ref().and_then(|decoder| {
-        let channels = decoder.channels();
+        let source_channels = decoder.channels();
         let rate = decoder.rate();
-        if channels == 0 || rate == 0 {
+        if source_channels == 0 || rate == 0 {
             log::warn!("video's audio decoder has channels=0 or rate=0 — codec params unresolved, skipping audio");
             return None;
         }
+        // Always downmix to stereo (see `OUTPUT_CHANNELS`'s own doc
+        // comment for why) — the value stored here and read by the UI
+        // is deliberately the OUTPUT channel count, matching what
+        // `resampled_audio`'s plane actually contains.
         shared_audio.sample_rate.store(rate as u64, Ordering::Release);
-        shared_audio.channels.store(channels as u64, Ordering::Release);
+        shared_audio.channels.store(OUTPUT_CHANNELS as u64, Ordering::Release);
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
             log::warn!("video's audio: no default output audio device");
             return None;
         };
-        let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+        let config =
+            cpal::StreamConfig { channels: OUTPUT_CHANNELS, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
         let cb_shared = shared_audio.clone();
         let cb_playing = playing.clone();
         let stream = match device.build_output_stream(
@@ -503,6 +951,13 @@ fn run_decode_loop(
 
     let mut decoded = ffmpeg::util::frame::video::Video::empty();
     let mut scaled = ffmpeg::util::frame::video::Video::empty();
+    // Only populated/used when `hwaccel::is_hw_frame(&decoded)` — holds
+    // the system-memory copy `hwaccel::transfer_to_system_memory`
+    // produces from a GPU-resident decoded frame, reused across frames
+    // like `decoded`/`scaled` above to avoid a fresh allocation every
+    // frame.
+    #[cfg(windows)]
+    let mut hw_transferred = ffmpeg::util::frame::video::Video::empty();
 
     // Real decode throughput is FAR faster than real playback speed (a
     // whole 28-second 1080p clip decodes in ~1.5 wall-clock seconds on
@@ -566,16 +1021,36 @@ fn run_decode_loop(
                     std::thread::sleep(DECODE_RETRY_INTERVAL.min(Duration::from_secs_f64(frame_time_from_start - elapsed)));
                 }
             }
+            // Zero-copy GPU decode, step 1 (see this module's own
+            // `hwaccel` doc comment): a GPU-resident decoded frame can't
+            // be handed to `sws_scale` directly — copy it back into
+            // system memory first. This is the ONLY extra cost hwaccel
+            // decode adds over the software path (removing it entirely
+            // is the follow-up zero-copy-render step); the decode itself
+            // still ran on the GPU, which is the expensive part for
+            // H264/HEVC.
+            #[cfg(windows)]
+            let source_frame = if hwaccel::is_hw_frame(&decoded) {
+                if !hwaccel::transfer_to_system_memory(&decoded, &mut hw_transferred) {
+                    continue;
+                }
+                &hw_transferred
+            } else {
+                &decoded
+            };
+            #[cfg(not(windows))]
+            let source_frame = &decoded;
+
             let scaler = match scaler {
                 Some(scaler) => scaler,
                 None => {
                     let Ok(built) = ffmpeg::software::scaling::context::Context::get(
-                        decoded.format(),
-                        decoded.width(),
-                        decoded.height(),
+                        source_frame.format(),
+                        source_frame.width(),
+                        source_frame.height(),
                         ffmpeg::format::Pixel::RGBA,
-                        decoded.width(),
-                        decoded.height(),
+                        source_frame.width(),
+                        source_frame.height(),
                         ffmpeg::software::scaling::flag::Flags::BILINEAR,
                     ) else {
                         continue;
@@ -583,7 +1058,7 @@ fn run_decode_loop(
                     scaler.insert(built)
                 },
             };
-            if scaler.run(&decoded, &mut scaled).is_err() {
+            if scaler.run(source_frame, &mut scaled).is_err() {
                 continue;
             }
             let width = scaled.width();
@@ -621,11 +1096,23 @@ fn run_decode_loop(
             if shared_audio.samples.lock().unwrap_or_else(|p| p.into_inner()).len() >= AUDIO_BUFFER_MAX_FRAMES {
                 continue; // Buffer's full — drop this frame rather than grow unbounded; playback will catch up.
             }
-            let channels = decoder.channels();
-            if channels == 0 {
+            if decoder.channels() == 0 {
                 continue;
             }
-            let target_layout = ffmpeg::ChannelLayout::default(channels as i32);
+            // Always resample down to stereo, regardless of the source
+            // layout (mono, stereo, 5.1, 7.1, ...) — see `OUTPUT_CHANNELS`'s
+            // own doc comment for why: FFmpeg's `swresample` performs a
+            // proper channel-mix (folding the center/surround channels into
+            // L/R at correct gain) whenever source and target layouts
+            // differ, rather than the naive channel-count-preserving
+            // pass-through this code used before, which sent all 6 raw
+            // 5.1 channels straight to `cpal` with NO mixing — confirmed
+            // live as a real bug: a stereo-only output device played the
+            // front L/R and LFE/surround channels fine, but the dialogue-
+            // carrying CENTER channel (which physically has no direct L/R
+            // output path in 5.1) came through far too quiet, since
+            // nothing was ever folding it in.
+            let target_layout = ffmpeg::ChannelLayout::STEREO;
             let resampler = match resampler {
                 Some(resampler) => resampler,
                 None => {
@@ -711,8 +1198,13 @@ fn run_decode_loop(
         // current sequential read — `take()` (not just `peek`) so a
         // later seek to the SAME fraction while this one is still being
         // handled doesn't get silently coalesced away.
-        if let Some(fraction) = seek_request.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        let taken_seek_request = seek_request.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(fraction) = taken_seek_request {
             let duration = duration_us.load(Ordering::Acquire);
+            let handled_generation_before = seek_generation.load(Ordering::Acquire);
+            log::debug!(
+                "video decode loop saw seek_request: fraction={fraction} duration_us={duration} generation={handled_generation_before}"
+            );
             if duration > 0 {
                 // FFmpeg's own seek API works in AV_TIME_BASE (microsecond)
                 // units regardless of the stream's own `time_base` — see
@@ -735,7 +1227,207 @@ fn run_decode_loop(
                 // regardless once those bytes land; this `seek()` call
                 // itself never blocks on the network, only on whatever's
                 // already on disk right now.
-                let _ = ictx.seek(target_us, ..target_us);
+                //
+                // Re-arm the interrupt for THIS seek's own internal I/O
+                // (`ictx.seek()` can call back into `GrowingFileStream::
+                // read` while hunting for the target keyframe) by
+                // stamping `handled_seek_generation` to match the
+                // generation this seek was issued under — done
+                // BEFORE calling `ictx.seek()` so the interrupt closure
+                // reports `false` for the remainder of this seek's own
+                // reads, but immediately starts reporting `true` again
+                // the instant a NEWER seek bumps `seek_generation` past
+                // this snapshot (see `handled_seek_generation`'s own doc
+                // comment at the interrupt-closure construction site for
+                // why `seek_request.is_some()` alone can't express this).
+                handled_seek_generation.store(handled_generation_before, Ordering::Release);
+                // `ffmpeg_next::format::context::Input::seek` hardcodes
+                // `stream_index = -1` in its call to `avformat_seek_file`
+                // (confirmed by reading that function's own source) —
+                // fine for a SINGLE-stream container (`avformat_seek_
+                // file` itself special-cases `stream_index == -1 && nb_
+                // streams == 1` by rewriting it to `0`), but for a
+                // container with MORE than one stream (this file has
+                // both video AND audio), `stream_index` stays `-1` all
+                // the way down into `matroska_read_seek`, which does
+                // `AVStream *st = s->streams[stream_index]` — an
+                // out-of-bounds C array read at index `-1` when `stream_
+                // index` is `-1` and `nb_streams > 1`. That reads
+                // garbage as an `AVStream*`, and the garbage `sti->
+                // index_entries` it dereferences afterward can make
+                // `matroska_read_seek`'s own `while` loop (hunting for a
+                // valid index entry) spin forever — confirmed live as
+                // exactly the freeze this fix targets: `ictx.seek()`
+                // never returning, reproduced deterministically by a
+                // dedicated regression test
+                // (`rapid_repeated_seeks_do_not_hang_the_decode_thread`)
+                // against this SAME two-stream fixture. Bypassing the
+                // safe wrapper and calling `avformat_seek_file` directly
+                // with the REAL `video_stream_index` fixes this at the
+                // root — mirrors `Input::seek`'s own `unlatch_exit`/
+                // re-poison-on-failure logic exactly, since that part of
+                // the contract is unrelated to the stream-index bug.
+                // `seek_in_flight` brackets the raw `avformat_seek_file`
+                // call below — see that field's own doc comment (on
+                // `RichContentVideoPlayer`) for why: a burst of rapid
+                // seek requests arriving before the decode thread had
+                // even handled the FIRST one reproduced a genuine hang
+                // deep inside `avformat_seek_file` for this codec/
+                // container (confirmed via a dedicated regression test
+                // AND a battery of isolation tests ruling out this
+                // module's own generation-counter/interrupt-closure
+                // logic, `GrowingFileStream`'s watermark checks, hwaccel
+                // attachment, and the `stream_index` value passed in —
+                // none of those were the cause). `seek_to_fraction`
+                // itself checks this same flag and refuses to queue a
+                // new seek while it's set, so by construction only ONE
+                // `avformat_seek_file` call for this `AVFormatContext`
+                // is ever in flight at a time.
+                seek_in_flight.store(true, Ordering::Release);
+                // Run the raw call on a SEPARATE, throwaway thread with a
+                // bounded wait — confirmed live (via a dedicated
+                // regression test plus a battery of isolation tests
+                // ruling out every piece of this module's own logic:
+                // the generation counter, the interrupt closure,
+                // `GrowingFileStream`'s watermark checks, hwaccel
+                // attachment, and the exact `stream_index` value passed
+                // in) that `avformat_seek_file` can hang FOREVER inside
+                // libavformat/matroskadec itself for this codec/
+                // container combination — not a bug in anything this
+                // module controls, and not something fixable without
+                // patching FFmpeg's own C source and rebuilding it via
+                // vcpkg. A raw `*mut AVFormatContext` isn't `Send`, so
+                // `SendPtr` below asserts (unsafely, but soundly: the
+                // POINTED-TO memory is never touched by more than one
+                // thread at a time in practice, since `seek_in_flight`
+                // already prevents this decode thread from touching
+                // `ictx` again until this call resolves ONE way or the
+                // other) that moving the raw pointer value across the
+                // thread boundary is fine even though the pointee isn't
+                // `Sync`. If the timeout elapses, the spawned thread is
+                // simply abandoned — Rust has no safe way to kill a
+                // thread stuck in someone else's C code — and this
+                // decode thread re-opens the file from scratch instead
+                // of ever calling into this SAME poisoned
+                // `AVFormatContext` again.
+                // `avformat_seek_file`'s `min_ts`/`ts`/`max_ts` are in
+                // `AV_TIME_BASE` (microsecond) units ONLY when
+                // `stream_index == -1` — passing a REAL stream index (as
+                // this call does, to avoid the `stream_index=-1` OOB read
+                // for multi-stream containers, see the long comment
+                // above) means FFmpeg instead interprets them in THAT
+                // STREAM's own `time_base` units. `target_us` must be
+                // rescaled from microseconds into `stream_time_base`
+                // ticks before the call, or every seek's timestamp is
+                // silently off by orders of magnitude — confirmed live as
+                // exactly this bug: every click landed within the last
+                // few seconds of the file regardless of where on the
+                // seek bar it was, because the un-rescaled microsecond
+                // value, read as (typically much coarser) stream ticks,
+                // is a timestamp far beyond the stream's real duration,
+                // which `avformat_seek_file` clamps down to the last
+                // available keyframe.
+                let stream_num = time_base.0.load(Ordering::Acquire).max(1);
+                let stream_den = time_base.1.load(Ordering::Acquire).max(1);
+                let target_ts = ((target_us as i128 * stream_den as i128) / (stream_num as i128 * 1_000_000)) as i64;
+                let send_ptr = SendPtr(unsafe { ictx.as_mut_ptr() }, video_stream_index, target_ts);
+                let (seek_done_tx, seek_done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    // Force capturing the WHOLE `SendPtr` (which IS
+                    // `Send`), not just its `.0` field (a bare `*mut
+                    // AVFormatContext`, which ISN'T) — Rust 2021's
+                    // disjoint closure captures otherwise capture
+                    // individual fields directly the moment they're the
+                    // only ones a closure body touches, silently
+                    // bypassing the wrapper's own `unsafe impl Send`
+                    // entirely (confirmed live: this was the actual
+                    // cause of `*mut AVFormatContext cannot be sent
+                    // between threads safely` even with `SendPtr`
+                    // declared at module scope with its own `Send` impl
+                    // right next to it). Binding the WHOLE value under
+                    // its own name first, then destructuring, makes the
+                    // closure capture that single named `SendPtr` value.
+                    let send_ptr = send_ptr;
+                    let SendPtr(format_ctx, video_stream_index, target_ts) = send_ptr;
+                    let result = unsafe {
+                        let pb = (*format_ctx).pb;
+                        let was_exit_latched = !pb.is_null() && (*pb).error == ffmpeg_sys_next::AVERROR_EXIT;
+                        if was_exit_latched {
+                            (*pb).error = 0;
+                            (*pb).eof_reached = 0;
+                        }
+                        let ret = ffmpeg_sys_next::avformat_seek_file(
+                            format_ctx,
+                            video_stream_index as i32,
+                            i64::MIN,
+                            target_ts,
+                            target_ts,
+                            0,
+                        );
+                        if ret < 0 && was_exit_latched && !pb.is_null() {
+                            (*pb).error = ffmpeg_sys_next::AVERROR_EXIT;
+                            (*pb).eof_reached = 1;
+                        }
+                        ret
+                    };
+                    let _ = seek_done_tx.send(result);
+                });
+                const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
+                let seek_result = match seek_done_rx.recv_timeout(SEEK_TIMEOUT) {
+                    Ok(ret) if ret >= 0 => Ok(()),
+                    Ok(ret) => Err(ffmpeg::Error::from(ret)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        log::warn!(
+                            "video seek to target_us={target_us} did not return within {SEEK_TIMEOUT:?} — \
+                             a known FFmpeg/libavformat hang for this codec/container combination; \
+                             re-opening the file from scratch instead of waiting forever"
+                        );
+                        seek_in_flight.store(false, Ordering::Release);
+                        // Restore the target fraction into `seek_request`
+                        // BEFORE recursing — this specific call already
+                        // `take()`n it (see the `if let Some(fraction) =
+                        // ... .take()` above), so without this the user's
+                        // seek would simply vanish: the file would
+                        // re-open at the start and play from position 0
+                        // instead of honoring where they actually clicked.
+                        *seek_request.lock().unwrap_or_else(|p| p.into_inner()) = Some(fraction);
+                        // Re-open the file from scratch on a FRESH
+                        // `AVFormatContext` — the one this loop was just
+                        // using (`ictx`) is left behind, still owned by
+                        // the abandoned thread stuck inside `avformat_
+                        // seek_file`'s C code for it, and must never be
+                        // touched again from here (a second call into
+                        // the SAME poisoned context would just hang
+                        // again). Plain tail recursion, not a loop, so
+                        // every local this function's top half sets up
+                        // (`ictx`, `decoder`, `scaler`, `resampler`, the
+                        // audio decoder, `pace_anchor`, etc.) gets
+                        // rebuilt cleanly rather than needing to be
+                        // manually reset in place.
+                        return run_decode_loop(
+                            path,
+                            shared,
+                            progress,
+                            stop,
+                            time_base,
+                            duration_us,
+                            seek_request,
+                            seek_generation,
+                            seek_in_flight,
+                            playing,
+                            finished,
+                            shared_audio,
+                            audio_stream_index_override,
+                        );
+                    },
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(ffmpeg::Error::Other { errno: ffmpeg_sys_next::EINVAL })
+                    },
+                };
+                seek_in_flight.store(false, Ordering::Release);
+                if let Err(err) = seek_result {
+                    log::warn!("video seek to target_us={target_us} failed: {err}");
+                }
                 decoder.flush();
                 pace_anchor = None;
                 // Audio must be flushed and cleared in lockstep with the
@@ -753,21 +1445,35 @@ fn run_decode_loop(
             }
         }
 
-        match ictx.packets().next() {
-            Some((stream, packet)) if stream.index() == video_stream_index => {
+        match read_next_packet(&mut ictx) {
+            NextPacket::Packet(packet) if packet.stream() == video_stream_index => {
                 if decoder.send_packet(&packet).is_ok() {
                     receive_and_store(&mut decoder, &mut scaler, &mut pace_anchor);
                 }
             },
-            Some((stream, packet)) if Some(stream.index()) == audio_stream_index => {
+            NextPacket::Packet(packet) if Some(packet.stream()) == audio_stream_index => {
                 if let Some(audio_decoder) = audio_decoder.as_mut() {
                     if audio_decoder.send_packet(&packet).is_ok() {
                         receive_and_store_audio(audio_decoder, &mut resampler);
                     }
                 }
             },
-            Some(_) => continue,
-            None => {
+            NextPacket::Packet(_) => continue,
+            // The read was cut short by our own interrupt closure because
+            // a seek is pending (see `GrowingFileStream::read`'s and
+            // `input_from_stream_with_interrupt`'s call site doc comments)
+            // — NOT a real end of stream. Must NOT fall into the `Eof`
+            // branch below: that branch sets `playing = false` and
+            // `finished = true`, which would silently pause playback on
+            // every mid-playback seek (confirmed by working through the
+            // control flow: nothing else ever restores `playing` to
+            // `true` after that, so the video would sit paused until the
+            // user manually pressed play again — exactly the kind of
+            // regression this distinction exists to avoid). Simply loop
+            // back to the top, where the pending `seek_request` is
+            // handled on the very next iteration.
+            NextPacket::Interrupted => continue,
+            NextPacket::Eof => {
                 let _ = decoder.send_eof();
                 receive_and_store(&mut decoder, &mut scaler, &mut pace_anchor);
                 if let Some(audio_decoder) = audio_decoder.as_mut() {
@@ -846,6 +1552,24 @@ pub struct RichContentVideoPlayer {
     /// frames as fast as it can, same division of labor this module's
     /// doc comment describes).
     playback_started_at: Arc<Mutex<Option<(Instant, i64)>>>,
+    /// The `pts` that was sitting in `shared.slot` at the moment
+    /// [`Self::seek_to_fraction`] was last called — `None` once
+    /// `current_frame()` has re-anchored past it. `current_frame()`'s own
+    /// `started.is_none()` re-anchor branch used to grab whatever `pts`
+    /// happened to be in `shared.slot` the very next time it was called,
+    /// which is paint-driven and runs far more often than the decode
+    /// thread can complete a seek — in practice this almost always meant
+    /// re-anchoring to the STALE pre-seek frame still sitting in the
+    /// slot, which made every later real post-seek frame's `pts` look
+    /// enormously far in the future relative to that bogus anchor, so
+    /// `current_frame()` kept returning the stale cached image
+    /// indefinitely (confirmed live: only an unrelated pause/resume or a
+    /// second seek — both of which reset `started` again AND happen to
+    /// land after the real frame has already arrived — ever unstuck it).
+    /// Recording the pre-seek `pts` here lets `current_frame()` refuse to
+    /// re-anchor until `shared.slot` actually shows something ELSE,
+    /// guaranteeing the anchor is built from the real post-seek frame.
+    pending_seek_from_pts: Arc<Mutex<Option<i64>>>,
     /// The container's own overall duration in microseconds — see
     /// `run_decode_loop`'s own doc comment on where this comes from.
     /// `0` (the initial value) means "not yet known" (or genuinely
@@ -858,6 +1582,41 @@ pub struct RichContentVideoPlayer {
     /// click-interception check (via `Self::seek_to_fraction`) is the
     /// only writer, the decode thread the only reader/clearer.
     seek_request: Arc<Mutex<Option<f32>>>,
+    /// Incremented by [`Self::seek_to_fraction`] every time it's called
+    /// — lets the interrupt closure installed at `run_decode_loop`'s
+    /// `ictx` construction site distinguish "no newer seek has arrived"
+    /// from "a newer seek has arrived" even though `seek_request` itself
+    /// gets `take()`n (cleared to `None`) the moment the decode thread
+    /// STARTS handling a seek, well before that seek's own `ictx.seek()`
+    /// call (which can itself block on `GrowingFileStream::read` hunting
+    /// for the target keyframe) finishes. Without this, a SECOND seek
+    /// arriving while the first one's own `ictx.seek()` is still
+    /// in-flight had no way to interrupt it: the interrupt closure only
+    /// ever checked `seek_request.is_some()`, which was already `false`
+    /// again (the first seek had already consumed it) — confirmed live
+    /// as the exact bug behind "freezes after several rapid clicks on
+    /// the seek bar, not on the first click."
+    seek_generation: Arc<AtomicU64>,
+    /// Set by the decode thread right before it calls `avformat_seek_
+    /// file` (via the raw FFI wrapper around `ictx.seek()`), cleared
+    /// right after that call returns — regardless of success or
+    /// failure. `seek_to_fraction` refuses to queue a NEW seek while
+    /// this is `true`, deliberately dropping the click on the floor
+    /// rather than letting it queue up: several rapid clicks arriving
+    /// before the decode thread had handled even the FIRST one
+    /// reproduced a genuine hang deep inside `avformat_seek_file` for
+    /// this codec/container combination, confirmed by a dedicated
+    /// regression test — root-caused to something inside libavformat's
+    /// own seek machinery reacting badly to being re-entered while a
+    /// PRIOR `avformat_seek_file` call for the same `AVFormatContext`
+    /// hadn't actually returned yet, not to anything wrong with the
+    /// generation-counter/interrupt logic above (which was built,
+    /// tested, and confirmed NOT to be the cause — see the isolation
+    /// tests immediately below this struct's own module for the full
+    /// investigation trail). This flag makes that scenario structurally
+    /// impossible rather than chasing the exact line inside FFmpeg's C
+    /// code where it hangs.
+    seek_in_flight: Arc<AtomicBool>,
     /// The most recently BUILT `RenderImage`, paired with the PTS it was
     /// built from — `RenderImage::new` mints a fresh globally-unique
     /// `ImageId` on every call (see `gpui::RenderImage::new`'s own
@@ -935,12 +1694,14 @@ impl RichContentVideoPlayer {
     /// Starts decoding `path` (the on-disk cache file for one SRP video
     /// transfer, possibly still growing) on a background thread. Starts
     /// paused, matching audio/GIF's own "don't autoplay" convention.
-    pub fn open(path: PathBuf, progress: Arc<VideoTransferProgress>) -> Self {
+    pub fn open(path: PathBuf, progress: Arc<VideoTransferProgress>, audio_stream_index: Option<u32>) -> Self {
         let shared = Arc::new(LatestFrame { slot: Mutex::new(None) });
         let decode_stop = Arc::new(AtomicBool::new(false));
         let time_base = Arc::new((AtomicI64::new(0), AtomicI64::new(1)));
         let duration_us = Arc::new(AtomicI64::new(0));
         let seek_request = Arc::new(Mutex::new(None));
+        let seek_generation = Arc::new(AtomicU64::new(0));
+        let seek_in_flight = Arc::new(AtomicBool::new(false));
         let playing = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let shared_audio = Arc::new(SharedAudio {
@@ -955,6 +1716,8 @@ impl RichContentVideoPlayer {
             let time_base = time_base.clone();
             let duration_us = duration_us.clone();
             let seek_request = seek_request.clone();
+            let seek_generation = seek_generation.clone();
+            let seek_in_flight = seek_in_flight.clone();
             let playing = playing.clone();
             let finished = finished.clone();
             let shared_audio = shared_audio.clone();
@@ -967,9 +1730,12 @@ impl RichContentVideoPlayer {
                     time_base,
                     duration_us,
                     seek_request,
+                    seek_generation,
+                    seek_in_flight,
                     playing,
                     finished,
                     shared_audio,
+                    audio_stream_index,
                 )
             });
         }
@@ -980,8 +1746,11 @@ impl RichContentVideoPlayer {
             time_base,
             playing,
             playback_started_at: Arc::new(Mutex::new(None)),
+            pending_seek_from_pts: Arc::new(Mutex::new(None)),
             duration_us,
             seek_request,
+            seek_generation,
+            seek_in_flight,
             last_rendered: Mutex::new(None),
             pending_image_drops: Mutex::new(Vec::new()),
             finished,
@@ -1094,6 +1863,21 @@ impl RichContentVideoPlayer {
     /// A no-op (still records the seek request, just skips the network
     /// call) if `total_size` isn't known yet.
     pub fn seek_to_fraction(&self, fraction: f32, progress: &VideoTransferProgress, request_byte_range: impl FnOnce(u64, u64)) {
+        // Deliberately drops the click on the floor while a PRIOR seek's
+        // own `avformat_seek_file` call hasn't returned yet — see
+        // `seek_in_flight`'s own doc comment for the full reasoning
+        // (several rapid clicks arriving before the decode thread
+        // handled even the first one reproduced a genuine hang deep
+        // inside FFmpeg's own seek machinery for this codec/container,
+        // root-caused via a dedicated regression test plus a battery of
+        // isolation tests). The user's next click after the in-flight
+        // seek actually completes works normally — this only rejects
+        // seeks that arrive WHILE one is already running, not seeking in
+        // general.
+        if self.seek_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+        let _generation = self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1;
         *self.seek_request.lock().unwrap_or_else(|p| p.into_inner()) = Some(fraction.clamp(0.0, 1.0));
         let total_size = progress.total_size();
         if total_size > 0 {
@@ -1108,6 +1892,23 @@ impl RichContentVideoPlayer {
             let window_start = estimated_offset.saturating_sub(SEEK_RANGE_REQUEST_LEN / 2);
             request_byte_range(window_start, SEEK_RANGE_REQUEST_LEN);
         }
+        // Snapshot whatever `pts` is in `shared.slot` RIGHT NOW (still the
+        // pre-seek frame) — see `pending_seek_from_pts`'s own doc comment
+        // for why `current_frame()` needs this instead of re-anchoring on
+        // whatever it finds the next time it's called.
+        *self.pending_seek_from_pts.lock().unwrap_or_else(|p| p.into_inner()) =
+            self.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+        // Invalidates the paint-side pacing anchor `current_frame` uses
+        // while playing — see that method's own doc comment on the `if
+        // started.is_none()` branch for why this is required (not just
+        // an optimization) for a seek that happens WHILE ALREADY
+        // PLAYING: without clearing this, `current_frame` kept comparing
+        // the freshly seeked-to frame's PTS against the PRE-seek anchor,
+        // almost always judging the new frame "too far in the future"
+        // and freezing the picture on the pre-seek frame until an
+        // unrelated pause/resume cycle happened to re-establish a fresh
+        // anchor via `toggle_play_pause`.
+        *self.playback_started_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Stops playback and marks this player as showing a fixed stand-in
@@ -1208,7 +2009,50 @@ impl RichContentVideoPlayer {
         let pts = *pts;
 
         if self.is_playing() {
-            let started = self.playback_started_at.lock().unwrap_or_else(|p| p.into_inner());
+            let mut started = self.playback_started_at.lock().unwrap_or_else(|p| p.into_inner());
+            // `None` here means "no anchor yet relative to the CURRENT
+            // decode run" — true both right after `toggle_play_pause()`
+            // resumes (which sets a real anchor immediately, so this
+            // branch is mostly moot there) and, more importantly, right
+            // after a seek WHILE ALREADY PLAYING: `seek_to_fraction`
+            // clears this to `None` but has no way to know the new
+            // frame's PTS in advance (only the decode thread, on its own
+            // separate `pace_anchor`, learns that once the first
+            // post-seek frame actually decodes) — so establish the
+            // anchor HERE, from whatever `slot` holds right now, the
+            // first time this method observes the cleared state. Without
+            // this, `started` stayed permanently `None` after a
+            // mid-playback seek — no anchor ever got set again once
+            // `toggle_play_pause()` wasn't the thing that triggered the
+            // resume — so EVERY subsequent frame after the very first
+            // post-seek one skipped this gate entirely, i.e. pacing
+            // silently stopped being enforced at all for the rest of
+            // playback. Confirmed live as the actual bug: a seek while
+            // playing left the on-screen picture frozen on the pre-seek
+            // frame (this same `if started.is_none()` gap meant the
+            // stale cached image in `last_rendered` — from BEFORE this
+            // fix, when the gate as originally written unconditionally
+            // fell through past a `None` anchor straight to the
+            // cache — never got invalidated by a fresh PTS check), and
+            // only a pause/resume cycle (which DOES call
+            // `toggle_play_pause`, re-establishing a real anchor) made
+            // the seeked-to frame appear.
+            if started.is_none() {
+                // Refuse to anchor on a `pts` that matches the snapshot
+                // taken at seek time (still the pre-seek frame — the
+                // decode thread hasn't overwritten `shared.slot` yet) —
+                // see `pending_seek_from_pts`'s own doc comment. Falling
+                // through with `started` still `None` just means this
+                // same "not anchored yet" branch runs again next paint,
+                // which is fine: paint happens far more often than the
+                // decode thread can complete a seek, so within a frame
+                // or two `pts` will actually change and this unblocks.
+                let mut pending_from = self.pending_seek_from_pts.lock().unwrap_or_else(|p| p.into_inner());
+                if *pending_from != Some(pts) {
+                    *pending_from = None;
+                    *started = Some((Instant::now(), pts));
+                }
+            }
             if let Some((started_at, started_pts)) = *started {
                 let num = self.time_base.0.load(Ordering::Acquire).max(0) as f64;
                 let den = self.time_base.1.load(Ordering::Acquire).max(1) as f64;
@@ -1274,8 +2118,8 @@ mod tests {
         }
         let total_size = std::fs::metadata(&path).unwrap().len();
         let progress = Arc::new(VideoTransferProgress::new());
-        progress.update(total_size, total_size);
-        Some(RichContentVideoPlayer::open(path, progress))
+        progress.update(total_size, 0, Vec::new(), total_size);
+        Some(RichContentVideoPlayer::open(path, progress, None))
     }
 
     fn wait_for_decode(player: &RichContentVideoPlayer) -> bool {
@@ -1324,6 +2168,256 @@ mod tests {
         assert!(!player.is_playing());
     }
 
+    /// Regression test for [`read_next_packet`]: an interrupted read
+    /// (`Error::Exit`, fired by `input_from_stream_with_interrupt`'s
+    /// closure) must come back as `NextPacket::Interrupted`, NOT
+    /// `NextPacket::Eof` — the two look identical through the ergonomic
+    /// `PacketIter` this module deliberately avoids for exactly this
+    /// reason (see `read_next_packet`'s own doc comment). Drives a real
+    /// fixture file directly (not through `RichContentVideoPlayer`) so
+    /// the interrupt closure's `true`/`false` transition is fully
+    /// controlled from the test itself.
+    #[test]
+    fn read_next_packet_distinguishes_interrupted_from_real_eof() {
+        let path = test_fixture_path("sample_1920x1080.mkv");
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let _ = ffmpeg_next::init();
+
+        let file = std::fs::File::open(&path).expect("opening fixture");
+        let stream_io =
+            ffmpeg_next::format::context::StreamIo::from_read_seek(file).expect("wrapping fixture in StreamIo");
+        let abort = Arc::new(AtomicBool::new(false));
+        let interrupt_flag = abort.clone();
+        let mut ictx = ffmpeg_next::format::input_from_stream_with_interrupt(
+            stream_io,
+            Some("sample_1920x1080.mkv"),
+            None,
+            move || interrupt_flag.load(Ordering::Acquire),
+        )
+        .expect("opening fixture as an Input");
+
+        // Baseline: with the interrupt flag not yet set, an ordinary read
+        // against a healthy, fully-on-disk file must succeed.
+        match read_next_packet(&mut ictx) {
+            NextPacket::Packet(_) => {},
+            other => panic!("expected a real packet before any interrupt, got a {other:?}-shaped outcome"),
+        }
+
+        // Now arm the interrupt and keep reading — FFmpeg's custom-AVIO
+        // read trampoline only polls the closure when it actually needs
+        // to pull fresh bytes through our `Read` callback, not on every
+        // packet (its own internal `AVIOContext` buffer, 32KB by
+        // default, can serve several packets from what a PREVIOUS read
+        // already pulled in) — so this drains packets until the buffer
+        // is exhausted and a real callback (and therefore the interrupt
+        // check) happens. Bounded so a genuine regression (interrupt
+        // never observed at all) fails the test instead of hanging.
+        abort.store(true, Ordering::Release);
+        let mut saw_interrupted = false;
+        for _ in 0..10_000 {
+            match read_next_packet(&mut ictx) {
+                NextPacket::Packet(_) => continue,
+                NextPacket::Interrupted => {
+                    saw_interrupted = true;
+                    break;
+                },
+                NextPacket::Eof => panic!("hit real EOF before ever observing an interrupt — file too short for this test's buffer-draining assumption"),
+            }
+        }
+        assert!(saw_interrupted, "expected Interrupted once the abort flag was set and enough packets were drained to exhaust AVIOContext's read-ahead buffer");
+
+        // Un-arm and seek back to the start (mirrors `run_decode_loop`'s
+        // own seek-handling block: `take()` the request BEFORE calling
+        // `ictx.seek()`, so the interrupt closure already reports `false`
+        // by the time `Input::seek`'s own `unlatch_exit` clears the
+        // `AVERROR_EXIT` latch) — reads must resume normally afterward,
+        // proving the interrupt doesn't permanently poison the context.
+        abort.store(false, Ordering::Release);
+        ictx.seek(0, ..).expect("seeking back to the start after an interrupt");
+        match read_next_packet(&mut ictx) {
+            NextPacket::Packet(_) => {},
+            other => panic!("expected reads to resume normally after un-arming + seeking, got a {other:?}-shaped outcome"),
+        }
+    }
+
+    impl std::fmt::Debug for NextPacket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                NextPacket::Packet(_) => write!(f, "Packet"),
+                NextPacket::Interrupted => write!(f, "Interrupted"),
+                NextPacket::Eof => write!(f, "Eof"),
+            }
+        }
+    }
+
+    /// Regression test for the bug this session's fix targets: seeking
+    /// WHILE the video is actively playing must leave `is_playing()`
+    /// still `true` afterward. Before `read_next_packet` existed,
+    /// `run_decode_loop` drove `ictx.packets().next()` (`PacketIter`),
+    /// which collapses an interrupted read into a plain `None` —
+    /// indistinguishable from real end-of-stream — so a seek landing
+    /// while a blocking read was in flight would fall into the
+    /// real-EOF branch, which sets `playing = false`/`finished = true`.
+    /// Nothing else in this module ever restores `playing` afterward, so
+    /// that misrouting silently paused playback on every such seek,
+    /// requiring a manual play click to resume (confirmed live as the
+    /// exact symptom reported: seeking mid-playback appeared to freeze
+    /// the video until pause/play was pressed).
+    #[test]
+    fn seeking_while_playing_does_not_pause() {
+        let Some(player) = open_test_player("sample_1920x1080.mkv") else { return };
+        assert!(wait_for_decode(&player), "decode thread never produced a first frame");
+        player.toggle_play_pause();
+        assert!(player.is_playing(), "must be playing before the seek this test exercises");
+
+        let total_size = std::fs::metadata(test_fixture_path("sample_1920x1080.mkv")).unwrap().len();
+        let progress = Arc::new(VideoTransferProgress::new());
+        progress.update(total_size, 0, Vec::new(), total_size);
+        player.seek_to_fraction(0.5, &progress, |_offset, _len| {});
+
+        // Give the decode thread real time to observe and act on the
+        // seek request — generous budget since this is exactly the path
+        // that used to stall for a long time under the bug this test
+        // guards against.
+        let mut still_playing_after_seek = false;
+        for _ in 0..250 {
+            std::thread::sleep(Duration::from_millis(20));
+            if player.is_playing() {
+                still_playing_after_seek = true;
+                break;
+            }
+        }
+        assert!(still_playing_after_seek, "seeking while playing must not leave the player paused");
+    }
+
+    /// Regression test for the bug reported live: the decode thread
+    /// freezing for minutes (dragging the whole GPUI window down with
+    /// it, since `Terminal::mouse_down` runs synchronously on the main
+    /// thread) after SEVERAL rapid clicks on the seek bar — not on the
+    /// first click. Root cause: `ictx.seek()` itself can block on
+    /// `GrowingFileStream::read` while hunting for the target keyframe's
+    /// bytes; a SECOND seek arriving while the FIRST one's `ictx.seek()`
+    /// call is still in flight had no way to interrupt it, because the
+    /// interrupt closure only checked `seek_request.is_some()` — which
+    /// was already `false` again (the first seek had already `take()`n
+    /// it before calling `ictx.seek()`). Fixed via `seek_generation`, a
+    /// counter bumped on every `seek_to_fraction` call that the interrupt
+    /// closure compares against a snapshot taken right before `ictx.
+    /// seek()` runs (see that field's own doc comment for the full
+    /// reasoning). This test fires many seeks back-to-back, with no
+    /// delay between them, and asserts the decode thread is still able
+    /// to make forward progress (produce a fresh frame) within a bounded
+    /// time afterward — before the fix, this reliably hung until the
+    /// test's own timeout.
+    #[test]
+    fn rapid_repeated_seeks_do_not_hang_the_decode_thread() {
+        let Some(player) = open_test_player("sample_1920x1080.mkv") else { return };
+        assert!(wait_for_decode(&player), "decode thread never produced a first frame");
+        player.toggle_play_pause();
+        assert!(player.is_playing());
+
+        let total_size = std::fs::metadata(test_fixture_path("sample_1920x1080.mkv")).unwrap().len();
+        let progress = Arc::new(VideoTransferProgress::new());
+        progress.update(total_size, 0, Vec::new(), total_size);
+
+        // Fire seeks to varying fractions with NO delay between them —
+        // mirrors "several rapid clicks on the seek bar," deliberately
+        // not waiting for one seek to finish before issuing the next, so
+        // there's a real chance of landing squarely inside a prior
+        // seek's own in-flight `ictx.seek()` call.
+        for fraction in [0.1_f32, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6, 0.5] {
+            player.seek_to_fraction(fraction, &progress, |_offset, _len| {});
+        }
+
+        // The decode thread must still be alive and producing frames
+        // after all that — clear the last-known frame's PTS and wait for
+        // a NEW one to land, proving the decode loop is still iterating
+        // and not stuck inside a single `ictx.seek()` call forever.
+        let last_pts_before = player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+        let mut made_progress = false;
+        for _ in 0..500 {
+            std::thread::sleep(Duration::from_millis(20));
+            let current_pts = player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+            if current_pts.is_some() && current_pts != last_pts_before {
+                made_progress = true;
+                break;
+            }
+        }
+        assert!(
+            made_progress,
+            "decode thread never produced a new frame after a burst of rapid seeks — it's stuck (the hang this test guards against)"
+        );
+    }
+
+    /// Isolation test for the hang above: opens the SAME fixture through
+    /// FFmpeg's own plain path-based `ffmpeg_next::format::input` (real
+    /// `std::fs::File` under the hood, NOT our custom `GrowingFileStream`
+    /// `AVIOContext` at all), decodes a handful of packets (mirrors
+    /// `wait_for_decode` + `toggle_play_pause` establishing real decoder
+    /// state before the seek in the failing test above), then fires ONE
+    /// `ictx.seek()` to the exact same `target_us` that hangs in the
+    /// real player. If this ALSO hangs, the bug is entirely inside
+    /// FFmpeg/libavformat's own seek machinery for this file — nothing
+    /// to do with `GrowingFileStream`, the interrupt closure, or
+    /// `seek_generation`. If it does NOT hang, the bug is specific to
+    /// something about the custom AVIOContext path.
+    #[test]
+    fn plain_path_open_single_seek_does_not_hang() {
+        let path = test_fixture_path("sample_1920x1080.mkv");
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let _ = ffmpeg_next::init();
+        // `ffmpeg_next::format::input` needs a registered protocol
+        // handler for plain file paths, which this build's statically-
+        // linked FFmpeg doesn't have wired up (confirmed live: "Protocol
+        // not found") — use `StreamIo::from_read_seek` over an ordinary
+        // `std::fs::File` instead, still through the custom-AVIOContext
+        // path (same mechanism `GrowingFileStream` itself uses), but
+        // with NONE of `GrowingFileStream`'s own watermark-blocking/
+        // interrupt logic — isolates whether the hang is inherent to
+        // FFmpeg's own seek machinery for this file, or specific to
+        // something `GrowingFileStream` itself does.
+        let file = std::fs::File::open(&path).expect("opening fixture file");
+        let stream_io = ffmpeg_next::format::context::StreamIo::from_read_seek(file).expect("wrapping fixture in StreamIo");
+        let filename = path.file_name().and_then(|n| n.to_str());
+        let mut ictx = ffmpeg_next::format::input_from_stream(stream_io, filename, None)
+            .expect("opening fixture via plain StreamIo (no custom watermark/interrupt logic)");
+        let video_stream_index = ictx.streams().best(ffmpeg_next::media::Type::Video).expect("has a video stream").index();
+
+        // Decode a handful of real packets first — mirrors the failing
+        // test's own `wait_for_decode` establishing real decoder state
+        // before the seek that hangs.
+        let mut decoded_packets = 0;
+        for (stream, _packet) in ictx.packets() {
+            if stream.index() == video_stream_index {
+                decoded_packets += 1;
+                if decoded_packets >= 5 {
+                    break;
+                }
+            }
+        }
+        assert!(decoded_packets >= 5, "fixture too short to decode 5 packets before the seek this test exercises");
+
+        // The EXACT target_us the real player's own hang was observed
+        // at (`fraction=0.5` against this fixture's `duration_us=
+        // 28237000`, per that test's own log output).
+        let target_us: i64 = 14_118_500;
+        let seek_started_at = Instant::now();
+        let seek_result = ictx.seek(target_us, ..target_us);
+        let elapsed = seek_started_at.elapsed();
+        eprintln!("DEBUG plain path-based ictx.seek finished: result={seek_result:?} took={elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "plain path-based ictx.seek() took {elapsed:?} (>10s) — the hang reproduces even WITHOUT the custom AVIOContext, \
+             meaning the bug is inside FFmpeg/libavformat itself for this file, not in GrowingFileStream/the interrupt closure"
+        );
+    }
+
     #[test]
     fn decoded_frame_has_expected_dimensions() {
         let Some(player) = open_test_player("sample_1920x1080.mkv") else { return };
@@ -1359,7 +2453,7 @@ mod tests {
         std::fs::write(&dest_path, b"").expect("creating empty dest file");
 
         let progress = Arc::new(VideoTransferProgress::new());
-        let player = RichContentVideoPlayer::open(dest_path.clone(), progress.clone());
+        let player = RichContentVideoPlayer::open(dest_path.clone(), progress.clone(), None);
         // The decode thread only advances PAST its first frame while
         // actually playing (see `run_decode_loop`'s pause-gate doc
         // comment) — a real pause fix that made this test's own
@@ -1380,12 +2474,12 @@ mod tests {
             let end = (written + piece_len).min(source_bytes.len());
             std::fs::write(&dest_path, &source_bytes[..end]).expect("appending to dest file");
             written = end;
-            progress.update(written as u64, total_size);
+            progress.update(written as u64, total_size, Vec::new(), total_size);
             std::thread::sleep(Duration::from_millis(150));
         }
         // Final write covers any remainder from integer division above.
         std::fs::write(&dest_path, &source_bytes).expect("writing final dest file");
-        progress.update(total_size, total_size);
+        progress.update(total_size, 0, Vec::new(), total_size);
 
         // Give the decode thread a real chance to catch up to the now-
         // complete file — generous budget since this test's own writes

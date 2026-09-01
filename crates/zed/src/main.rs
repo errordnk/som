@@ -231,6 +231,33 @@ fn main() {
         level => Some(level.to_string()),
     };
     zlog::process_env(log_filter);
+    // `zlog::init()` (just above) already ran `refresh_from_settings` once,
+    // but at that point `process_env` hadn't been called with `som_log`'s
+    // configured level yet (no `RUST_LOG`/`ZED_LOG` env var is set on a
+    // normal launch, so the FIRST `process_env` call inside `zlog::init()`
+    // found nothing and returned early without ever calling `init_env_
+    // filter`) — so the scope map built by that first `refresh_from_
+    // settings` reflects an EMPTY env filter, and `LEVEL_ENABLED_MAX_
+    // CONFIG` (the fast-path gate every `log::trace!`/`log::debug!` call
+    // checks first) got cached at the crate's built-in default (`Info`),
+    // never revisited. The `process_env` call directly above DOES update
+    // `LEVEL_ENABLED_MAX_STATIC` from `som_log.level`, but that value on
+    // its own doesn't feed back into `LEVEL_ENABLED_MAX_CONFIG` — only
+    // `refresh_from_settings` does that. Without this second call, a
+    // `settings.json` `"log": {"level": "trace"}` (or any level below the
+    // built-in default) was silently ignored for every module: `log::
+    // trace!` calls compiled fine and looked correctly gated in the
+    // source, but were dropped by this stale fast-path check before ever
+    // reaching the scope-map's real per-module logic. Confirmed live: a
+    // seek-bar click's own `log::trace!("mouse_down: ...")` — always
+    // unconditional at the top of that function — never appeared in
+    // `~/.config/som/logs/*.log` despite `settings.json` explicitly
+    // requesting `"trace"`, even though `DEBUG`-level lines from other
+    // modules printed normally (those satisfied the stale `Info`-derived
+    // gate; `Trace`/`Debug`-only call sites elsewhere in the SAME modules
+    // did not, inconsistently, depending on what each module's own default
+    // happened to be under `DEFAULT_FILTERS`).
+    zlog::filter::refresh_from_settings(&std::collections::HashMap::default());
 
     #[cfg(target_os = "windows")]
     {

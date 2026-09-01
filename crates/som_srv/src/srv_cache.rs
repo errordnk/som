@@ -80,6 +80,16 @@ struct Inner {
     entries: HashMap<CacheKey, CacheEntry>,
     subscribers: HashMap<CacheKey, Vec<ProgressSender>>,
     sender_routes: HashMap<CacheKey, SenderRoute>,
+    /// Populated only by an explicit `SrvRequest::RegisterRangeResponder`
+    /// — see that variant's own doc comment for why a byte-range
+    /// response needs a connection separate from `sender_routes`' (the
+    /// sequential `PutChunk` stream's own connection, which can be
+    /// saturated with outgoing chunks for minutes on a large file).
+    /// `route_byte_range_request` checks this FIRST, falling back to
+    /// `sender_routes` only if no responder has registered (keeps this
+    /// backward-compatible with any sender that never sends `Register
+    /// RangeResponder` at all).
+    range_response_routes: HashMap<CacheKey, SenderRoute>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -294,17 +304,38 @@ impl SrvCache {
         inner.sender_routes.insert((session_id, file_id), send);
     }
 
-    /// Forwards `request` to `(session_id, file_id)`'s registered sender
-    /// route, if one exists — a miss (no route registered, or the
-    /// registered route's underlying connection has since closed and its
-    /// `send` call fails) is silently swallowed, not an error: see
-    /// `SrvRequest::RequestByteRange`'s own doc comment for why an
-    /// undeliverable range request is an accepted gap, not a new failure
-    /// mode, mirroring the OLD PTY `Query` mechanism's identical
-    /// tolerance for a query that simply never gets answered.
+    /// Registers `send` as the DEDICATED route for `SrvRequest::
+    /// RequestByteRange` forwarding — see `SrvRequest::
+    /// RegisterRangeResponder`'s own doc comment for why this exists
+    /// separately from `register_sender_route`.
+    pub fn register_range_responder_route(&self, session_id: u32, file_id: u32, send: SenderRoute) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.range_response_routes.insert((session_id, file_id), send);
+    }
+
+    /// Forwards `request` to `(session_id, file_id)`'s registered range-
+    /// responder route if one was explicitly registered (see `SrvRequest::
+    /// RegisterRangeResponder`'s own doc comment for why that's preferred
+    /// — it's on a connection dedicated to range responses, uncontended
+    /// by the sequential `PutChunk` stream), falling back to the plain
+    /// sender route otherwise (a sender that never registers a dedicated
+    /// responder — images/GIF, or an older `somcat` build — still gets a
+    /// working, just non-prioritized, byte-range reply). A miss on BOTH
+    /// (no route registered at all, or the registered route's underlying
+    /// connection has since closed and its `send` call fails) is silently
+    /// swallowed, not an error: see `SrvRequest::RequestByteRange`'s own
+    /// doc comment for why an undeliverable range request is an accepted
+    /// gap, not a new failure mode, mirroring the OLD PTY `Query`
+    /// mechanism's identical tolerance for a query that simply never
+    /// gets answered.
     pub fn route_byte_range_request(&self, session_id: u32, file_id: u32, request: SrvRequest) {
         let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(route) = inner.sender_routes.get(&(session_id, file_id)) {
+        let key = (session_id, file_id);
+        if let Some(route) = inner.range_response_routes.get(&key) {
+            let _ = route(request);
+            return;
+        }
+        if let Some(route) = inner.sender_routes.get(&key) {
             let _ = route(request);
         }
     }

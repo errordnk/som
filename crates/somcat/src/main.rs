@@ -658,12 +658,49 @@ fn send_range_chunks_from_disk(
     file: &std::sync::Mutex<std::fs::File>,
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
-    (session_id, file_id): SrpIds,
+    ids: SrpIds,
     total_size: u64,
     range_offset: u64,
     range_len: u64,
 ) -> Result<(), String> {
+    send_range_chunks_from_disk_interruptible(channel, file, content_type, metadata, ids, total_size, range_offset, range_len, None)
+        .map(|_| ())
+}
+
+/// Outcome of [`send_range_chunks_from_disk_interruptible`] — distinguishes
+/// "sent the whole requested range" from "stopped early because a newer
+/// seek redirected us," which the caller (the main sequential loop in
+/// [`stream_file_from_disk`]) needs to tell apart: the former means move
+/// on to the next range in sequence, the latter means jump straight to
+/// wherever the seek landed instead.
+enum SendOutcome {
+    Completed,
+    RedirectedTo(u64),
+}
+
+/// Same job as [`send_range_chunks_from_disk`], but checks `seek_signal`
+/// (if given) between every chunk and stops early — returning
+/// `SendOutcome::RedirectedTo` — the instant it sees a DIFFERENT offset
+/// than `range_offset` waiting there. Used by the main sequential loop
+/// (which passes `Some(seek_signal)`) so a user seek takes effect
+/// immediately instead of only after the current multi-gigabyte
+/// sequential pass finishes; the byte-range-responder's own one-off
+/// range sends `None` — an already-targeted range reply has nothing
+/// further to redirect away from.
+#[allow(clippy::too_many_arguments)]
+fn send_range_chunks_from_disk_interruptible(
+    channel: &srv_channel::SrvChannel,
+    file: &std::sync::Mutex<std::fs::File>,
+    content_type: terminal::rich_content_transport::ContentType,
+    metadata: terminal::rich_content_transport::ContentMetadata,
+    (session_id, file_id): SrpIds,
+    total_size: u64,
+    range_offset: u64,
+    range_len: u64,
+    seek_signal: Option<&SeekSignal>,
+) -> Result<SendOutcome, String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::sync::atomic::Ordering;
 
     let range_len = range_len.min(total_size.saturating_sub(range_offset));
     let srv_content_type = srv_channel::to_srv_content_type(content_type);
@@ -672,6 +709,35 @@ fn send_range_chunks_from_disk(
     let end = range_offset + range_len;
     let mut buf = vec![0u8; CHUNK_SIZE];
     while offset < end {
+        if let Some(seek_signal) = seek_signal {
+            let pending = seek_signal.load(Ordering::Acquire);
+            // `NO_SEEK_PENDING` is the only "nothing new happened" value —
+            // `pending != offset` alone is NOT enough to mean "a NEWER
+            // seek arrived," because `seek_signal` is never reset back to
+            // `NO_SEEK_PENDING` after a redirect is taken (there's no
+            // single writer that could safely do so: the byte-range-
+            // responder thread only ever WRITES a fresh target on a new
+            // seek, it doesn't know when this loop has finished acting on
+            // the last one). Without this compare-and-clear, the very
+            // FIRST chunk sent after taking a redirect immediately
+            // "reads" its own already-handled target back (`pending`
+            // stays stuck at that same old value while `offset` moves
+            // forward past it), redirecting again to the SAME point over
+            // and over — confirmed live as `somcat` spinning forever
+            // resending one chunk near a seek target while Som's own
+            // widget sat frozen on the pre-seek frame, never receiving
+            // anything past that single point. Atomically claiming the
+            // pending value (swapping it to `NO_SEEK_PENDING`) the first
+            // time this loop observes it means a seek is consumed
+            // exactly once — a genuinely NEWER seek arriving later
+            // simply stores a fresh non-`NO_SEEK_PENDING` value again.
+            if pending != NO_SEEK_PENDING
+                && pending != offset
+                && seek_signal.compare_exchange(pending, NO_SEEK_PENDING, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
+                return Ok(SendOutcome::RedirectedTo(pending));
+            }
+        }
         let piece_len = (end - offset).min(CHUNK_SIZE as u64) as usize;
         {
             let mut guard = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -681,25 +747,64 @@ fn send_range_chunks_from_disk(
         channel.put_chunk(session_id, file_id, offset, buf[..piece_len].to_vec(), total_size, srv_content_type, srv_metadata)?;
         offset += piece_len as u64;
     }
-    Ok(())
+    Ok(SendOutcome::Completed)
 }
+
+/// Sentinel stored in [`SeekSignal`] meaning "no seek pending" — `u64`
+/// has no natural "none" value, and every REAL seek target is a valid
+/// file offset that could theoretically be 0 (the very start), so a
+/// separate out-of-band sentinel is needed rather than overloading 0
+/// itself. `total_size` (a video/audio file's length) can never reach
+/// `u64::MAX` in practice, so this is safe to use as "unset."
+const NO_SEEK_PENDING: u64 = u64::MAX;
+
+/// Shared between [`spawn_byte_range_responder_from_disk`] (the writer,
+/// on a real user seek) and [`stream_file_from_disk`]'s main sequential
+/// loop (the reader, checked between every chunk) — see [`spawn_byte_
+/// range_responder_from_disk`]'s own doc comment for why a seek needs to
+/// REDIRECT the sequential stream's own position, not just answer a
+/// one-off byte-range request alongside it.
+type SeekSignal = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
 /// File-backed counterpart to [`spawn_byte_range_responder`] — services
 /// `RequestByteRange` by seeking/reading `file` instead of slicing an
 /// in-memory buffer, so it works correctly once the sequential sender no
 /// longer holds the whole file resident (see [`stream_file_from_disk`]).
+///
+/// Uses its OWN `SrvChannel` connection (registered via `SrvRequest::
+/// RegisterRangeResponder`), separate from the sequential sender's own
+/// connection — see that protocol variant's own doc comment for why: a
+/// range response sharing the sequential sender's connection has to win
+/// a mutex race against a steady stream of outgoing `PutChunk`s for a
+/// large, still-in-flight file, and a plain (non-fair) mutex has no
+/// obligation to let a rarely-contending thread win against one
+/// re-acquiring the lock in a tight loop. Confirmed live as multi-
+/// second-to-minutes seek latency that scaled with file size before this
+/// fix. Also raises `seek_signal` to `offset` — see [`SeekSignal`]'s own
+/// doc comment for why the sequential loop needs to be redirected, not
+/// just have this one range answered alongside its own unrelated,
+/// now-stale progress through the file: continuing to sequentially send
+/// bytes from the OLD position after the user has jumped elsewhere
+/// wastes the disk/pipe bandwidth this whole redesign exists to stop
+/// wasting, and the widget only cares about bytes from the NEW position
+/// onward once a seek has happened.
 fn spawn_byte_range_responder_from_disk(
-    channel: std::sync::Arc<srv_channel::SrvChannel>,
     file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
     ids: SrpIds,
     total_size: u64,
-) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
-    use std::sync::atomic::{AtomicBool, Ordering};
+) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, SeekSignal, std::thread::JoinHandle<()>), String> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let (session_id, file_id) = ids;
+    let channel = std::sync::Arc::new(srv_channel::SrvChannel::connect()?);
+    channel.register_range_responder(session_id, file_id)?;
 
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let seek_signal: SeekSignal = std::sync::Arc::new(AtomicU64::new(NO_SEEK_PENDING));
     let stop_for_thread = stop.clone();
+    let seek_signal_for_thread = seek_signal.clone();
     let handle = std::thread::spawn(move || {
         loop {
             if stop_for_thread.load(Ordering::Relaxed) {
@@ -712,6 +817,7 @@ fn spawn_byte_range_responder_from_disk(
                     offset,
                     len,
                 })) if (session_id, file_id) == ids => {
+                    seek_signal_for_thread.store(offset, Ordering::Release);
                     let _ = send_range_chunks_from_disk(&channel, &file, content_type, metadata, ids, total_size, offset, len);
                 },
                 Ok(_) => continue,
@@ -719,7 +825,7 @@ fn spawn_byte_range_responder_from_disk(
             }
         }
     });
-    (stop, handle)
+    Ok((stop, seek_signal, handle))
 }
 
 /// Streams `path` (a video or audio file) to Som over SRP by reading it
@@ -753,14 +859,8 @@ fn stream_file_from_disk(
     let shared_file = std::sync::Arc::new(std::sync::Mutex::new(file));
     let shared_channel = std::sync::Arc::new(channel);
 
-    let (stop, handle) = spawn_byte_range_responder_from_disk(
-        shared_channel.clone(),
-        shared_file.clone(),
-        content_type,
-        metadata,
-        ids,
-        total_size,
-    );
+    let (stop, seek_signal, handle) =
+        spawn_byte_range_responder_from_disk(shared_file.clone(), content_type, metadata, ids, total_size)?;
 
     // Non-faststart MP4 has its `moov` atom at the end of the file, and
     // MKV can likewise have its Cues (seek index) element near the end
@@ -789,7 +889,37 @@ fn stream_file_from_disk(
             send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata, ids, total_size, tail_offset, TAIL_FETCH_LEN);
     }
 
-    let result = send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata, ids, total_size, 0, total_size);
+    // Sequential send, restarting from wherever the latest seek landed
+    // instead of continuing from its own old position — see `SeekSignal`'s
+    // own doc comment for why blindly continuing a stale sequential pass
+    // after the user has jumped elsewhere would waste the disk/pipe
+    // bandwidth this whole redesign exists to stop wasting. Each pass
+    // covers `[start, total_size)`; a redirect starts an entirely new pass
+    // from the NEW position rather than resuming the old one, since once
+    // the user has seeked, bytes before the new position are no longer
+    // the priority (a later backward seek re-requests them on demand via
+    // the byte-range responder, same as any other gap).
+    let mut start = 0u64;
+    let result = loop {
+        match send_range_chunks_from_disk_interruptible(
+            &shared_channel,
+            &shared_file,
+            content_type,
+            metadata,
+            ids,
+            total_size,
+            start,
+            total_size - start,
+            Some(&seek_signal),
+        ) {
+            Ok(SendOutcome::Completed) => break Ok(()),
+            Ok(SendOutcome::RedirectedTo(new_start)) => {
+                start = new_start;
+                continue;
+            },
+            Err(err) => break Err(err),
+        }
+    };
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(handle);
     result

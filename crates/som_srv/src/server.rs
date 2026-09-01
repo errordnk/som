@@ -350,6 +350,15 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::RequestByteRange { session_id, file_id, offset, len } => {
                 cache.route_byte_range_request(session_id, file_id, SrvRequest::RequestByteRange { session_id, file_id, offset, len });
             }
+            SrvRequest::RegisterRangeResponder { session_id, file_id } => {
+                let connection = connection.clone();
+                let writer = writer.clone();
+                cache.register_range_responder_route(
+                    session_id,
+                    file_id,
+                    Arc::new(move |request| forward_srv_request(&connection, &writer, &request)),
+                );
+            }
             SrvRequest::ListSessions { client_id } => {
                 let sessions = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let matching: Vec<SessionInfo> = sessions

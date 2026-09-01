@@ -118,6 +118,15 @@ impl SrvChannel {
     pub fn read_incoming(&self) -> Result<Incoming, String> {
         read_any(&self.connection)
     }
+
+    /// Registers this connection as the DEDICATED target for `SrvRequest::
+    /// RequestByteRange` forwarding for `(session_id, file_id)` — see
+    /// `som_srv::protocol::SrvRequest::RegisterRangeResponder`'s own doc
+    /// comment for why this needs to be a connection separate from
+    /// whichever one is sending the sequential `PutChunk` stream.
+    pub fn register_range_responder(&self, session_id: u32, file_id: u32) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::RegisterRangeResponder { session_id, file_id })
+    }
 }
 
 impl std::fmt::Debug for Incoming {

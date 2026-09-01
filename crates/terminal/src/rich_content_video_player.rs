@@ -513,6 +513,21 @@ struct GrowingFileStream {
     /// makes forward progress).
     seek_request: Arc<Mutex<Option<f32>>>,
     position: u64,
+    /// Fires a fresh `RequestByteRange` for whatever position `read`
+    /// itself is blocked waiting on — see [`RequestByteRange`]'s own doc
+    /// comment for why this exists as well as `seek_to_fraction`'s own
+    /// one-off window request: `avformat_seek_file`'s internal keyframe/
+    /// index hunt reads at positions this struct has no visibility into
+    /// ahead of time, so the ONLY reliable way to keep a cold (never-
+    /// requested-before) seek fast is for `read` to ask for bytes right
+    /// where it's ACTUALLY stuck, the moment it first notices it's
+    /// stuck — not to guess a wider window up front and hope it's wide
+    /// enough. `last_requested_position` suppresses re-requesting the
+    /// SAME stuck position on every 100ms retry-sleep iteration (the
+    /// request is already in flight; re-sending it doesn't make the
+    /// bytes arrive any faster, just adds needless socket traffic).
+    request_byte_range: Option<RequestByteRange>,
+    last_requested_position: Option<u64>,
 }
 
 impl GrowingFileStream {
@@ -521,14 +536,25 @@ impl GrowingFileStream {
         progress: Arc<VideoTransferProgress>,
         stop: Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<f32>>>,
+        request_byte_range: Option<RequestByteRange>,
     ) -> std::io::Result<Self> {
-        Ok(Self { file: std::fs::File::open(path)?, progress, stop, seek_request, position: 0 })
+        Ok(Self {
+            file: std::fs::File::open(path)?,
+            progress,
+            stop,
+            seek_request,
+            position: 0,
+            request_byte_range,
+            last_requested_position: None,
+        })
     }
 }
 
 impl std::io::Read for GrowingFileStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::io::{Seek, SeekFrom};
+        let diag_wait_started_at = Instant::now();
+        let mut diag_slept = false;
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, "video player dropped"));
@@ -561,16 +587,39 @@ impl std::io::Read for GrowingFileStream {
                 self.file.seek(SeekFrom::Start(self.position))?;
                 let n = self.file.read(&mut buf[..readable])?;
                 self.position += n as u64;
+                self.last_requested_position = None;
+                if diag_slept {
+                    log::debug!("DIAG: GrowingFileStream::read unblocked after {:?}", diag_wait_started_at.elapsed());
+                }
                 return Ok(n);
             }
             if total_size > 0 && self.position >= total_size {
                 return Ok(0); // Real EOF — the whole file has arrived and we've read all of it.
+            }
+            // Actively ask for bytes at THIS exact position rather than
+            // only ever waiting on whatever `seek_to_fraction`'s own
+            // fixed-size window guessed — see `request_byte_range`'s own
+            // doc comment for why the guessed window frequently misses:
+            // `avformat_seek_file`'s internal keyframe/index hunt for
+            // this container can land anywhere, not just near the linear
+            // fraction-based estimate. Only fires once per stuck
+            // position (`last_requested_position` dedupes across this
+            // loop's own 100ms retry-sleep iterations) — the request is
+            // already in flight; resending it doesn't make bytes arrive
+            // faster.
+            if let Some(request_byte_range) = self.request_byte_range.as_ref()
+                && self.last_requested_position != Some(self.position)
+            {
+                const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
+                request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
+                self.last_requested_position = Some(self.position);
             }
             // Caught up to what's currently on disk, but more is still
             // coming — block (StreamIo's own doc comment requires a
             // blocking stream; FFmpeg has no retry layer of its own for
             // custom I/O) until RichContentCache::apply_chunk advances
             // contiguous_len further.
+            diag_slept = true;
             std::thread::sleep(DECODE_RETRY_INTERVAL);
         }
     }
@@ -705,6 +754,7 @@ fn run_decode_loop(
     // doc comment). `None` keeps the existing heuristic-based selection
     // unchanged.
     audio_stream_index_override: Option<u32>,
+    request_byte_range: Option<RequestByteRange>,
 ) {
     use ffmpeg_next as ffmpeg;
 
@@ -723,7 +773,13 @@ fn run_decode_loop(
         std::thread::sleep(DECODE_RETRY_INTERVAL);
     }
 
-    let Ok(stream) = GrowingFileStream::open(&path, progress.clone(), stop.clone(), seek_request.clone()) else {
+    let Ok(stream) = GrowingFileStream::open(
+        &path,
+        progress.clone(),
+        stop.clone(),
+        seek_request.clone(),
+        request_byte_range.clone(),
+    ) else {
         return;
     };
     let Ok(stream_io) = ffmpeg::format::context::StreamIo::from_read_seek(stream) else {
@@ -848,6 +904,33 @@ fn run_decode_loop(
         .and_then(|n| ictx.streams().filter(|s| s.parameters().medium() == ffmpeg::media::Type::Audio).nth(n as usize))
         .or_else(|| ictx.streams().best(ffmpeg::media::Type::Audio))
         .map(|input| input.index());
+    // Tell libavformat to skip every stream this player will never touch
+    // (extra audio dubs, subtitle tracks, cover-art/font attachments) at
+    // the DEMUX level, not just discard their packets after the fact in
+    // this loop's own `NextPacket::Packet(_) => continue` branch below.
+    // `AVStream.discard` is checked inside `av_read_frame` itself — a
+    // discarded stream's packets are skipped without the same per-packet
+    // allocation/parsing cost a kept-then-thrown-away packet still pays.
+    // A real (if secondary) win for files with unusually many tracks —
+    // e.g. a 16GB Matroska file with 22 streams (1 video + 7 audio dubs +
+    // 14 subtitle tracks, `ffprobe`-confirmed) — though live measurement
+    // showed this alone doesn't explain a much bigger bug found the same
+    // session: see `awaiting_post_seek_pts`'s own doc comment for the
+    // actual cause of "seeking while paused never shows the new frame."
+    // `ffmpeg_next`'s safe `Stream`/`StreamMut` API has no discard
+    // setter (only a getter), so this goes through the raw `AVStream`
+    // pointer directly, matching this module's own established pattern
+    // for raw FFI where the safe wrapper doesn't expose something.
+    unsafe {
+        let format_ctx = ictx.as_mut_ptr();
+        for i in 0..(*format_ctx).nb_streams as isize {
+            let stream = *(*format_ctx).streams.offset(i);
+            let index = (*stream).index as usize;
+            if index != video_stream_index && Some(index) != audio_stream_index {
+                (*stream).discard = ffmpeg_sys_next::AVDiscard::AVDISCARD_ALL;
+            }
+        }
+    }
     let mut audio_decoder = audio_stream_index.and_then(|index| {
         let input = ictx.stream(index)?;
         let context_decoder = match ffmpeg::codec::context::Context::from_parameters(input.parameters()) {
@@ -985,6 +1068,24 @@ fn run_decode_loop(
     // one" (handles both the initial start and the frame right after a
     // seek uniformly).
     let mut pace_anchor: Option<(Instant, i64)> = None;
+    // The `pts` that was in `shared.slot` at the moment the MOST RECENT
+    // seek was taken — `None` once a frame with a DIFFERENT `pts` has
+    // been stored since. While `Some`, the pause-gate below must not
+    // stall: without this, a seek that arrives while paused breaks the
+    // gate once (correctly), but the very NEXT outer-loop iteration
+    // (reached after `Interrupted`/`continue`, or simply after handling
+    // the seek and looping back around) re-checks `has_a_frame_already
+    // && !playing` — which is STILL true, because `shared.slot` still
+    // holds the PRE-seek frame; the real post-seek frame hasn't been
+    // decoded yet. With `seek_request` already consumed (`None`), the
+    // gate then blocks forever: nothing else ever sets `playing = true`
+    // or repopulates `seek_request` for a paused player. Confirmed live
+    // as the actual cause of "seeking while paused just does nothing" —
+    // not slow demuxing, not a slow `avformat_seek_file` call (both were
+    // separately measured at low milliseconds), but the decode thread
+    // never reaching `read_next_packet` again after the seek at all.
+    let mut awaiting_post_seek_pts: Option<i64> = None;
+    let mut diag_seek_started_at: Option<Instant> = None;
 
     let mut receive_and_store = |decoder: &mut ffmpeg::decoder::Video, scaler: &mut Option<ffmpeg::software::scaling::context::Context>, pace_anchor: &mut Option<(Instant, i64)>| {
         while decoder.receive_frame(&mut decoded).is_ok() {
@@ -1171,7 +1272,7 @@ fn run_decode_loop(
         // `slot` holds with no PTS gating, so the seeked-to frame
         // becomes visible as soon as it decodes.
         let has_a_frame_already = shared.slot.lock().unwrap_or_else(|p| p.into_inner()).is_some();
-        if has_a_frame_already && !playing.load(Ordering::Acquire) {
+        if has_a_frame_already && !playing.load(Ordering::Acquire) && awaiting_post_seek_pts.is_none() {
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -1200,11 +1301,16 @@ fn run_decode_loop(
         // handled doesn't get silently coalesced away.
         let taken_seek_request = seek_request.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(fraction) = taken_seek_request {
+            diag_seek_started_at = Some(Instant::now());
             let duration = duration_us.load(Ordering::Acquire);
             let handled_generation_before = seek_generation.load(Ordering::Acquire);
             log::debug!(
                 "video decode loop saw seek_request: fraction={fraction} duration_us={duration} generation={handled_generation_before}"
             );
+            // Snapshot the pre-seek `pts` — see `awaiting_post_seek_pts`'s
+            // own doc comment for why the pause-gate must stay exempt
+            // until `shared.slot` shows something ELSE.
+            awaiting_post_seek_pts = shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
             if duration > 0 {
                 // FFmpeg's own seek API works in AV_TIME_BASE (microsecond)
                 // units regardless of the stream's own `time_base` — see
@@ -1418,6 +1524,7 @@ fn run_decode_loop(
                             finished,
                             shared_audio,
                             audio_stream_index_override,
+                            request_byte_range,
                         );
                     },
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1425,6 +1532,9 @@ fn run_decode_loop(
                     },
                 };
                 seek_in_flight.store(false, Ordering::Release);
+                if let Some(started_at) = diag_seek_started_at {
+                    log::debug!("DIAG: avformat_seek_file resolved after {:?}", started_at.elapsed());
+                }
                 if let Err(err) = seek_result {
                     log::warn!("video seek to target_us={target_us} failed: {err}");
                 }
@@ -1449,6 +1559,25 @@ fn run_decode_loop(
             NextPacket::Packet(packet) if packet.stream() == video_stream_index => {
                 if decoder.send_packet(&packet).is_ok() {
                     receive_and_store(&mut decoder, &mut scaler, &mut pace_anchor);
+                    // Clear the pause-gate exemption once a genuinely NEW
+                    // frame (different `pts` than the pre-seek snapshot)
+                    // has landed — see `awaiting_post_seek_pts`'s own doc
+                    // comment. A decoder can need more than one packet
+                    // before `receive_frame` yields anything (B-frame
+                    // reordering) or can occasionally yield the SAME pts
+                    // back (rare, but not impossible for some streams),
+                    // so this checks the actual stored value rather than
+                    // assuming one `receive_and_store` call is enough.
+                    if awaiting_post_seek_pts.is_some() {
+                        let current_pts =
+                            shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+                        if current_pts != awaiting_post_seek_pts {
+                            awaiting_post_seek_pts = None;
+                            if let Some(started_at) = diag_seek_started_at.take() {
+                                log::debug!("DIAG: post-seek frame landed after {:?}", started_at.elapsed());
+                            }
+                        }
+                    }
                 }
             },
             NextPacket::Packet(packet) if Some(packet.stream()) == audio_stream_index => {
@@ -1690,11 +1819,33 @@ impl Drop for RichContentVideoPlayer {
     }
 }
 
+/// A `RequestByteRange` request for `(offset, len)` — shared shape for
+/// both the one-off request `seek_to_fraction` fires and the ongoing
+/// requests [`GrowingFileStream::read`] itself fires when it blocks on a
+/// byte range nobody has asked for yet. See [`GrowingFileStream::read`]'s
+/// own doc comment for why relying SOLELY on the seek-time request isn't
+/// enough: FFmpeg's `avformat_seek_file` frequently needs bytes outside
+/// the fixed window that call requested (hunting for a container's own
+/// index/keyframe near, but not exactly at, the estimated linear byte
+/// offset), and this callback is `read`'s only way to ask for more
+/// without knowing anything about `session_id`/`file_id` itself (those
+/// live in `crates/terminal`'s `Terminal`, a GPUI type this module can't
+/// depend on).
+type RequestByteRange = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 impl RichContentVideoPlayer {
     /// Starts decoding `path` (the on-disk cache file for one SRP video
     /// transfer, possibly still growing) on a background thread. Starts
     /// paused, matching audio/GIF's own "don't autoplay" convention.
-    pub fn open(path: PathBuf, progress: Arc<VideoTransferProgress>, audio_stream_index: Option<u32>) -> Self {
+    /// `request_byte_range` is `None` in tests that already have the
+    /// whole file locally (nothing to request) — see [`RequestByteRange`]'s
+    /// own doc comment for why production callers always pass `Some`.
+    pub fn open(
+        path: PathBuf,
+        progress: Arc<VideoTransferProgress>,
+        audio_stream_index: Option<u32>,
+        request_byte_range: Option<RequestByteRange>,
+    ) -> Self {
         let shared = Arc::new(LatestFrame { slot: Mutex::new(None) });
         let decode_stop = Arc::new(AtomicBool::new(false));
         let time_base = Arc::new((AtomicI64::new(0), AtomicI64::new(1)));
@@ -1736,6 +1887,7 @@ impl RichContentVideoPlayer {
                     finished,
                     shared_audio,
                     audio_stream_index,
+                    request_byte_range,
                 )
             });
         }
@@ -2119,7 +2271,7 @@ mod tests {
         let total_size = std::fs::metadata(&path).unwrap().len();
         let progress = Arc::new(VideoTransferProgress::new());
         progress.update(total_size, 0, Vec::new(), total_size);
-        Some(RichContentVideoPlayer::open(path, progress, None))
+        Some(RichContentVideoPlayer::open(path, progress, None, None))
     }
 
     fn wait_for_decode(player: &RichContentVideoPlayer) -> bool {
@@ -2293,6 +2445,69 @@ mod tests {
         assert!(still_playing_after_seek, "seeking while playing must not leave the player paused");
     }
 
+    /// Regression test for a real, reproduced-live bug: seeking WHILE
+    /// PAUSED on a large file never showed the new frame at all — not
+    /// slow, permanently stuck. Root cause, confirmed via live
+    /// instrumentation (temporary, since removed): the outer decode
+    /// loop's pause-gate (`has_a_frame_already && !playing`) correctly
+    /// breaks the FIRST time it sees a pending `seek_request`, but the
+    /// very NEXT time the outer loop reaches the top of its `loop` body
+    /// — reached either right after handling the seek, or via `NextPacket::
+    /// Interrupted`'s `continue` — `shared.slot` STILL holds the pre-seek
+    /// frame (the real one hasn't decoded yet) and `seek_request` is
+    /// already consumed, so the gate re-triggers and sleeps forever:
+    /// nothing else ever sets `playing = true` or repopulates `seek_
+    /// request` for a paused player. `avformat_seek_file` itself and
+    /// individual `GrowingFileStream`/`read_next_packet` calls were all
+    /// separately measured in the low milliseconds — this was purely a
+    /// control-flow bug in this module, not slow demuxing or a slow
+    /// libavformat call. See `awaiting_post_seek_pts`'s own doc comment
+    /// for the fix (exempts the pause-gate until a genuinely new frame
+    /// lands).
+    ///
+    /// Runs against a real, large (16GB+) local file specifically
+    /// because that's what the original live report used — `GrowingFileStream`
+    /// behaves identically whether the file arrived via `som-srv`
+    /// streaming or (as here) already sits fully on disk, so a local
+    /// open reproduces the same bug without needing a live transfer.
+    /// Skipped (not failed) if the specific movie file isn't present on
+    /// this machine.
+    #[test]
+    fn seek_near_end_of_large_local_file_completes_quickly() {
+        let path = std::path::PathBuf::from(
+            "C:/home/dnk/som/Ready.or.Not.2.Here.I.Come.2026.1080p.MA.WEB-DLRip.x264-HiDt_EniaHD.mkv",
+        );
+        if !path.is_file() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let total_size = std::fs::metadata(&path).unwrap().len();
+        let progress = Arc::new(VideoTransferProgress::new());
+        progress.update(total_size, 0, Vec::new(), total_size);
+        let player = RichContentVideoPlayer::open(path, progress.clone(), None, None);
+        assert!(wait_for_decode(&player), "decode thread never produced a first frame");
+
+        let pts_before = player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+        let seek_started_at = Instant::now();
+        player.seek_to_fraction(0.9, &progress, |_offset, _len| {});
+
+        // 250 * 20ms = 5s — generous headroom over the ~120ms this
+        // actually takes post-fix, while still failing fast (not 30s)
+        // if the pause-gate bug (or something equally bad) regresses.
+        let mut new_pts_seen = false;
+        for _ in 0..250 {
+            std::thread::sleep(Duration::from_millis(20));
+            let current_pts = player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
+            if current_pts.is_some() && current_pts != pts_before {
+                new_pts_seen = true;
+                break;
+            }
+        }
+        let elapsed = seek_started_at.elapsed();
+        eprintln!("seek to fraction=0.9 on the 16GB file: new frame appeared after {elapsed:?} (new_pts_seen={new_pts_seen})");
+        assert!(new_pts_seen, "seek near the end of the 16GB file never produced a new frame within {elapsed:?}");
+    }
+
     /// Regression test for the bug reported live: the decode thread
     /// freezing for minutes (dragging the whole GPUI window down with
     /// it, since `Terminal::mouse_down` runs synchronously on the main
@@ -2453,7 +2668,7 @@ mod tests {
         std::fs::write(&dest_path, b"").expect("creating empty dest file");
 
         let progress = Arc::new(VideoTransferProgress::new());
-        let player = RichContentVideoPlayer::open(dest_path.clone(), progress.clone(), None);
+        let player = RichContentVideoPlayer::open(dest_path.clone(), progress.clone(), None, None);
         // The decode thread only advances PAST its first frame while
         // actually playing (see `run_decode_loop`'s pause-gate doc
         // comment) — a real pause fix that made this test's own

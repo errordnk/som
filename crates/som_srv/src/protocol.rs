@@ -562,6 +562,29 @@ pub enum SrvRequest {
     /// — see this plan's own doc comment for why that's an accepted gap,
     /// not a new failure mode.
     RequestByteRange { session_id: u32, file_id: u32, offset: u64, len: u64 },
+    /// Sent by `somcat` (never by Som) on a SECOND connection, separate
+    /// from whichever one is sending the sequential `PutChunk` stream for
+    /// this `(session_id, file_id)` — registers THIS connection as the
+    /// one `RequestByteRange` gets forwarded to, instead of the
+    /// sequential sender's own connection. Exists because the sequential
+    /// sender for a large file can be mid-flight for minutes, holding its
+    /// own connection saturated with a steady stream of outgoing
+    /// `PutChunk`s the whole time — a `RequestByteRange` reply sharing
+    /// that SAME connection (and the sender-side `write_lock` guarding
+    /// it) has to win a mutex race against every one of those chunks to
+    /// get a word in, and a plain (non-fair) `Mutex` has no obligation to
+    /// let a rarely-contending thread win against one re-acquiring the
+    /// lock in a tight loop — confirmed live as multi-second-to-minutes
+    /// seek latency that scaled with file size (more chunks in flight for
+    /// longer = more mutex contention to lose to), even though the
+    /// `avformat_seek_file`/disk-read work a seek actually needs is
+    /// itself sub-millisecond. Routing range responses through a
+    /// dedicated connection removes the contention entirely rather than
+    /// trying to arbitrate it. `som-srv` keeps BOTH the implicit
+    /// PutChunk-derived route and this explicit one; `route_byte_range_
+    /// request` prefers this one when present (see `SrvCache`'s own doc
+    /// comment).
+    RegisterRangeResponder { session_id: u32, file_id: u32 },
 }
 
 /// daemon -> `somcat`/other SRP clients, answering a `SrvRequest`.

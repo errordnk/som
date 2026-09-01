@@ -567,6 +567,50 @@ fn print_placeholder_grid_with_cell_dims(
 /// the same effect (`ISIG` is cleared), so this applies on both.
 const ETX: u8 = 0x03;
 
+/// Set by [`spawn_ctrlc_watcher`]'s background thread the instant it sees
+/// `ETX` on stdin, checked by the long-running sequential send loop
+/// (`send_range_chunks_from_disk_interruptible`) between chunks — the fix
+/// for Ctrl+C doing nothing while a large video/audio file is still
+/// streaming. Before this, stdin was only ever read for the two short,
+/// one-shot placeholder-grid handshakes (`query_cell_size_px`/
+/// `query_cell_count`), both of which complete and return well before the
+/// multi-gigabyte transfer loop even starts — nothing was left listening
+/// on stdin during the part of the run that can actually take minutes,
+/// so `ETX`'s own doc comment ("every stdin-reading loop here needs to
+/// check for it explicitly") was true in spirit but incomplete in
+/// practice.
+static CTRL_C_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Spawns a background thread that blocks reading stdin one byte at a
+/// time for the remainder of the process's life, setting
+/// [`CTRL_C_REQUESTED`] the moment it sees `ETX` (`0x03`) and then
+/// exiting. Must only be started AFTER the placeholder-grid handshake's
+/// own short-lived stdin reads (`query_cell_size_px`/`query_cell_count`)
+/// have both already returned — two readers racing the same stdin handle
+/// at once would nondeterministically split the handshake's own reply
+/// bytes between them. `stream_file`'s branches all print their
+/// placeholder grid before starting the long transfer (see each
+/// branch's own "placeholder grid FIRST" comment), so calling this right
+/// before handing off to `stream_bytes`/`stream_file_from_disk` is safe.
+fn spawn_ctrlc_watcher() {
+    std::thread::spawn(|| {
+        let mut stdin = std::io::stdin();
+        let mut byte = [0u8; 1];
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(0) => return, // stdin closed
+                Ok(_) => {
+                    if byte[0] == ETX {
+                        CTRL_C_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                },
+                Err(_) => return,
+            }
+        }
+    });
+}
+
 /// Session/file id pair identifying one SRP transfer on the wire — see
 /// [`new_ids`]'s doc comment for how these are derived and why they're
 /// masked to 24 bits.
@@ -669,13 +713,16 @@ fn send_range_chunks_from_disk(
 
 /// Outcome of [`send_range_chunks_from_disk_interruptible`] — distinguishes
 /// "sent the whole requested range" from "stopped early because a newer
-/// seek redirected us," which the caller (the main sequential loop in
-/// [`stream_file_from_disk`]) needs to tell apart: the former means move
-/// on to the next range in sequence, the latter means jump straight to
-/// wherever the seek landed instead.
+/// seek redirected us" from "stopped early because the user hit Ctrl+C,"
+/// which the caller (the main sequential loop in [`stream_file_from_disk`])
+/// needs to tell apart: the first means move on to the next range in
+/// sequence, the second means jump straight to wherever the seek landed
+/// instead, the third means stop the whole transfer and let the process
+/// exit.
 enum SendOutcome {
     Completed,
     RedirectedTo(u64),
+    Interrupted,
 }
 
 /// Same job as [`send_range_chunks_from_disk`], but checks `seek_signal`
@@ -709,6 +756,9 @@ fn send_range_chunks_from_disk_interruptible(
     let end = range_offset + range_len;
     let mut buf = vec![0u8; CHUNK_SIZE];
     while offset < end {
+        if CTRL_C_REQUESTED.load(Ordering::Acquire) {
+            return Ok(SendOutcome::Interrupted);
+        }
         if let Some(seek_signal) = seek_signal {
             let pending = seek_signal.load(Ordering::Acquire);
             // `NO_SEEK_PENDING` is the only "nothing new happened" value —
@@ -854,6 +904,15 @@ fn stream_file_from_disk(
     metadata: terminal::rich_content_transport::ContentMetadata,
     ids: SrpIds,
 ) -> Result<(), String> {
+    // Both callers (video/audio branches of `stream_file`) have already
+    // printed their placeholder grid and completed the short stdin
+    // handshakes that requires (`query_cell_size_px`/`query_cell_count`)
+    // — see those functions' own doc comments — so it's now safe to start
+    // reading stdin for the rest of the process's life without racing
+    // that handshake. See `spawn_ctrlc_watcher`'s own doc comment for why
+    // this couldn't just start at the top of `main` instead.
+    spawn_ctrlc_watcher();
+
     let total_size = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?.len();
     let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;
     let shared_file = std::sync::Arc::new(std::sync::Mutex::new(file));
@@ -917,6 +976,7 @@ fn stream_file_from_disk(
                 start = new_start;
                 continue;
             },
+            Ok(SendOutcome::Interrupted) => break Ok(()),
             Err(err) => break Err(err),
         }
     };
@@ -1172,7 +1232,7 @@ mod tests {
             eprintln!("skipping: {} not present", path.display());
             return;
         }
-        let metadata = video_metadata(path.to_str().unwrap()).expect("probe should succeed on a real fixture");
+        let metadata = video_metadata(path.to_str().unwrap(), None, None).expect("probe should succeed on a real fixture");
         let terminal::rich_content_transport::ContentMetadata::Video { width_px, height_px, .. } = metadata else {
             panic!("expected ContentMetadata::Video");
         };
@@ -1197,7 +1257,7 @@ mod tests {
             return;
         }
         let start = std::time::Instant::now();
-        let metadata = video_metadata(path.to_str().unwrap()).expect("probe should succeed on a real large fixture");
+        let metadata = video_metadata(path.to_str().unwrap(), None, None).expect("probe should succeed on a real large fixture");
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(5), "probe took {elapsed:?}, expected a fast header-only read");
         let terminal::rich_content_transport::ContentMetadata::Video { width_px, height_px, .. } = metadata else {

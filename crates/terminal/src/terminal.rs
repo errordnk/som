@@ -481,6 +481,7 @@ impl TerminalBuilder {
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
             rich_content_drag: None,
+            rich_content_drag_last_fraction: None,
             #[cfg(windows)]
             shell_program: None,
             activation_script: Vec::new(),
@@ -785,6 +786,7 @@ impl TerminalBuilder {
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
                 rich_content_drag: None,
+                rich_content_drag_last_fraction: None,
                 #[cfg(windows)]
                 shell_program,
                 activation_script: activation_script.clone(),
@@ -1072,6 +1074,25 @@ pub struct Terminal {
     /// future seek-drag needs to know which placement to keep seeking
     /// as the pointer moves, not just that "some" widget was clicked.
     rich_content_drag: Option<(u32, u32)>,
+    /// The `fraction` most recently sent to a seek for the widget
+    /// currently in `rich_content_drag`, if any — lets `mouse_drag`'s own
+    /// seek-follow branch skip re-issuing an IDENTICAL seek when the
+    /// pointer hasn't meaningfully moved since the last one. Without
+    /// this, `mouse_down`'s own click already fires one seek via
+    /// `handle_rich_content_click`, and then GPUI's very next
+    /// `MouseMoveEvent` — which fires even for a single click with zero
+    /// or near-zero pixel movement, ordinary mouse-hardware/OS jitter,
+    /// not a real drag gesture — reaches this SAME position through
+    /// `mouse_drag` and fires a SECOND, redundant seek to the identical
+    /// fraction almost instantly after the first. For video specifically
+    /// this isn't just wasted work: two `avformat_seek_file` calls racing
+    /// against the SAME `AVFormatContext` in close succession reproduced
+    /// a genuine stuck-forever decode thread live (confirmed via the
+    /// side-channel's own `generation` counter jumping 1→2 for the exact
+    /// same fraction within the same log timestamp, then the decode
+    /// thread never producing another frame). `None` whenever `rich_
+    /// content_drag` itself is `None` (cleared together in `mouse_up`).
+    rich_content_drag_last_fraction: Option<f32>,
     #[cfg(windows)]
     shell_program: Option<String>,
     template: CopyTemplate,
@@ -2445,7 +2466,16 @@ impl Terminal {
                 progress.update(contiguous_len, tail_available_from, pending_ranges.clone(), total_size);
                 self.rich_content_video_progress.borrow_mut().insert(key, progress.clone());
                 let audio_stream_index = self.rich_content_cache.video_audio_stream_index(session_id, file_id);
-                let player = rich_content_video_player::RichContentVideoPlayer::open(path, progress, audio_stream_index);
+                let request_byte_range: std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> =
+                    std::sync::Arc::new(move |offset, len| {
+                        rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                    });
+                let player = rich_content_video_player::RichContentVideoPlayer::open(
+                    path,
+                    progress,
+                    audio_stream_index,
+                    Some(request_byte_range),
+                );
                 players.insert(key, player);
             } else if let Some(progress) = self.rich_content_video_progress.borrow().get(&key) {
                 // `GrowingFileStream`'s decode thread blocks on THIS
@@ -2703,6 +2733,12 @@ impl Terminal {
                 if is_video {
                     self.seek_rich_content_video_playback(session_id, file_id, fraction);
                 }
+                // Remember this click's own fraction — see `rich_content_
+                // drag_last_fraction`'s own doc comment for why `mouse_
+                // drag` needs this to avoid re-issuing an identical seek
+                // for the SAME click's own (near-)zero-movement follow-up
+                // `MouseMoveEvent`.
+                self.rich_content_drag_last_fraction = Some(fraction);
             }
             return true;
         }
@@ -3793,8 +3829,51 @@ impl Terminal {
                 if offset_x >= cell_width * 2.0
                     && let Some(fraction) = self.seek_fraction_for_position(session_id, file_id, e.position)
                 {
-                    self.seek_rich_content_audio_playback(session_id, file_id, fraction);
-                    cx.notify();
+                    // Same is_audio/is_video dispatch `handle_rich_content_
+                    // click` already does — this branch used to call the
+                    // AUDIO seek unconditionally regardless of which kind
+                    // of placement was actually being dragged, so dragging
+                    // a VIDEO widget's seek bar silently never reached
+                    // `RichContentVideoPlayer::seek_to_fraction` at all
+                    // (only the unrelated audio-side byte-range-request
+                    // bookkeeping ran, harmlessly, against video's own
+                    // `total_size`/`contiguous_len` numbers, which happen
+                    // to be populated too since `RichContentCache` doesn't
+                    // distinguish). Confirmed live as the actual cause of
+                    // "seeking far away while dragging does nothing" — a
+                    // plain click (`handle_rich_content_click`) already
+                    // dispatched correctly, so short drags that stayed
+                    // within a click-like gesture were unaffected, but any
+                    // real drag onto a video widget's seek bar was routed
+                    // to the wrong player.
+                    // Skip re-issuing an identical seek — see `rich_
+                    // content_drag_last_fraction`'s own doc comment.
+                    // GPUI fires a `MouseMoveEvent` even for a single
+                    // click with near-zero pixel movement, so the very
+                    // first call into this branch after `mouse_down`
+                    // usually carries the SAME fraction `handle_rich_
+                    // content_click` already seeked to; without this
+                    // check that fires a second, redundant seek almost
+                    // instantly after the first, which for video raced
+                    // two `avformat_seek_file` calls against the same
+                    // `AVFormatContext` and reproduced a stuck-forever
+                    // decode thread live.
+                    if self.rich_content_drag_last_fraction != Some(fraction) {
+                        let is_audio = self.rich_content_audio_players.borrow().contains_key(&(session_id, file_id));
+                        #[cfg(target_os = "windows")]
+                        let is_video = self.rich_content_video_players.borrow().contains_key(&(session_id, file_id));
+                        #[cfg(not(target_os = "windows"))]
+                        let is_video = false;
+                        if is_audio {
+                            self.seek_rich_content_audio_playback(session_id, file_id, fraction);
+                        }
+                        #[cfg(target_os = "windows")]
+                        if is_video {
+                            self.seek_rich_content_video_playback(session_id, file_id, fraction);
+                        }
+                        self.rich_content_drag_last_fraction = Some(fraction);
+                        cx.notify();
+                    }
                 }
             }
             return;
@@ -3957,6 +4036,7 @@ impl Terminal {
         // reading it) means the NEXT click starts fresh, same as every
         // other per-click piece of state on this type.
         if self.rich_content_drag.take().is_some() {
+            self.rich_content_drag_last_fraction = None;
             return;
         }
 

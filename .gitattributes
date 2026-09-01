@@ -25,6 +25,8 @@
 *.h linguist-vendored
 *.c linguist-vendored
 *.exe linguist-vendored
+*.cmake linguist-vendored
+CMakeLists.txt linguist-vendored
 *.md linguist-documentation
 assets/** linguist-vendored
 tooling/** linguist-vendored

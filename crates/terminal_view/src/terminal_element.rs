@@ -793,7 +793,7 @@ impl TerminalElement {
                             if matches!(terminal_view.mode, TerminalMode::Standalone)
                                 || terminal_view.focus_handle.is_focused(window)
                             {
-                                terminal_view.scroll_wheel(e, cx);
+                                terminal_view.scroll_wheel(e, window, cx);
                                 cx.notify();
                             }
                         })
@@ -1892,6 +1892,51 @@ fn paint_rich_content_placements(
         cx.drop_image(image, Some(window));
     }
 
+    // Markdown placements are painted from their own full-grid (viewport
+    // + scrollback) scan, NOT from `origins` above (which only sees
+    // placeholder cells currently on-screen) — see `Terminal::
+    // markdown_placement_origins`'s doc comment for why: a document
+    // taller than the terminal's visible height needs its placement
+    // found and painted even when part or all of its placeholder grid
+    // has scrolled out of the viewport. Run this before the `origins.
+    // is_empty()` early return below, since a markdown-only screen (no
+    // other rich content visible) would otherwise skip painting
+    // entirely.
+    {
+        // Collected up front and the borrow dropped before painting —
+        // `paint_rich_content_markdown_widget` needs `&mut App`, which
+        // can't coexist with `terminal.read(cx)`'s immutable borrow of
+        // `cx` still held.
+        let markdown_paint_inputs: Vec<_> = {
+            let terminal_ref = terminal.read(cx);
+            let markdown_geometry = terminal_ref.markdown_placement_origins();
+            markdown_placements
+                .iter()
+                .filter_map(|(session_id, file_id, rendered_text)| {
+                    let geometry = *markdown_geometry.get(&(*session_id, *file_id))?;
+                    let scroll_offset = terminal_ref.rich_content_markdown_scroll_offset(*session_id, *file_id);
+                    Some((*session_id, *file_id, rendered_text.clone(), geometry, scroll_offset))
+                })
+                .collect()
+        };
+        for (session_id, file_id, rendered_text, geometry, scroll_offset) in markdown_paint_inputs {
+            if let Some(bounds) = paint_rich_content_markdown_widget(
+                &rendered_text,
+                Some(geometry.max_column),
+                Some(geometry.max_row),
+                scroll_offset,
+                origin,
+                geometry.origin_line,
+                geometry.origin_column,
+                layout,
+                window,
+                cx,
+            ) {
+                terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
+            }
+        }
+    }
+
     if origins.is_empty() {
         return false;
     }
@@ -1926,25 +1971,6 @@ fn paint_rich_content_placements(
                 }
             }
             any_animating |= *is_playing;
-            continue;
-        }
-
-        if let Some((_, _, rendered_text)) = markdown_placements.iter().find(|(sid, fid, _)| *sid == session_id && *fid == file_id) {
-            let max_column_seen = max_columns_seen.get(&key).copied();
-            let max_row_seen = max_rows_seen.get(&key).copied();
-            if let Some(bounds) = paint_rich_content_markdown_widget(
-                rendered_text,
-                max_column_seen,
-                max_row_seen,
-                origin,
-                origin_line,
-                origin_column,
-                layout,
-                window,
-                cx,
-            ) {
-                terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
-            }
             continue;
         }
 
@@ -2258,11 +2284,31 @@ fn paint_rich_content_placements(
 /// `MarkdownElement` integration (or a lighter hand-rolled styler) this
 /// function's own doc comment above explains isn't a good fit for THIS
 /// call site as-is.
+/// Unlike `paint_rich_content_media_widget`/the image paint path, a
+/// markdown placement's reserved footprint (`max_row_seen`, coming from
+/// `Terminal::markdown_placement_origins`'s full-grid — scrollback
+/// included — scan) can be, and often is, TALLER than the terminal's
+/// visible height: `somcat` reserves exactly as many rows as the
+/// document has lines (see `print_markdown_placeholder_grid`'s doc
+/// comment), with no clamp to the current viewport. So this function
+/// (1) clips painting to whatever ROWS of the placement are currently
+/// on-screen (`origin_line` may be negative — scrolled above the top —
+/// or the placement may extend below the bottom of the screen; only the
+/// on-screen slice gets drawn, everything else is simply not painted
+/// this frame, the same way ordinary terminal scrollback isn't painted
+/// when it's off-screen) and (2) applies `scroll_offset_lines` (the
+/// widget-local Scroll Lock offset — see `Terminal::
+/// rich_content_markdown_scroll_offset`'s own doc comment) as an
+/// independent second offset INTO `rendered_text`, letting the visible
+/// window move through the document without the underlying placement's
+/// on-screen position (tied to the terminal's own scrollback) changing
+/// at all.
 #[allow(clippy::too_many_arguments)]
 fn paint_rich_content_markdown_widget(
     rendered_text: &str,
     max_column_seen: Option<u32>,
     max_row_seen: Option<u32>,
+    scroll_offset_lines: u32,
     origin: Point<Pixels>,
     origin_line: i32,
     origin_column: i32,
@@ -2274,9 +2320,6 @@ fn paint_rich_content_markdown_widget(
     let line_height = layout.dimensions.line_height;
     let display_line = origin_line + layout.display_offset as i32;
     let num_lines = layout.dimensions.num_lines() as i32;
-    if display_line < 0 || display_line >= num_lines {
-        return None;
-    }
 
     let columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
     let width = cell_width * columns;
@@ -2285,10 +2328,23 @@ fn paint_rich_content_markdown_widget(
     // count + 1` the way video's placeholder grid reserves an extra
     // control row) — `max_row_seen` is the highest DECODED row index
     // (0-based), so the row COUNT is one more than that.
-    let rows = max_row_seen.map(|r| r + 1).unwrap_or(1) as f32;
-    let height = line_height * rows;
-    let position = point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
-    let bounds = Bounds::new(position, gpui::size(width, height));
+    let placement_rows = max_row_seen.map(|r| r + 1).unwrap_or(1) as i32;
+
+    // The rows of the FULL placement (0..placement_rows) that fall
+    // within the visible screen (0..num_lines) right now — clamped on
+    // both ends, since either edge (or both) can be off-screen.
+    let first_visible_row = (-display_line).max(0);
+    let last_visible_row = (num_lines - display_line).min(placement_rows);
+    if first_visible_row >= last_visible_row {
+        return None;
+    }
+    let visible_row_count = last_visible_row - first_visible_row;
+
+    let position = point(
+        origin.x + origin_column as f32 * cell_width,
+        origin.y + (display_line + first_visible_row) as f32 * line_height,
+    );
+    let bounds = Bounds::new(position, gpui::size(width, visible_row_count as f32 * line_height));
 
     window.paint_quad(fill(bounds, rich_content_widget_bg()));
 
@@ -2297,10 +2353,11 @@ fn paint_rich_content_markdown_widget(
     text_style.font_size = line_height.into();
     let font = text_style.font();
 
-    for (index, line_text) in rendered_text.lines().enumerate() {
-        if index as f32 >= rows {
-            break;
-        }
+    // `scroll_offset_lines` shifts which lines of `rendered_text` map to
+    // `first_visible_row`, independent of the placement's on-screen
+    // position — Scroll Lock moves this without touching `display_line`.
+    let skip = scroll_offset_lines as usize + first_visible_row as usize;
+    for (index, line_text) in rendered_text.lines().skip(skip).take(visible_row_count as usize).enumerate() {
         let run = TextRun { len: line_text.len(), font: font.clone(), color: text_style.color, ..Default::default() };
         let shaped = window.text_system().shape_line(line_text.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None);
         let at = point(position.x, position.y + index as f32 * line_height);

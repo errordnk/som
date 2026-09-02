@@ -9,7 +9,7 @@ use blink_manager::BlinkManager;
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt, WeakEntity,
+    Pixels, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt, WeakEntity, Window,
     div,
 };
 use itertools::Itertools;
@@ -493,7 +493,33 @@ impl TerminalView {
         max_scroll_top_in_lines as f32 * line_height
     }
 
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        // Scroll Lock ON redirects the wheel to whichever markdown
+        // widget the cursor is over instead of the terminal's own
+        // scrollback — see [[project_srp_audio_and_md_browser_roadmap]]
+        // memory / SRP_LUA.md for why: a markdown document reserves a
+        // placeholder-grid footprint as tall as the whole file (see
+        // `print_markdown_placeholder_grid` in `somcat`), which can be
+        // far taller than the terminal's visible height, so it needs its
+        // own independent scroll rather than fighting the terminal's.
+        if window.scrolllock().on {
+            let terminal = self.terminal.read(cx);
+            if let Some((session_id, file_id, line_count)) = terminal.markdown_placement_under(event.position) {
+                let line_height = terminal.last_content().terminal_bounds.line_height;
+                let y_delta = event.delta.pixel_delta(line_height).y;
+                // Wheel-up (positive y_delta) moves toward the top of the
+                // document (negative delta_lines) — matches the terminal's
+                // own scroll-up-reveals-earlier-content convention.
+                let delta_lines = -(y_delta / line_height).round() as i32;
+                if delta_lines != 0 {
+                    let max_offset = line_count.saturating_sub(1);
+                    terminal.scroll_rich_content_markdown(session_id, file_id, delta_lines, max_offset);
+                    cx.notify();
+                }
+                return;
+            }
+        }
+
         let terminal_content = self.terminal.read(cx).last_content();
 
         if self.block_below_cursor.is_some() && terminal_content.display_offset == 0 {

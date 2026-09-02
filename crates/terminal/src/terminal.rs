@@ -7110,6 +7110,70 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_rich_content_markdown_placement_reaches_the_paint_path_via_a_real_process(cx: &mut TestAppContext) {
+        // Markdown counterpart to `test_rich_content_placements_reach_the_
+        // paint_path_via_a_real_process` above — proves the SRP_LUA.md
+        // "Phase 1" pipeline end-to-end through a real `somcat` child
+        // process (real ConPTY): `.md` file -> content-type detection ->
+        // PutChunk -> `SrvCache` -> `Terminal::rich_content_markdown_
+        // placements()` (which runs the payload through the frontend
+        // `render()` Lua call internally). Doesn't paint anything itself
+        // (no `Window`/`App` in a `#[gpui::test]`) — this is the data-
+        // availability half of the paint path `paint_rich_content_
+        // markdown_widget` (in `terminal_view::terminal_element`) reads
+        // from at real paint time.
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let markdown_dir = std::env::temp_dir().join(format!("som_markdown_paint_path_test_{}", std::process::id()));
+        std::fs::create_dir_all(&markdown_dir).unwrap();
+        let markdown_path = markdown_dir.join("test.md");
+        std::fs::write(&markdown_path, "# Hello\n\nThis is a test.").unwrap();
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+
+        let (terminal, _completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somcat_path.to_string_lossy().into_owned(),
+            vec![markdown_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let mut rendered_text = None;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+
+            let placements = terminal.update(cx, |term, _| term.rich_content_markdown_placements());
+            if let Some((session_id, _file_id, text)) = placements.into_iter().next() {
+                assert!(session_id > 0, "session_id must be a real, nonzero id");
+                rendered_text = Some(text);
+                break;
+            }
+        }
+
+        let rendered_text = rendered_text.expect("rich_content_markdown_placements() never returned a placement within the poll budget");
+        assert_eq!(rendered_text, "# Hello\n\nThis is a test.", "Phase 1's identity render() must pass the source through unchanged");
+
+        let _ = std::fs::remove_dir_all(&markdown_dir);
+    }
+
+    #[gpui::test]
     async fn test_rich_content_audio_placement_decodes_and_plays_via_a_real_process(cx: &mut TestAppContext) {
         // Audio counterpart to
         // `test_rich_content_placements_reach_the_paint_path_via_a_real_

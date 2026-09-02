@@ -1773,7 +1773,7 @@ fn paint_rich_content_placements(
         let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
         luminance > 0.5
     };
-    let (origins, placements, audio_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
+    let (origins, placements, audio_placements, markdown_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
         terminal.update(cx, |terminal, _cx| {
         // For each (session_id, file_id) group, remember the grid position
         // of whichever visible cell decodes as (row=0, column=0) if one is
@@ -1862,6 +1862,7 @@ fn paint_rich_content_placements(
 
         let placements = terminal.rich_content_placements();
         let audio_placements = terminal.rich_content_audio_placements();
+        let markdown_placements = terminal.rich_content_markdown_placements();
         #[cfg(target_os = "windows")]
         let video_placements = terminal.rich_content_video_placements(widget_bg_is_light);
         #[cfg(not(target_os = "windows"))]
@@ -1879,7 +1880,7 @@ fn paint_rich_content_placements(
         let pending_image_drops = terminal.take_pending_video_image_drops();
         #[cfg(not(target_os = "windows"))]
         let pending_image_drops: Vec<std::sync::Arc<gpui::RenderImage>> = Vec::new();
-        (origins, placements, audio_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops)
+        (origins, placements, audio_placements, markdown_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops)
     });
 
     // Released regardless of whether `origins` turns out empty below —
@@ -1925,6 +1926,25 @@ fn paint_rich_content_placements(
                 }
             }
             any_animating |= *is_playing;
+            continue;
+        }
+
+        if let Some((_, _, rendered_text)) = markdown_placements.iter().find(|(sid, fid, _)| *sid == session_id && *fid == file_id) {
+            let max_column_seen = max_columns_seen.get(&key).copied();
+            let max_row_seen = max_rows_seen.get(&key).copied();
+            if let Some(bounds) = paint_rich_content_markdown_widget(
+                rendered_text,
+                max_column_seen,
+                max_row_seen,
+                origin,
+                origin_line,
+                origin_column,
+                layout,
+                window,
+                cx,
+            ) {
+                terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
+            }
             continue;
         }
 
@@ -2214,6 +2234,82 @@ fn paint_rich_content_placements(
 /// interaction model (play/pause, seek, stop) doesn't depend on whether
 /// the underlying media is audio or video.
 #[allow(clippy::too_many_arguments)]
+/// Paints a `ContentType::Markdown` placement's already-frontend-rendered
+/// text (`Terminal::rich_content_markdown_placements`'s own `String` —
+/// see `SRP_LUA.md`'s "Phase 1" section for where that text comes from)
+/// as plain multi-line text, one `ShapedLine` per `\n`-delimited line —
+/// NOT through `crates/markdown`'s `MarkdownElement`, which is a full
+/// three-phase `Element` (`request_layout`/`prepaint`/`paint`, each
+/// needing intermediate state threaded between them) built for an
+/// ordinary GPUI `div().child(...)` tree, not this imperative paint
+/// call site (confirmed by reading its own implementation and every
+/// existing call site in this codebase — all of them go through a
+/// normal element tree, none call its three phases by hand the way this
+/// function calls `ShapedLine::paint` directly). Mirrors `paint_rich_
+/// content_media_widget`'s own `shape_and_paint` closure — the exact
+/// same primitive the audio widget already uses for its time-readout
+/// labels, just looped over multiple lines instead of one.
+///
+/// No markdown syntax (`**bold**`, links, code fences, headings) is
+/// actually rendered differently from plain text yet — this paints
+/// `rendered_text` as-is, whatever the frontend `render()` call
+/// produced. Real markdown styling is a later phase (see `SRP_LUA.md`'s
+/// "Phase 2"), once there's a concrete reason to reach for the heavier
+/// `MarkdownElement` integration (or a lighter hand-rolled styler) this
+/// function's own doc comment above explains isn't a good fit for THIS
+/// call site as-is.
+#[allow(clippy::too_many_arguments)]
+fn paint_rich_content_markdown_widget(
+    rendered_text: &str,
+    max_column_seen: Option<u32>,
+    max_row_seen: Option<u32>,
+    origin: Point<Pixels>,
+    origin_line: i32,
+    origin_column: i32,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Bounds<Pixels>> {
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+    let display_line = origin_line + layout.display_offset as i32;
+    let num_lines = layout.dimensions.num_lines() as i32;
+    if display_line < 0 || display_line >= num_lines {
+        return None;
+    }
+
+    let columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
+    let width = cell_width * columns;
+    // `+ 1`, matching `print_markdown_placeholder_grid`'s own footprint
+    // in `somcat` (it reserves exactly `line_count` rows, not `line_
+    // count + 1` the way video's placeholder grid reserves an extra
+    // control row) — `max_row_seen` is the highest DECODED row index
+    // (0-based), so the row COUNT is one more than that.
+    let rows = max_row_seen.map(|r| r + 1).unwrap_or(1) as f32;
+    let height = line_height * rows;
+    let position = point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
+    let bounds = Bounds::new(position, gpui::size(width, height));
+
+    window.paint_quad(fill(bounds, rich_content_widget_bg()));
+
+    let mut text_style = layout.base_text_style.clone();
+    text_style.color = gpui::white();
+    text_style.font_size = line_height.into();
+    let font = text_style.font();
+
+    for (index, line_text) in rendered_text.lines().enumerate() {
+        if index as f32 >= rows {
+            break;
+        }
+        let run = TextRun { len: line_text.len(), font: font.clone(), color: text_style.color, ..Default::default() };
+        let shaped = window.text_system().shape_line(line_text.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None);
+        let at = point(position.x, position.y + index as f32 * line_height);
+        shaped.paint(at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+    }
+
+    Some(bounds)
+}
+
 fn paint_rich_content_media_widget(
     max_column_seen: Option<u32>,
     position_fraction: f32,

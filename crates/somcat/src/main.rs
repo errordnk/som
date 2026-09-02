@@ -492,6 +492,23 @@ fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), Str
     print_placeholder_grid_with_cell_dims(session_id, file_id, AUDIO_WIDGET_COLUMNS, AUDIO_WIDGET_ROWS)
 }
 
+/// Placeholder-grid footprint for a markdown file: as wide as the
+/// terminal currently is (`print_placeholder_grid_with_cell_dims`
+/// clamps this down to `terminal_columns`/`terminal_rows - 1` itself —
+/// see that function's own doc comment — so passing an oversized figure
+/// here is the normal, expected way to say "use the terminal's own
+/// width" rather than a bug), as tall as the file has newlines. Neither
+/// figure needs to be exact: Som's own markdown renderer wraps/reflows
+/// text to fit whatever footprint this placement actually reserves, the
+/// same tolerance the audio/video widgets already have for an
+/// approximate reserved area.
+const MARKDOWN_MAX_COLUMNS: u32 = 9999;
+
+fn print_markdown_placeholder_grid(session_id: u32, file_id: u32, bytes: &[u8]) -> Result<(), String> {
+    let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+    print_placeholder_grid_with_cell_dims(session_id, file_id, MARKDOWN_MAX_COLUMNS, line_count)
+}
+
 fn print_placeholder_grid_with_cell_dims(
     session_id: u32,
     file_id: u32,
@@ -996,8 +1013,7 @@ fn stream_file_from_disk(
 /// the wire and the footprint is reserved.
 ///
 /// Content type is inferred from the file extension: `.gif`, `.jpg`/
-/// `.jpeg`, `.png`, `.mp3`, `.flac` (markdown/video are reserved
-/// `ContentType` variants, not wired up to any extension yet).
+/// `.jpeg`, `.png`, `.mp3`, `.flac`, `.mp4`/`.mkv`/`.avi`, `.md`.
 ///
 /// For images: THIS process prints the Unicode-placeholder grid itself
 /// — deliberately not Som, which used to inject this text into its own
@@ -1025,9 +1041,10 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         Some("png") => ContentType::Png,
         Some("mp3" | "flac") => ContentType::Audio,
         Some("mp4" | "mkv" | "avi") => ContentType::Video,
+        Some("md") => ContentType::Markdown,
         Some(other) => {
             return Err(format!(
-                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac/.mp4/.mkv/.avi are supported so far"
+                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac/.mp4/.mkv/.avi/.md are supported so far"
             ));
         },
         None => return Err("file has no extension, can't infer content type".to_string()),
@@ -1122,6 +1139,21 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         print_video_placeholder_grid(session_id, file_id, width_px, height_px)?;
 
         return stream_file_from_disk(path, channel, content_type, metadata, ids);
+    }
+
+    if content_type == ContentType::Markdown {
+        let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+        let metadata = ContentMetadata::Markdown;
+        let (session_id, file_id) = ids;
+
+        // Placeholder grid FIRST, streaming SECOND — same reordering
+        // every other content type already needs (see e.g. the video
+        // branch's own comment for the full reasoning: without a
+        // placeholder printed yet, Som has no id to open a markdown
+        // player for at all).
+        print_markdown_placeholder_grid(session_id, file_id, &bytes)?;
+
+        return stream_bytes(&channel, &bytes, content_type, metadata, ids);
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;

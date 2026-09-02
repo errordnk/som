@@ -135,7 +135,8 @@ and PROVEN live before growing the API surface:
    content type in this project has gone through (see `SRP_PROTOCOL.md`/
    `SRP_INTEGRATION_GUIDE.md`'s own verification sections).
 
-### Status (2026-09-02): backend + frontend runtimes done, paint not yet wired
+### Status (2026-09-02): text-only round trip landed — `somcat file.md`
+works end to end
 
 Landed and live-tested:
 - `som-srv` backend (`SrvRequest::RunLuaScript`, `crates/som_srv/src/
@@ -152,22 +153,56 @@ Landed and live-tested:
   refresh_or_create`, returns `Vec<(session_id, file_id, rendered_
   text)>` — the same shape `rich_content_audio_placements`/
   `rich_content_video_placements` already have.
+- **`somcat` now sends `.md` files** (`stream_file`'s markdown branch,
+  reusing the same whole-file-read-then-`stream_bytes` path
+  images/GIF already use — markdown files are small) — `print_markdown_
+  placeholder_grid` sizes the footprint from the terminal's own width
+  and the file's own line count.
+- **Paint path wired**: `terminal_element.rs`'s `paint_rich_content_
+  placements` now has a markdown branch, calling a new `paint_rich_
+  content_markdown_widget` — one `ShapedLine` per `\n`-delimited line,
+  the SAME primitive the audio widget's time-readout labels already
+  use, NOT `crates/markdown`'s `MarkdownElement` (confirmed by reading
+  its implementation: it's a full three-phase `Element` built for an
+  ordinary `div().child(...)` tree, not this imperative paint call
+  site — every existing call site in the codebase goes through a
+  normal element tree, none call its phases by hand). This means no
+  markdown SYNTAX (`**bold**`, links, headings, code fences) is
+  actually styled differently from plain text yet — `rendered_text` is
+  painted as-is.
 
-**NOT yet done**: nothing calls `rich_content_markdown_placements()`
-from the paint path. `terminal_element.rs`'s `paint_rich_content_
-placements` has branches for image/audio/video placements but none for
-markdown yet — the rendered text this phase produces has nowhere on
-screen to land. Wiring that in means constructing a `crates/markdown`
-`Markdown`/`MarkdownElement` (which needs a GPUI `Context`/`Window` this
-crate's own `rich_content_markdown_player.rs` deliberately doesn't have
-access to — see that file's own doc comment on why it returns a plain
-`String`, not a GPUI entity) at the `terminal_element.rs` call site,
-alongside whatever layout/sizing decision a text block needs (unlike
-audio/video's fixed-size widgets, markdown's natural height depends on
-its own content and the placeholder grid's reserved footprint would
-need to already match it — see `ContentMetadata::Markdown`'s own doc
-comment on carrying no geometric metadata, flagged as a possible Phase
-2 revisit). This is the concrete next step, not yet started.
+### Next step: image/audio/video links inside markdown
+
+Explicit user requirement (2026-09-02): a markdown document's own
+content will link to image/audio/video files, and those links need to
+show up as the SAME rich-content widgets they already do standalone
+(the image/audio/video paint branches this markdown branch sits next
+to in `paint_rich_content_placements`), not as inert text/URLs. Not
+started — this is the immediate next step after the text-only round
+trip above. Concretely, this needs:
+
+- Parsing `rendered_text` for markdown image/media link syntax
+  (`![alt](path)` at minimum) rather than treating it as opaque text —
+  happens somewhere between the frontend `render()` call and the paint
+  path, exact layering not yet decided (could be the frontend Lua
+  script's own job, since it already sees the source and controls what
+  "rendered" means — see Phase 2's own "scripts choose HOW to render"
+  note above, which this need reinforces).
+- Each linked media file becomes its OWN `(session_id, file_id)`
+  placement, streamed through the exact same `PutChunk`/placeholder-
+  grid machinery a standalone `somcat image.png` already uses — the
+  question is WHO triggers that second transfer: `somcat` itself
+  (reading the markdown file, discovering links, spawning additional
+  transfers for each one) is the natural fit, given it already owns
+  file-reading and transfer logic for every other content type; the
+  frontend Lua script doing it instead would need Rust bindings it
+  doesn't have in Phase 1 (see "Explicitly OUT of scope" below).
+- Layout: an image/audio/video placement embedded IN a markdown
+  document needs to occupy space inline with the surrounding text
+  (unlike today's standalone placements, which each own their whole
+  placeholder-grid footprint) — `paint_rich_content_markdown_widget`'s
+  current one-`ShapedLine`-per-line loop has no concept of a non-text
+  element interrupting a line yet.
 
 ### Explicitly OUT of scope for Phase 1
 

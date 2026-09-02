@@ -1923,7 +1923,6 @@ fn paint_rich_content_placements(
             if let Some(bounds) = paint_rich_content_markdown_widget(
                 &rendered_text,
                 Some(geometry.max_column),
-                Some(geometry.max_row),
                 scroll_offset,
                 origin,
                 geometry.origin_line,
@@ -2303,11 +2302,50 @@ fn paint_rich_content_placements(
 /// window move through the document without the underlying placement's
 /// on-screen position (tied to the terminal's own scrollback) changing
 /// at all.
+/// Zed's own proportional UI font, embedded specifically for markdown
+/// prose — see `crates/assets/src/assets.rs`'s `fonts/zed-sans*.ttf.zst`
+/// doc comment. All four style variants (regular/bold/italic/bold-
+/// italic) share this ONE family name; `Font.weight`/`Font.style` pick
+/// the right variant, the same convention every other multi-weight font
+/// family in this codebase already uses (confirmed via the embedded
+/// TTFs' own `name` table — all four report `"Zed Sans"`).
+const MARKDOWN_PROSE_FONT_FAMILY: &str = "Zed Sans";
+
+fn markdown_span_font(family: gpui::SharedString, span: &crate::markdown_styling::StyledSpan) -> Font {
+    Font {
+        family,
+        features: gpui::FontFeatures::default(),
+        fallbacks: None,
+        weight: crate::markdown_styling::font_weight_for(span.emphasis),
+        style: crate::markdown_styling::font_style_for(span.emphasis),
+    }
+}
+
+/// Real markdown styling: parses+lays out `rendered_text` via
+/// `crate::markdown_styling::layout_markdown` (headings, bold/italic,
+/// lists, code blocks/spans, links, block quotes, strikethrough, rules
+/// — the full Phase 2 feature set, see that module's own doc comment)
+/// and paints the result with multiple `TextRun`s per line — the SAME
+/// low-level primitive (`window.text_system().shape_line()` +
+/// `ShapedLine::paint()`) the audio widget's time-readout labels already
+/// use for a single run, just with more than one run per line here.
+///
+/// The row count actually painted comes from `layout_markdown`'s own
+/// output (`laid_out.len()`), NOT `max_row_seen`/the placeholder grid's
+/// `\n`-based line count from `somcat` — real markdown layout changes
+/// how many visual rows the content needs (headings/lists/code blocks
+/// don't map 1:1 to source lines), so `somcat`'s grid is only a
+/// generously-sized reservation, not a used-as-truth row count. Som
+/// decides the real height itself, after it already has the source
+/// text (see `SRP_LUA.md`'s "Phase 2" section for why this is simpler
+/// than a new query/response round trip to tell `somcat` the exact
+/// count up front). `max_column_seen` still comes from the grid — width
+/// tracks the terminal's own column count reliably, only height does
+/// not.
 #[allow(clippy::too_many_arguments)]
 fn paint_rich_content_markdown_widget(
     rendered_text: &str,
     max_column_seen: Option<u32>,
-    max_row_seen: Option<u32>,
     scroll_offset_lines: u32,
     origin: Point<Pixels>,
     origin_line: i32,
@@ -2321,14 +2359,11 @@ fn paint_rich_content_markdown_widget(
     let display_line = origin_line + layout.display_offset as i32;
     let num_lines = layout.dimensions.num_lines() as i32;
 
+    let laid_out = crate::markdown_styling::layout_markdown(rendered_text);
+    let placement_rows = laid_out.len().max(1) as i32;
+
     let columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
     let width = cell_width * columns;
-    // `+ 1`, matching `print_markdown_placeholder_grid`'s own footprint
-    // in `somcat` (it reserves exactly `line_count` rows, not `line_
-    // count + 1` the way video's placeholder grid reserves an extra
-    // control row) — `max_row_seen` is the highest DECODED row index
-    // (0-based), so the row COUNT is one more than that.
-    let placement_rows = max_row_seen.map(|r| r + 1).unwrap_or(1) as i32;
 
     // The rows of the FULL placement (0..placement_rows) that fall
     // within the visible screen (0..num_lines) right now — clamped on
@@ -2348,20 +2383,81 @@ fn paint_rich_content_markdown_widget(
 
     window.paint_quad(fill(bounds, rich_content_widget_bg()));
 
-    let mut text_style = layout.base_text_style.clone();
-    text_style.color = gpui::white();
-    text_style.font_size = line_height.into();
-    let font = text_style.font();
+    let base_font_size = line_height;
+    let prose_family: gpui::SharedString = MARKDOWN_PROSE_FONT_FAMILY.into();
+    let mono_family: gpui::SharedString = layout.base_text_style.font_family.clone();
+    let link_color = gpui::rgba(0x89b4faff).into();
+    let quote_bar_color = gpui::rgba(0x585b70ff);
 
-    // `scroll_offset_lines` shifts which lines of `rendered_text` map to
+    // `scroll_offset_lines` shifts which lines of `laid_out` map to
     // `first_visible_row`, independent of the placement's on-screen
     // position — Scroll Lock moves this without touching `display_line`.
     let skip = scroll_offset_lines as usize + first_visible_row as usize;
-    for (index, line_text) in rendered_text.lines().skip(skip).take(visible_row_count as usize).enumerate() {
-        let run = TextRun { len: line_text.len(), font: font.clone(), color: text_style.color, ..Default::default() };
-        let shaped = window.text_system().shape_line(line_text.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None);
+    for (index, line) in laid_out.iter().skip(skip).take(visible_row_count as usize).enumerate() {
         let at = point(position.x, position.y + index as f32 * line_height);
-        shaped.paint(at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+
+        if line.is_rule {
+            let rule_bounds = Bounds::new(
+                point(at.x + cell_width * 0.5, at.y + line_height * 0.5),
+                gpui::size(width - cell_width, gpui::px(1.0)),
+            );
+            window.paint_quad(fill(rule_bounds, quote_bar_color));
+            continue;
+        }
+
+        if line.is_block_quote {
+            let bar_bounds = Bounds::new(at, gpui::size(gpui::px(3.0), line_height));
+            window.paint_quad(fill(bar_bounds, quote_bar_color));
+        }
+
+        if line.spans.is_empty() {
+            continue;
+        }
+
+        // Headings render larger and bold — level 1 biggest, scaling
+        // down toward level 6, capped so a heading never exceeds twice
+        // the base row height (keeps the reserved footprint's per-row
+        // `line_height` assumption from drifting too far for very large
+        // headings).
+        let heading_scale = match line.heading_level {
+            Some(1) => 1.6,
+            Some(2) => 1.45,
+            Some(3) => 1.3,
+            Some(4) => 1.15,
+            Some(5) => 1.05,
+            Some(_) => 1.0,
+            None => 1.0,
+        };
+        let font_size = base_font_size * heading_scale;
+        let text_indent = if line.is_block_quote { cell_width } else { gpui::px(0.0) };
+
+        let mut text = String::new();
+        let mut runs = Vec::with_capacity(line.spans.len());
+        for span in &line.spans {
+            let family = if span.monospace { mono_family.clone() } else { prose_family.clone() };
+            let mut font = markdown_span_font(family, span);
+            if line.heading_level.is_some() {
+                font.weight = gpui::FontWeight::BOLD;
+            }
+            let color = if span.is_link { link_color } else { gpui::white() };
+            let strikethrough =
+                span.strikethrough.then(|| StrikethroughStyle { color: Some(color), thickness: gpui::px(1.0) });
+            let underline = span
+                .is_link
+                .then(|| UnderlineStyle { color: Some(color), thickness: gpui::px(1.0), wavy: false });
+            runs.push(TextRun {
+                len: span.text.len(),
+                font,
+                color,
+                background_color: None,
+                underline,
+                strikethrough,
+            });
+            text.push_str(&span.text);
+        }
+
+        let shaped = window.text_system().shape_line(text.into(), font_size, &runs, None);
+        shaped.paint(point(at.x + text_indent, at.y), line_height, gpui::TextAlign::Left, None, window, cx).log_err();
     }
 
     Some(bounds)

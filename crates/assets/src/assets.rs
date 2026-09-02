@@ -10,7 +10,28 @@ use rust_embed::RustEmbed;
 #[include = "macos.json"]
 #[include = "linux.json"]
 #[include = "nord.json"]
-#[include = "fonts/FiraCodeNerdFont-Regular.ttf"]
+// Stored zstd-compressed (`.ttf.zst`, level 19 — see `crates/assets/
+// examples/compress_fonts.rs`) — measured 2026-09-02: font outline data
+// compresses extremely well under zstd (49% smaller for FiraCode, ~81%
+// smaller for each Zed Sans variant), so the four Zed Sans files alone
+// go from ~24MB raw to ~4.7MB embedded. Decompressed once at startup by
+// `load_fonts`/`load_test_fonts` below via `decompress_zst` (same
+// helper the `ffmpeg/` block further down already uses) rather than
+// lazily extracted to disk the way FFmpeg's DLLs are — fonts load
+// straight into `cx.text_system()` in memory, there's no "extract to a
+// real file" step for them to hook into.
+#[include = "fonts/FiraCodeNerdFont-Regular.ttf.zst"]
+// Zed's own proportional UI font family, embedded so the markdown paint
+// path (`paint_rich_content_markdown_widget` in `terminal_view::
+// terminal_element`) can render real heading/bold/italic styling
+// instead of the monospace terminal font every OTHER placement type
+// uses — markdown text isn't a terminal grid, so it isn't bound to
+// `FiraCodeNerdFont`'s fixed-width metrics the way plain-text
+// placements are.
+#[include = "fonts/zed-sans.ttf.zst"]
+#[include = "fonts/zed-sans-bold.ttf.zst"]
+#[include = "fonts/zed-sans-italic.ttf.zst"]
+#[include = "fonts/zed-sans-bolditalic.ttf.zst"]
 #[include = "icons/*.svg"]
 // Stand-in frame the video widget shows in place of the last-played
 // frame once playback is stopped (`RichContentVideoPlayer::stop`) — see
@@ -111,12 +132,13 @@ impl Assets {
         let font_paths = self.list("")?;
         let mut embedded_fonts = Vec::new();
         for font_path in font_paths {
-            if font_path.ends_with(".ttf") {
-                let font_bytes = cx
+            if font_path.ends_with(".ttf.zst") {
+                let compressed = cx
                     .asset_source()
                     .load(&font_path)?
                     .expect("Assets should never return None");
-                embedded_fonts.push(font_bytes);
+                let decompressed = decompress_zst(&compressed)?;
+                embedded_fonts.push(std::borrow::Cow::Owned(decompressed));
             }
         }
 
@@ -124,10 +146,8 @@ impl Assets {
     }
 
     pub fn load_test_fonts(&self, cx: &App) {
-        cx.text_system()
-            .add_fonts(vec![
-                self.load("fonts/FiraCodeNerdFont-Regular.ttf").unwrap().unwrap(),
-            ])
-            .unwrap()
+        let compressed = self.load("fonts/FiraCodeNerdFont-Regular.ttf.zst").unwrap().unwrap();
+        let decompressed = decompress_zst(&compressed).unwrap();
+        cx.text_system().add_fonts(vec![std::borrow::Cow::Owned(decompressed)]).unwrap()
     }
 }

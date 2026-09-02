@@ -505,7 +505,24 @@ fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), Str
 const MARKDOWN_MAX_COLUMNS: u32 = 9999;
 
 fn print_markdown_placeholder_grid(session_id: u32, file_id: u32, bytes: &[u8]) -> Result<(), String> {
-    let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+    // The RENDERED row count (`markdown_line_count::count_rendered_lines`),
+    // not the raw file's newline count — markdown source formatting
+    // (extra blank lines, list item density, etc.) doesn't map 1:1 onto
+    // rendered rows, so reserving `bytes`' own `\n` count left a real,
+    // visible gap between the widget's actual painted content and the
+    // shell's next prompt (confirmed live: a 354-line source file with
+    // several blank-line-heavy sections rendered to far fewer than 354
+    // rows, leaving that many blank reserved rows dangling below the
+    // widget). This crate exists specifically so `somcat` and `terminal_
+    // view::markdown_styling::layout_markdown` count rows the same way
+    // without `somcat` linking the GPUI-dependent `markdown` crate.
+    let source = String::from_utf8_lossy(bytes);
+    // `.max(1)`: an empty/whitespace-only document still needs a
+    // one-row placeholder to open a widget for at all — `count_rendered_
+    // lines` itself returns 0 for empty input (matching `layout_markdown`
+    // exactly), the floor is this caller's own concern, not that
+    // function's.
+    let line_count = markdown_line_count::count_rendered_lines(&source).max(1);
     // Full document height, NOT clamped to the terminal's current visible
     // rows — a document taller than the viewport is expected to scroll
     // (into the terminal's own scrollback, same as any other long output),

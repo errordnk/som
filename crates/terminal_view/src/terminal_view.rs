@@ -1,5 +1,6 @@
 mod blink_manager;
 pub mod cursor;
+pub mod markdown_styling;
 pub mod pending_terminal_tab;
 pub mod terminal_element;
 pub mod terminal_panel;

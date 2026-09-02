@@ -31,7 +31,7 @@ struct ParseState {
 
 #[derive(Debug, Default)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(crate) struct ParsedMarkdownData {
+pub struct ParsedMarkdownData {
     pub events: Vec<(Range<usize>, MarkdownEvent)>,
     pub root_block_starts: Vec<usize>,
     pub html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
@@ -41,7 +41,7 @@ pub(crate) struct ParsedMarkdownData {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ParsedMetadataBlock {
+pub struct ParsedMetadataBlock {
     pub content_range: Range<usize>,
     pub rows: Option<Vec<MetadataRow>>,
 }
@@ -205,7 +205,7 @@ fn trim_metadata_range(source: &str, range: Range<usize>) -> Range<usize> {
     start..end
 }
 
-pub(crate) fn parse_markdown_with_options(
+pub fn parse_markdown_with_options(
     text: &str,
     parse_html: bool,
     parse_heading_slugs: bool,

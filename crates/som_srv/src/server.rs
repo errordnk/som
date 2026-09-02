@@ -380,6 +380,11 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::Handshake(_) => {
                 log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
             }
+            SrvRequest::RunLuaScript { session_id, file_id, script_source } => {
+                if let Err(err) = crate::lua::run_and_stream(cache, session_id, file_id, &script_source) {
+                    log::error!("Lua script for ({session_id:08x}, {file_id:08x}) failed: {err:#}");
+                }
+            }
         }
     }
 }

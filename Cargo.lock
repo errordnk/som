@@ -4405,6 +4405,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "markdown_line_count"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7341,6 +7348,7 @@ dependencies = [
  "ffmpeg-next",
  "image",
  "libc",
+ "markdown_line_count",
  "serde_json",
  "som_srv",
  "symphonia",

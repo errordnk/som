@@ -1,0 +1,16 @@
+[package]
+name = "markdown_line_count"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/markdown_line_count.rs"
+doctest = false
+
+[dependencies]
+pulldown-cmark.workspace = true

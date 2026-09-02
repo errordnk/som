@@ -19,6 +19,7 @@ members = [
     "crates/http_client",
     "crates/http_client_tls",
     "crates/markdown",
+    "crates/markdown_line_count",
     "crates/menu",
     "crates/migrator",
     "crates/paths",
@@ -95,6 +96,7 @@ http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
 icons = { path = "crates/icons" }
 markdown = { path = "crates/markdown" }
+markdown_line_count = { path = "crates/markdown_line_count" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
 migrator = { path = "crates/migrator" }

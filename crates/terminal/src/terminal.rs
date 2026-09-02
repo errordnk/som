@@ -7,6 +7,8 @@ mod pty_info;
 pub mod rich_content_audio_player;
 pub mod rich_content_cache;
 pub mod rich_content_gif_player;
+pub mod rich_content_lua_frontend;
+pub mod rich_content_markdown_player;
 pub mod rich_content_player;
 pub mod rich_content_srv_channel;
 pub mod rich_content_static_image_player;
@@ -502,6 +504,7 @@ impl TerminalBuilder {
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
+            rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -807,6 +810,7 @@ impl TerminalBuilder {
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
+                rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1145,6 +1149,15 @@ pub struct Terminal {
     /// a normal reopen-without-autoplay happens and the user's own
     /// press is what starts it.
     rich_content_audio_stopped: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
+    /// One [`rich_content_markdown_player::RichContentMarkdownPlayer`] per
+    /// `ContentType::Markdown` placement — see that type's own doc
+    /// comment for why it needs neither the animation-frame bookkeeping
+    /// `rich_content_players` (images) has nor the live-device-stream
+    /// ownership `rich_content_audio_players` has: markdown is re-
+    /// rendered (never streamed to a device or animated) whenever the
+    /// cache's `contiguous_len` grows past what was last rendered.
+    rich_content_markdown_players:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_markdown_player::RichContentMarkdownPlayer>>,
     /// One [`rich_content_audio_player::AudioTransferProgress`] per
     /// audio placement, created alongside its `RichContentAudioPlayer`
     /// entry in `rich_content_audio_players` and updated every time
@@ -2185,6 +2198,47 @@ impl Terminal {
                 player.elapsed(),
                 std::time::Duration::from_millis(duration_ms as u64),
             ));
+        }
+        out
+    }
+
+    /// Every `ContentType::Markdown` placement's currently rendered text
+    /// — see `SRP_LUA.md`'s "Phase 1" section for the design this
+    /// implements. Mirrors `rich_content_audio_placements`'s shape (scan
+    /// `rich_content_cache.all_known_ids()`, refresh lazily at paint
+    /// time, keep the player alive across paints in a `RefCell` map
+    /// rather than throwing it away and rebuilding every call) but with
+    /// no playback state to report — a placement here is either not yet
+    /// rendered (`contiguous_len == 0`, not included in the result) or
+    /// rendered up through however many contiguous bytes have arrived so
+    /// far, growing incrementally like every other progressive content
+    /// type in this crate.
+    pub fn rich_content_markdown_placements(&self) -> Vec<(u32, u32, String)> {
+        let mut players = self.rich_content_markdown_players.borrow_mut();
+        let mut out = Vec::new();
+        for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
+            let Some(content_type) = self.rich_content_cache.content_type(session_id, file_id) else {
+                continue;
+            };
+            if content_type != rich_content_transport::ContentType::Markdown {
+                continue;
+            }
+            let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+                continue;
+            };
+            let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
+            let key = (session_id, file_id);
+            let existing = players.remove(&key);
+            match rich_content_markdown_player::refresh_or_create(path, contiguous_len, existing) {
+                Ok(Some(player)) => {
+                    out.push((session_id, file_id, player.rendered().to_string()));
+                    players.insert(key, player);
+                },
+                Ok(None) => {},
+                Err(err) => {
+                    log::warn!("markdown placement {session_id}:{file_id} failed to render: {err}");
+                },
+            }
         }
         out
     }

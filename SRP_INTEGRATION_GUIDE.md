@@ -612,20 +612,52 @@ what to do about it:
 - Windows `SetConsoleOutputCP`/raw-`WriteFile` handling for the grid text.
 - Session/file id derivation.
 
-## Worked example: the yazi driver (needs migration)
+## Worked example: the yazi driver
 
-The reference implementation, `yazi-adapter/src/drivers/srp.rs` in
-[`errordnk/yazi`](https://github.com/errordnk/yazi), currently
-implements the OLD transport described in "Migrating from the old
-PTY/base91 transport" above — its `image_show` function builds base91
-envelopes and writes them to stdout. It needs the migration described in
-that section: replace the envelope-building/base91-encoding step with a
-`som-srv` client connection and `PutChunk` messages, while keeping the
-placeholder-grid printing, terminal-cell-size sizing (via yazi's own
-`Rect`), and `Brand::Som` detection (`yazi-emulator/src/brand.rs`, via
-`SOM_WINDOW_ID`) exactly as they are today.
+The reference implementation, `yazi-adapter/src/drivers/srp/` in
+[`errordnk/yazi`](https://github.com/errordnk/yazi), has been migrated
+to the current `som-srv` transport (2026-09-02) and now has full parity
+with `somcat`, not just images/GIF:
+
+- **Transport**: `srp/protocol.rs`, `srp/pipe.rs`, `srp/daemon.rs`, and
+  `srp/srv_channel.rs` are a hand-kept, client-only port of `som_srv::
+  protocol`/`som_srv::pipe`/`som_srv::daemon`/`somcat`'s own `srv_
+  channel.rs` — see `protocol.rs`'s own doc comment for why this is a
+  port rather than a dependency on the `som_srv` crate (it pulls in
+  `alacritty_terminal`/`smol`/`sysinfo`/`zlog`, all Som-internal and
+  unwanted in a general-purpose file manager's dependency tree). Unlike
+  `somcat` (which finds `som-srv` next to its own executable, since the
+  two are built and deployed together), this driver has no such
+  relationship to `som-srv` at all — it looks for it at the fixed path
+  `~/.local/bin/som-srv[.exe]` instead (`daemon.rs`), spawning it
+  detached if not already running, same retry-then-give-up shape as
+  `som_srv::daemon::connect_or_spawn`.
+- **Images/GIF** (`srp/mod.rs`'s `show_image`): unchanged in spirit from
+  before the migration — reads the whole (typically small) file into
+  memory, probes its header (`metadata.rs`), prints the placeholder
+  grid, then sends the buffer as `PutChunk`s over a fresh `SrvChannel`.
+- **Video** (`stream_video`) and **audio** (`stream_audio`): new,
+  streamed off disk in bounded chunks (never the whole file into
+  memory), with a dedicated byte-range-responder connection
+  (`RegisterRangeResponder`) so a seek on Som's side gets answered
+  promptly instead of queueing behind a large in-flight sequential
+  transfer — mirrors `somcat::stream_file_from_disk`/`spawn_byte_range_
+  responder_from_disk`/`send_range_chunks_from_disk_interruptible`
+  field-for-field, including the seek-signal compare-and-clear pattern
+  (see `mod.rs`'s own doc comments for the bugs that pattern fixes).
+  Neither branch does real ffprobe/symphonia-style metadata probing —
+  see `metadata.rs`'s own doc comment for why — so both fall back to a
+  fixed placeholder footprint (same numbers `somcat` itself falls back
+  to when its own real probe fails); Som decodes the real file and
+  learns its true dimensions once playback actually starts regardless.
+- **Placeholder-grid printing, terminal-cell-size sizing** (via yazi's
+  own `Rect`/`Image::pixel_area`), and **`Brand::Som` detection**
+  (`yazi-emulator/src/brand.rs`, via `SOM_WINDOW_ID`) are unchanged from
+  before the migration.
 
 If you're integrating SRP into a different application, the yazi driver
-is still a useful reference for the geometry/detection pieces (unchanged
-by this migration) — just don't copy its current transport-layer code
-verbatim; follow this guide's `som-srv` sections instead.
+is a useful reference for both the transport port (`srp/protocol.rs`
+through `srp/srv_channel.rs`) and the geometry/detection pieces — follow
+this guide's `som-srv` sections for the wire protocol itself, and treat
+`srp/mod.rs` as a worked example of wiring video/audio through it
+end-to-end, not just images.

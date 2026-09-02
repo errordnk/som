@@ -88,6 +88,23 @@ impl SrvProgressState {
         self.lock_metadata().take()
     }
 
+    /// Puts metadata back after a failed [`Self::take_metadata`] consumer
+    /// — needed because `RichContentCache::record_progress` opens the
+    /// `som-srv` cache FILE on disk the first time it sees a given id,
+    /// and that file is written by the daemon asynchronously; if `Terminal::
+    /// ensure_rich_content_srv_subscription` calls it before the daemon
+    /// has created the file yet, `record_progress` fails and — without
+    /// this — the metadata `take_metadata` already consumed would be lost
+    /// forever (it's a one-shot `Option`), permanently stranding this
+    /// placement: no `RichContentCache` entry ever gets created, so
+    /// `rich_content_markdown_placements`/equivalents never see it.
+    /// Confirmed live: a markdown file whose placeholder grid scrolled
+    /// off-screen before the daemon's cache file existed hit exactly this
+    /// race and never rendered.
+    pub fn restore_metadata(&self, metadata: (ContentType, ContentMetadata)) {
+        *self.lock_metadata() = Some(metadata);
+    }
+
     fn lock_metadata(&self) -> MutexGuard<'_, Option<(ContentType, ContentMetadata)>> {
         self.metadata.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }

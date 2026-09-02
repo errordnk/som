@@ -170,6 +170,35 @@ Landed and live-tested:
   markdown SYNTAX (`**bold**`, links, headings, code fences) is
   actually styled differently from plain text yet — `rendered_text` is
   painted as-is.
+- **Documents taller than the terminal scroll correctly** (fixed the
+  same day, caught live testing a real 354-line file): `somcat`'s
+  placeholder grid reserves the file's FULL line count, not clamped to
+  the current viewport — so a long document's placeholder cells
+  routinely sit outside what's currently on-screen by the time a paint
+  pass runs. Two places that previously only scanned the VISIBLE
+  viewport (`Terminal::poll_rich_content_srv_subscriptions`,
+  `Terminal::markdown_placement_origins`) now scan the entire grid —
+  scrollback included — via `term.grid()` indexed from `topmost_line()`
+  to `bottommost_line()`, matching alacritty's own `Line` convention
+  (0 = top of current viewport, negative = scrollback). Without this,
+  a placement whose grid never happened to be on-screen during a paint
+  pass would never even get a `som-srv` subscription, permanently
+  stranding it. `paint_rich_content_markdown_widget` clips to whatever
+  ROWS of the placement are currently visible rather than requiring the
+  whole thing on-screen at once. A companion race (`RichContentCache::
+  record_progress` opening the daemon's cache file before the daemon
+  had created it) is handled by `SrvProgressState::restore_metadata`,
+  putting metadata back for a retry instead of losing it (one-shot
+  `Option`) on the first failed attempt.
+- **Scroll Lock scrolls the markdown widget instead of the terminal**:
+  `TerminalView::scroll_wheel` checks `window.scrolllock().on` — when
+  engaged, the wheel moves a per-placement widget-local line offset
+  (`Terminal::scroll_rich_content_markdown`/`rich_content_markdown_
+  scroll_offset`, keyed off which markdown placement is under the
+  cursor via `Terminal::markdown_placement_under`) instead of the
+  terminal's own `display_offset`. Off, the wheel scrolls the terminal
+  exactly as before — the two scroll spaces are fully independent by
+  design, not layered on top of each other.
 
 ### Next step: image/audio/video links inside markdown
 

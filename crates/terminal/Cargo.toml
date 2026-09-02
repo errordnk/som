@@ -38,6 +38,7 @@ image.workspace = true
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 paths.workspace = true
 regex.workspace = true
 release_channel.workspace = true

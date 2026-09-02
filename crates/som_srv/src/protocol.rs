@@ -585,6 +585,27 @@ pub enum SrvRequest {
     /// request` prefers this one when present (see `SrvCache`'s own doc
     /// comment).
     RegisterRangeResponder { session_id: u32, file_id: u32 },
+    /// Runs `script_source` as a fresh, explicitly-sandboxed `mlua::Lua`
+    /// VM (see `crate::lua::phase1_stdlib`'s own doc comment — NOT
+    /// `mlua::Lua::new()`'s default, which turned out live-confirmed to
+    /// still include `io`, since mlua's own `StdLib::ALL_SAFE` classifies
+    /// `io` as "safe" in the sense of "doesn't corrupt the VM," not "no
+    /// filesystem access") INSIDE `som-srv` itself — the first case where the
+    /// daemon originates `PutChunk`s on its own, rather than only relaying
+    /// ones an external client (`somcat`, the yazi driver) already sent.
+    /// The script's single string return value becomes the markdown
+    /// source, chunked and pushed through the exact same `SrvCache::
+    /// put_chunk` path (and thus the exact same `SrvResponse::Progress`
+    /// subscriber-notification machinery) a real `PutChunk` sender already
+    /// uses — `(session_id, file_id)` here plays the identical role it
+    /// does in `PutChunk` itself: the placeholder-grid id a client printed
+    /// on the PTY BEFORE sending this request, so Som already has
+    /// somewhere to paint the result once it arrives. Phase 1 only
+    /// (`SRP_LUA.md`): no filesystem/network/DB access exposed to the
+    /// script yet, and no persistent VM across calls — each request gets
+    /// its own fresh `Lua::new()`, run synchronously to completion before
+    /// this variant's handler returns.
+    RunLuaScript { session_id: u32, file_id: u32, script_source: String },
 }
 
 /// daemon -> `somcat`/other SRP clients, answering a `SrvRequest`.

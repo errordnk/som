@@ -15,6 +15,7 @@ terminal.workspace = true
 symphonia.workspace = true
 som_srv.workspace = true
 serde_json.workspace = true
+markdown_line_count.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

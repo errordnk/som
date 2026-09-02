@@ -636,20 +636,39 @@ with `somcat`, not just images/GIF:
   before the migration — reads the whole (typically small) file into
   memory, probes its header (`metadata.rs`), prints the placeholder
   grid, then sends the buffer as `PutChunk`s over a fresh `SrvChannel`.
-- **Video** (`stream_video`) and **audio** (`stream_audio`): new,
-  streamed off disk in bounded chunks (never the whole file into
-  memory), with a dedicated byte-range-responder connection
-  (`RegisterRangeResponder`) so a seek on Som's side gets answered
-  promptly instead of queueing behind a large in-flight sequential
-  transfer — mirrors `somcat::stream_file_from_disk`/`spawn_byte_range_
-  responder_from_disk`/`send_range_chunks_from_disk_interruptible`
-  field-for-field, including the seek-signal compare-and-clear pattern
-  (see `mod.rs`'s own doc comments for the bugs that pattern fixes).
-  Neither branch does real ffprobe/symphonia-style metadata probing —
-  see `metadata.rs`'s own doc comment for why — so both fall back to a
-  fixed placeholder footprint (same numbers `somcat` itself falls back
-  to when its own real probe fails); Som decodes the real file and
-  learns its true dimensions once playback actually starts regardless.
+- **Video** (`stream_video`): streamed off disk in bounded chunks (never
+  the whole file into memory), with a dedicated byte-range-responder
+  connection (`RegisterRangeResponder`) so a seek on Som's side gets
+  answered promptly instead of queueing behind a large in-flight
+  sequential transfer — mirrors `somcat::stream_file_from_disk`/`spawn_
+  byte_range_responder_from_disk`/`send_range_chunks_from_disk_
+  interruptible` field-for-field, including the seek-signal compare-and-
+  clear pattern (see `mod.rs`'s own doc comments for the bugs that
+  pattern fixes). Does NOT do real ffprobe-style metadata probing — see
+  `metadata.rs`'s own doc comment for why (FFmpeg is a large, platform-
+  specific dependency this driver deliberately avoids) — so it falls
+  back to a fixed placeholder footprint (same numbers `somcat` itself
+  falls back to when its own real probe fails); Som decodes the real
+  file and learns its true dimensions once playback actually starts
+  regardless.
+- **Audio** (`audio_show`, `pub` rather than `pub(super)`): same disk-
+  streaming path as video, but WITH real header metadata (sample_rate/
+  channels/bits_per_sample/duration_ms) via `symphonia` — unlike video's
+  FFmpeg probe, this is cheap enough (a small header read, not a multi-
+  gigabyte container probe) to always attempt (`metadata::audio_
+  metadata`). Called directly by `Adapter::audio_show`
+  (`yazi-adapter/src/adapter.rs`) rather than going through `Driver::
+  image_show`'s per-driver dispatch — audio has no equivalent concept on
+  any OTHER driver in this codebase (they all exist to place pixels, not
+  play sound), so there's no dispatch table entry to route through. Has
+  a companion Lua binding (`ya.audio_show`, `yazi-plugin/src/utils/
+  image.rs`) and previewer (`yazi-plugin/preset/plugins/audio.lua`,
+  registered for `mime = "audio/*"` in `yazi-default.toml`), which fall
+  back to `file.lua`'s plain classification preview outside Som (checked
+  via `SOM_WINDOW_ID`) since no other driver has any audio concept to
+  fall back to. The widget's fixed footprint (`AUDIO_WIDGET_COLUMNS`/
+  `ROWS`, 40x1) is centered both horizontally and vertically within the
+  preview pane, not anchored to a corner.
 - **Placeholder-grid printing, terminal-cell-size sizing** (via yazi's
   own `Rect`/`Image::pixel_area`), and **`Brand::Som` detection**
   (`yazi-emulator/src/brand.rs`, via `SOM_WINDOW_ID`) are unchanged from

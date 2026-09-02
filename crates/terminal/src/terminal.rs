@@ -505,6 +505,7 @@ impl TerminalBuilder {
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -811,6 +812,7 @@ impl TerminalBuilder {
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -961,6 +963,19 @@ impl Deref for IndexedCell {
     fn deref(&self) -> &Cell {
         &self.cell
     }
+}
+
+/// A markdown placement's absolute-grid origin plus its exact footprint,
+/// as found by [`Terminal::markdown_placement_origins`]'s full-grid scan
+/// (scrollback included) — see that method's own doc comment for the
+/// coordinate convention and why this can't reuse the image/audio/video
+/// paint loop's viewport-only `max_columns_seen`/`max_rows_seen` maps.
+#[derive(Clone, Copy, Debug)]
+pub struct MarkdownPlacementGeometry {
+    pub origin_line: i32,
+    pub origin_column: i32,
+    pub max_column: u32,
+    pub max_row: u32,
 }
 
 // TODO: Un-pub
@@ -1158,6 +1173,16 @@ pub struct Terminal {
     /// cache's `contiguous_len` grows past what was last rendered.
     rich_content_markdown_players:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_markdown_player::RichContentMarkdownPlayer>>,
+    /// Per-placement scroll offset (in text lines, 0 = top of the
+    /// document) for markdown widgets, moved only when Scroll Lock is
+    /// engaged — see `TerminalView::scroll_wheel`'s Scroll Lock branch.
+    /// Independent of the terminal's own `display_offset`: with Scroll
+    /// Lock off, the mouse wheel scrolls the terminal as always and this
+    /// stays untouched; with it on, the wheel instead moves this offset
+    /// and the terminal's own scroll position stays put, so the widget's
+    /// on-screen window can move without dragging the surrounding
+    /// terminal content along with it.
+    rich_content_markdown_scroll_offsets: std::cell::RefCell<std::collections::HashMap<(u32, u32), u32>>,
     /// One [`rich_content_audio_player::AudioTransferProgress`] per
     /// audio placement, created alongside its `RichContentAudioPlayer`
     /// entry in `rich_content_audio_players` and updated every time
@@ -2025,55 +2050,88 @@ impl Terminal {
             (None, None) => return, // no metadata seen yet, and no entry to update either
         };
 
-        if let Err(err) =
-            self.rich_content_cache
-                .record_progress(content_type, session_id, file_id, state.contiguous_len(), state.total_size(), metadata)
-        {
+        if let Err(err) = self.rich_content_cache.record_progress(
+            content_type,
+            session_id,
+            file_id,
+            state.contiguous_len(),
+            state.total_size(),
+            metadata,
+        ) {
             log::debug!("failed to open som-srv cache file for {session_id:#x}:{file_id:#x}: {err:#}");
+            // The daemon creates its cache file on disk asynchronously
+            // (first `PutChunk` write) — if this call landed before that
+            // happened, `record_progress` fails to open it, and without
+            // restoring the metadata here it would be lost forever
+            // (`take_metadata` is one-shot), permanently stranding this
+            // placement with no `RichContentCache` entry. See `restore_
+            // metadata`'s own doc comment.
+            state.restore_metadata((content_type, metadata));
         }
     }
 
     /// Scans the placeholder grid for every `(session_id, file_id)`
-    /// currently visible, and calls
-    /// [`Self::ensure_rich_content_srv_subscription`] for each.
+    /// anywhere in the grid — scrollback included, not just the current
+    /// viewport — and calls [`Self::ensure_rich_content_srv_subscription`]
+    /// for each.
     ///
-    /// Reads the LIVE grid directly (`self.term.lock()` +
-    /// `renderable_content()`, the same source `make_content` copies
-    /// into `self.last_content` on every `sync()`) rather than
-    /// `self.last_content()` itself — `last_content` is only ever
-    /// refreshed by `sync()`, which needs a real `Window`/paint pass and
-    /// so never runs at all in a headless `#[gpui::test]` (confirmed
-    /// directly: `last_content().cells` stayed empty for the whole
-    /// duration of such a test, even with real chunks actively arriving
-    /// over the wire) — depending on it here would make subscription
-    /// discovery silently do nothing outside of a real paint loop, which
-    /// is exactly the gap headless tests like
-    /// `test_rich_content_placements_reach_the_paint_path_via_a_real_
-    /// process` exist to close by calling this method directly in their
-    /// own poll loop instead.
+    /// Reads the LIVE grid directly (`self.term.lock()` + `term.grid()`,
+    /// indexed from `term.topmost_line()` through `term.bottommost_line()`
+    /// — the same full-grid scan `Terminal::markdown_placement_origins`
+    /// uses, see that method's own doc comment) rather than `self.
+    /// last_content()` — `last_content` is only ever refreshed by
+    /// `sync()`, which needs a real `Window`/paint pass and so never runs
+    /// at all in a headless `#[gpui::test]` (confirmed directly: `last_
+    /// content().cells` stayed empty for the whole duration of such a
+    /// test, even with real chunks actively arriving over the wire) —
+    /// depending on it here would make subscription discovery silently
+    /// do nothing outside of a real paint loop, which is exactly the gap
+    /// headless tests like `test_rich_content_placements_reach_the_
+    /// paint_path_via_a_real_process` exist to close by calling this
+    /// method directly in their own poll loop instead.
+    ///
+    /// CORRECTION: originally scanned only `term.renderable_content().
+    /// display_iter` (viewport-only) — this silently broke subscription
+    /// discovery entirely for any placement whose placeholder grid is
+    /// taller than the terminal's visible height and has scrolled out of
+    /// view by the time a paint pass runs (a markdown document's
+    /// placeholder grid, reserved at the file's full line count per
+    /// `print_markdown_placeholder_grid` in `somcat`, routinely does):
+    /// `rich_content_cache` would never learn the id existed at all,
+    /// because nothing else in the paint path calls this except per-
+    /// currently-visible-id. Confirmed live — a 354-line markdown file's
+    /// placeholder grid scrolled fully off-screen before this method's
+    /// old viewport-only scan ever ran, leaving `rich_content_cache.
+    /// all_known_ids()` permanently empty for it.
     pub fn poll_rich_content_srv_subscriptions(&mut self) {
         use kitty_graphics_placeholder::{PlaceholderCell, decode_placeholder_cell};
 
         let mut ids: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         {
             let term = self.term.lock();
-            for indexed_cell in term.renderable_content().display_iter {
-                let fg_rgb = match indexed_cell.cell.fg {
-                    alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                    _ => continue,
-                };
-                let underline_rgb = match indexed_cell.cell.underline_color() {
-                    Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                    Some(_) => continue,
-                    None => None,
-                };
-                let diacritics = indexed_cell.cell.zerowidth().unwrap_or(&[]);
-                let Some(PlaceholderCell { image_id: session_id, placement_id: file_id, .. }) =
-                    decode_placeholder_cell(indexed_cell.cell.c, fg_rgb, underline_rgb, diacritics)
-                else {
-                    continue;
-                };
-                ids.insert((session_id, file_id));
+            let grid = term.grid();
+            let top = grid.topmost_line().0;
+            let bottom = grid.bottommost_line().0;
+            for line_num in top..=bottom {
+                let row = &grid[Line(line_num)];
+                for cell in row.into_iter() {
+                    let fg_rgb = match cell.fg {
+                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                        _ => continue,
+                    };
+                    let underline_rgb = match cell.underline_color() {
+                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                        Some(_) => continue,
+                        None => None,
+                    };
+                    let diacritics = cell.zerowidth().unwrap_or(&[]);
+                    let Some(PlaceholderCell { image_id: session_id, placement_id: file_id, .. }) =
+                        decode_placeholder_cell(cell.c, fg_rgb, underline_rgb, diacritics)
+                    else {
+                        continue;
+                    };
+                    ids.insert((session_id, file_id));
+                }
             }
         }
 
@@ -2241,6 +2299,130 @@ impl Terminal {
             }
         }
         out
+    }
+
+    /// Finds every markdown placement's on-screen origin by scanning the
+    /// ENTIRE grid — scrollback history included, not just the current
+    /// viewport (`self.term.lock()` + `term.grid()`, indexed from
+    /// `term.topmost_line()` through `term.bottommost_line()`, unlike
+    /// `terminal_element.rs`'s main origins-scanning loop, which only
+    /// walks `last_content().cells`/`renderable_content()` — both
+    /// deliberately viewport-only for the image/audio/video placements
+    /// that loop also handles). A markdown document taller than the
+    /// terminal's visible height scrolls into ordinary scrollback like
+    /// any other output; without this scan, once the placeholder grid's
+    /// top row scrolls above the viewport the paint path would find no
+    /// visible placeholder cell at all and stop rendering the widget
+    /// entirely (the bug this method exists to fix — see SRP_LUA.md).
+    ///
+    /// Returned coordinates are ABSOLUTE grid `Line` values (same
+    /// convention `terminal_element.rs`'s own `origins` map already uses,
+    /// derived from `IndexedCell::point.line.0` — see `Terminal::
+    /// make_content`, which copies `renderable_content().display_iter`'s
+    /// points through unchanged, no viewport-relative conversion). The
+    /// caller adds the current `display_offset` on top (`display_line =
+    /// origin_line + display_offset`, the same formula every other
+    /// placement type's paint branch already uses) to get an actual
+    /// paintable on-screen row.
+    ///
+    /// Also returns each placement's exact `(max_column, max_row)` seen
+    /// anywhere in the grid — unlike the image/audio/video paint loop's
+    /// `max_columns_seen`/`max_rows_seen` maps (which accumulate a
+    /// running maximum across paint calls because they only ever see
+    /// whatever's currently in the viewport), this scan covers the
+    /// entire placeholder grid in one pass, so the true size is known
+    /// immediately without needing that accumulation trick.
+    pub fn markdown_placement_origins(
+        &self,
+    ) -> std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry> {
+        use kitty_graphics_placeholder::{PlaceholderCell, decode_placeholder_cell};
+
+        let mut geometry: std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry> = std::collections::HashMap::new();
+        let term = self.term.lock();
+        let grid = term.grid();
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        for line_num in top..=bottom {
+            let line = Line(line_num);
+            let row = &grid[line];
+            for (column_index, cell) in row.into_iter().enumerate() {
+                let fg_rgb = match cell.fg {
+                    alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                    _ => continue,
+                };
+                let underline_rgb = match cell.underline_color() {
+                    Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                    Some(_) => continue,
+                    None => None,
+                };
+                let diacritics = cell.zerowidth().unwrap_or(&[]);
+                let Some(PlaceholderCell { image_id: session_id, placement_id: file_id, row: decoded_row, column: decoded_column }) =
+                    decode_placeholder_cell(cell.c, fg_rgb, underline_rgb, diacritics)
+                else {
+                    continue;
+                };
+                let key = (session_id, file_id);
+                let origin_line = line_num - decoded_row as i32;
+                let origin_column = column_index as i32 - decoded_column as i32;
+                let entry = geometry.entry(key).or_insert(MarkdownPlacementGeometry {
+                    origin_line,
+                    origin_column,
+                    max_column: 0,
+                    max_row: 0,
+                });
+                entry.max_column = entry.max_column.max(decoded_column);
+                entry.max_row = entry.max_row.max(decoded_row);
+            }
+        }
+        geometry
+    }
+
+    /// Current widget-local scroll offset (in text lines) for a markdown
+    /// placement — `0` if it's never been scrolled. See
+    /// `rich_content_markdown_scroll_offsets`'s own doc comment for how
+    /// this differs from the terminal's own `display_offset`.
+    pub fn rich_content_markdown_scroll_offset(&self, session_id: u32, file_id: u32) -> u32 {
+        self.rich_content_markdown_scroll_offsets.borrow().get(&(session_id, file_id)).copied().unwrap_or(0)
+    }
+
+    /// Scrolls a markdown placement's widget-local view by `delta_lines`
+    /// (positive = further into the document, negative = back toward the
+    /// top), clamped to `[0, max_offset]`. Called from `TerminalView::
+    /// scroll_wheel`'s Scroll Lock branch — see that method for how mouse
+    /// wheel input is routed here instead of to the terminal's own scroll
+    /// when Scroll Lock is engaged.
+    pub fn scroll_rich_content_markdown(&self, session_id: u32, file_id: u32, delta_lines: i32, max_offset: u32) {
+        let mut offsets = self.rich_content_markdown_scroll_offsets.borrow_mut();
+        let entry = offsets.entry((session_id, file_id)).or_insert(0);
+        let new_offset = (*entry as i32 + delta_lines).clamp(0, max_offset as i32);
+        *entry = new_offset as u32;
+    }
+
+    /// Finds the markdown placement (if any) whose recorded on-screen
+    /// bounds contain `position` (absolute window pixel coordinates,
+    /// same space `record_rich_content_placement_bounds` stores — see
+    /// `handle_rich_content_click`'s identical lookup pattern for audio/
+    /// video). Returns `(session_id, file_id, total_line_count)` — the
+    /// line count is the widget's own scroll clamp ceiling, needed by
+    /// `TerminalView::scroll_wheel`'s Scroll Lock branch to bound how far
+    /// `scroll_rich_content_markdown` can move.
+    pub fn markdown_placement_under(&self, position: gpui::Point<Pixels>) -> Option<(u32, u32, u32)> {
+        for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
+            if !self.rich_content_markdown_players.borrow().contains_key(&(session_id, file_id)) {
+                continue;
+            }
+            if !bounds.contains(&position) {
+                continue;
+            }
+            let line_count = self
+                .rich_content_markdown_players
+                .borrow()
+                .get(&(session_id, file_id))
+                .map(|player| player.rendered().lines().count() as u32)
+                .unwrap_or(0);
+            return Some((session_id, file_id, line_count));
+        }
+        None
     }
 
     /// Toggles play/pause for the audio placement at `(session_id,

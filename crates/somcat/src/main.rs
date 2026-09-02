@@ -506,7 +506,24 @@ const MARKDOWN_MAX_COLUMNS: u32 = 9999;
 
 fn print_markdown_placeholder_grid(session_id: u32, file_id: u32, bytes: &[u8]) -> Result<(), String> {
     let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32 + 1;
-    print_placeholder_grid_with_cell_dims(session_id, file_id, MARKDOWN_MAX_COLUMNS, line_count)
+    // Full document height, NOT clamped to the terminal's current visible
+    // rows — a document taller than the viewport is expected to scroll
+    // (into the terminal's own scrollback, same as any other long output),
+    // not to have its bottom silently cut off. Only the column count is
+    // clamped, independently of rows (NOT `print_placeholder_grid_with_
+    // cell_dims`'s aspect-ratio-preserving scale, which is correct for
+    // images but was wrong here: with a 354-line file and
+    // `MARKDOWN_MAX_COLUMNS` = 9999, that scale factor collapsed `rows`
+    // down to single digits before this fix — see git history).
+    let columns = query_cell_count().map(|(c, _)| c).unwrap_or(MARKDOWN_MAX_COLUMNS).min(MARKDOWN_MAX_COLUMNS).max(1);
+    // Bypasses `print_placeholder_grid_with_cell_dims`'s row clamp —
+    // deliberately, per the doc comment above: markdown height is never
+    // trimmed to fit the current viewport, only wired straight to `write_
+    // placeholder_grid_rows`. A document taller than the terminal scrolls
+    // into scrollback like any other long output; Som's own paint path is
+    // responsible for finding placeholder cells there (not just in the
+    // visible viewport) and for widget-local scrolling via Scroll Lock.
+    write_placeholder_grid_rows(session_id, file_id, columns, line_count)
 }
 
 fn print_placeholder_grid_with_cell_dims(
@@ -544,15 +561,19 @@ fn print_placeholder_grid_with_cell_dims(
         }
     }
 
-    // Hard `\r\n` between rows: the terminal's own soft-wrap reflow always
-    // re-wraps to ITS current width, not the image's — it can't hold a
-    // placement at a narrower width while the window is wider, which would
-    // stretch the image past its real aspect ratio. Som instead actively
-    // re-derives and rewrites this grid's cells in place on every resize
-    // (see `Terminal::resync_rich_content_placements`), so staying with
-    // explicit row boundaries here keeps the on-screen shape predictable
-    // between resizes rather than relying on wrap behavior this protocol
-    // doesn't want.
+    write_placeholder_grid_rows(session_id, file_id, columns, rows)
+}
+
+// Hard `\r\n` between rows: the terminal's own soft-wrap reflow always
+// re-wraps to ITS current width, not the image's — it can't hold a
+// placement at a narrower width while the window is wider, which would
+// stretch the image past its real aspect ratio. Som instead actively
+// re-derives and rewrites this grid's cells in place on every resize
+// (see `Terminal::resync_rich_content_placements`), so staying with
+// explicit row boundaries here keeps the on-screen shape predictable
+// between resizes rather than relying on wrap behavior this protocol
+// doesn't want.
+fn write_placeholder_grid_rows(session_id: u32, file_id: u32, columns: u32, rows: u32) -> Result<(), String> {
     let mut text = String::new();
     let (sr, sg, sb) = id_to_rgb(session_id);
     let (fr, fg, fb) = id_to_rgb(file_id);

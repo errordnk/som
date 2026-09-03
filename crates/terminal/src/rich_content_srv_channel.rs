@@ -61,6 +61,19 @@ pub struct SrvProgressState {
     /// never actually changes mid-transfer).
     metadata: Mutex<Option<(ContentType, ContentMetadata)>>,
     stop: AtomicBool,
+    /// Set when a `SrvResponse::StopPlayback` push arrives on this
+    /// placement's subscription connection — see `SrvRequest::
+    /// StopPlayback`'s own doc comment for who sends this and why
+    /// (currently only the yazi driver, when its preview cursor moves to
+    /// a different file). Checked once per paint pass by `Terminal::
+    /// rich_content_audio_placements`/`rich_content_video_placements`,
+    /// which tear the player down the same way a click on the widget's
+    /// own stop icon already does — this flag is the trigger, not a
+    /// player-owned field, so the SAME background thread that already
+    /// owns this whole struct can set it without reaching into
+    /// `Terminal`'s player maps at all (which live on the paint thread
+    /// only).
+    stop_playback_requested: AtomicBool,
 }
 
 impl SrvProgressState {
@@ -111,6 +124,14 @@ impl SrvProgressState {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Takes (clears) the stop-playback flag — `true` at most once per
+    /// `SrvResponse::StopPlayback` push, mirroring `take_metadata`'s own
+    /// "consume, don't just peek" shape so the caller's teardown logic
+    /// runs exactly once per request, not on every subsequent paint pass.
+    pub fn take_stop_playback_requested(&self) -> bool {
+        self.stop_playback_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -255,6 +276,11 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
                 if guard.is_none() {
                     *guard = Some((to_terminal_content_type(content_type), to_terminal_metadata(metadata)));
                 }
+            },
+            SrvResponse::StopPlayback { session_id: response_session, file_id: response_file }
+                if response_session == session_id && response_file == file_id =>
+            {
+                state.stop_playback_requested.store(true, Ordering::Release);
             },
             _ => continue, // unrelated response — ignore, keep waiting
         }

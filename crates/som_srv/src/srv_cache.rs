@@ -288,6 +288,26 @@ impl SrvCache {
         inner.subscribers.entry(key).or_default().push(send);
     }
 
+    /// Pushes `SrvResponse::StopPlayback` to every current subscriber of
+    /// `(session_id, file_id)` — see `SrvRequest::StopPlayback`'s own doc
+    /// comment for the full rationale. Unlike `push_chunk`'s `Progress`
+    /// push, this is NOT gated on any watermark actually changing — it
+    /// fires unconditionally, once, whenever a `StopPlayback` request
+    /// arrives, since there's no "already sent this" state to compare
+    /// against the way there is for progress (which naturally
+    /// deduplicates via the watermark-changed check). A subscriber whose
+    /// `send` call fails (connection already closed) is silently skipped,
+    /// same tolerance every other best-effort push in this cache already
+    /// has.
+    pub fn notify_stop_playback(&self, session_id: u32, file_id: u32) {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::StopPlayback { session_id, file_id });
+            }
+        }
+    }
+
     /// Registers `send` as the ONE way to reach the client currently
     /// holding `(session_id, file_id)`'s file — called the first time a
     /// connection's `PutChunk` for a given key is seen (see `server::
@@ -410,6 +430,33 @@ mod tests {
 
         assert_eq!(*first_calls.lock().unwrap(), 0, "the replaced route must never be called");
         assert_eq!(*second_calls.lock().unwrap(), 1, "only the latest registered route must be called");
+    }
+
+    #[test]
+    fn notify_stop_playback_pushes_to_every_subscriber() {
+        let cache = SrvCache::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let observed = observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+
+        cache.notify_stop_playback(1, 2);
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(matches!(observed[0], SrvResponse::StopPlayback { session_id: 1, file_id: 2 }));
+    }
+
+    #[test]
+    fn notify_stop_playback_is_a_silent_no_op_with_no_subscriber() {
+        let cache = SrvCache::new();
+        // No `subscribe` call at all — must not panic or error.
+        cache.notify_stop_playback(99, 99);
     }
 
     fn test_metadata() -> ContentMetadata {

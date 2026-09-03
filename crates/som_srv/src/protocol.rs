@@ -606,6 +606,29 @@ pub enum SrvRequest {
     /// its own fresh `Lua::new()`, run synchronously to completion before
     /// this variant's handler returns.
     RunLuaScript { session_id: u32, file_id: u32, script_source: String },
+    /// Sent by an SRP client (`somcat`, the yazi driver — never by Som
+    /// itself) on a fresh, one-shot connection, exactly mirroring
+    /// `RequestByteRange`'s own connection shape — the mechanism a
+    /// PREVIEW-style client uses to tell Som "stop decoding/playing
+    /// `(session_id, file_id)`'s audio/video, its placeholder cells are
+    /// about to be overwritten by a different placement." Exists
+    /// specifically for yazi's own preview pane: switching the cursor to
+    /// a different file overwrites the PTY-side placeholder cells
+    /// belonging to whatever audio/video was previously playing, but
+    /// (unlike a real `clear` escape sequence, which `Terminal::process_
+    /// event`'s `AlacTermEvent::ClearScreen` arm already handles) nothing
+    /// on the wire told Som the OLD placement was actually abandoned —
+    /// its `cpal`/FFmpeg decode thread just kept running fully audible
+    /// with no widget left anywhere to reach it. `som-srv` forwards this,
+    /// verbatim, to every current `SubscribeProgress` subscriber for the
+    /// same key (see `SrvCache::notify_stop_playback`) as `SrvResponse::
+    /// StopPlayback` — in practice that's Som's own long-lived progress-
+    /// listener connection, the same one `SrvResponse::Progress` already
+    /// arrives on. Silently a no-op if nobody is subscribed (e.g. Som
+    /// already tore the player down itself, or never opened one for this
+    /// id at all) — same "already gone, nothing to do" tolerance every
+    /// other best-effort message in this protocol already has.
+    StopPlayback { session_id: u32, file_id: u32 },
 }
 
 /// daemon -> `somcat`/other SRP clients, answering a `SrvRequest`.
@@ -678,6 +701,10 @@ pub enum SrvResponse {
         content_type: ContentType,
         metadata: ContentMetadata,
     },
+    /// Pushed (unsolicited) on a `SubscribeProgress` connection, answering
+    /// a DIFFERENT client's `SrvRequest::StopPlayback` for the same
+    /// `(session_id, file_id)` — see that variant's own doc comment.
+    StopPlayback { session_id: u32, file_id: u32 },
 }
 
 /// Mirrors `crates/terminal/src/rich_content_transport::ContentType`

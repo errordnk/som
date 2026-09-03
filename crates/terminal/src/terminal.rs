@@ -2164,6 +2164,26 @@ impl Terminal {
                 continue;
             }
             let key = (session_id, file_id);
+            // Checked BEFORE the "open a player" branch below — a
+            // `SrvResponse::StopPlayback` push (see `SrvRequest::
+            // StopPlayback`'s own doc comment: currently sent only by the
+            // yazi driver, when its preview cursor moves to a different
+            // file) means this placement's OLD player, if any, should be
+            // torn down exactly the way `stop_rich_content_audio_playback`
+            // already does for the widget's own stop icon — inlined here
+            // (rather than calling that method) since it does its own
+            // `rich_content_audio_players.borrow_mut()`, which would
+            // panic against the `players` borrow already held above. If
+            // no player was open yet for this id (the request arrived for
+            // a placement whose bytes never got far enough to autoplay),
+            // removing a key that was never inserted is a correct no-op.
+            if let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key)
+                && srv_state.take_stop_playback_requested()
+            {
+                self.rich_content_audio_stopped.borrow_mut().insert(key);
+                players.remove(&key);
+                self.rich_content_audio_progress.borrow_mut().remove(&key);
+            }
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);
             if !players.contains_key(&key) {
@@ -2672,6 +2692,26 @@ impl Terminal {
                 continue;
             }
             let key = (session_id, file_id);
+            // Checked BEFORE the "open a player" branch below — same
+            // `SrvResponse::StopPlayback` handling `rich_content_audio_
+            // placements` already has (see that method's own comment for
+            // the full rationale); genuinely tears the player down
+            // (`.remove`, not `stop_rich_content_video_playback`'s own
+            // pause+rewind — that method exists for the widget's stop
+            // icon, which leaves a stand-in image behind for a later
+            // "play again" click; here there's no widget left to click
+            // at all once the placement is gone, same reasoning `Alac
+            // TermEvent::ClearScreen`'s handler already documents for why
+            // IT drops the whole map too). Inlined rather than calling a
+            // shared helper for the same borrow-conflict reason audio's
+            // copy is inlined: `players` (`rich_content_video_players`)
+            // is already mutably borrowed above.
+            if let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key)
+                && srv_state.take_stop_playback_requested()
+            {
+                players.remove(&key);
+                self.rich_content_video_progress.borrow_mut().remove(&key);
+            }
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);
             // `RichContentCache` only tracks `contiguous_len`/`total_size`

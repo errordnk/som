@@ -14,6 +14,7 @@ mod redraw;
 mod relay;
 mod server;
 mod session;
+mod single_instance;
 mod srv_cache;
 mod term_size;
 
@@ -208,7 +209,22 @@ fn main() {
     // Cross-platform — same daemon/RELAY split, same dispatch, on both
     // Windows and Unix.
     let result = if args.daemon {
-        server::run()
+        // See `single_instance`'s own module doc comment for the exact
+        // race this closes: `daemon::connect_or_spawn`'s "connect, else
+        // spawn" check has a window where two clients can both decide to
+        // spawn, and — on Windows specifically — both successfully bind
+        // the pipe name (named pipes have no `EADDRINUSE`-equivalent).
+        // Losing this race is the expected outcome for a losing spawn,
+        // not an error: exit cleanly (code 0) rather than going on to
+        // `server::run()` and creating a second, orphaned daemon.
+        match single_instance::try_acquire_daemon_lock() {
+            Ok(Some(_guard)) => server::run(),
+            Ok(None) => {
+                log::info!("another som-srv daemon is already running, exiting");
+                return;
+            },
+            Err(err) => Err(err),
+        }
     } else {
         // A RELAY's own invocation is positional (`<profile> <pane-id>
         // <program>` — see `Args`'s doc comment), so `--client-id` is

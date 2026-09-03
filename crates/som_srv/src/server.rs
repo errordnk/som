@@ -350,6 +350,9 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::RequestByteRange { session_id, file_id, offset, len } => {
                 cache.route_byte_range_request(session_id, file_id, SrvRequest::RequestByteRange { session_id, file_id, offset, len });
             }
+            SrvRequest::StopPlayback { session_id, file_id } => {
+                cache.notify_stop_playback(session_id, file_id);
+            }
             SrvRequest::RegisterRangeResponder { session_id, file_id } => {
                 let connection = connection.clone();
                 let writer = writer.clone();

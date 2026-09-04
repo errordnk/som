@@ -2628,28 +2628,24 @@ fn paint_rich_content_media_widget(
     // glyph than the left side's did). Both sides now pad out from the
     // glyph's own actual painted edge instead of a guessed one-cell box.
     let play_glyph = if is_playing { nf_pause } else { nf_play };
-    let play_glyph_width = shape_and_paint(play_glyph, position, window, cx);
+    let play_glyph_width = {
+        let run = TextRun { len: play_glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(play_glyph.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None).width
+    };
 
-    // Two cells of padding between the play/pause glyph and the
-    // current-time readout — without it the two visually ran together
-    // (glyph and time text abutting with no gap), confirmed live.
-    let current_time_position = point(position.x + play_glyph_width + cell_width * 2.0, position.y);
-    paint_time(elapsed, current_time_position, window, cx);
-
-    // Stop glyph anchored so its right edge lands on the trailing cell,
-    // total time immediately to its left with two cells of padding —
-    // mirrors the leading play/pause + current-time layout on the
-    // opposite end.
+    // Stop glyph anchored so its right edge lands on the trailing cell —
+    // computed before the time readouts below since the narrow-widget
+    // fallback needs its position regardless of whether time text ends
+    // up painted at all.
     let stop_glyph_width = {
         let run = TextRun { len: nf_stop.len(), font: text_style.font(), color: text_color, ..Default::default() };
         window.text_system().shape_line(nf_stop.into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None).width
     };
     let stop_position = point(position.x + width - cell_width.max(stop_glyph_width), position.y);
-    shape_and_paint(nf_stop, stop_position, window, cx);
     let stop_bounds = Bounds::new(stop_position, gpui::size(stop_glyph_width.max(cell_width), line_height));
 
+    let current_time_position = point(position.x + play_glyph_width + cell_width * 2.0, position.y);
     let total_time_position = point(stop_position.x - cell_width * 2.0 - time_text_width, position.y);
-    paint_time(duration, total_time_position, window, cx);
 
     // The seek bar occupies whatever's left between the current-time
     // readout and the total-time readout, with one cell of padding on
@@ -2663,8 +2659,37 @@ fn paint_rich_content_media_widget(
     // (the REAL measured width of the time template — see that
     // variable's own doc comment), not a cell-count guess, so the bar
     // never overlaps either time readout regardless of font metrics.
-    let bar_start_x = current_time_position.x + time_text_width + cell_width;
-    let bar_end_x = total_time_position.x - cell_width;
+    let full_bar_start_x = current_time_position.x + time_text_width + cell_width;
+    let full_bar_end_x = total_time_position.x - cell_width;
+
+    // Narrow-widget fallback: a yazi preview pane (typically a third or
+    // quarter of the window's width, unlike somcat's usual near-full-
+    // width placement) routinely can't fit both "HH:MM:SS" readouts AND
+    // a usable bar in between — `full_bar_end_x <= full_bar_start_x`.
+    // Confirmed live: play/pause/stop (whose bounds don't depend on this
+    // math at all) kept working in that case, but the seek bar silently
+    // never painted or hit-tested at all, since the ONLY previous
+    // behavior here was skip-the-bar-entirely. Dropping both time
+    // readouts and letting the bar claim the freed space (one cell of
+    // padding on each side of the play/pause and stop glyphs, same
+    // padding convention the full layout already uses) keeps seeking
+    // usable in a narrow pane at the cost of the numeric time display —
+    // preferable to a seek bar that just doesn't exist.
+    let (bar_start_x, bar_end_x, paint_time_readouts) = if full_bar_end_x > full_bar_start_x {
+        (full_bar_start_x, full_bar_end_x, true)
+    } else {
+        let narrow_start_x = position.x + play_glyph_width + cell_width;
+        let narrow_end_x = stop_position.x - cell_width;
+        (narrow_start_x, narrow_end_x, false)
+    };
+
+    shape_and_paint(play_glyph, position, window, cx);
+    shape_and_paint(nf_stop, stop_position, window, cx);
+    if paint_time_readouts {
+        paint_time(elapsed, current_time_position, window, cx);
+        paint_time(duration, total_time_position, window, cx);
+    }
+
     let mut bar_bounds_out = None;
     if bar_end_x > bar_start_x {
         let bar_bounds = Bounds::new(

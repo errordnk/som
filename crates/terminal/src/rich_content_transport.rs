@@ -110,7 +110,7 @@ pub enum VideoCodec {
 /// content type (either wasted wire bytes or, worse, fields silently
 /// reinterpreted across unrelated content types as more variants get
 /// added later).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentMetadata {
     /// A still or animated raster image — GIF today, PNG/JPEG once those
     /// `ContentType`s exist. `width_px`/`height_px` are the DECODED pixel
@@ -151,7 +151,24 @@ pub enum ContentMetadata {
     /// `SRP_PROTOCOL.md`'s progressive-audio section). `0` means unknown,
     /// same "unknown, don't guess" convention [`Self::Image`]'s
     /// `width_px`/`height_px` already use.
-    Audio { sample_rate: u32, channels: u8, bits_per_sample: u8, duration_ms: u32 },
+    Audio {
+        sample_rate: u32,
+        channels: u8,
+        bits_per_sample: u8,
+        duration_ms: u32,
+        /// The source file's own extension (no leading dot, e.g. `"mp3"`)
+        /// — passed through to `symphonia`'s format probe as a hint (via
+        /// `Hint::with_extension`). Needed now that there is no on-disk
+        /// file/`Path` a decoder could otherwise infer this from at all
+        /// (`SrvCache`'s own doc comment: `som-srv` no longer persists
+        /// chunks to disk) — confirmed live as necessary for some
+        /// containers, whose probe can be ambiguous without it (see
+        /// `ContentMetadata::Video::extension`'s own doc comment for the
+        /// video-side version of the same finding). Empty string means
+        /// unknown (a sender that can't determine it) — the probe still
+        /// runs, just without the hint's usual shortcut.
+        extension: String,
+    },
     /// Reserved for [`ContentType::Video`] — same rationale as
     /// [`Self::Audio`]. `fps_numerator`/`fps_denominator` (rather than a
     /// single float or rounded integer fps) mirrors how GIF/video
@@ -179,6 +196,21 @@ pub enum ContentMetadata {
         /// index`, there is no "best" heuristic fallback here — subtitles
         /// are opt-in, never picked automatically.
         subtitle_stream_index: Option<u32>,
+        /// The source file's own extension (no leading dot, e.g. `"mkv"`,
+        /// `"mp4"`) — passed through to FFmpeg's format probe as a hint
+        /// (`ffmpeg::format::input_from_stream_with_interrupt`'s own
+        /// `format_name`/filename-hint parameter). Needed now that there
+        /// is no on-disk file/`Path` `GrowingFileStream` could otherwise
+        /// derive this from (`SrvCache`'s own doc comment: `som-srv` no
+        /// longer persists chunks to disk at all). Confirmed live as
+        /// load-bearing, not cosmetic: a fixed generic hint (e.g.
+        /// `"placement.video"` for every file regardless of real
+        /// container) let MKV probe successfully (its EBML header is
+        /// distinctive enough on its own) but made MP4 and AVI fixtures
+        /// fail probing entirely ("Could not find codec parameters...
+        /// unspecified pixel format") — those containers' probes lean on
+        /// the extension hint more heavily. Empty string means unknown.
+        extension: String,
     },
     /// [`ContentType::Markdown`] carries no geometric/format metadata at
     /// all — plain text, rendered by whatever overlay eventually consumes
@@ -193,7 +225,13 @@ mod tests {
     #[test]
     fn content_metadata_variants_are_distinguishable_by_equality() {
         let image = ContentMetadata::Image { width_px: 480, height_px: 480, color_bits: 32, is_animated: true };
-        let audio = ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 208_500 };
+        let audio = ContentMetadata::Audio {
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            duration_ms: 208_500,
+            extension: "mp3".to_string(),
+        };
         let video = ContentMetadata::Video {
             width_px: 1920,
             height_px: 1080,
@@ -202,6 +240,7 @@ mod tests {
             codec: VideoCodec::Mpeg4,
             audio_stream_index: None,
             subtitle_stream_index: None,
+            extension: "mp4".to_string(),
         };
         let markdown = ContentMetadata::Markdown;
 
@@ -211,7 +250,13 @@ mod tests {
         assert_eq!(image, image);
         assert_eq!(
             audio,
-            ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 208_500 }
+            ContentMetadata::Audio {
+                sample_rate: 44_100,
+                channels: 2,
+                bits_per_sample: 16,
+                duration_ms: 208_500,
+                extension: "mp3".to_string(),
+            }
         );
     }
 
@@ -221,7 +266,22 @@ mod tests {
         // special-case) — this just documents the convention for future
         // callers, mirroring the same "0 = unknown" rule `ContentMetadata::
         // Image`'s width_px/height_px use.
-        let audio = ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 0 };
-        assert_eq!(audio, ContentMetadata::Audio { sample_rate: 44_100, channels: 2, bits_per_sample: 16, duration_ms: 0 });
+        let audio = ContentMetadata::Audio {
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            duration_ms: 0,
+            extension: "flac".to_string(),
+        };
+        assert_eq!(
+            audio,
+            ContentMetadata::Audio {
+                sample_rate: 44_100,
+                channels: 2,
+                bits_per_sample: 16,
+                duration_ms: 0,
+                extension: "flac".to_string(),
+            }
+        );
     }
 }

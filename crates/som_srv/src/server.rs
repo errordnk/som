@@ -323,9 +323,22 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
     // `SrvCache`'s internal lock on every single `PutChunk`.
     let mut registered_routes: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
 
-    loop {
-        let message = read_srv_message(&connection)?;
-        match message {
+    // Every key THIS connection has registered itself as the range
+    // responder for (`RegisterRangeResponder`) — `somcat`'s pull-model
+    // responder connection, one per video/audio playback. Used below, on
+    // this function's own exit (any return path: graceful or via `?`),
+    // to detect the Ctrl+C case: the user killed `somcat` directly rather
+    // than Som ever sending `SrvRequest::EndPlayback` for it, so nothing
+    // else would otherwise tell Som this placement's source is gone. The
+    // reader loop below is wrapped in its own closure specifically so
+    // this cleanup can run on EVERY exit path (`?`-propagated error or a
+    // clean return) rather than duplicating it at each one.
+    let mut range_responder_keys: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+
+    let result = (|| -> anyhow::Result<()> {
+        loop {
+            let message = read_srv_message(&connection)?;
+            match message {
             SrvRequest::PutChunk { session_id, file_id, offset, data, total_size, content_type, metadata } => {
                 if registered_routes.insert((session_id, file_id)) {
                     let connection = connection.clone();
@@ -353,7 +366,11 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::StopPlayback { session_id, file_id } => {
                 cache.notify_stop_playback(session_id, file_id);
             }
+            SrvRequest::EndPlayback { session_id, file_id } => {
+                cache.route_end_playback(session_id, file_id);
+            }
             SrvRequest::RegisterRangeResponder { session_id, file_id } => {
+                range_responder_keys.insert((session_id, file_id));
                 let connection = connection.clone();
                 let writer = writer.clone();
                 cache.register_range_responder_route(
@@ -388,8 +405,28 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     log::error!("Lua script for ({session_id:08x}, {file_id:08x}) failed: {err:#}");
                 }
             }
+            }
         }
+    })();
+
+    // This connection is gone (cleanly closed or errored out of the loop
+    // above via `?`) — for every key it was registered as the range
+    // responder for, tell Som playback has ended, exactly as if an
+    // explicit `SrvRequest::EndPlayback` had arrived first. Covers the
+    // Ctrl+C case specifically: the user killed `somcat` directly, so no
+    // `StopPlayback`/`EndPlayback` message was ever sent by anyone —
+    // without this, the placement would sit there forever still showing
+    // as "playing" with a dead source behind it, since nothing else
+    // would ever tell Som otherwise. The natural-EOF and explicit-stop
+    // cases (Som sends `EndPlayback` itself, `somcat` reacts and exits on
+    // its own) also end up here once `somcat`'s connection subsequently
+    // closes, but `notify_stop_playback` is a no-op if Som already tore
+    // the placement down — see that method's own doc comment.
+    for (session_id, file_id) in range_responder_keys {
+        cache.notify_stop_playback(session_id, file_id);
     }
+
+    result
 }
 
 fn read_srv_message(connection: &PipeConnection) -> anyhow::Result<SrvRequest> {

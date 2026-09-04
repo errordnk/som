@@ -77,6 +77,7 @@ fn video_metadata() -> ContentMetadata {
         codec: VideoCodec::H264,
         audio_stream_index: None,
         subtitle_stream_index: None,
+        extension: "mp4".to_string(),
     }
 }
 

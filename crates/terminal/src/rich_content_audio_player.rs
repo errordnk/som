@@ -34,11 +34,128 @@
 //! the only process guaranteed to be physically local to the user's
 //! speakers.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+/// Fires a `SrvRequest::RequestByteRange` for `(offset, len)` — the audio
+/// counterpart to `rich_content_video_player`'s own `RequestByteRange`
+/// alias, same shape for the same reason (this module can't depend on
+/// `Terminal`/`session_id`/`file_id` directly, so the caller closes over
+/// them). `None` in tests that already have the whole file locally
+/// (nothing to request).
+type RequestByteRange = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// How large an on-demand byte-range fetch to ask for once `GrowingSrvStream::
+/// read` finds itself stuck — mirrors video's own `ON_DEMAND_RANGE_LEN`
+/// (`rich_content_video_player.rs`). Audio files are typically much
+/// smaller than video, but this same fixed window comfortably covers a
+/// stuck read regardless — a request that overshoots past `total_size`
+/// is harmless (the sender simply clamps it).
+const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
+
+/// A `Read + Seek` view over one placement's `SrvProgressState` in-memory
+/// forward-only buffer — the audio counterpart to `rich_content_video_
+/// player`'s `GrowingFileStream` (see that type's own doc comment for
+/// why there's no on-disk file behind this at all).
+///
+/// Actively fires its own `RequestByteRange` when stuck, exactly like
+/// `GrowingFileStream::read` — an earlier version of this reader only
+/// ever waited passively, relying on `Terminal::request_audio_byte_range`
+/// (an explicit user seek) to be the sole source of on-demand fetches.
+/// That leaves a real gap `som-srv`'s own `SrvCache::subscribe` doc
+/// comment calls out explicitly: `som-srv` no longer retains any chunk's
+/// bytes once forwarded, so a subscriber arriving after a transfer has
+/// already fully streamed through (confirmed live: a short/fast file,
+/// e.g. this module's own `tone.flac` test fixture, can finish streaming
+/// before Som ever subscribes) gets a replay of the watermark numbers
+/// only (`contiguous_len`/`total_size`, both already at the file's full
+/// size) with an EMPTY local buffer — `contiguous_len` says every byte
+/// is "available," but none of them ever actually arrive, and nothing
+/// was watching to trigger a range fetch. Firing a fetch here, the
+/// moment a read is stuck despite the watermark claiming readability,
+/// closes that gap without requiring the sender to still be connected.
+struct GrowingSrvStream {
+    srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
+    stop: Arc<AtomicBool>,
+    position: u64,
+    request_byte_range: Option<RequestByteRange>,
+    last_requested_position: Option<u64>,
+}
+
+impl std::io::Read for GrowingSrvStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "audio player dropped"));
+            }
+            let n = self.srv_state.read_buffered(self.position, buf);
+            if n > 0 {
+                self.position += n as u64;
+                self.srv_state.advance_consumed_up_to(self.position);
+                self.last_requested_position = None;
+                return Ok(n);
+            }
+            let total_size = self.srv_state.total_size();
+            if total_size > 0 && self.position >= total_size {
+                return Ok(0); // Real EOF.
+            }
+            // Stuck: the buffer has nothing for `self.position` right
+            // now, whether because it genuinely hasn't arrived yet OR
+            // because it arrived before this reader ever subscribed (see
+            // this struct's own doc comment) — both cases look identical
+            // from here, and both are fixed the same way: ask for it.
+            // Deduped by `last_requested_position` so a stuck read
+            // doesn't resend the same request on every retry-sleep tick.
+            if let Some(request_byte_range) = self.request_byte_range.as_ref()
+                && self.last_requested_position != Some(self.position)
+            {
+                self.srv_state.reset_buffer_for_seek(self.position);
+                request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
+                self.last_requested_position = Some(self.position);
+            }
+            std::thread::sleep(DECODE_RETRY_INTERVAL);
+        }
+    }
+}
+
+impl std::io::Seek for GrowingSrvStream {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let total_size = loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "audio player dropped"));
+            }
+            let total_size = self.srv_state.total_size();
+            if total_size > 0 || !matches!(pos, SeekFrom::End(_)) {
+                break total_size;
+            }
+            std::thread::sleep(DECODE_RETRY_INTERVAL);
+        };
+        let new_position = match pos {
+            SeekFrom::Start(offset) => offset as i64,
+            SeekFrom::End(offset) => total_size as i64 + offset,
+            SeekFrom::Current(offset) => self.position as i64 + offset,
+        };
+        if new_position < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek to a negative position"));
+        }
+        self.position = new_position as u64;
+        Ok(self.position)
+    }
+}
+
+impl symphonia::core::io::MediaSource for GrowingSrvStream {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        let total_size = self.srv_state.total_size();
+        if total_size > 0 { Some(total_size) } else { None }
+    }
+}
 
 /// How much of an in-progress SRP audio transfer is available right now
 /// — shared between `Terminal` (the only writer, updated each time
@@ -108,24 +225,31 @@ struct SharedPcm {
 }
 
 /// Runs on a dedicated background thread for the lifetime of one
-/// [`RichContentAudioPlayer`] — decodes packets from `path` (the SAME
-/// on-disk cache file `RichContentCache` is progressively writing into)
-/// as far as `progress` currently allows, appending samples to `shared`,
-/// then repeats: re-checks how many contiguous bytes are available NOW
-/// (via `progress`, updated independently by `Terminal` — see
+/// [`RichContentAudioPlayer`] — decodes packets from `srv_state`'s
+/// in-memory forward-only buffer (see [`GrowingSrvStream`]'s own doc
+/// comment for why there's no on-disk file behind this at all) as far as
+/// `progress` currently allows, appending samples to `shared`, then
+/// repeats: re-checks how many contiguous bytes are available NOW (via
+/// `progress`, updated independently by `Terminal` — see
 /// [`AudioTransferProgress`]'s own doc comment for why this indirection
 /// exists instead of a direct `RichContentCache` reference), and keeps
 /// decoding forward from wherever the persistent `FormatReader` left
 /// off. `next_packet()` on a partial file reliably errors
 /// (IoError/UnexpectedEof-shaped) without corrupting the reader's
-/// internal state when it runs out of currently-available bytes — since
-/// the underlying source is a plain growing `std::fs::File`, reading
-/// again later (after more bytes have been written to the same file)
-/// just continues from the same file position, no fresh probe needed.
+/// internal state when it runs out of currently-available bytes —
+/// `GrowingSrvStream::read` blocks internally until either more bytes
+/// arrive or the transfer completes, same contract `rich_content_video_
+/// player::GrowingFileStream::read` documents.
 ///
 /// Exits once `total_size` bytes have been consumed (the whole file is
 /// decoded) or a genuine (non-truncation) decode error occurs.
-fn run_decode_loop(path: PathBuf, shared: Arc<SharedPcm>, progress: Arc<AudioTransferProgress>, stop: Arc<AtomicBool>) {
+fn run_decode_loop(
+    srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
+    shared: Arc<SharedPcm>,
+    progress: Arc<AudioTransferProgress>,
+    stop: Arc<AtomicBool>,
+    request_byte_range: Option<RequestByteRange>,
+) {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
     use symphonia::core::errors::Error as SymphoniaError;
@@ -134,9 +258,26 @@ fn run_decode_loop(path: PathBuf, shared: Arc<SharedPcm>, progress: Arc<AudioTra
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
+    // Wait for the sender's own file extension (part of the FIRST
+    // `Progress` push's `ContentMetadata::Audio::extension` — see
+    // `SrvProgressState::extension`'s own doc comment) before probing —
+    // same reasoning `rich_content_video_player::run_decode_loop`'s
+    // identical wait documents: some containers' probes lean on the
+    // extension hint heavily enough that a missing/wrong one can fail
+    // probing outright, and there's no on-disk `Path` to derive this
+    // from anymore (`SrvCache`'s own doc comment).
+    let extension = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(extension) = srv_state.extension() {
+            break extension;
+        }
+        std::thread::sleep(DECODE_RETRY_INTERVAL);
+    };
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(extension);
+    if !extension.is_empty() {
+        hint.with_extension(&extension);
     }
 
     // Wait for enough of a prefix to exist that `symphonia` can even
@@ -147,11 +288,14 @@ fn run_decode_loop(path: PathBuf, shared: Arc<SharedPcm>, progress: Arc<AudioTra
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(file) = std::fs::File::open(&path) else {
-            std::thread::sleep(DECODE_RETRY_INTERVAL);
-            continue;
+        let stream = GrowingSrvStream {
+            srv_state: srv_state.clone(),
+            stop: stop.clone(),
+            position: 0,
+            request_byte_range: request_byte_range.clone(),
+            last_requested_position: None,
         };
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mss = MediaSourceStream::new(Box::new(stream), Default::default());
         match symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         {
             Ok(probed) => {
@@ -239,12 +383,22 @@ fn run_decode_loop(path: PathBuf, shared: Arc<SharedPcm>, progress: Arc<AudioTra
 /// needed, not a stylistic choice.
 pub struct RichContentAudioPlayer {
     shared: Arc<SharedPcm>,
-    /// Kept alive only so `Drop`ping the player tears down the device
-    /// stream — never read otherwise. `cpal::Stream` is not `Send` on
-    /// every backend, so this field, and this whole struct, must stay
-    /// on whichever thread creates it (the paint/main thread, same as
-    /// every other `Terminal` field).
-    _stream: cpal::Stream,
+    /// `None` until [`Self::poll_ready`] observes a decoded sample
+    /// rate/channel count and actually opens the device — `cpal::
+    /// StreamConfig` has no "figure it out later" mode, and the decode
+    /// thread can take an unbounded amount of time to probe a growing
+    /// file's format (worst case: a still-arriving file with no
+    /// probeable prefix yet), so this can no longer be a blocking wait
+    /// inside `open()` (see `open()`'s own doc comment — an earlier
+    /// version blocked the caller, which was this project's actual
+    /// paint/main thread, for up to 5 seconds per open and confirmed
+    /// live to hang the whole window when whatever ran after that wait
+    /// also stalled). Kept alive once `Some` only so `Drop`ping the
+    /// player tears down the device stream — never read otherwise.
+    /// `cpal::Stream` is not `Send` on every backend, so this field, and
+    /// this whole struct, must stay on whichever thread creates it (the
+    /// paint/main thread, same as every other `Terminal` field).
+    _stream: Option<cpal::Stream>,
     /// Signals the background decode thread to stop — set on `Drop` so
     /// the thread doesn't keep polling a cache file that no longer has
     /// a live player watching it. Not joined (same reasoning `somcat`'s
@@ -263,7 +417,7 @@ impl Drop for RichContentAudioPlayer {
 }
 
 impl RichContentAudioPlayer {
-    /// Starts decoding `path` (the on-disk cache file for one SRP audio
+    /// Starts decoding `srv_state`'s in-memory buffer (one SRP audio
     /// transfer, possibly still growing) on a background thread and
     /// opens a `cpal` output stream against the default output device,
     /// starting paused (matching how a freshly opened media file/browser
@@ -278,6 +432,19 @@ impl RichContentAudioPlayer {
     /// (a nonzero `contiguous_len`) just to have a real path to pass in
     /// at all.
     ///
+    /// Returns immediately — it does NOT wait for the decode thread to
+    /// produce a sample rate/channel count, and does NOT open the `cpal`
+    /// device itself. An earlier version blocked here (up to 5 seconds)
+    /// waiting for exactly that, which meant every call ran on this
+    /// project's real caller, the GPUI paint/main thread — confirmed
+    /// live to freeze the whole window (unresponsive even to the title
+    /// bar's close button) the moment probing or device/stream creation
+    /// took long enough. The caller must poll [`Self::poll_ready`] once
+    /// per paint until it returns `true` before treating this player as
+    /// actually producing sound; until then all playback-state queries
+    /// (`is_playing`, `position_fraction`, etc.) are well-defined and
+    /// simply report "not started yet" rather than erroring.
+    ///
     /// `progress` is polled by the decode thread to distinguish "ran out
     /// of bytes because the file is still streaming in" (keep retrying)
     /// from "ran out of bytes because this really is the end of the
@@ -285,7 +452,11 @@ impl RichContentAudioPlayer {
     /// [`AudioTransferProgress`]'s own doc comment for why), typically
     /// once per `RichContentCache::apply_chunk` call for this same
     /// `(session_id, file_id)`.
-    pub fn open(path: PathBuf, progress: Arc<AudioTransferProgress>) -> Result<Self, String> {
+    pub fn open(
+        srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
+        progress: Arc<AudioTransferProgress>,
+        request_byte_range: Option<RequestByteRange>,
+    ) -> Result<Self, String> {
         let shared = Arc::new(SharedPcm {
             samples: Mutex::new(Vec::new()),
             sample_rate: std::sync::atomic::AtomicU32::new(0),
@@ -297,47 +468,88 @@ impl RichContentAudioPlayer {
         {
             let shared = shared.clone();
             let decode_stop = decode_stop.clone();
-            std::thread::spawn(move || run_decode_loop(path, shared, progress, decode_stop));
+            std::thread::spawn(move || run_decode_loop(srv_state, shared, progress, decode_stop, request_byte_range));
         }
 
-        // The output device/stream needs a sample rate/channel count up
-        // front, but the decode thread hasn't necessarily produced them
-        // yet (it's still waiting for a probeable prefix) — briefly wait
-        // for the first decoded packet to populate `shared.sample_rate`/
-        // `channels` before opening the device, since `cpal::StreamConfig`
-        // has no "figure it out later" mode. This is the one place
-        // `open()` itself blocks; short-lived in practice (the decode
-        // thread's own probe retry loop is what actually gates this, not
-        // an extra wait added here).
-        let mut waited = std::time::Duration::ZERO;
-        let (sample_rate, channels) = loop {
-            let sample_rate = shared.sample_rate.load(Ordering::Acquire);
-            let channels = shared.channels.load(Ordering::Acquire);
-            if sample_rate > 0 && channels > 0 {
-                break (sample_rate, channels as u16);
-            }
-            if shared.decode_finished.load(Ordering::Acquire) {
-                decode_stop.store(true, Ordering::Relaxed);
-                return Err("audio file produced no decodable samples".to_string());
-            }
-            if waited > std::time::Duration::from_secs(5) {
-                decode_stop.store(true, Ordering::Relaxed);
-                return Err("timed out waiting for audio format to become probeable".to_string());
-            }
-            std::thread::sleep(DECODE_RETRY_INTERVAL);
-            waited += DECODE_RETRY_INTERVAL;
-        };
+        Ok(Self {
+            shared,
+            _stream: None,
+            decode_stop,
+            position_frames: Arc::new(AtomicU64::new(0)),
+            playing: Arc::new(AtomicBool::new(false)),
+        })
+    }
 
+    /// Non-blocking — call once per paint for a player whose device
+    /// stream isn't open yet (`is_ready()` still `false`). Checks
+    /// whether the background decode thread has produced a sample
+    /// rate/channel count; if so, opens the `cpal` output device and
+    /// starts the stream (the same work `open()` used to do inline
+    /// while blocking the caller — see `open()`'s own doc comment for
+    /// why that moved here) and returns `true`. Returns `false`
+    /// (immediately, no waiting) if the format isn't known yet, if the
+    /// decode thread finished without ever producing one (genuinely
+    /// undecodable file — check [`Self::failed`] to distinguish this
+    /// from "still waiting"), or if opening the device itself failed.
+    /// A no-op returning `true` if the stream is already open.
+    pub fn poll_ready(&mut self) -> bool {
+        if self._stream.is_some() {
+            return true;
+        }
+        let sample_rate = self.shared.sample_rate.load(Ordering::Acquire);
+        let channels = self.shared.channels.load(Ordering::Acquire);
+        if sample_rate == 0 || channels == 0 {
+            return false;
+        }
+        let channels = channels as u16;
+
+        match Self::open_device(sample_rate, channels, self.shared.clone(), self.position_frames.clone(), self.playing.clone())
+        {
+            Ok(stream) => {
+                self._stream = Some(stream);
+                true
+            },
+            Err(err) => {
+                log::error!("opening audio output device: {err}");
+                self.decode_stop.store(true, Ordering::Relaxed);
+                self.shared.decode_finished.store(true, Ordering::Release);
+                false
+            },
+        }
+    }
+
+    /// `true` once the decode thread has given up without ever
+    /// producing a sample rate (an undecodable file, or a device-open
+    /// failure from [`Self::poll_ready`]) — lets a caller distinguish
+    /// "still buffering, try again next paint" from "never going to
+    /// become ready, stop polling" without needing its own timeout.
+    pub fn failed(&self) -> bool {
+        self._stream.is_none() && self.shared.decode_finished.load(Ordering::Acquire)
+    }
+
+    /// `true` once the `cpal` output stream is open and playback control
+    /// (`toggle_play_pause`, `set_playing`) actually produces sound —
+    /// before this, those calls are harmless no-ops on `playing`'s own
+    /// state (honored retroactively the moment [`Self::poll_ready`]
+    /// finishes opening the stream).
+    pub fn is_ready(&self) -> bool {
+        self._stream.is_some()
+    }
+
+    fn open_device(
+        sample_rate: u32,
+        channels: u16,
+        shared: Arc<SharedPcm>,
+        position_frames: Arc<AtomicU64>,
+        playing: Arc<AtomicBool>,
+    ) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| "no default output audio device".to_string())?;
         let config = cpal::StreamConfig { channels, sample_rate, buffer_size: cpal::BufferSize::Default };
 
-        let position_frames = Arc::new(AtomicU64::new(0));
-        let playing = Arc::new(AtomicBool::new(false));
-
-        let cb_shared = shared.clone();
-        let cb_position = position_frames.clone();
-        let cb_playing = playing.clone();
+        let cb_shared = shared;
+        let cb_position = position_frames;
+        let cb_playing = playing;
         let channels_usize = channels as usize;
 
         let stream = device
@@ -379,8 +591,7 @@ impl RichContentAudioPlayer {
             )
             .map_err(|e| format!("building output stream: {e}"))?;
         stream.play().map_err(|e| format!("starting output stream: {e}"))?;
-
-        Ok(Self { shared, _stream: stream, decode_stop, position_frames, playing })
+        Ok(stream)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -482,33 +693,41 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac")
     }
 
-    /// Opens a player against the WHOLE fixture file already present on
-    /// disk (`contiguous_len`/`total_size` both report the file's real,
-    /// fixed size) — simulates the "file fully downloaded" case, the
-    /// simplest one these bookkeeping tests need; a live end-to-end test
-    /// of genuinely progressive decode-while-streaming lives in
-    /// `terminal.rs` (`test_rich_content_audio_placement_decodes_and_
-    /// plays_via_a_real_process`), which drives this through a real
-    /// `somcat` process and real SRP chunk arrival instead.
+    /// Opens a player against the WHOLE fixture file already "arrived"
+    /// in a freshly seeded `SrvProgressState` (`contiguous_len`/
+    /// `total_size` both report the file's real, fixed size) — simulates
+    /// the "file fully downloaded" case, the simplest one these
+    /// bookkeeping tests need; a live end-to-end test of genuinely
+    /// progressive decode-while-streaming lives in `terminal.rs`
+    /// (`test_rich_content_audio_placement_decodes_and_plays_via_a_real_
+    /// process`), which drives this through a real `somcat` process and
+    /// real SRP chunk arrival instead.
     fn open_test_player() -> Option<RichContentAudioPlayer> {
         let path = test_flac_path();
         if !path.exists() {
             eprintln!("skipping: {} not present", path.display());
             return None;
         }
-        let total_size = std::fs::metadata(&path).unwrap().len();
+        let data = std::fs::read(&path).unwrap();
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.seed_whole_file_for_test(&data, extension);
+        let total_size = data.len() as u64;
         let progress = Arc::new(AudioTransferProgress::new());
         progress.update(total_size, total_size);
-        RichContentAudioPlayer::open(path, progress).ok()
+        RichContentAudioPlayer::open(srv_state, progress, None).ok()
     }
 
-    fn wait_for_decode(player: &RichContentAudioPlayer) {
+    fn wait_for_decode(player: &mut RichContentAudioPlayer) {
         // Give the background decode thread a moment to at least start
-        // producing samples — same bounded-retry shape used elsewhere in
-        // this codebase for "wait for a background thread to make
-        // progress" (see feedback_bounded_test_loops memory).
+        // producing samples, polling `poll_ready` the same way the real
+        // paint path now must (see `poll_ready`'s own doc comment for
+        // why `open()` itself no longer waits) — same bounded-retry
+        // shape used elsewhere in this codebase for "wait for a
+        // background thread to make progress" (see
+        // feedback_bounded_test_loops memory).
         for _ in 0..50 {
-            if player.shared.sample_rate.load(Ordering::Acquire) > 0 {
+            if player.poll_ready() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -528,16 +747,16 @@ mod tests {
 
     #[test]
     fn decode_thread_populates_sample_rate_and_channels() {
-        let Some(player) = open_test_player() else { return };
-        wait_for_decode(&player);
+        let Some(mut player) = open_test_player() else { return };
+        wait_for_decode(&mut player);
         assert!(player.shared.sample_rate.load(Ordering::Acquire) > 0);
         assert!(player.shared.channels.load(Ordering::Acquire) > 0);
     }
 
     #[test]
     fn seek_to_fraction_updates_position_fraction() {
-        let Some(player) = open_test_player() else { return };
-        wait_for_decode(&player);
+        let Some(mut player) = open_test_player() else { return };
+        wait_for_decode(&mut player);
         player.seek_to_fraction(0.5, TEST_FIXTURE_DURATION_MS);
         assert!((player.position_fraction(TEST_FIXTURE_DURATION_MS) - 0.5).abs() < 0.01);
     }
@@ -550,6 +769,20 @@ mod tests {
         assert!(player.is_playing());
         player.toggle_play_pause();
         assert!(!player.is_playing());
+    }
+
+    #[test]
+    fn open_returns_immediately_without_a_stream_and_poll_ready_opens_it() {
+        // Regression test for the real hang this player used to cause:
+        // `open()` itself must never block waiting on the decode thread
+        // (confirmed live — it froze the whole GPUI window). `is_ready`
+        // must be `false` right after `open()` returns, and only flip
+        // to `true` once `poll_ready` is actually called and the decode
+        // thread has produced a sample rate/channel count.
+        let Some(mut player) = open_test_player() else { return };
+        assert!(!player.is_ready());
+        wait_for_decode(&mut player);
+        assert!(player.is_ready());
     }
 
     #[test]

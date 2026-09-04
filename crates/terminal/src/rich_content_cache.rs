@@ -30,8 +30,18 @@ use crate::rich_content_transport::{ContentMetadata, ContentType};
 /// are complete and correct" without needing to track individual chunk
 /// ranges itself.
 struct CacheEntry {
-    file: File,
-    path: PathBuf,
+    /// `None` for `Video`/`Audio` entries created via [`RichContentCache::
+    /// record_progress`] — those content types no longer have an on-disk
+    /// file at all (`GrowingFileStream`/the audio decoder's equivalent
+    /// read straight out of `SrvProgressState`'s in-memory buffer
+    /// instead, see that type's own doc comment for why). `Some` for
+    /// every entry [`RichContentCache::apply_chunk`] creates (the OLD
+    /// PTY-parsing write path, still disk-backed) and for `record_
+    /// progress` entries of every OTHER content type (image/GIF/
+    /// markdown), which stay disk-backed in this pass — see the plan
+    /// this change implements for why those are explicitly out of scope.
+    file: Option<File>,
+    path: Option<PathBuf>,
     contiguous_len: u64,
     /// Out-of-order chunks that landed ahead of the current watermark,
     /// kept here (not yet counted into `contiguous_len`) until the gap
@@ -155,8 +165,8 @@ impl RichContentCache {
             self.entries.insert(
                 key,
                 CacheEntry {
-                    file,
-                    path,
+                    file: Some(file),
+                    path: Some(path),
                     contiguous_len: 0,
                     pending_ranges: Vec::new(),
                     content_type,
@@ -170,7 +180,7 @@ impl RichContentCache {
                         _ => None,
                     },
                     audio_metadata: match metadata {
-                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
+                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, .. } => {
                             Some((sample_rate, channels, bits_per_sample, duration_ms))
                         },
                         _ => None,
@@ -184,8 +194,13 @@ impl RichContentCache {
         }
         let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
 
-        entry.file.seek(SeekFrom::Start(chunk_offset))?;
-        entry.file.write_all(payload)?;
+        // `apply_chunk` always creates its entry with `Some(file)` just
+        // above — the only way `file` is ever `None` is via `record_
+        // progress`'s Video/Audio branch (see `CacheEntry::file`'s own
+        // doc comment), a path this function never takes.
+        let file = entry.file.as_mut().expect("apply_chunk's own entries always have a file");
+        file.seek(SeekFrom::Start(chunk_offset))?;
+        file.write_all(payload)?;
 
         let chunk_end = chunk_offset + payload.len() as u64;
         if chunk_offset <= entry.contiguous_len {
@@ -216,16 +231,28 @@ impl RichContentCache {
 
     /// Records a `som_srv::protocol::SrvResponse::Progress` push:
     /// updates `contiguous_len`/`total_size`/metadata for `(session_id,
-    /// file_id)` WITHOUT writing any payload bytes to disk — `som-srv`
-    /// already wrote those bytes itself, to the same cache directory
-    /// this type points at (see `som_srv::srv_cache::SrvCache::
-    /// default_cache_dir`, which matches `rich_content_cache_dir()` in
-    /// `crates/terminal/src/terminal.rs`), so writing them again here
-    /// would be redundant at best and a race at worst (two independent
-    /// writers to the same file). Opens (read-only) the cache file the
-    /// FIRST time a given `(session_id, file_id)` is seen — same
-    /// lazy-open shape `apply_chunk` uses, just without ever calling
-    /// `write_all`.
+    /// file_id)` WITHOUT writing any payload bytes to disk itself.
+    ///
+    /// For `Video`/`Audio`, there is no cache FILE to open at all
+    /// anymore — `som-srv` no longer persists chunks to disk for any
+    /// content type (see `som_srv::srv_cache::SrvCache`'s own doc
+    /// comment), and those two content types' decoders
+    /// (`GrowingFileStream`/the audio decoder's equivalent) read
+    /// directly out of `SrvProgressState`'s in-memory buffer instead of
+    /// ever consulting this cache's `path()` — so this method only
+    /// tracks bookkeeping (watermarks, `video_audio_stream_index`, etc.)
+    /// for those two, never touching the filesystem.
+    ///
+    /// For every OTHER content type (image/GIF/markdown — still
+    /// disk-backed in this pass, see the plan this implements for why),
+    /// `som-srv` no longer writes any content type to disk either —
+    /// `RichContentCache::apply_chunk` (the OLD PTY-parsing write path)
+    /// is the only thing that still creates a file on disk for image/
+    /// GIF/markdown today. A `record_progress` entry for one of those
+    /// content types opens that SAME file if `apply_chunk` already
+    /// created it, or fails (same tolerance as before — see this
+    /// method's own call site in `Terminal::ensure_rich_content_srv_
+    /// subscription`) if nothing has written it yet.
     pub fn record_progress(
         &mut self,
         content_type: ContentType,
@@ -237,9 +264,14 @@ impl RichContentCache {
     ) -> std::io::Result<()> {
         let key = (session_id, file_id);
         if !self.entries.contains_key(&key) {
-            let ext = Self::extension_for(content_type);
-            let path = self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
-            let file = OpenOptions::new().read(true).open(&path)?;
+            let (file, path) = if matches!(content_type, ContentType::Video | ContentType::Audio) {
+                (None, None)
+            } else {
+                let ext = Self::extension_for(content_type);
+                let path = self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
+                let file = OpenOptions::new().read(true).open(&path)?;
+                (Some(file), Some(path))
+            };
             self.entries.insert(
                 key,
                 CacheEntry {
@@ -258,7 +290,7 @@ impl RichContentCache {
                         _ => None,
                     },
                     audio_metadata: match metadata {
-                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
+                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, .. } => {
                             Some((sample_rate, channels, bits_per_sample, duration_ms))
                         },
                         _ => None,
@@ -284,14 +316,18 @@ impl RichContentCache {
     }
 
     /// The on-disk path for a given file, if any chunk for it has arrived
-    /// yet. A decoder reads from this path directly (up to
+    /// yet AND this content type is still disk-backed (image/GIF/
+    /// markdown — `None` for `Video`/`Audio` entries even once they
+    /// exist, since those two no longer have a file at all, see
+    /// [`CacheEntry::file`]'s own doc comment). A decoder for a
+    /// disk-backed content type reads from this path directly (up to
     /// [`Self::contiguous_len`] bytes) rather than through this store —
     /// mirrors the "receiver reads bytes off disk itself" model the whole
     /// progressive-copy design is built around, instead of routing
     /// decoded pixel data back through an in-memory store the way
     /// `ImageStore` does for Kitty.
     pub fn path(&self, session_id: u32, file_id: u32) -> Option<&std::path::Path> {
-        self.entries.get(&(session_id, file_id)).map(|e| e.path.as_path())
+        self.entries.get(&(session_id, file_id))?.path.as_deref()
     }
 
     /// The `ContentType` the first chunk for this id declared — decoding

@@ -164,10 +164,10 @@ pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetada
         M::Image { width_px, height_px, color_bits, is_animated } => {
             som_srv::protocol::ContentMetadata::Image { width_px, height_px, color_bits, is_animated }
         },
-        M::Audio { sample_rate, channels, bits_per_sample, duration_ms } => {
-            som_srv::protocol::ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms }
+        M::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension } => {
+            som_srv::protocol::ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension }
         },
-        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec, audio_stream_index, subtitle_stream_index } => {
+        M::Video { width_px, height_px, fps_numerator, fps_denominator, codec, audio_stream_index, subtitle_stream_index, extension } => {
             som_srv::protocol::ContentMetadata::Video {
                 width_px,
                 height_px,
@@ -176,6 +176,7 @@ pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetada
                 codec: to_srv_video_codec(codec),
                 audio_stream_index,
                 subtitle_stream_index,
+                extension,
             }
         },
         M::Markdown => som_srv::protocol::ContentMetadata::Markdown,

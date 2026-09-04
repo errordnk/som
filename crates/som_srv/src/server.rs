@@ -48,14 +48,30 @@ struct ConnectionGuard;
 
 impl ConnectionGuard {
     fn new() -> Self {
-        LIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+        // `Relaxed` is deliberate, not an oversight: this counter has no
+        // ordering relationship with any OTHER memory operation that
+        // matters — `spawn_idle_shutdown_watcher` only ever cares about
+        // the numeric value eventually becoming visible, never about
+        // happens-before ordering against some other write. `SeqCst`
+        // (the original choice here) is the most expensive ordering on
+        // most architectures — a full cross-core fence on every single
+        // increment/decrement — and this fires on EVERY connection,
+        // including the short-lived `RequestByteRange` ones video/audio
+        // playback opens many times per second while decoding. Confirmed
+        // live (2026-09-04) as a real, reproducible cause of video
+        // playback stutter: A/B tested by disabling the watcher thread
+        // entirely, which fixed the stutter, then narrowed down to this
+        // ordering rather than the thread's mere existence — see this
+        // module's own regression notes in project memory for the full
+        // bisect.
+        LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         Self
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -92,14 +108,14 @@ fn spawn_idle_shutdown_watcher() {
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            if LIVE_CONNECTIONS.load(Ordering::SeqCst) != 0 {
+            if LIVE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
                 continue;
             }
             let idle_since = std::time::Instant::now();
             let mut still_idle = true;
             while idle_since.elapsed() < IDLE_SHUTDOWN_DELAY {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                if LIVE_CONNECTIONS.load(Ordering::SeqCst) != 0 {
+                if LIVE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
                     still_idle = false;
                     break;
                 }

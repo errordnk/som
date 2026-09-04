@@ -60,7 +60,6 @@
 //! for GIF (elapsed-vs-per-frame-delay there, elapsed-vs-PTS here).
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -464,30 +463,34 @@ struct LatestFrame {
     slot: Mutex<Option<(image::RgbaImage, i64)>>,
 }
 
-/// A `Read + Seek` view over the SAME on-disk cache file
-/// [`crate::rich_content_cache::RichContentCache`] is still writing into
-/// — see this module's own top-level doc comment for why this exists
-/// instead of `ffmpeg::format::input(path)`'s plain file-path open.
+/// A `Read + Seek` view over the SAME in-memory forward-only buffer
+/// [`crate::rich_content_srv_channel::SrvProgressState`] owns — see this
+/// module's own top-level doc comment for why this exists instead of
+/// `ffmpeg::format::input(path)`'s plain file-path open, and see
+/// `SrvProgressState`'s own doc comment for why there's no on-disk file
+/// behind any of this anymore (`som-srv` no longer persists chunks to
+/// disk at all — a full on-disk copy per playback previously exhausted
+/// real disk space on a large-enough file and blocked it from playing).
 ///
 /// `read` blocks (sleep-retry) when the requested range extends past
 /// [`VideoTransferProgress::contiguous_len`] — the file's real end is
-/// [`VideoTransferProgress::total_size`], not the current on-disk
-/// length, and only returns `Ok(0)` (real EOF) once `contiguous_len`
-/// has actually reached `total_size`. `seek`'s `SeekFrom::End` and
-/// `AVSEEK_SIZE` probing (handled by `StreamIo`'s own `seek` callback
-/// via `Seek::stream_position`+`SeekFrom::End(0)`) both need `Seek`'s
-/// own notion of "the end" to agree with that same `total_size`, not
-/// the file's current physical length — otherwise FFmpeg's index/moov
-/// scan (which seeks near the presumed end of the file) would either
-/// undershoot on a still-growing file or overshoot past what a
-/// completed one's own `stream_len` reports, both of which produce a
-/// `seek` past valid bounds. This struct's `Seek` impl therefore treats
-/// the file as if it were already `total_size` bytes long from the very
-/// first byte, with everything past `contiguous_len` simply not
-/// readable yet — reads into that region block exactly like a live
-/// network read past its currently-buffered prefix would.
+/// [`VideoTransferProgress::total_size`], not how much has been
+/// buffered so far, and only returns `Ok(0)` (real EOF) once
+/// `contiguous_len` has actually reached `total_size`. `seek`'s
+/// `SeekFrom::End` and `AVSEEK_SIZE` probing (handled by `StreamIo`'s
+/// own `seek` callback via `Seek::stream_position`+`SeekFrom::End(0)`)
+/// both need `Seek`'s own notion of "the end" to agree with that same
+/// `total_size`, not the buffer's current length — otherwise FFmpeg's
+/// index/moov scan (which seeks near the presumed end of the file)
+/// would either undershoot on a still-growing file or overshoot past
+/// what a completed one's own `stream_len` reports, both of which
+/// produce a `seek` past valid bounds. This struct's `Seek` impl
+/// therefore treats the file as if it were already `total_size` bytes
+/// long from the very first byte, with everything past `contiguous_len`
+/// simply not readable yet — reads into that region block exactly like
+/// a live network read past its currently-buffered prefix would.
 struct GrowingFileStream {
-    file: std::fs::File,
+    srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
     progress: Arc<VideoTransferProgress>,
     stop: Arc<AtomicBool>,
     /// Same `seek_request` [`run_decode_loop`]'s outer loop reads — this
@@ -532,14 +535,14 @@ struct GrowingFileStream {
 
 impl GrowingFileStream {
     fn open(
-        path: &std::path::Path,
+        srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
         progress: Arc<VideoTransferProgress>,
         stop: Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<f32>>>,
         request_byte_range: Option<RequestByteRange>,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            file: std::fs::File::open(path)?,
+            srv_state,
             progress,
             stop,
             seek_request,
@@ -552,7 +555,6 @@ impl GrowingFileStream {
 
 impl std::io::Read for GrowingFileStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use std::io::{Seek, SeekFrom};
         let diag_wait_started_at = Instant::now();
         let mut diag_slept = false;
         loop {
@@ -583,15 +585,27 @@ impl std::io::Read for GrowingFileStream {
                 0
             };
             if readable_up_to > self.position {
-                let readable = (readable_up_to - self.position).min(buf.len() as u64) as usize;
-                self.file.seek(SeekFrom::Start(self.position))?;
-                let n = self.file.read(&mut buf[..readable])?;
-                self.position += n as u64;
-                self.last_requested_position = None;
-                if diag_slept {
-                    log::debug!("DIAG: GrowingFileStream::read unblocked after {:?}", diag_wait_started_at.elapsed());
+                // `read_buffered` can still return 0 here even though the
+                // watermark says this position is readable — the buffer's
+                // own `append_chunk` runs on the SAME background thread as
+                // the watermark update, so this is normally momentary
+                // (the next loop iteration sees it), not a real gap; see
+                // `SrvProgressState::append_chunk`'s own doc comment for
+                // the one case it genuinely never arrives (a `RequestByte
+                // Range` answer landing ahead of the buffer's own tail
+                // gets dropped, same as any other out-of-order chunk this
+                // reader hasn't caught up to yet) — falling through to the
+                // retry-sleep below handles both cases identically.
+                let n = self.srv_state.read_buffered(self.position, buf);
+                if n > 0 {
+                    self.position += n as u64;
+                    self.srv_state.advance_consumed_up_to(self.position);
+                    self.last_requested_position = None;
+                    if diag_slept {
+                        log::debug!("DIAG: GrowingFileStream::read unblocked after {:?}", diag_wait_started_at.elapsed());
+                    }
+                    return Ok(n);
                 }
-                return Ok(n);
             }
             if total_size > 0 && self.position >= total_size {
                 return Ok(0); // Real EOF — the whole file has arrived and we've read all of it.
@@ -610,15 +624,29 @@ impl std::io::Read for GrowingFileStream {
             if let Some(request_byte_range) = self.request_byte_range.as_ref()
                 && self.last_requested_position != Some(self.position)
             {
+                // The buffer has nothing usable for `self.position` (that's
+                // why we're here) and the answer to this request will land
+                // at `self.position`, arbitrarily far ahead of whatever the
+                // buffer's current tail is — `append_chunk`'s own doc
+                // comment is explicit that an ahead-of-tail chunk is
+                // otherwise silently DROPPED, not queued, so without this
+                // reset the fetched bytes would vanish the moment they
+                // arrive and this read would block forever. Clearing here
+                // (immediately before the request that will need the
+                // fresh anchor) rather than from `Seek::seek` itself keeps
+                // FFmpeg's own frequent probe-time seeks within the
+                // already-buffered region cheap — only a seek that's
+                // ACTUALLY unreachable from what's buffered pays this cost.
+                self.srv_state.reset_buffer_for_seek(self.position);
                 const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
                 request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
                 self.last_requested_position = Some(self.position);
             }
-            // Caught up to what's currently on disk, but more is still
+            // Caught up to what's currently buffered, but more is still
             // coming — block (StreamIo's own doc comment requires a
             // blocking stream; FFmpeg has no retry layer of its own for
-            // custom I/O) until RichContentCache::apply_chunk advances
-            // contiguous_len further.
+            // custom I/O) until the next `Progress` push advances
+            // `contiguous_len` further.
             diag_slept = true;
             std::thread::sleep(DECODE_RETRY_INTERVAL);
         }
@@ -727,6 +755,36 @@ fn read_next_packet(ictx: &mut ffmpeg_next::format::context::Input) -> NextPacke
     }
 }
 
+/// Picks the container's main video stream — NOT simply `ictx.streams().
+/// best(Video)`, which picks the stream with the largest resolution*
+/// frame-count product FFmpeg can determine from the header alone.
+/// Confirmed live as wrong for a real file: a multi-track MKV (h264 main
+/// feature + several AC3/EAC3 audio tracks + subtitle tracks + an
+/// embedded MJPEG cover-art attachment) had `best(Video)` pick the
+/// single-frame MJPEG cover art over the actual multi-thousand-frame
+/// h264 feature — `best()`'s own heuristic apparently weighs pixel
+/// dimensions before frame count when a stream's frame count isn't yet
+/// knowable from the header, and a cover-art frame is often encoded at
+/// a HIGHER resolution than the feature itself. The result: playback
+/// opened, decoded the codec parameters for stream 8 (mjpeg) instead of
+/// stream 0 (h264), failed immediately ("Could not find codec
+/// parameters"), and the placement never appeared at all — not a crash,
+/// just silent failure. MJPEG is the standard codec real-world muxers
+/// (ffmpeg, mkvmerge) use for embedded cover art specifically — never a
+/// legitimate movie/show's own primary video codec in practice — so
+/// deprioritizing it below every non-MJPEG candidate closes this gap
+/// without needing per-container attachment-flag parsing (MKV's own
+/// attachment/cover-art disposition flags aren't uniformly exposed
+/// through `ffmpeg-next`'s safe API today).
+fn best_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<ffmpeg_next::format::stream::Stream<'_>> {
+    use ffmpeg_next as ffmpeg;
+    let non_mjpeg = ictx
+        .streams()
+        .filter(|s| s.parameters().id() != ffmpeg::codec::Id::MJPEG)
+        .max_by_key(|s| (s.parameters().medium() == ffmpeg::media::Type::Video, s.frames(), s.duration()));
+    non_mjpeg.filter(|s| s.parameters().medium() == ffmpeg::media::Type::Video).or_else(|| ictx.streams().best(ffmpeg::media::Type::Video))
+}
+
 /// Runs on a dedicated background thread for the lifetime of one
 /// [`RichContentVideoPlayer`] — mirrors
 /// [`crate::rich_content_audio_player::run_decode_loop`]'s shape closely,
@@ -736,7 +794,7 @@ fn read_next_packet(ictx: &mut ffmpeg_next::format::context::Input) -> NextPacke
 /// regardless of how much of the file has arrived yet.
 #[allow(clippy::too_many_arguments)]
 fn run_decode_loop(
-    path: PathBuf,
+    srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
     shared: Arc<LatestFrame>,
     progress: Arc<VideoTransferProgress>,
     stop: Arc<AtomicBool>,
@@ -760,21 +818,31 @@ fn run_decode_loop(
 
     let _ = ffmpeg::init();
 
-    // Wait for a real, openable file to exist before even trying to
-    // build the `GrowingFileStream` — `std::fs::File::open` itself needs
-    // the path to exist, which it may not yet on the very first chunk's
-    // arrival (`RichContentCache::apply_chunk` creates the file on its
-    // first call, but there's an unavoidable gap between "the id is
-    // known" and "the file is on disk").
-    while !path.is_file() {
+    // Wait for the sender's own file extension to arrive (part of the
+    // FIRST `Progress` push's `ContentMetadata::Video::extension` — see
+    // `SrvProgressState::extension`'s own doc comment) before even
+    // attempting the probe below — confirmed live as load-bearing, not
+    // cosmetic: a fixed generic hint (e.g. `.video` for every file
+    // regardless of real container) let MKV probe successfully (its
+    // EBML header is distinctive enough on its own) but made MP4 and AVI
+    // fixtures fail probing entirely ("Could not find codec parameters
+    // ... unspecified pixel format") — those containers' probes lean on
+    // the extension hint more heavily. There is no on-disk `Path` to
+    // derive this from anymore (`SrvCache`'s own doc comment: `som-srv`
+    // no longer persists chunks to disk at all).
+    let extension = loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
+        if let Some(extension) = srv_state.extension() {
+            break extension;
+        }
         std::thread::sleep(DECODE_RETRY_INTERVAL);
-    }
+    };
+    let filename_owned = format!("placement.{extension}");
 
     let Ok(stream) = GrowingFileStream::open(
-        &path,
+        srv_state.clone(),
         progress.clone(),
         stop.clone(),
         seek_request.clone(),
@@ -788,6 +856,7 @@ fn run_decode_loop(
     // `filename` is passed through to ffmpeg's own probe purely as an
     // extension hint (nudges format detection, never itself opens
     // anything) — real bytes always come through `stream_io`.
+    let filename = Some(filename_owned.as_str());
     //
     // No retry loop here: `GrowingFileStream::read` (the only source of
     // bytes `input_from_stream`'s own probe can pull from) already
@@ -799,7 +868,6 @@ fn run_decode_loop(
     // container), not "not enough bytes yet" — `StreamIo` also isn't
     // `Clone`, so there is no stream left to retry with even if that
     // distinction mattered here.
-    let filename = path.file_name().and_then(|n| n.to_str());
     // An interrupt callback, not just the blocking-retry `Read` above, is
     // what actually lets a pending seek cut a stalled read short:
     // `ictx.packets().next()` is a single call into FFmpeg from Rust's
@@ -854,7 +922,7 @@ fn run_decode_loop(
         duration_us.store(raw_duration, Ordering::Release);
     }
 
-    let Some(input) = ictx.streams().best(ffmpeg::media::Type::Video) else {
+    let Some(input) = best_video_stream(&ictx) else {
         return; // No video track at all — never will be one.
     };
     let video_stream_index = input.index();
@@ -1511,7 +1579,7 @@ fn run_decode_loop(
                         // rebuilt cleanly rather than needing to be
                         // manually reset in place.
                         return run_decode_loop(
-                            path,
+                            srv_state,
                             shared,
                             progress,
                             stop,
@@ -1841,7 +1909,7 @@ impl RichContentVideoPlayer {
     /// whole file locally (nothing to request) — see [`RequestByteRange`]'s
     /// own doc comment for why production callers always pass `Some`.
     pub fn open(
-        path: PathBuf,
+        srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
         progress: Arc<VideoTransferProgress>,
         audio_stream_index: Option<u32>,
         request_byte_range: Option<RequestByteRange>,
@@ -1874,7 +1942,7 @@ impl RichContentVideoPlayer {
             let shared_audio = shared_audio.clone();
             std::thread::spawn(move || {
                 run_decode_loop(
-                    path,
+                    srv_state,
                     shared,
                     progress,
                     decode_stop,
@@ -2268,14 +2336,30 @@ mod tests {
             eprintln!("skipping: {} not present", path.display());
             return None;
         }
-        let total_size = std::fs::metadata(&path).unwrap().len();
+        let data = std::fs::read(&path).unwrap();
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.seed_whole_file_for_test(&data, extension);
+        let total_size = data.len() as u64;
         let progress = Arc::new(VideoTransferProgress::new());
         progress.update(total_size, 0, Vec::new(), total_size);
-        Some(RichContentVideoPlayer::open(path, progress, None, None))
+        Some(RichContentVideoPlayer::open(srv_state, progress, None, None))
     }
 
     fn wait_for_decode(player: &RichContentVideoPlayer) -> bool {
-        for _ in 0..150 {
+        wait_for_decode_with_attempts(player, 150)
+    }
+
+    /// Same as [`wait_for_decode`], but with a caller-chosen attempt count
+    /// (20ms apart) instead of the fixed 3s budget — needed by tests whose
+    /// probe genuinely has more work to do before a first frame, e.g.
+    /// `seek_near_end_of_large_local_file_completes_quickly`'s initial
+    /// open, where the container's index sits near the end of a 16GB file
+    /// and reaching it can require SEVERAL chained on-demand `RequestByteRange`
+    /// round trips (each with its own thread-spawn + disk-seek + retry-
+    /// interval latency), not just one.
+    fn wait_for_decode_with_attempts(player: &RichContentVideoPlayer, attempts: u32) -> bool {
+        for _ in 0..attempts {
             if player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
                 return true;
             }
@@ -2482,10 +2566,29 @@ mod tests {
             return;
         }
         let total_size = std::fs::metadata(&path).unwrap().len();
+        let srv_state = crate::rich_content_srv_channel::SrvProgressState::spawn_streaming_seed_for_test(path.clone());
         let progress = Arc::new(VideoTransferProgress::new());
-        progress.update(total_size, 0, Vec::new(), total_size);
-        let player = RichContentVideoPlayer::open(path, progress.clone(), None, None);
-        assert!(wait_for_decode(&player), "decode thread never produced a first frame");
+        progress.update(0, 0, Vec::new(), total_size);
+        // Real production callers always pass `Some` here (see `RequestByteRange`'s
+        // own doc comment) — a seek target far ahead of the sequential
+        // streaming thread's current position (the whole point of this
+        // test, seeking to fraction=0.9 of a 16GB file) needs an on-demand
+        // fetch, not a wait for the sequential stream to catch up.
+        let request_byte_range_state = srv_state.clone();
+        let request_byte_range_path = path.clone();
+        let request_byte_range: RequestByteRange = Arc::new(move |offset, len| {
+            request_byte_range_state.serve_byte_range_from_disk_for_test(request_byte_range_path.clone(), offset, len);
+        });
+        let player = RichContentVideoPlayer::open(srv_state, progress.clone(), None, Some(request_byte_range));
+        // 750 * 20ms = 15s — this file's index sits near the very end
+        // (confirmed: probing it reads at byte offset ~16.15GB), so
+        // reaching it can take several chained on-demand `RequestByteRange`
+        // round trips before the first frame decodes, unlike every other
+        // fixture in this test module (all either small enough to seed
+        // whole, or fast to probe from the front) — still bounded, not
+        // unconditional, so a genuine hang here still fails the test
+        // rather than blocking forever.
+        assert!(wait_for_decode_with_attempts(&player, 750), "decode thread never produced a first frame");
 
         let pts_before = player.shared.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, pts)| *pts);
         let seek_started_at = Instant::now();
@@ -2664,11 +2767,10 @@ mod tests {
         let source_bytes = std::fs::read(&source_path).expect("reading fixture");
         let total_size = source_bytes.len() as u64;
 
-        let dest_path = std::env::temp_dir().join("som_video_progressive_write_test.mkv");
-        std::fs::write(&dest_path, b"").expect("creating empty dest file");
-
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.set_extension_for_test("mkv");
         let progress = Arc::new(VideoTransferProgress::new());
-        let player = RichContentVideoPlayer::open(dest_path.clone(), progress.clone(), None, None);
+        let player = RichContentVideoPlayer::open(srv_state.clone(), progress.clone(), None, None);
         // The decode thread only advances PAST its first frame while
         // actually playing (see `run_decode_loop`'s pause-gate doc
         // comment) — a real pause fix that made this test's own
@@ -2687,13 +2789,15 @@ mod tests {
         let mut written = 0usize;
         for _ in 0..piece_count {
             let end = (written + piece_len).min(source_bytes.len());
-            std::fs::write(&dest_path, &source_bytes[..end]).expect("appending to dest file");
+            srv_state.append_piece_for_test(written as u64, &source_bytes[written..end], total_size);
             written = end;
             progress.update(written as u64, total_size, Vec::new(), total_size);
             std::thread::sleep(Duration::from_millis(150));
         }
-        // Final write covers any remainder from integer division above.
-        std::fs::write(&dest_path, &source_bytes).expect("writing final dest file");
+        // Final piece covers any remainder from integer division above.
+        if written < source_bytes.len() {
+            srv_state.append_piece_for_test(written as u64, &source_bytes[written..], total_size);
+        }
         progress.update(total_size, 0, Vec::new(), total_size);
 
         // Give the decode thread a real chance to catch up to the now-
@@ -2707,8 +2811,6 @@ mod tests {
                 last_seen_pts = last_seen_pts.max(*pts);
             }
         }
-
-        let _ = std::fs::remove_file(&dest_path);
 
         assert!(last_seen_pts > i64::MIN, "decode thread never produced any frame for the progressively-written file");
         // Without the seek-on-reopen fix, `last_seen_pts` stalled at

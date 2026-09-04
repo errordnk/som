@@ -2056,7 +2056,7 @@ impl Terminal {
             file_id,
             state.contiguous_len(),
             state.total_size(),
-            metadata,
+            metadata.clone(),
         ) {
             log::debug!("failed to open som-srv cache file for {session_id:#x}:{file_id:#x}: {err:#}");
             // The daemon creates its cache file on disk asynchronously
@@ -2187,7 +2187,11 @@ impl Terminal {
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);
             if !players.contains_key(&key) {
-                let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+                // No more `RichContentCache::path()`/on-disk file for
+                // audio either — same treatment as video, see `Terminal::
+                // rich_content_video_placements`'s identical comment for
+                // why.
+                let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key).cloned() else {
                     continue;
                 };
                 // Opened as soon as ANY bytes are cached — no "wait for
@@ -2202,11 +2206,14 @@ impl Terminal {
                 if contiguous_len == 0 {
                     continue;
                 }
-                let path = path.to_path_buf();
                 let progress = std::sync::Arc::new(rich_content_audio_player::AudioTransferProgress::new());
                 progress.update(contiguous_len, total_size);
                 self.rich_content_audio_progress.borrow_mut().insert(key, progress.clone());
-                match rich_content_audio_player::RichContentAudioPlayer::open(path, progress) {
+                let request_byte_range: std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> =
+                    std::sync::Arc::new(move |offset, len| {
+                        rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                    });
+                match rich_content_audio_player::RichContentAudioPlayer::open(srv_state, progress, Some(request_byte_range)) {
                     Ok(player) => {
                         // Autoplay — matches video's own "always plays as
                         // soon as any frame is decoded" behavior (see
@@ -2243,6 +2250,20 @@ impl Terminal {
                 // opened.
                 progress.update(contiguous_len, total_size);
             }
+            let player = players.get_mut(&key).expect("just inserted or already present");
+            // Non-blocking — opens the `cpal` device/stream the first
+            // paint after the decode thread has a sample rate/channel
+            // count (see `RichContentAudioPlayer::open`'s own doc
+            // comment for why this can no longer happen inside `open`
+            // itself: doing it there blocked this exact paint path,
+            // confirmed live to hang the whole window). A no-op once
+            // already open.
+            player.poll_ready();
+            if player.failed() {
+                players.remove(&key);
+                self.rich_content_audio_progress.borrow_mut().remove(&key);
+                continue;
+            }
             let player = players.get(&key).expect("just inserted or already present");
             let duration_ms = self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
             // Auto-stop on reaching the real end of playback — video
@@ -2265,6 +2286,11 @@ impl Terminal {
                 players.remove(&key);
                 self.rich_content_audio_stopped.borrow_mut().insert(key);
                 self.rich_content_audio_progress.borrow_mut().remove(&key);
+                // Same "somcat is gone for good" signal the widget's own
+                // stop icon sends (`stop_rich_content_audio_playback`) —
+                // natural EOF is just as much a definitive end of
+                // playback as an explicit stop click.
+                rich_content_srv_channel::end_playback(session_id, file_id);
                 out.push((session_id, file_id, 0.0, false, std::time::Duration::ZERO, std::time::Duration::from_millis(duration_ms as u64)));
                 continue;
             }
@@ -2495,6 +2521,13 @@ impl Terminal {
         self.rich_content_audio_stopped.borrow_mut().insert(key);
         self.rich_content_audio_players.borrow_mut().remove(&key);
         self.rich_content_audio_progress.borrow_mut().remove(&key);
+        // Tells the `somcat` process backing this placement to exit — see
+        // `rich_content_srv_channel::end_playback`'s own doc comment. The
+        // widget's stop icon is a genuine, one-way end of playback (unlike
+        // pause, which never touches `somcat` at all): once this fires,
+        // there is no more live process to serve a later play click even
+        // if the placeholder cells are still on screen.
+        rich_content_srv_channel::end_playback(session_id, file_id);
     }
 
     /// Tears down every currently open audio player outright (unlike
@@ -2527,18 +2560,16 @@ impl Terminal {
     }
 
     /// Video counterpart to [`Self::stop_rich_content_audio_playback`] —
-    /// pauses and rewinds without dropping the player, same reasoning.
-    /// Windows-only, same reason video's other fields/methods are.
+    /// same "genuine, one-way end of playback" treatment, not pause: drops
+    /// the player outright and tells `somcat` to exit, same reasoning as
+    /// audio's own stop icon. Windows-only, same reason video's other
+    /// fields/methods are.
     #[cfg(target_os = "windows")]
     pub fn stop_rich_content_video_playback(&self, session_id: u32, file_id: u32) {
         let key = (session_id, file_id);
-        let players = self.rich_content_video_players.borrow();
-        let progress = self.rich_content_video_progress.borrow();
-        if let (Some(player), Some(progress)) = (players.get(&key), progress.get(&key)) {
-            player.stop(progress, |offset, len| {
-                self.request_audio_byte_range(session_id, file_id, offset, len);
-            });
-        }
+        self.rich_content_video_players.borrow_mut().remove(&key);
+        self.rich_content_video_progress.borrow_mut().remove(&key);
+        rich_content_srv_channel::end_playback(session_id, file_id);
     }
 
     /// How many bytes to ask for at once when a seek lands past what's
@@ -2731,13 +2762,22 @@ impl Terminal {
                 self.rich_content_srv_progress.borrow().get(&key).map(|state| state.pending_ranges()).unwrap_or_default();
             let just_opened = !players.contains_key(&key);
             if just_opened {
-                let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+                // No more `RichContentCache::path()`/on-disk file for
+                // video — `GrowingFileStream` now reads directly out of
+                // this placement's `SrvProgressState` in-memory buffer
+                // (see that type's own doc comment for why: a full
+                // on-disk copy per playback used to exhaust real disk
+                // space on a large enough file). `SrvProgressState` is
+                // only populated once `ensure_rich_content_srv_
+                // subscription` has run for this key — same "not
+                // subscribed yet" early-out `RichContentCache::path()`'s
+                // `None` used to cover.
+                let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key).cloned() else {
                     continue;
                 };
                 if contiguous_len == 0 {
                     continue;
                 }
-                let path = path.to_path_buf();
                 let progress = std::sync::Arc::new(rich_content_video_player::VideoTransferProgress::new());
                 progress.update(contiguous_len, tail_available_from, pending_ranges.clone(), total_size);
                 self.rich_content_video_progress.borrow_mut().insert(key, progress.clone());
@@ -2747,7 +2787,7 @@ impl Terminal {
                         rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
                     });
                 let player = rich_content_video_player::RichContentVideoPlayer::open(
-                    path,
+                    srv_state,
                     progress,
                     audio_stream_index,
                     Some(request_byte_range),
@@ -2777,26 +2817,25 @@ impl Terminal {
             if just_opened {
                 player.toggle_play_pause();
             }
-            // Auto-stop on reaching the real end of playback — not just
-            // the passive `is_finished` bookkeeping `toggle_rich_content_
-            // video_playback` already reacted to reactively (only on the
-            // NEXT play click). Checked every paint pass so the widget
-            // visibly settles into the stopped state (00:00:00, empty
-            // seek bar, `dna.png` stand-in) the moment playback actually
+            // Auto-stop on reaching the real end of playback — same
+            // genuine teardown the widget's own stop icon now uses (see
+            // `stop_rich_content_video_playback`'s own doc comment): drops
+            // the player and tells `somcat` to exit, since natural EOF is
+            // just as much a definitive end of playback as an explicit
+            // stop click, not a pausable/resumable state. Checked every
+            // paint pass so this fires the moment playback actually
             // reaches the end, not only after the user happens to click
-            // play again. `!player.is_playing()` guards against calling
-            // `stop` on every single paint pass once finished (`stop`
-            // itself is idempotent, but there's no reason to keep
-            // re-queuing a seek every frame) — `run_decode_loop`'s own
-            // EOF handling already flips `playing` to `false` once
-            // `finished` is set, so this fires exactly once per real
-            // end-of-playback.
-            if player.is_finished() && !player.is_playing() && !player.is_stopped()
-                && let Some(progress) = self.rich_content_video_progress.borrow().get(&key)
-            {
-                player.stop(progress, |offset, len| {
-                    self.request_audio_byte_range(session_id, file_id, offset, len);
-                });
+            // play again — `run_decode_loop`'s own EOF handling already
+            // flips `playing` to `false` once `finished` is set. Inlined
+            // (not calling `stop_rich_content_video_playback`) for the
+            // same borrow-conflict reason the `StopPlayback` handling
+            // above is inlined: `players` is already mutably borrowed for
+            // this whole loop.
+            if player.is_finished() && !player.is_playing() {
+                players.remove(&key);
+                self.rich_content_video_progress.borrow_mut().remove(&key);
+                rich_content_srv_channel::end_playback(session_id, file_id);
+                continue;
             }
             // Pushed even with no frame (`current_frame()` returns
             // `None` right after `RichContentVideoPlayer::stop` clears
@@ -7470,12 +7509,13 @@ mod tests {
 
         let (session_id, file_id) = session_and_file_id.expect("set alongside saw_placement");
 
-        // Toggle playback on (starts paused, matching the module's own
-        // "don't autoplay" doc comment) and confirm the reported position
-        // actually advances — proves the `cpal` callback thread is really
-        // consuming samples, not just that a player object exists.
-        terminal.update(cx, |term, _| term.toggle_rich_content_audio_playback(session_id, file_id));
-
+        // A freshly opened placement autoplays (`rich_content_audio_
+        // placements`'s own doc comment: matches video's "always plays
+        // as soon as any frame is decoded" behavior) — no explicit
+        // toggle needed here; confirm the reported position actually
+        // advances on its own, proving the `cpal` callback thread is
+        // really consuming samples, not just that a player object
+        // exists.
         let mut first_fraction: Option<f32> = None;
         let mut saw_advance = false;
         for _ in 0..40 {
@@ -7493,7 +7533,7 @@ mod tests {
             else {
                 continue;
             };
-            assert!(*is_playing, "playback must report as playing after toggling it on");
+            assert!(*is_playing, "a freshly opened placement must autoplay");
             match first_fraction {
                 None => first_fraction = Some(*position_fraction),
                 Some(first) if *position_fraction > first => {
@@ -7503,7 +7543,7 @@ mod tests {
                 Some(_) => {},
             }
         }
-        assert!(saw_advance, "playback position never advanced after toggling play on");
+        assert!(saw_advance, "playback position never advanced after autoplay started it");
     }
 
     #[cfg(target_os = "windows")]

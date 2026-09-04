@@ -585,6 +585,30 @@ pub enum SrvRequest {
     /// request` prefers this one when present (see `SrvCache`'s own doc
     /// comment).
     RegisterRangeResponder { session_id: u32, file_id: u32 },
+    /// Sent by Som (never by `somcat`) on the SAME connection as
+    /// `SubscribeProgress`/`RequestByteRange`, telling whichever client
+    /// registered itself as `(session_id, file_id)`'s range responder
+    /// (`RegisterRangeResponder`) that playback has definitively ended —
+    /// natural end-of-content (decode reached EOF) or the user pressing
+    /// the widget's own stop icon / closing the placement. Routed by the
+    /// daemon exactly like `RequestByteRange` (`SrvCache::route_byte_
+    /// range_request`'s same `range_response_routes` lookup, see that
+    /// method's own doc comment) straight to the registered responder
+    /// connection — `somcat`'s reader loop treats this as its cue to stop
+    /// answering `RequestByteRange` and exit, letting the shell that
+    /// launched it print its next prompt. This is the reverse direction
+    /// of the existing `StopPlayback` variant below (that one is sent BY
+    /// an SRP client TO Som, e.g. yazi's preview cursor moving away) —
+    /// the two together cover both "the source wants the viewer to stop"
+    /// and "the viewer wants the source to stop" without conflating them
+    /// into one ambiguous message. Silently undeliverable (no-op) if the
+    /// responder connection has already closed — same tolerance every
+    /// other best-effort message in this protocol already has (e.g. the
+    /// Ctrl+C case: `somcat` is already gone by the time this would
+    /// arrive, so there's nothing left to tell — the daemon separately
+    /// notices that disconnect on its own and pushes `StopPlayback` to
+    /// subscribers, see `handle_srv_request`'s own doc comment).
+    EndPlayback { session_id: u32, file_id: u32 },
     /// Runs `script_source` as a fresh, explicitly-sandboxed `mlua::Lua`
     /// VM (see `crate::lua::phase1_stdlib`'s own doc comment — NOT
     /// `mlua::Lua::new()`'s default, which turned out live-confirmed to
@@ -700,6 +724,20 @@ pub enum SrvResponse {
         total_size: u64,
         content_type: ContentType,
         metadata: ContentMetadata,
+        /// The exact `(offset, data)` this push's own triggering
+        /// `PutChunk` carried — the actual byte-delivery mechanism now
+        /// that `som-srv` no longer persists chunks to disk (see
+        /// `srv_cache::SrvCache::put_chunk`'s own doc comment for why):
+        /// a subscriber (Som's `SrvProgressState`) appends `chunk_data`
+        /// to its own in-memory forward-only buffer at `chunk_offset`
+        /// instead of reading it back off a file `som-srv` would
+        /// otherwise have written. Travels on every push, not just
+        /// pushes that advance `contiguous_len` from the front — an
+        /// out-of-order/tail/`RequestByteRange`-answer chunk still needs
+        /// its own bytes delivered even though it doesn't move that
+        /// particular watermark.
+        chunk_offset: u64,
+        chunk_data: Vec<u8>,
     },
     /// Pushed (unsolicited) on a `SubscribeProgress` connection, answering
     /// a DIFFERENT client's `SrvRequest::StopPlayback` for the same
@@ -740,10 +778,22 @@ pub enum VideoCodec {
 /// Mirrors `crates/terminal/src/rich_content_transport::ContentMetadata`
 /// field-for-field — see `ContentType`'s own doc comment for why this is
 /// a separate copy, not a shared type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentMetadata {
     Image { width_px: u32, height_px: u32, color_bits: u8, is_animated: bool },
-    Audio { sample_rate: u32, channels: u8, bits_per_sample: u8, duration_ms: u32 },
+    Audio {
+        sample_rate: u32,
+        channels: u8,
+        bits_per_sample: u8,
+        duration_ms: u32,
+        /// Mirrors `crates/terminal/src/rich_content_transport::
+        /// ContentMetadata::Audio::extension` field-for-field — see that
+        /// field's own doc comment for why this exists now that `som-srv`
+        /// no longer persists chunks to a real on-disk file (`SrvCache`'s
+        /// own doc comment) whose extension a decoder's probe could
+        /// otherwise infer from a `Path`.
+        extension: String,
+    },
     Video {
         width_px: u32,
         height_px: u32,
@@ -758,6 +808,10 @@ pub enum ContentMetadata {
         /// ContentMetadata::Video::subtitle_stream_index` field-for-field
         /// — see that field's own doc comment.
         subtitle_stream_index: Option<u32>,
+        /// Mirrors `crates/terminal/src/rich_content_transport::
+        /// ContentMetadata::Video::extension` field-for-field — see that
+        /// field's own doc comment.
+        extension: String,
     },
     Markdown,
 }

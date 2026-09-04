@@ -21,7 +21,99 @@ use crate::srv_cache::SrvCache;
 use som_srv::pipe::{self, PipeConnection};
 use som_srv::protocol::{ConnectionKind, HandshakeInfo, HolderOutput, RelayInput, SessionInfo, SrvRequest, SrvResponse, daemon_socket_path};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// How many connections (RELAY or `Srv`) are CURRENTLY being handled —
+/// incremented for the whole lifetime of each connection's handler thread
+/// (`handle_relay`/`handle_srv_request`), decremented via [`ConnectionGuard`]'s
+/// `Drop` impl regardless of how that thread exits (clean return or an
+/// early `?`-propagated error). This is the signal [`spawn_idle_shutdown_
+/// watcher`] polls to decide whether the daemon has gone idle — see that
+/// function's own doc comment for why a raw connection count (not the
+/// `SessionRegistry`/`SrvCache` state) is the right thing to watch: a
+/// short-lived `Srv` request (`ListSessions`, `RequestByteRange`, etc.)
+/// briefly bumping this to 1 and back down within milliseconds is fine —
+/// the watcher only acts after seeing 0 for the FULL idle window, so a
+/// connection this brief never has a chance to look like sustained
+/// idleness.
+static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard bumping [`LIVE_CONNECTIONS`] up on construction, back down
+/// on `Drop` — used instead of manual increment/decrement pairs so every
+/// early-return path (there are many, via `?`, in both `handle_relay` and
+/// `handle_srv_request`) still decrements correctly without needing its
+/// own explicit cleanup.
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    fn new() -> Self {
+        LIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long the daemon waits, after [`LIVE_CONNECTIONS`] first reads 0,
+/// before actually exiting — see [`spawn_idle_shutdown_watcher`]'s own doc
+/// comment for why this needs to be a real window rather than an
+/// immediate exit.
+const IDLE_SHUTDOWN_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Spawns a background thread that exits the WHOLE daemon process
+/// (`std::process::exit(0)`) once [`LIVE_CONNECTIONS`] has read 0 for a
+/// full [`IDLE_SHUTDOWN_DELAY`] window, polling every second. This closes
+/// a real, previously-open gap: unlike the old per-pane HOLDER (which
+/// exited naturally when its one shell process died), this shared daemon
+/// used to keep running forever once started, even after every Som
+/// window and every `somcat` process on the machine had long since
+/// closed — confirmed live (2026-09-04) as a stray `som-srv.exe` still
+/// resident well after the Som window that started it had been closed,
+/// requiring a manual `taskkill` before a fresh daemon (or a test run
+/// binding the same named pipe) could start cleanly.
+///
+/// A plain "exit the instant the count hits 0" check is deliberately NOT
+/// what this does: the count legitimately dips to 0 for a moment between
+/// two unrelated connections all the time (e.g. a `somcat` process
+/// finishing its own `RegisterRangeResponder` connection's teardown right
+/// as a brand new one is dialing in — see `ConnectionGuard`'s own doc
+/// comment) — exiting on that instant would kill the daemon out from
+/// under a legitimate reconnect. Re-checking after `IDLE_SHUTDOWN_DELAY`
+/// has fully elapsed with the count STILL at 0 the whole time turns a
+/// momentary dip into a much stronger, much less risky signal: nothing at
+/// all has connected in a real window of time, not just "nothing is
+/// connected in this exact instant."
+fn spawn_idle_shutdown_watcher() {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if LIVE_CONNECTIONS.load(Ordering::SeqCst) != 0 {
+                continue;
+            }
+            let idle_since = std::time::Instant::now();
+            let mut still_idle = true;
+            while idle_since.elapsed() < IDLE_SHUTDOWN_DELAY {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if LIVE_CONNECTIONS.load(Ordering::SeqCst) != 0 {
+                    still_idle = false;
+                    break;
+                }
+            }
+            if still_idle {
+                log::info!(
+                    "som-srv daemon idle for {:?} with no live connections, shutting down",
+                    IDLE_SHUTDOWN_DELAY
+                );
+                std::process::exit(0);
+            }
+        }
+    });
+}
 
 /// Registry key: `client_id` is `None` for a local/WSL RELAY, `Some(...)`
 /// for a real SSH RELAY (see `RelayInput::Register::client_id`'s doc
@@ -62,6 +154,8 @@ pub fn run() -> anyhow::Result<()> {
     let listener = pipe::bind(&socket_path)?;
     log::info!("som-srv daemon listening on {socket_path:?}");
 
+    spawn_idle_shutdown_watcher();
+
     loop {
         let connection = match pipe::accept_on(&listener) {
             Ok(connection) => connection,
@@ -75,6 +169,7 @@ pub fn run() -> anyhow::Result<()> {
         let registry = registry.clone();
         let cache = cache.clone();
         std::thread::spawn(move || {
+            let _connection_guard = ConnectionGuard::new();
             let kind = match ConnectionKind::read_from(&connection) {
                 Ok(kind) => kind,
                 Err(err) => {

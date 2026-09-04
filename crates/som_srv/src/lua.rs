@@ -34,8 +34,8 @@ pub fn run_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, script_so
     let markdown = run_script(script_source)?;
     let bytes = markdown.as_bytes();
     let total_size = bytes.len() as u64;
-    let cache_dir = SrvCache::default_cache_dir();
 
+    let cache_dir = SrvCache::default_cache_dir();
     for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
         let offset = (index * CHUNK_SIZE) as u64;
         cache.put_chunk(&cache_dir, session_id, file_id, offset, chunk, total_size, ContentType::Markdown, ContentMetadata::Markdown)?;

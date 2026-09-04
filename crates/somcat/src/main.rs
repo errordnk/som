@@ -251,6 +251,37 @@ fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
 /// exactly as it did before this function existed, not a big deal for a
 /// single unprobeable file.
 #[cfg(windows)]
+/// Picks the container's main video stream — NOT simply `ictx.streams().
+/// best(Video)`, which picks the stream with the largest resolution*
+/// frame-count product FFmpeg can determine from the header alone.
+/// Confirmed live as wrong for a real file: a multi-track MKV (h264 main
+/// feature + several AC3/EAC3 audio tracks + subtitle tracks + an
+/// embedded MJPEG cover-art attachment) had `best(Video)` pick the
+/// single-frame MJPEG cover art over the actual multi-thousand-frame
+/// h264 feature — `best()`'s own heuristic apparently weighs pixel
+/// dimensions before frame count when a stream's frame count isn't yet
+/// knowable from the header, and a cover-art frame is often encoded at
+/// a HIGHER resolution than the feature itself. MJPEG is the standard
+/// codec real-world muxers (ffmpeg, mkvmerge) use for embedded cover art
+/// specifically — never a legitimate movie/show's own primary video
+/// codec in practice — so deprioritizing it below every non-MJPEG
+/// candidate closes this gap without needing per-container attachment-
+/// flag parsing. MUST match `crates/terminal/src/rich_content_video_
+/// player.rs`'s identical `best_video_stream` byte-for-byte (this crate
+/// has no dependency access to that one's private fn) — both `somcat`'s
+/// own probe here AND Som's real decode thread need to agree on which
+/// stream is "the video," or a probe here could report a different
+/// codec/resolution than what actually plays.
+fn best_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<ffmpeg_next::format::stream::Stream<'_>> {
+    let non_mjpeg = ictx
+        .streams()
+        .filter(|s| s.parameters().id() != ffmpeg_next::codec::Id::MJPEG)
+        .max_by_key(|s| (s.parameters().medium() == ffmpeg_next::media::Type::Video, s.frames(), s.duration()));
+    non_mjpeg
+        .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Video)
+        .or_else(|| ictx.streams().best(ffmpeg_next::media::Type::Video))
+}
+
 fn video_metadata(
     path: &str,
     audio_stream_index: Option<u32>,
@@ -264,7 +295,7 @@ fn video_metadata(
         .map_err(|e| format!("{path}: wrapping file for probing: {e}"))?;
     let filename = std::path::Path::new(path).file_name().and_then(|n| n.to_str());
     let ictx = ffmpeg_next::format::input_from_stream(stream_io, filename, None).map_err(|e| format!("probing {path}: {e}"))?;
-    let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).ok_or_else(|| format!("{path}: no video stream found"))?;
+    let stream = best_video_stream(&ictx).ok_or_else(|| format!("{path}: no video stream found"))?;
 
     let params = stream.parameters();
     let context_decoder =
@@ -287,6 +318,7 @@ fn video_metadata(
         _ => VideoCodec::Unknown,
     };
 
+    let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
     Ok(ContentMetadata::Video {
         width_px,
         height_px,
@@ -295,6 +327,7 @@ fn video_metadata(
         codec,
         audio_stream_index,
         subtitle_stream_index,
+        extension,
     })
 }
 
@@ -623,17 +656,15 @@ fn write_placeholder_grid_rows(session_id: u32, file_id: u32, columns: u32, rows
 const ETX: u8 = 0x03;
 
 /// Set by [`spawn_ctrlc_watcher`]'s background thread the instant it sees
-/// `ETX` on stdin, checked by the long-running sequential send loop
-/// (`send_range_chunks_from_disk_interruptible`) between chunks — the fix
-/// for Ctrl+C doing nothing while a large video/audio file is still
-/// streaming. Before this, stdin was only ever read for the two short,
-/// one-shot placeholder-grid handshakes (`query_cell_size_px`/
-/// `query_cell_count`), both of which complete and return well before the
-/// multi-gigabyte transfer loop even starts — nothing was left listening
-/// on stdin during the part of the run that can actually take minutes,
-/// so `ETX`'s own doc comment ("every stdin-reading loop here needs to
-/// check for it explicitly") was true in spirit but incomplete in
-/// practice.
+/// `ETX` on stdin — checked by [`stream_file_from_disk`]'s own wait loop
+/// to know when to stop answering `RequestByteRange` and exit. Before
+/// this, stdin was only ever read for the two short, one-shot
+/// placeholder-grid handshakes (`query_cell_size_px`/`query_cell_count`),
+/// both of which complete and return well before a large video/audio
+/// file's transfer even starts — nothing was left listening on stdin
+/// during the part of the run that can actually take minutes, so `ETX`'s
+/// own doc comment ("every stdin-reading loop here needs to check for it
+/// explicitly") was true in spirit but incomplete in practice.
 static CTRL_C_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Spawns a background thread that blocks reading stdin one byte at a
@@ -736,7 +767,7 @@ fn send_range_chunks(
     let srv_metadata = srv_channel::to_srv_metadata(metadata);
     let mut offset = range_offset;
     for piece in slice.chunks(CHUNK_SIZE) {
-        channel.put_chunk(session_id, file_id, offset, piece.to_vec(), total_size, srv_content_type, srv_metadata)?;
+        channel.put_chunk(session_id, file_id, offset, piece.to_vec(), total_size, srv_content_type, srv_metadata.clone())?;
         offset += piece.len() as u64;
     }
     Ok(())
@@ -745,52 +776,18 @@ fn send_range_chunks(
 /// Sends `file[range_offset .. range_offset + range_len)` as
 /// [`CHUNK_SIZE`]-sized `SrvRequest::PutChunk` messages over `channel` —
 /// the file-backed counterpart to [`send_range_chunks`], used for video/
-/// audio (see [`stream_file_from_disk`]'s own doc comment for why those
-/// two content types read from disk instead of a fully-materialized
-/// in-memory buffer). `file` is read via `Seek`+`Read` rather than kept
-/// at a running cursor, since range requests (from [`spawn_byte_range_
-/// responder_from_disk`]) can interleave with the sequential send loop
-/// on a SEPARATE thread sharing the same `Mutex<File>`.
+/// audio (see [`stream_file_from_disk`]'s own doc comment for the pull-
+/// style design this serves: the front/tail announce chunks and every
+/// `RequestByteRange` reply all go through this same function). `file` is
+/// read via `Seek`+`Read` rather than kept at a running cursor, since
+/// concurrent range requests (from [`spawn_byte_range_responder_from_
+/// disk`]'s own thread) can interleave on a SEPARATE thread sharing the
+/// same `Mutex<File>`. Checks [`CTRL_C_REQUESTED`] between chunks so a
+/// user interrupt takes effect promptly even mid-range, though in
+/// practice every range this function ever sends is small (an announce
+/// chunk or one on-demand reply), never a whole large file.
 #[allow(clippy::too_many_arguments)]
 fn send_range_chunks_from_disk(
-    channel: &srv_channel::SrvChannel,
-    file: &std::sync::Mutex<std::fs::File>,
-    content_type: terminal::rich_content_transport::ContentType,
-    metadata: terminal::rich_content_transport::ContentMetadata,
-    ids: SrpIds,
-    total_size: u64,
-    range_offset: u64,
-    range_len: u64,
-) -> Result<(), String> {
-    send_range_chunks_from_disk_interruptible(channel, file, content_type, metadata, ids, total_size, range_offset, range_len, None)
-        .map(|_| ())
-}
-
-/// Outcome of [`send_range_chunks_from_disk_interruptible`] — distinguishes
-/// "sent the whole requested range" from "stopped early because a newer
-/// seek redirected us" from "stopped early because the user hit Ctrl+C,"
-/// which the caller (the main sequential loop in [`stream_file_from_disk`])
-/// needs to tell apart: the first means move on to the next range in
-/// sequence, the second means jump straight to wherever the seek landed
-/// instead, the third means stop the whole transfer and let the process
-/// exit.
-enum SendOutcome {
-    Completed,
-    RedirectedTo(u64),
-    Interrupted,
-}
-
-/// Same job as [`send_range_chunks_from_disk`], but checks `seek_signal`
-/// (if given) between every chunk and stops early — returning
-/// `SendOutcome::RedirectedTo` — the instant it sees a DIFFERENT offset
-/// than `range_offset` waiting there. Used by the main sequential loop
-/// (which passes `Some(seek_signal)`) so a user seek takes effect
-/// immediately instead of only after the current multi-gigabyte
-/// sequential pass finishes; the byte-range-responder's own one-off
-/// range sends `None` — an already-targeted range reply has nothing
-/// further to redirect away from.
-#[allow(clippy::too_many_arguments)]
-fn send_range_chunks_from_disk_interruptible(
     channel: &srv_channel::SrvChannel,
     file: &std::sync::Mutex<std::fs::File>,
     content_type: terminal::rich_content_transport::ContentType,
@@ -799,8 +796,7 @@ fn send_range_chunks_from_disk_interruptible(
     total_size: u64,
     range_offset: u64,
     range_len: u64,
-    seek_signal: Option<&SeekSignal>,
-) -> Result<SendOutcome, String> {
+) -> Result<(), String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::sync::atomic::Ordering;
 
@@ -812,36 +808,7 @@ fn send_range_chunks_from_disk_interruptible(
     let mut buf = vec![0u8; CHUNK_SIZE];
     while offset < end {
         if CTRL_C_REQUESTED.load(Ordering::Acquire) {
-            return Ok(SendOutcome::Interrupted);
-        }
-        if let Some(seek_signal) = seek_signal {
-            let pending = seek_signal.load(Ordering::Acquire);
-            // `NO_SEEK_PENDING` is the only "nothing new happened" value —
-            // `pending != offset` alone is NOT enough to mean "a NEWER
-            // seek arrived," because `seek_signal` is never reset back to
-            // `NO_SEEK_PENDING` after a redirect is taken (there's no
-            // single writer that could safely do so: the byte-range-
-            // responder thread only ever WRITES a fresh target on a new
-            // seek, it doesn't know when this loop has finished acting on
-            // the last one). Without this compare-and-clear, the very
-            // FIRST chunk sent after taking a redirect immediately
-            // "reads" its own already-handled target back (`pending`
-            // stays stuck at that same old value while `offset` moves
-            // forward past it), redirecting again to the SAME point over
-            // and over — confirmed live as `somcat` spinning forever
-            // resending one chunk near a seek target while Som's own
-            // widget sat frozen on the pre-seek frame, never receiving
-            // anything past that single point. Atomically claiming the
-            // pending value (swapping it to `NO_SEEK_PENDING`) the first
-            // time this loop observes it means a seek is consumed
-            // exactly once — a genuinely NEWER seek arriving later
-            // simply stores a fresh non-`NO_SEEK_PENDING` value again.
-            if pending != NO_SEEK_PENDING
-                && pending != offset
-                && seek_signal.compare_exchange(pending, NO_SEEK_PENDING, Ordering::AcqRel, Ordering::Acquire).is_ok()
-            {
-                return Ok(SendOutcome::RedirectedTo(pending));
-            }
+            return Ok(());
         }
         let piece_len = (end - offset).min(CHUNK_SIZE as u64) as usize;
         {
@@ -849,67 +816,50 @@ fn send_range_chunks_from_disk_interruptible(
             guard.seek(SeekFrom::Start(offset)).map_err(|e| format!("seeking to {offset}: {e}"))?;
             guard.read_exact(&mut buf[..piece_len]).map_err(|e| format!("reading {piece_len} bytes at {offset}: {e}"))?;
         }
-        channel.put_chunk(session_id, file_id, offset, buf[..piece_len].to_vec(), total_size, srv_content_type, srv_metadata)?;
+        channel.put_chunk(session_id, file_id, offset, buf[..piece_len].to_vec(), total_size, srv_content_type, srv_metadata.clone())?;
         offset += piece_len as u64;
     }
-    Ok(SendOutcome::Completed)
+    Ok(())
 }
-
-/// Sentinel stored in [`SeekSignal`] meaning "no seek pending" — `u64`
-/// has no natural "none" value, and every REAL seek target is a valid
-/// file offset that could theoretically be 0 (the very start), so a
-/// separate out-of-band sentinel is needed rather than overloading 0
-/// itself. `total_size` (a video/audio file's length) can never reach
-/// `u64::MAX` in practice, so this is safe to use as "unset."
-const NO_SEEK_PENDING: u64 = u64::MAX;
-
-/// Shared between [`spawn_byte_range_responder_from_disk`] (the writer,
-/// on a real user seek) and [`stream_file_from_disk`]'s main sequential
-/// loop (the reader, checked between every chunk) — see [`spawn_byte_
-/// range_responder_from_disk`]'s own doc comment for why a seek needs to
-/// REDIRECT the sequential stream's own position, not just answer a
-/// one-off byte-range request alongside it.
-type SeekSignal = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
 /// File-backed counterpart to [`spawn_byte_range_responder`] — services
 /// `RequestByteRange` by seeking/reading `file` instead of slicing an
-/// in-memory buffer, so it works correctly once the sequential sender no
-/// longer holds the whole file resident (see [`stream_file_from_disk`]).
+/// in-memory buffer. This is now the ENTIRE data-delivery path for
+/// video/audio (see [`stream_file_from_disk`]'s own doc comment for the
+/// pull-style redesign this is a part of) — every byte past the small
+/// front/tail announce chunks arrives only because this thread answered
+/// a request for it, never because anything was pushed proactively.
 ///
 /// Uses its OWN `SrvChannel` connection (registered via `SrvRequest::
-/// RegisterRangeResponder`), separate from the sequential sender's own
-/// connection — see that protocol variant's own doc comment for why: a
-/// range response sharing the sequential sender's connection has to win
-/// a mutex race against a steady stream of outgoing `PutChunk`s for a
-/// large, still-in-flight file, and a plain (non-fair) mutex has no
-/// obligation to let a rarely-contending thread win against one
-/// re-acquiring the lock in a tight loop. Confirmed live as multi-
-/// second-to-minutes seek latency that scaled with file size before this
-/// fix. Also raises `seek_signal` to `offset` — see [`SeekSignal`]'s own
-/// doc comment for why the sequential loop needs to be redirected, not
-/// just have this one range answered alongside its own unrelated,
-/// now-stale progress through the file: continuing to sequentially send
-/// bytes from the OLD position after the user has jumped elsewhere
-/// wastes the disk/pipe bandwidth this whole redesign exists to stop
-/// wasting, and the widget only cares about bytes from the NEW position
-/// onward once a seek has happened.
+/// RegisterRangeResponder`), separate from whichever connection sent the
+/// announce chunks — see that protocol variant's own doc comment for why:
+/// even in the pull model, a slow response here shouldn't have to wait on
+/// unrelated traffic on another connection.
+///
+/// Also listens on this same connection for `SrvRequest::EndPlayback` —
+/// Som's signal that playback has definitively ended (natural EOF, or the
+/// widget's own stop icon) — setting the returned `ended` flag instead of
+/// answering it, letting [`stream_file_from_disk`]'s own wait loop notice
+/// and exit. See that function's own doc comment for the full "why does
+/// `somcat` need to know this at all" reasoning.
 fn spawn_byte_range_responder_from_disk(
     file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     content_type: terminal::rich_content_transport::ContentType,
     metadata: terminal::rich_content_transport::ContentMetadata,
     ids: SrpIds,
     total_size: u64,
-) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, SeekSignal, std::thread::JoinHandle<()>), String> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>), String>
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let (session_id, file_id) = ids;
     let channel = std::sync::Arc::new(srv_channel::SrvChannel::connect()?);
     channel.register_range_responder(session_id, file_id)?;
 
     let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let seek_signal: SeekSignal = std::sync::Arc::new(AtomicU64::new(NO_SEEK_PENDING));
     let stop_for_thread = stop.clone();
-    let seek_signal_for_thread = seek_signal.clone();
+    let ended = std::sync::Arc::new(AtomicBool::new(false));
+    let ended_for_thread = ended.clone();
     let handle = std::thread::spawn(move || {
         loop {
             if stop_for_thread.load(Ordering::Relaxed) {
@@ -922,15 +872,20 @@ fn spawn_byte_range_responder_from_disk(
                     offset,
                     len,
                 })) if (session_id, file_id) == ids => {
-                    seek_signal_for_thread.store(offset, Ordering::Release);
-                    let _ = send_range_chunks_from_disk(&channel, &file, content_type, metadata, ids, total_size, offset, len);
+                    let _ = send_range_chunks_from_disk(&channel, &file, content_type, metadata.clone(), ids, total_size, offset, len);
+                },
+                Ok(srv_channel::Incoming::Request(som_srv::protocol::SrvRequest::EndPlayback { session_id, file_id }))
+                    if (session_id, file_id) == ids =>
+                {
+                    ended_for_thread.store(true, Ordering::Release);
+                    return;
                 },
                 Ok(_) => continue,
                 Err(_) => return,
             }
         }
     });
-    Ok((stop, seek_signal, handle))
+    Ok((stop, ended, handle))
 }
 
 /// Streams `path` (a video or audio file) to Som over SRP by reading it
@@ -952,6 +907,57 @@ fn spawn_byte_range_responder_from_disk(
 /// anyway for metadata probing (`gif_metadata`/`static_image_metadata`
 /// both operate on an in-memory byte slice) and are typically small
 /// enough that this was never the bottleneck those formats have.
+///
+/// Streams `path` PULL-STYLE: `somcat` never proactively pushes the file
+/// forward — it sends one small announcing chunk (and, for video, a tail
+/// fetch), registers itself as the byte-range responder, then holds the
+/// terminal in the foreground (exactly like `cat`/`less` would) answering
+/// `SrvRequest::RequestByteRange` on demand for as long as playback can
+/// still ask for more. This is deliberate, not a leftover from the old
+/// design: the user's own model here is that `somcat` occupies the
+/// terminal the whole time content is playing, the same way `cat`ing a
+/// file keeps the shell busy until the file is exhausted — a prompt
+/// appearing while video/audio is still playing would let the user run a
+/// new command (or start ANOTHER `somcat` against the same placement)
+/// while this one is still the thing feeding it, which is exactly the
+/// confusing double-control state this design avoids. `somcat` only
+/// returns — thus only lets the shell print its next prompt — once
+/// playback has definitively ended, one of three ways, all funneled
+/// through the same exit path below:
+/// 1. **Natural end of content.** Som reaches EOF during decode and tells
+///    `som-srv` to relay [`som_srv::protocol::SrvRequest::EndPlayback`]
+///    back down THIS responder connection (mirrors `RequestByteRange`'s
+///    own existing Som -> daemon -> registered-responder routing, see
+///    `RegisterRangeResponder`'s doc comment) — handled in the responder
+///    thread's read loop below, same as any other routed request.
+/// 2. **User pressed stop / closed the placement in Som.** Same
+///    `EndPlayback` message, sent by `Terminal::stop_rich_content_*`
+///    instead of the decode-EOF path — from `somcat`'s side these two
+///    cases are indistinguishable and don't need to be: either way,
+///    nothing is going to ask for more bytes again.
+/// 3. **User pressed Ctrl+C in the terminal itself.** Caught by
+///    [`spawn_ctrlc_watcher`] exactly as before pull-model existed.
+///
+/// This REPLACES an earlier "sequential push, `RequestByteRange` only as
+/// a fallback for stragglers" design — confirmed live as broken for large
+/// files specifically: on a fast local named pipe, a full sequential pass
+/// over a real 16GB movie completed in ~2 SECONDS (`send_range_chunks_
+/// from_disk_interruptible`'s own `Ok(SendOutcome::Completed)` returned
+/// well before Som had even finished subscribing), after which `somcat`
+/// exited and closed every connection — leaving Som's own in-memory
+/// buffer (bounded on purpose, see `som_srv::srv_cache::CacheEntry::
+/// recent_bytes`'s own doc comment) with nowhere near enough of the file
+/// to decode from, and no live sender left to ask for more. A small file
+/// (or a slow enough network) happened to let subscription win the race
+/// often enough that this looked like it worked — it never actually
+/// solved the underlying push-vs-subscribe race, just usually finished
+/// before the race lost. Real streaming players (HLS/DASH, and every
+/// other network video player) don't have this race at all because they
+/// never push proactively either — the client always asks for exactly
+/// the segment/range it currently needs, same principle this function now
+/// follows: `somcat` holds the file open and answers on demand for as
+/// long as the process runs, instead of racing to finish a one-shot send
+/// before anyone's ready to receive it.
 fn stream_file_from_disk(
     path: &str,
     channel: srv_channel::SrvChannel,
@@ -973,71 +979,51 @@ fn stream_file_from_disk(
     let shared_file = std::sync::Arc::new(std::sync::Mutex::new(file));
     let shared_channel = std::sync::Arc::new(channel);
 
-    let (stop, seek_signal, handle) =
-        spawn_byte_range_responder_from_disk(shared_file.clone(), content_type, metadata, ids, total_size)?;
+    let (stop, ended, handle) =
+        spawn_byte_range_responder_from_disk(shared_file.clone(), content_type, metadata.clone(), ids, total_size)?;
+
+    // The ONE proactive push this function still does: just enough of the
+    // file's own FRONT for `som-srv` to create its cache entry (`total_
+    // size`/`content_type`/`metadata`, needed before Som has anything to
+    // subscribe TO at all — see `SrvCache::put_chunk`'s own doc comment)
+    // and for FFmpeg's format probe to have a real shot at succeeding
+    // without a round trip. Deliberately small and bounded — this is an
+    // announcement, not the start of a sequential pass; everything past
+    // it (including the REST of this same front region, if the probe
+    // needs more) arrives only via `RequestByteRange`.
+    const ANNOUNCE_LEN: u64 = 256 * 1024;
+    let announce_len = ANNOUNCE_LEN.min(total_size);
+    send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata.clone(), ids, total_size, 0, announce_len)?;
 
     // Non-faststart MP4 has its `moov` atom at the end of the file, and
     // MKV can likewise have its Cues (seek index) element near the end
     // rather than up front — either way, FFmpeg's format probe on Som's
-    // side (`GrowingFileStream::seek`, `SeekFrom::End`) blocks until
-    // bytes near the true end are on disk, which the sequential loop
-    // below won't reach until nearly the whole file has streamed in.
-    // Confirmed live: a 16GB MKV whose Cues sit near the end took ~20
-    // minutes for the widget to start playing — the sequential send
-    // had to reach ~99% of the file before FFmpeg's probe could
-    // complete, despite MKV's EBML *header* metadata being near the
-    // front (that part was never the issue; the seek-to-end during
-    // indexing was). Originally this fired only for `.mp4`, on the
-    // assumption MKV never needs it — that assumption was wrong.
-    // Firing this range request FIRST (via the responder thread
-    // machinery already used for real seeks) lets the probe complete
-    // promptly regardless of container layout or extension. Doing it
-    // unconditionally for every video is simplest and harmless: the
-    // sequential loop below naturally skips re-covering this range
-    // once it catches up (`SrvCache::put_chunk`'s watermark logic is
-    // idempotent for offsets at or before the current watermark).
+    // side (`GrowingFileStream::seek`, `SeekFrom::End`) would otherwise
+    // need a full extra `RequestByteRange` round trip just to learn the
+    // tail even exists. Sending it proactively alongside the front
+    // announce chunk above saves that round trip; it's still bounded (4MB
+    // fixed, not proportional to file size) so it doesn't reintroduce the
+    // "push the whole file" problem this function exists to avoid.
     if content_type == terminal::rich_content_transport::ContentType::Video {
         const TAIL_FETCH_LEN: u64 = 4 * 1024 * 1024;
         let tail_offset = total_size.saturating_sub(TAIL_FETCH_LEN);
         let _ =
-            send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata, ids, total_size, tail_offset, TAIL_FETCH_LEN);
+            send_range_chunks_from_disk(&shared_channel, &shared_file, content_type, metadata.clone(), ids, total_size, tail_offset, TAIL_FETCH_LEN);
     }
 
-    // Sequential send, restarting from wherever the latest seek landed
-    // instead of continuing from its own old position — see `SeekSignal`'s
-    // own doc comment for why blindly continuing a stale sequential pass
-    // after the user has jumped elsewhere would waste the disk/pipe
-    // bandwidth this whole redesign exists to stop wasting. Each pass
-    // covers `[start, total_size)`; a redirect starts an entirely new pass
-    // from the NEW position rather than resuming the old one, since once
-    // the user has seeked, bytes before the new position are no longer
-    // the priority (a later backward seek re-requests them on demand via
-    // the byte-range responder, same as any other gap).
-    let mut start = 0u64;
-    let result = loop {
-        match send_range_chunks_from_disk_interruptible(
-            &shared_channel,
-            &shared_file,
-            content_type,
-            metadata,
-            ids,
-            total_size,
-            start,
-            total_size - start,
-            Some(&seek_signal),
-        ) {
-            Ok(SendOutcome::Completed) => break Ok(()),
-            Ok(SendOutcome::RedirectedTo(new_start)) => {
-                start = new_start;
-                continue;
-            },
-            Ok(SendOutcome::Interrupted) => break Ok(()),
-            Err(err) => break Err(err),
-        }
-    };
+    // Hold the file open and keep answering `RequestByteRange` (via the
+    // responder thread spawned above) until playback has definitively
+    // ended — either `ended` (Som relayed `SrvRequest::EndPlayback`,
+    // meaning natural EOF or an explicit stop/close on Som's side) or
+    // `CTRL_C_REQUESTED` (`spawn_ctrlc_watcher`, the user pressing Ctrl+C
+    // in this terminal) — see this function's own doc comment for why
+    // both must lead here, not just Ctrl+C.
+    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) && !ended.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(handle);
-    result
+    Ok(())
 }
 
 /// Streams `path` to Som over SRP, then prints a placeholder grid
@@ -1098,7 +1084,8 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 
     if content_type == ContentType::Audio {
         let (sample_rate, channels, bits_per_sample, duration_ms) = audio_metadata(path)?;
-        let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms };
+        let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+        let metadata = ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension };
         let (session_id, file_id) = ids;
 
         // Placeholder grid FIRST, streaming SECOND — the reverse order
@@ -1129,6 +1116,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         // footprint back down once printed — a video narrower than
         // 16:9 (e.g. cinemascope) left visible letterboxing gaps for
         // the placement's entire lifetime, confirmed live.
+        let fallback_extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
         #[cfg(windows)]
         let metadata = video_metadata(path, audio_stream_index, subtitle_stream_index).unwrap_or(ContentMetadata::Video {
             width_px: 0,
@@ -1138,6 +1126,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
             codec: terminal::rich_content_transport::VideoCodec::Unknown,
             audio_stream_index,
             subtitle_stream_index,
+            extension: fallback_extension,
         });
         // No FFmpeg on non-Windows builds yet (see `video_metadata`'s own
         // doc comment) — same fallback as a failed probe on Windows.
@@ -1150,6 +1139,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
             codec: terminal::rich_content_transport::VideoCodec::Unknown,
             audio_stream_index,
             subtitle_stream_index,
+            extension: fallback_extension,
         };
         let (width_px, height_px) = match metadata {
             ContentMetadata::Video { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {

@@ -1,0 +1,237 @@
+# Бенчмарк локальных LLM для перевода комментариев Wowhead
+
+> Временный документ. Не относится к проекту Som — будет удалён.
+> Дата: 2026-09-05. Железо: Mac mini M4, 16 GB unified memory, macOS 15.6.
+
+---
+
+## Для следующей сессии Claude (читать первым)
+
+Этот файл — результат работы на Mac mini M4. Пользователь передаёт его новой сессии
+(вероятно на Windows), чтобы не терять контекст.
+
+**Что уже сделано:**
+- Ollama настроена и доступна по LAN с Mac mini: `http://192.168.50.4:11434`
+  (демон Ollama.app v0.33.3, `OLLAMA_HOST=0.0.0.0:11434`). Конфликт двух демонов
+  устранён (brew-версия удалена).
+- Прогнан бенчмарк 5 моделей на реальных комментариях Wowhead. Победитель —
+  `gemma4:e4b-mlx` (см. рейтинг ниже).
+
+**Что осталось / возможные следующие шаги (пользователь ещё думает):**
+1. Собрать глоссарий терминов WoW (Scarlet Crusade → Алый орден и т.п.) и вписать
+   в системный промпт.
+2. Написать скрипт батч-перевода 10 МБ комментариев через ollama на Mac mini
+   (`http://192.168.50.4:11434`) с постобработкой по словарю замен.
+3. Либо — скрипт на Claude API (Haiku) с кэшированным промптом, если нужно
+   чистовое качество без ручной вычитки.
+4. Удалить лишние скачанные модели (`ollama rm ...`, см. конец файла).
+5. Удалить этот файл из репозитория (`git rm OLLAMA_WOWHEAD_BENCHMARK.md`).
+
+**Важно:** Mac mini должен быть включён и в сети, чтобы дёргать ollama по LAN
+с Windows. IP `192.168.50.4` динамический — проверить актуальность или использовать
+`mac.local:11434`.
+
+---
+
+## Задача
+
+Перевод пользовательских комментариев к квестам с wowhead.com (EN → RU).
+Специфика текста: игровой жаргон (`mob`, `evade`, `wyrm`, `phase`, `pull`),
+аббревиатуры (`DK`, `HFP`, `IQD`, `TBC`, `WQ`, `CRZ`), опечатки, разговорный
+синтаксис, сарказм, BB-разметка ссылок (`[url=...]`, `[item=...]`).
+
+## Инфраструктура
+
+- Ollama v0.33.3 (Ollama.app), доступна по LAN: `http://192.168.50.4:11434`
+  (`OLLAMA_HOST=0.0.0.0:11434`, слушает все интерфейсы).
+- Ранее был конфликт двух демонов (brew v0.31.1 + Ollama.app v0.33.3) за порт
+  11434 — brew-версия удалена, остался один демон.
+- macOS Application Firewall выключен. IP динамический (DHCP от 192.168.50.1),
+  активный интерфейс `en1` (проводной). Для стабильного доступа — закрепить IP
+  или использовать `mac.local:11434`.
+- **Нет аутентификации** — API открыт всем в подсети `192.168.50.0/24`.
+
+## Системный промпт (одинаковый для всех моделей)
+
+```
+You translate World of Warcraft quest guide comments from English into Russian.
+Rules:
+- Keep proper nouns (NPC names, zones, items, spells, abbreviations like DK, HFP, TBC)
+  in English or use the official Russian WoW localization if you are certain of it;
+  never invent a translation.
+- Keep game jargon recognizable: mob=моб, quest=квест, phase=фаза,
+  evade=эвейд/сброс агро, to pull=пулить.
+- Preserve URLs, item links and numbers exactly.
+- Keep the informal, sometimes sarcastic tone.
+- Output ONLY the Russian translation, nothing else.
+```
+
+Параметры: `temperature=0.3`. Для qwen3 — `think=false`. Для 14b — `num_ctx=4096`
+(иначе не влезает в GPU и режется на CPU).
+
+## Тестовый материал
+
+4 реальных комментария с quest=12779 «The Black Knight's Fall» (Wowhead):
+
+**COMMENT 1:**
+> out of curiosity is the kil 200 scarlet soldiers a set amount or is it like 1 of the mobs that die in 3 hits?
+
+**COMMENT 2:**
+> it will be one of the new type of destroy everything quests, i cant remember what its called right now but blizzard has a name for it. look at the description: "Use this horn to call forth one of my wyrms. Climb upon its back and command it into battle. With it you will end the Scarlet Crusade" showing that you'll be using something other than your self TBCversion is kinda like the HFP bombings or IQD bombings.
+
+**COMMENT 3:**
+> On early beta you do not have to wait before enemy gets devoured completely, you can get near opponent hit 3 (and hope he wont 'evade' which uses to happen often) and fly high again, wyrm will continue on chewing it's snack in the air :)
+
+**COMMENT 4:**
+> Make sure you stock up on your [url=http://www.wowhead.com/?item=39327]Noth's Special Brew[/url] before turning in this quest! The phase system will 'relocate' Noth to the next portion of the DK starting quest chain.
+
+---
+
+## Скорость (Mac mini M4, 16 GB)
+
+| Модель | На диске | tok/s | GPU | Примечание |
+|---|---|---|---|---|
+| gemma4:e4b-mlx | 9.5 GB | **~55** | 100% | MLX-движок |
+| qwen2.5:7b-instruct | 4.7 GB | ~22 | 100% | сеть была занята pull'ами при замере |
+| qwen3:8b | 5.2 GB | ~19 | 100% | thinking выключен |
+| aya-expanse:8b | 5.1 GB | ~20 | 100% | |
+| qwen2.5:14b-instruct | 9.0 GB | **~11** | 100%* | *только с `num_ctx<=4096`; с 32k — 27% на CPU, ~172 с на первый ответ |
+
+## Полные результаты перевода
+
+### COMMENT 1 — тест на `Scarlet` и логику вопроса
+
+| Модель | Перевод |
+|---|---|
+| gemma4:e4b | Просто из любопытства, убийство 200 scarlet soldiers — это фиксированное количество, или это как 1 из мобов, которые умирают за 3 удара? |
+| qwen2.5:7b | Интересно, а кил 200 красных солдат — это фиксированное количество или как моб, который падает в три удара? |
+| qwen3:8b | из любопытства, это 200 солдат красной армии — это фиксированное количество или это как один из мобов, который падает за 3 удара? |
+| aya-expanse:8b | Это не определённое количество — каждый из 200 красных солдат может погибнуть за 3 удара. *(переврала: вопрос стал утверждением)* |
+| qwen2.5:14b | из чистого интереса, нужно убить 200 солдат Скарлетт или это какое-то фиксированное количество, или же это мобы, которых можно убить за 3 удара? *(сломала логику)* |
+
+### COMMENT 2 — тест на `Scarlet Crusade`, `wyrm`, `HFP/IQD`
+
+| Модель | Перевод |
+|---|---|
+| gemma4:e4b | Это будет один из новых типов квестов "уничтожить всё", я не помню, как он называется, но у Blizzard есть название. Посмотри на описание: "Используй этот рог, чтобы призвать одного из моих вирмов. Взобрайся на его спину и поведи его в битву. С ним ты **полотишь** конец **Алой Крестовой войне**", что показывает, что ты будешь использовать что-то, кроме себя. Версия TBC похожа на бомбардировки HFP или IQD. |
+| qwen2.5:7b | *(СОРВАЛАСЬ: выдала китайский текст с рассуждением о промпте «这个翻译超出了规定…», затем переписала)* …ты завершишь **Крестовый поход Скарлетт**… «Б**лizzard**» |
+| qwen3:8b | …но **блюззард** имеет своё имя… С его помощью ты завершишь **Скалистый Крест**. …**командуй его в бой**. |
+| aya-expanse:8b | …вызвать одного из моих **врымов**. **Посадитесь** на его спину и командуйте им в бою. С его помощью вы положите конец **Красному Кресту**. |
+| qwen2.5:14b | …вызвать одного из моих **вормов**. Восседайте на его спине и ведите в бой. С его помощью вы положите конец **Священной Крестовщины**. |
+
+**Ни одна модель не знает офиц. локализацию** (Scarlet Crusade = Алый орден / Алая длань).
+
+### COMMENT 3 — тест на `evade`, `wyrm`
+
+| Модель | Перевод |
+|---|---|
+| gemma4:e4b | На раннем бете вам не нужно ждать, пока враг будет полностью пожираем; можно подойти к противнику, нанести 3 удара (и надеяться, что он не «**эвейднет**», что случалось довольно часто) и снова взлететь. **Wyrm** продолжит жевать свой перекус в воздухе :) |
+| qwen2.5:7b | В раннем бета-тесте вам не нужно ждать, пока враг будет полностью съеден. Можно подойти к противнику, ударить его три раза (и надеяться, что он не "**эвейдит**", что случается часто), а затем снова взлететь высоко. **Змеище** продолжит жевать свою угощение в воздухе :)) |
+| qwen3:8b | На ранней бете не нужно ждать, пока враг полностью съеден, можно подойти на 3 хита и надеяться, что он не '**эвейдит**' (что часто случается), и снова взлететь, **вайрм** продолжит жевать свою еду в воздухе :) |
+| aya-expanse:8b | На ранней бете вам не нужно ждать, пока враг полностью съест свою добычу. Вы можете подлететь близко к противнику, нанести удар три раза (и надеяться, что он не **сбросит агро**, что часто происходит) и снова улететь в воздух, так как **врм** продолжит жевать свою добычу в воздухе. :) |
+| qwen2.5:14b | В раннем бете не нужно ждать, пока враг полностью не будет съеден, вы можете подойти к оппоненту, когда у него останется 3 очка *(ошибка: "hit 3" = нанести 3 удара, не "3 очка")* (и надеяться, что он не '**эвейдит**'…). **Вурм** продолжит жевать свою закуску в воздухе :)) |
+
+**aya-expanse** — единственная, кто понял смысл `evade` («сбросит агро»), а не транслитерировал.
+
+### COMMENT 4 — тест на разметку ссылки и имя предмета
+
+| Модель | Перевод |
+|---|---|
+| gemma4:e4b | Убедись, что ты запасаешь свой [url=…]Noth's Special Brew[/url] перед сдачей этого квеста! Система фаз "переместит" Noth к следующей части цепочки стартовых квестов DK. |
+| qwen2.5:7b | Убедитесь, что вы запаслись [url=…]Noth's Special Brew[/url] перед сдачей этого квеста! Система фаз переместит Noth на следующую часть стартового квеста DK. |
+| qwen3:8b | Убедитесь, что вы запаслись [url=…]Noth's Special Brew[/url], прежде чем сдать этот квест! Система фаз переместит **Нота** в следующую часть цепочки заданий DK. |
+| aya-expanse:8b | Перед сдачей этого квеста обязательно запаситесь [url=…]**Нетс Пивом Безсмысленным**[/url]! Система фаз переместит **Нета** в следующую часть квестовой цепи для **ДК**. |
+| qwen2.5:14b | Убедитесь, что вы запаслись [url=…]Noth's Special Brew[/url] перед сдачей этого квеста! **Фазовая система** перенесет Noth к следующей части цепочки начальных квестов для DK. |
+
+**aya-expanse** грубо сломала: перевела имя предмета в бред. Остальные — разметку сохранили.
+
+---
+
+## Итоговый рейтинг
+
+| Место | Модель | Балл | tok/s | Главная проблема |
+|---|---|---|---|---|
+| 🥇 | **gemma4:e4b-mlx** | 7/10 | ~55 | «Алая Крестовая война», HFP без пояснения; смесь «вирмов»/«Wyrm» |
+| 🥈 | **aya-expanse:8b** | 6.5/10 | ~20 | лучший в понимании смысла жаргона, но убила имя предмета → «Нетс Пивом Безсмысленным» |
+| 🥉 | qwen2.5:14b | 6/10 | ~11 | медленно, режется на CPU при полном контексте, прироста точности нет |
+| 4 | qwen3:8b | 5.5/10 | ~19 | худшая по терминологии («солдаты красной армии», «Скалистый Крест») |
+| 5 | qwen2.5:7b | 5/10 | ~22 | нестабильна — сорвалась в китайский текст с рассуждением о промпте |
+
+## Выводы
+
+1. **qwen2.5:14b не оправдалась на 16 GB.** Либо режется на CPU (медленно, ~11 tok/s),
+   либо жёстко ограничена по контексту. Прироста качества над 8B нет. Не тот случай,
+   когда «больше = лучше».
+2. **gemma4:e4b-mlx остаётся оптимальной** — уже установлена, работает на MLX (в 3–5 раз
+   быстрее GGUF-моделей), по качеству не уступает более крупным.
+3. **Главная проблема — не размер модели, а незнание игровой локализации.** Все модели
+   переводят `Scarlet Crusade`, `wyrm`, имена NPC/предметов наугад. Ни одна не знает
+   официальный русский перевод WoW.
+4. **Ни одна модель не даёт чистовой перевод.** Реалистичное качество: 5–7/10, обязательна
+   вычитка.
+
+## Рекомендации
+
+1. **Модель:** `gemma4:e4b-mlx`. Как «второе мнение» на сложных саркастичных комментариях —
+   `aya-expanse:8b`.
+2. **Глоссарий в системный промпт.** Ключевые термины с офиц. переводом:
+   `Scarlet Crusade → Алый орден`, `wyrm → змей`, `phase → фаза`, `DK → Рыцарь смерти`,
+   `mob → моб`, `pull → пулить`, `aggro → агро`, `to tag → застолбить`, и т.д.
+   Даёт +1–1.5 балла любой модели.
+3. **Постобработка скриптом:** словарь замен (`sed`/`awk`) по известным терминам и именам
+   после перевода — вычищает то, что модель переврала.
+4. **Батчинг:** по 1–3 комментария за запрос. Маленькие модели «съезжают» на длинном
+   контексте (глотают куски, меняют язык).
+5. **Объём 10 МБ** (~2.5 млн вх. токенов, ~4 млн вых.): на gemma4:e4b (~55 tok/s) —
+   примерно 20 часов генерации в один поток. Реально, но с обязательной вычиткой
+   и постобработкой по глоссарию. Альтернатива для чистового качества — Claude Haiku
+   через API с кэшированным системным промптом (~$15 за прогон).
+
+## Скрипт прогона (для воспроизведения)
+
+`run.py`:
+
+```python
+import json, sys, urllib.request, time
+
+HOST = "http://192.168.50.4:11434"
+sysmsg = open("sys.txt").read()
+
+comments = [
+    "out of curiosity is the kil 200 scarlet soldiers a set amount or is it like 1 of the mobs that die in 3 hits?",
+    'it will be one of the new type of destroy everything quests, i cant remember what its called right now but blizzard has a name for it. look at the description:  "Use this horn to call forth one of my wyrms. Climb upon its back and command it into battle. With it you will end the Scarlet Crusade"  showing that you\'ll be using something other than your self   TBCversion is kinda like the HFP bombings or IQD bombings.',
+    "On early beta you do not have to wait before enemy gets devoured completely, you can get near opponent hit 3 (and hope he wont 'evade' which uses to happen often) and fly high again, wyrm will continue on chewing it's snack in the air :)",
+    "Make sure you stock up on your [url=http://www.wowhead.com/?item=39327]Noth's Special Brew[/url] before turning in this quest! The phase system will 'relocate' Noth to the next portion of the DK starting quest chain.",
+]
+
+model = sys.argv[1]
+for i, c in enumerate(comments, 1):
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sysmsg},
+            {"role": "user", "content": c},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.3, "num_ctx": 4096},
+    }
+    if "qwen3" in model:
+        payload["think"] = False
+    t0 = time.time()
+    req = urllib.request.Request(f"{HOST}/api/chat", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    d = json.load(urllib.request.urlopen(req, timeout=300))
+    dt = time.time() - t0
+    tc, td = d.get("eval_count", 0), d.get("eval_duration", 1)
+    print(f"\n[{model}] COMMENT {i}  ({dt:.1f}s, {tc/(td/1e9):.0f} tok/s)")
+    print("RU:", d["message"]["content"].strip())
+```
+
+Запуск: `python3 run.py gemma4:e4b-mlx`
+
+## Скачанные для теста модели (можно удалить)
+
+```
+ollama rm qwen2.5:7b-instruct qwen3:8b aya-expanse:8b qwen2.5:14b-instruct
+```
+Освободит ~24 GB. `gemma4:e4b-mlx` оставить.

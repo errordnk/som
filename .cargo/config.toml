@@ -1,0 +1,26 @@
+# FFmpeg for the `ffmpeg-next` / `ffmpeg-sys-next` crates (used by
+# `crates/terminal` and `crates/somcat`) is provided by a local vcpkg
+# tree, probed at build time by the `vcpkg` crate. That probe needs
+# `VCPKG_ROOT` pointing at a tree that contains:
+#   - a `.vcpkg-root` marker file,
+#   - `installed/vcpkg/status` + one `installed/vcpkg/info/<pkg>.list`
+#     per installed package (see `scripts/fix-vcpkg-manifests.py` if a
+#     cleanup ever prunes those `.list` files — a single missing one
+#     makes the whole probe bail out and the build fall through to
+#     pkg-config, which is absent on Windows).
+#
+# This `[env]` block sets `VCPKG_ROOT` for every `cargo` invocation in
+# this workspace so no per-shell `export`/`setx` is required. `setx`
+# also sets it machine-wide (for build steps that run outside cargo);
+# this file is the belt-and-suspenders copy that travels with the repo.
+#
+# `force = false`: an explicit `VCPKG_ROOT` in the environment still
+# wins, so a machine with vcpkg elsewhere can override without editing
+# this file.
+#
+# On macOS/Linux this variable is inert: `ffmpeg-sys-next` only probes
+# vcpkg under `target_env = "msvc"` and otherwise uses system
+# pkg-config (Homebrew / apt), so the Windows path here is simply
+# ignored there.
+[env]
+VCPKG_ROOT = { value = "C:/home/dnk/vcpkg-root", force = false }

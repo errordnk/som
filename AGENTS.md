@@ -102,6 +102,29 @@ assets          — bundled fonts, icons
 cargo check -p som 2>&1 | tail -20
 ```
 
+## FFmpeg / vcpkg (Windows)
+
+`crates/terminal` and `crates/somcat` link FFmpeg via `ffmpeg-next` /
+`ffmpeg-sys-next`, which on Windows (MSVC) probe a local **vcpkg** tree.
+
+- The tree lives at `C:\home\dnk\vcpkg-root` (permanent — **not** under
+  `%TEMP%`, which Storage Sense wipes).
+- `VCPKG_ROOT` is set two ways: a `User` env var (`setx`) **and**
+  `.cargo/config.toml`'s `[env]` block (checked in), so no per-shell
+  `export` is needed.
+- If a build fails with *"Could not open port manifest file
+  `…\installed\vcpkg\info\<pkg>.list`"*, some `.list` manifests were
+  pruned. The `vcpkg` crate bails on the first missing one and the
+  build then falls through to pkg-config (absent on Windows) and fails
+  with a misleading *"FFmpeg not found"*. Fix:
+  ```bash
+  python scripts/fix-vcpkg-manifests.py
+  ```
+  It writes stub manifests for every installed package that lacks one
+  (they're all vcpkg host build-tools that install no triplet files).
+- macOS/Linux ignore all of the above — `ffmpeg-sys-next` only probes
+  vcpkg under MSVC and otherwise uses system pkg-config (brew / apt).
+
 ## Typical investigation pattern
 
 To check if a crate is in som's production dependency tree:

@@ -12,7 +12,7 @@ use crate::html::html_minifier::{Minifier, MinifierOptions};
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct ParsedHtmlBlock {
+pub(crate) struct ParsedHtmlBlock {
     pub source_range: Range<usize>,
     pub children: Vec<ParsedHtmlElement>,
 }

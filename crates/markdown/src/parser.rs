@@ -34,14 +34,17 @@ struct ParseState {
 pub struct ParsedMarkdownData {
     pub events: Vec<(Range<usize>, MarkdownEvent)>,
     pub root_block_starts: Vec<usize>,
-    pub html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
-    pub metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
+    // `html_blocks` / `metadata_blocks` and the types they hold are
+    // crate-internal — only `events` is consumed from outside the crate
+    // (see `terminal_view::markdown_styling`).
+    pub(crate) html_blocks: BTreeMap<usize, html::html_parser::ParsedHtmlBlock>,
+    pub(crate) metadata_blocks: BTreeMap<usize, ParsedMetadataBlock>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ParsedMetadataBlock {
+pub(crate) struct ParsedMetadataBlock {
     pub content_range: Range<usize>,
     pub rows: Option<Vec<MetadataRow>>,
 }

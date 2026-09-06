@@ -849,9 +849,13 @@ fn add_dll_search_directory(dir: &std::path::Path, label: &str) {
 fn load_embedded_fonts(cx: &App) {
     let asset_source = cx.asset_source();
     let mut fonts = Vec::new();
-    for name in &["fonts/FiraCodeNerdFont-Regular.ttf"] {
-        if let Some(bytes) = asset_source.load(name).ok().flatten() {
-            fonts.push(bytes);
+    // Bundled fonts are stored zstd-compressed (see `crates/assets/src/assets.rs`).
+    for name in &["fonts/FiraCodeNerdFont-Regular.ttf.zst"] {
+        if let Some(compressed) = asset_source.load(name).ok().flatten() {
+            match assets::decompress_zst(&compressed) {
+                Ok(bytes) => fonts.push(std::borrow::Cow::Owned(bytes)),
+                Err(error) => log::warn!("Failed to decompress bundled font {name}: {error}"),
+            }
         }
     }
     if !fonts.is_empty() {

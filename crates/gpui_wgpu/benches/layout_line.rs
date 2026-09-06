@@ -3,7 +3,10 @@ use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
 use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
-const FIRACODE_NERD_FONT: &[u8] = include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
+// The bundled font is stored zstd-compressed (see `crates/assets/src/assets.rs`);
+// decompress it once at bench startup.
+const FIRACODE_NERD_FONT_ZST: &[u8] =
+    include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf.zst");
 
 // ~4 000 chars of typical ASCII code text.
 fn code_text() -> String {
@@ -43,8 +46,10 @@ fn bench_layout_line(c: &mut Criterion) {
     // "Segoe UI" — used below purely as a second, distinct fallback font to
     // measure fallback-chain overhead against — resolves to a real font
     // without needing its own bundled asset.
+    let firacode = zstd::stream::decode_all(FIRACODE_NERD_FONT_ZST).unwrap();
+
     let system = CosmicTextSystem::new("FiraCode Nerd Font");
-    system.add_fonts(vec![Cow::Borrowed(FIRACODE_NERD_FONT)]).unwrap();
+    system.add_fonts(vec![Cow::Owned(firacode)]).unwrap();
 
     let font_id_no_fallback = system.font_id(&font("FiraCode Nerd Font")).unwrap();
 

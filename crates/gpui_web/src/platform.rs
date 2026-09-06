@@ -20,8 +20,10 @@ use std::{
 };
 use wasm_bindgen::prelude::*;
 
-static BUNDLED_FONTS: &[&[u8]] = &[include_bytes!(
-    "../../../assets/fonts/FiraCodeNerdFont-Regular.ttf"
+// Bundled fonts are stored zstd-compressed (see `crates/assets/src/assets.rs`);
+// decompressed once at platform startup.
+static BUNDLED_FONTS_ZST: &[&[u8]] = &[include_bytes!(
+    "../../../assets/fonts/FiraCodeNerdFont-Regular.ttf.zst"
 )];
 
 pub struct WebPlatform {
@@ -63,9 +65,15 @@ impl WebPlatform {
         let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
             "FiraCode Nerd Font",
         ));
-        let fonts = BUNDLED_FONTS
+        let fonts = BUNDLED_FONTS_ZST
             .iter()
-            .map(|bytes| Cow::Borrowed(*bytes))
+            .filter_map(|compressed| match zstd::stream::decode_all(*compressed) {
+                Ok(bytes) => Some(Cow::Owned(bytes)),
+                Err(error) => {
+                    log::error!("failed to decompress bundled font: {error:#}");
+                    None
+                }
+            })
             .collect();
         if let Err(error) = text_system.add_fonts(fonts) {
             log::error!("failed to load bundled fonts: {error:#}");

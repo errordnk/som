@@ -251,10 +251,14 @@ impl SvgRenderer {
 }
 
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
-    let font_paths = ["fonts/FiraCodeNerdFont-Regular.ttf"];
+    // Bundled fonts are stored zstd-compressed (see `crates/assets/src/assets.rs`).
+    let font_paths = ["fonts/FiraCodeNerdFont-Regular.ttf.zst"];
     for path in font_paths {
         match asset_source.load(path) {
-            Ok(Some(data)) => db.load_font_data(data.into_owned()),
+            Ok(Some(compressed)) => match zstd::stream::decode_all(compressed.as_ref()) {
+                Ok(data) => db.load_font_data(data),
+                Err(error) => log::warn!("Failed to decompress bundled font {path}: {error}"),
+            },
             Ok(None) => log::warn!("Bundled font not found: {path}"),
             Err(error) => log::warn!("Failed to load bundled font {path}: {error}"),
         }
@@ -299,12 +303,12 @@ mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};
 
-    const FIRACODE_NERD_FONT_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
+    const FIRACODE_NERD_FONT_REGULAR_ZST: &[u8] =
+        include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf.zst");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
-        db.load_font_data(FIRACODE_NERD_FONT_REGULAR.to_vec());
+        db.load_font_data(zstd::stream::decode_all(FIRACODE_NERD_FONT_REGULAR_ZST).unwrap());
         db
     }
 

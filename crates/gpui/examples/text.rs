@@ -354,14 +354,12 @@ fn run_example() {
             items: vec![],
         }]);
 
-        let fonts = [include_bytes!(
-            "../../../assets/fonts/FiraCodeNerdFont-Regular.ttf"
-        )]
-        .iter()
-        .map(|b| Cow::Borrowed(&b[..]))
-        .collect();
+        // Bundled font is stored zstd-compressed (see `crates/assets/src/assets.rs`).
+        const FIRACODE_ZST: &[u8] =
+            include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf.zst");
+        let firacode = zstd::stream::decode_all(FIRACODE_ZST).unwrap();
 
-        _ = cx.text_system().add_fonts(fonts);
+        _ = cx.text_system().add_fonts(vec![Cow::Owned(firacode)]);
 
         cx.init_colors();
         cx.set_global(GlobalTextContext(Arc::new(TextContext::default())));

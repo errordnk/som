@@ -2993,6 +2993,7 @@ dependencies = [
  "windows 0.61.3",
  "zed-font-kit",
  "zed-scap",
+ "zstd",
 ]
 
 [[package]]
@@ -3160,6 +3161,7 @@ dependencies = [
  "wasm_thread",
  "web-sys",
  "web-time",
+ "zstd",
 ]
 
 [[package]]
@@ -3189,6 +3191,7 @@ dependencies = [
  "web-sys",
  "wgpu",
  "zed-font-kit",
+ "zstd",
 ]
 
 [[package]]

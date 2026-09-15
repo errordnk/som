@@ -25,7 +25,7 @@
 # own `mac` SSH profile).
 set -euo pipefail
 
-MAC_HOST=192.168.50.6
+MAC_HOST=192.168.50.4
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ASSETS_SRV_DIR="$REPO_ROOT/assets/srv"
 

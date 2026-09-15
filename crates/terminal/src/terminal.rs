@@ -739,7 +739,7 @@ impl TerminalBuilder {
             });
 
             //And connect them together
-            let event_loop = EventLoop::new(
+            let mut event_loop = EventLoop::new(
                 term.clone(),
                 ZedListener(events_tx),
                 pty,
@@ -753,6 +753,18 @@ impl TerminalBuilder {
             // one extra blank line per newline. See `EventLoop::collapse_
             // cr_cr_lf` and `is_tmux_relay_shell`.
             .collapse_cr_cr_lf(is_tmux_relay_shell);
+
+            // TEMP DIAG (2026-09-15): raw PTY-byte capture for the
+            // phantom-screen-mush-after-backspace investigation — compare
+            // this against Zed's own raw byte stream for the identical
+            // action to determine whether Som receives a different byte
+            // stream than Zed, or the same stream rendered differently.
+            // DO NOT SHIP.
+            if let Ok(path) = std::env::var("SOM_RAW_PTY_LOG") {
+                if let Ok(file) = std::fs::File::create(&path) {
+                    event_loop = event_loop.with_raw_byte_sink(Box::new(file));
+                }
+            }
 
             let pty_tx = event_loop.channel();
             let _io_thread = event_loop.spawn(); // DANGER
@@ -866,7 +878,6 @@ impl TerminalBuilder {
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
-                log::trace!("DIAGLOOP: events_rx yielded an event, entering process+drain cycle");
                 terminal.update(cx, |terminal, cx| {
                     //Process the first event immediately for lowered latency
                     terminal.process_event(event, cx);
@@ -896,11 +907,9 @@ impl TerminalBuilder {
                                     }
 
                                     if events.len() > 100 {
-                                        log::trace!("DIAGLOOP: drain loop hit the 100-event cap, breaking early");
                                         break;
                                     }
                                 } else {
-                                    log::trace!("DIAGLOOP: events_rx closed (child exited?)");
                                     break;
                                 }
                             },
@@ -908,12 +917,10 @@ impl TerminalBuilder {
                     }
 
                     if events.is_empty() && !wakeup {
-                        log::trace!("DIAGLOOP: drain cycle empty, yielding and breaking 'outer (back to waiting on events_rx.next())");
                         yield_now().await;
                         break 'outer;
                     }
 
-                    log::trace!("DIAGLOOP: draining {} events (wakeup={wakeup})", events.len());
                     terminal.update(cx, |this, cx| {
                         if wakeup {
                             this.process_event(AlacTermEvent::Wakeup, cx);
@@ -1490,6 +1497,29 @@ impl Terminal {
 
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
                     info.emit_title_changed_if_changed(cx);
+                }
+
+                // A plain `cx.emit(Event::Wakeup)` only marks the window
+                // dirty for whatever repaint the platform decides to run
+                // next on its own — it doesn't itself force one. Under a
+                // fast, sustained burst of PTY output (e.g. holding
+                // backspace, which re-sends the whole erase sequence on
+                // every OS key-repeat tick) this drain loop can keep
+                // finding more events waiting every time it comes back
+                // around (see `subscribe`'s `'outer` loop), so the
+                // platform's own repaint scheduler never gets a gap to
+                // actually run until the burst stops — at which point the
+                // LAST notify sits pending until some unrelated event
+                // (e.g. the next keypress) finally triggers a real
+                // `draw()+present()`. This is the exact same class of bug
+                // `rich_content_force_redraw_due`/`force_redraw_windows`
+                // was added for (see that method's doc comment) — reuse
+                // the same throttle budget here so plain terminal output
+                // gets the same guarantee without adding a second,
+                // independent forced-redraw budget that could double the
+                // effective rate when both fire close together.
+                if self.rich_content_force_redraw_due() {
+                    cx.force_redraw_windows();
                 }
             }
             AlacTermEvent::ColorRequest(index, format) => {

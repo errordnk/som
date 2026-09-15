@@ -137,27 +137,31 @@ impl TerminalPanel {
                             .background_spawn(async move { ensure_remote_binary_deployed(&host_args, remote_kind) })
                             .await;
                         if let Err(err) = deploy_result {
-                            log::warn!("remote som-srv deploy check failed, proceeding with whatever is already there: {err:#}");
-                            // Best-effort: this profile's tab still gets
-                            // created below with whatever binary is already on
-                            // the remote host (which might work fine, or might
-                            // not — but silently trying anyway beats refusing
-                            // to open the tab at all). The banner is purely
-                            // informational — a real deploy failure (e.g. the
-                            // scp/kill retries in `ensure_remote_binary_
-                            // deployed` both failing) is exactly the kind of
-                            // "housekeeping went wrong, but you should know"
-                            // case a banner exists for, rather than a silent
-                            // log line the user has no way to notice.
+                            log::warn!("remote som-srv deploy check failed: {err:#}");
+                            // A failed deploy check is FATAL, not best-
+                            // effort — stopping right here, rather than
+                            // forging ahead into `tmux_wrapped_shell`/
+                            // spawning a shell command that (with no
+                            // `som-srv` binary reachable on the remote
+                            // host) is guaranteed to immediately fail too,
+                            // is the actual fix for a real, reported UX
+                            // problem: continuing anyway used to produce a
+                            // SECOND, much less specific "terminal tab
+                            // exited immediately (code 127)" notification
+                            // on top of this one, for the same underlying
+                            // cause — two overlapping technical messages
+                            // read as confusing noise, not two separate
+                            // facts (2026-09-15). The tab stays in place
+                            // (empty placeholder) and the explanation
+                            // surfaces as a `Tab`-scoped toast — see
+                            // `show_som_srv_error`'s own doc comment.
+                            let message = human_readable_deploy_error(&profile.name, &err);
                             workspace
                                 .update(cx, |workspace, cx| {
-                                    show_som_srv_error(
-                                        workspace,
-                                        format!("som-srv deploy check failed for this profile\n{err:#}"),
-                                        cx,
-                                    );
+                                    show_som_srv_error(workspace, placeholder_item_id, message, cx);
                                 })
                                 .ok();
+                            return anyhow::Ok(());
                         }
                     }
 
@@ -165,22 +169,12 @@ impl TerminalPanel {
                         Ok(pair) => pair,
                         Err(err) => {
                             log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
+                            // Same "stop at the first fatal error" shape as
+                            // the deploy-check failure above.
+                            let message = format!("Failed to set up tmux profile {:?}: {err:#}", profile.name);
                             workspace
-                                .update_in(cx, |workspace, window, cx| {
-                                    show_som_srv_error(
-                                        workspace,
-                                        format!("Failed to set up tmux profile {:?}\n{err:#}", profile.name),
-                                        cx,
-                                    );
-                                    // The placeholder tab inserted synchronously
-                                    // above never gets a real terminal now — close
-                                    // it rather than leaving an empty, permanently
-                                    // stuck tab behind.
-                                    if let Some(main_pane) = workspace.panes().first().cloned() {
-                                        main_pane.update(cx, |pane, cx| {
-                                            pane.remove_item(placeholder_item_id, true, true, window, cx);
-                                        });
-                                    }
+                                .update(cx, |workspace, cx| {
+                                    show_som_srv_error(workspace, placeholder_item_id, message, cx);
                                 })
                                 .ok();
                             return anyhow::Ok(());
@@ -232,17 +226,24 @@ impl TerminalPanel {
     /// to the default profile, which would be confusing (pressing "9" and
     /// getting profile 1 with no indication why).
     fn show_missing_profile_error(workspace: &mut Workspace, idx: usize, cx: &mut Context<Workspace>) {
-        use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
+        use workspace::notifications::{
+            NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
+        };
         let tab_count = cx.try_global::<TabProfiles>().map(|p| p.0.len()).unwrap_or(0);
         let msg = format!(
             "Som: no profile #{idx} in settings.json's \"tabs\" — only {tab_count} profile(s) configured."
         );
         let id = NotificationId::Named(format!("som-missing-profile-{idx}").into());
-        workspace.show_notification(id, cx, move |cx| {
+        // Global (no tab exists to scope this to — the keybinding didn't
+        // open one) + Warning (a missed keybinding, not a broken
+        // application — doesn't get the window-border treatment reserved
+        // for Global+Error).
+        workspace.show_scoped_notification(id, NotificationScope::Global, NotificationSeverity::Warning, cx, move |cx| {
             let msg2 = msg.clone();
             let msg3 = msg.clone();
             cx.new(|cx| {
                 MessageNotification::new(msg2, cx)
+                    .severity(NotificationSeverity::Warning)
                     .primary_message("Copy")
                     .primary_on_click(move |_window, cx| {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg3.clone()));
@@ -469,7 +470,7 @@ impl TerminalPanel {
             // longer exists in settings.json is skipped here exactly like
             // Phase 1 already skipped it (same fallible lookup, same
             // "don't guess" reasoning) — no placeholder, no later fill-in.
-            let placeholders: Vec<(usize, workspace::som_db::SomDbTab, gpui::EntityId)> = window_handle
+            let placeholders: Vec<(usize, workspace::som_db::SomDbTab, Entity<PendingTerminalTab>)> = window_handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
                         let placeholders: Vec<_> = db_state
@@ -481,7 +482,7 @@ impl TerminalPanel {
                                 let placeholder = cx.new(|cx| {
                                     PendingTerminalTab::new(Some(profile.name.clone()), profile.icon.clone(), cx)
                                 });
-                                let item_id = placeholder.entity_id();
+                                let placeholder_for_list = placeholder.clone();
                                 workspace.add_item_to_main_pane_at(
                                     Box::new(placeholder),
                                     Some(tab.profile_index),
@@ -489,7 +490,7 @@ impl TerminalPanel {
                                     window,
                                     cx,
                                 );
-                                Some((db_index, tab.clone(), item_id))
+                                Some((db_index, tab.clone(), placeholder_for_list))
                             })
                             .collect();
 
@@ -547,7 +548,8 @@ impl TerminalPanel {
             // named`) whenever it happens to be ready, regardless of
             // whether a slower tab elsewhere is still connecting.
             let mut tab_creations = Vec::with_capacity(placeholders.len());
-            for (db_index, tab, placeholder_item_id) in placeholders {
+            for (db_index, tab, placeholder) in placeholders {
+                let placeholder_item_id = placeholder.entity_id();
                 let Some(profile) = window_handle
                     .update(cx, |_, _, cx| {
                         workspace::TabProfiles::profile_at(tab.profile_index, cx)
@@ -635,28 +637,23 @@ impl TerminalPanel {
                                 })
                                 .await;
                             if let Err(err) = deploy_result {
-                                log::warn!(
-                                    "remote som-srv deploy check failed on restore, proceeding with whatever is already there: {err:#}"
-                                );
-                                // See the identical banner in `new_terminal`
-                                // for why this is worth surfacing, not just
-                                // logging — a restore-time deploy failure
-                                // is just as invisible to the user
-                                // otherwise.
+                                log::warn!("remote som-srv deploy check failed on restore: {err:#}");
+                                // Same "stop at the first fatal error,
+                                // show it as a Tab-scoped toast instead of
+                                // forging ahead into a doomed shell spawn"
+                                // shape as `new_terminal`'s identical
+                                // check — see `show_som_srv_error`'s own
+                                // doc comment for the full rationale
+                                // (2026-09-15).
+                                let message = human_readable_deploy_error(&profile.name, &err);
                                 window_handle
                                     .update(cx, |_, _, cx| {
                                         workspace.update(cx, |workspace, cx| {
-                                            show_som_srv_error(
-                                                workspace,
-                                                format!(
-                                                    "som-srv deploy check failed for profile {:?}\n{err:#}",
-                                                    profile.name
-                                                ),
-                                                cx,
-                                            );
+                                            show_som_srv_error(workspace, placeholder_item_id, message, cx);
                                         })
                                     })
                                     .ok();
+                                return anyhow::Ok(placeholder_item_id);
                             }
                         }
 
@@ -666,7 +663,21 @@ impl TerminalPanel {
                                 (settings.cursor_shape, settings.max_scroll_history_lines, approximate_cell_pixel_size(settings))
                             })
                             .unwrap_or((CursorShape::default(), None, None));
-                        let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size)?;
+                        let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size) {
+                            Ok(pair) => pair,
+                            Err(err) => {
+                                log::error!("failed to set up tmux profile {:?} on restore: {err:#}", profile.name);
+                                let message = format!("Failed to set up tmux profile {:?}: {err:#}", profile.name);
+                                window_handle
+                                    .update(cx, |_, _, cx| {
+                                        workspace.update(cx, |workspace, cx| {
+                                            show_som_srv_error(workspace, placeholder_item_id, message, cx);
+                                        })
+                                    })
+                                    .ok();
+                                return anyhow::Ok(placeholder_item_id);
+                            }
+                        };
                         let created = window_handle.update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
                                 let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
@@ -1152,6 +1163,19 @@ fn tmux_wrapped_shell(
         }
         kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
             let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback, kind);
+            // Same MSYS-vs-real-OpenSSH `PATH` ambiguity as `run_remote_
+            // command`/`scp_to_remote` — see `windows_openssh_binary`'s
+            // own doc comment. This is the interactive PTY process
+            // itself (not a one-shot probe/scp), so it matters just as
+            // much here: an `ssh` resolved to Git for Windows' MSYS copy
+            // would rewrite the remote-side `som-srv` invocation's own
+            // POSIX-looking arguments the exact same way it rewrote the
+            // deploy check's `chmod` path, before this fix.
+            let program = if matches!(kind, RemoteKind::Ssh) {
+                windows_openssh_binary(&program).to_string_lossy().into_owned()
+            } else {
+                program
+            };
             Ok((program, wrapped_args))
         }
     }
@@ -1510,25 +1534,63 @@ fn orphaned_pane_ids<'a>(sessions: &'a [som_srv::protocol::SessionInfo], live_pa
         .collect()
 }
 
-/// Shows a dismissible banner for a som-srv deploy/setup failure — same
-/// notification shape as `som_config.rs`'s `SomConfig::show_parse_error`
-/// (a plain `MessageNotification` with a "Copy" button for the full error
-/// text), reused here so ALL of Som's own user-facing error banners look
-/// and behave the same way, not just settings.json parse errors. Unlike
-/// `show_parse_error`, this doesn't need to search `cx.windows()` for a
-/// `Workspace` — every caller already has a `WeakEntity<Workspace>` in
-/// hand (the tab/restore context the failure happened in), so it takes
-/// one directly instead.
-fn show_som_srv_error(workspace: &mut Workspace, message: String, cx: &mut Context<Workspace>) {
-    use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
+/// Shows a `som-srv` deploy/setup failure as a toast, bottom-right,
+/// scoped to ONE tab — visible only while `tab_item_id` is the active
+/// item, disappearing/reappearing as the user switches away from/back to
+/// the broken tab, with a "Copy" button (full technical detail) and a
+/// close (×) button, same shape as every other `MessageNotification` in
+/// Som — NOT rendered as text baked into the tab's own body (an earlier
+/// version of this fix did that; explicitly corrected per user feedback,
+/// 2026-09-15: "все ошибки должны быть тостерами... с закрытием тостера
+/// через крестик"). A `NotificationId` unique per tab so two different
+/// broken profiles' errors don't clobber each other. See
+/// `workspace::notifications::NotificationScope`'s own doc comment for
+/// the full scoping rationale.
+/// Turns `ensure_remote_binary_deployed`'s `anyhow::Error` chain (raw
+/// `ssh`/`scp`/`chmod` process output — e.g. `ssh exited with Some(1):
+/// chmod: cannot access '...': No such file or directory`) into one
+/// plain-language sentence a non-Rust-developer user can actually act
+/// on, instead of surfacing that technical chain verbatim. Pattern-
+/// matches on the handful of failure shapes `ensure_remote_binary_
+/// deployed`/`scp_to_remote`/`run_remote_command` actually produce
+/// (confirmed by reading those functions directly, not guessed) rather
+/// than attempting to cover every conceivable `ssh`/`scp` failure —
+/// falls back to a generic "couldn't reach/set up the server" sentence
+/// (with the raw detail still available via the notification's own
+/// "Copy" button) for anything that doesn't match a known shape, so an
+/// unrecognized error is never silently swallowed, just less specifically
+/// worded.
+fn human_readable_deploy_error(profile_name: &str, err: &anyhow::Error) -> String {
+    let detail = format!("{err:#}");
+    let reason = if detail.contains("No such file or directory") {
+        "the som-srv program wasn't found on the server after copying it there"
+    } else if detail.contains("Permission denied") {
+        "the server refused permission while setting up som-srv"
+    } else if detail.contains("no embedded som-srv binary for") {
+        "Som doesn't have a som-srv build for that server's platform"
+    } else if detail.contains("failed to spawn") {
+        "couldn't even start ssh/scp — check that they're installed and on your PATH"
+    } else if detail.contains("scp exited with") {
+        "copying som-srv to the server failed"
+    } else {
+        "couldn't reach or set up the server"
+    };
+    format!("Couldn't set up the \"{profile_name}\" tab: {reason}.\n\nDetails:\n{detail}")
+}
+
+fn show_som_srv_error(workspace: &mut Workspace, tab_item_id: gpui::EntityId, message: String, cx: &mut Context<Workspace>) {
+    use workspace::notifications::{
+        NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
+    };
 
     let message = format!("Som: {message}");
-    let id = NotificationId::Named("som-srv-deploy-error".into());
-    workspace.show_notification(id, cx, move |cx| {
+    let id = NotificationId::Named(format!("som-srv-deploy-error-{}", tab_item_id.as_u64()).into());
+    workspace.show_scoped_notification(id, NotificationScope::Tab(tab_item_id), NotificationSeverity::Error, cx, move |cx| {
         let message2 = message.clone();
         let message3 = message.clone();
         cx.new(|cx| {
             MessageNotification::new(message2, cx)
+                .severity(NotificationSeverity::Error)
                 .primary_message("Copy")
                 .primary_on_click(move |_window, cx| {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(message3.clone()));
@@ -1574,15 +1636,66 @@ fn show_som_srv_error(workspace: &mut Workspace, message: String, cx: &mut Conte
 /// disruptive by nature here; the alternative, a remote compile, was both
 /// slower AND already had its own ETXTBSY-shaped failure mode against a
 /// live HOLDER — see `project_bugs` memory).
+/// Per-host mutexes so two tabs pointed at the SAME remote host never run
+/// `ensure_remote_binary_deployed` concurrently — each entry is keyed on
+/// `host_args.join(" ")` (the exact `ssh`/`wsl` argv, e.g. `"usa"`), so
+/// different hosts still deploy fully in parallel. Without this, two tabs
+/// restored from `db.json` for the same host (or a new tab opened while
+/// another to the same host is still connecting) both independently see
+/// "version mismatch", both kill the remote's `som-srv` processes, and
+/// both `scp` the new binary to the SAME destination path AT THE SAME
+/// TIME — `scp` is not atomic against a concurrent second `scp` to the
+/// same destination, so this could in principle corrupt the resulting
+/// file, and even when it doesn't, it needlessly doubles the wall-clock
+/// cost of every affected tab's open (confirmed live: two `usa` tabs
+/// open together both logged their own "redeploying" and "killing N
+/// som-srv process(es)" lines seconds apart, race-restarting each
+/// other's redeploy). A plain `Mutex` (not `RwLock`) is correct here —
+/// every caller needs EXCLUSIVE access for the whole deploy-check-then-
+/// maybe-redeploy sequence, there's no read-only variant of this
+/// function to share.
+static DEPLOY_LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
+    std::sync::Mutex::new(None);
+
+fn deploy_lock_for_host(host_args: &[String]) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let key = host_args.join(" ");
+    let mut locks = DEPLOY_LOCKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<()> {
+    // Held for this entire function's body (see `deploy_lock_for_host`'s
+    // doc comment) — a second concurrent call for the SAME host blocks
+    // here until the first one finishes, then re-runs its OWN version
+    // probe and almost certainly finds the first call already brought the
+    // host up to date, so it returns immediately via the early `Ok(())`
+    // below instead of redeploying a second time.
+    let host_lock = deploy_lock_for_host(host_args);
+    let _guard = host_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let local_version = som_srv::protocol::HandshakeInfo::current().version;
 
     let version_probe = wrap_remote_probe_args(host_args, "~/.local/bin/som-srv", &["--version"]);
-    let remote_info = run_remote_command(remote_kind, &version_probe)
+    log::debug!("deploy-check: probing remote version for {host_args:?} via {version_probe:?}");
+    let version_probe_output = run_remote_command(remote_kind, &version_probe);
+    log::debug!("deploy-check: version probe raw result for {host_args:?}: {version_probe_output:?}");
+    let remote_info = version_probe_output
         .ok()
-        .and_then(|output| serde_json::from_str::<som_srv::protocol::HandshakeInfo>(output.trim()).ok());
+        .and_then(|output| {
+            let parsed = serde_json::from_str::<som_srv::protocol::HandshakeInfo>(output.trim());
+            if let Err(err) = &parsed {
+                log::debug!("deploy-check: failed to parse version probe output {output:?} for {host_args:?}: {err:#}");
+            }
+            parsed.ok()
+        });
+    log::debug!("deploy-check: parsed remote_info for {host_args:?}: {remote_info:?}");
 
     if remote_info.as_ref().map(|info| info.version.as_str()) == Some(local_version.as_str()) {
+        log::debug!("deploy-check: {host_args:?} already up to date at version {local_version:?}, skipping redeploy");
         return Ok(()); // already up to date, nothing to do
     }
 
@@ -1621,11 +1734,13 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
         Some(info) => (info.os, info.arch),
         None => uname_platform(host_args, remote_kind)?,
     };
+    log::debug!("deploy-check: {host_args:?} resolved platform os={os:?} arch={arch:?}");
     let Some(local_binary) = ensure_embedded_binary_available(os, arch, &local_version) else {
         anyhow::bail!(
             "no embedded som-srv binary for {os:?}/{arch:?} — unsupported platform, falling back to plain (non-tmux) behavior"
         );
     };
+    log::debug!("deploy-check: {host_args:?} using local binary at {local_binary:?}");
 
     // Kill every som-srv process (RELAY and HOLDER alike) this account
     // owns on this host BEFORE overwriting the binary file in place — see
@@ -1647,8 +1762,11 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     const KILL_AND_SCP_ATTEMPTS: u32 = 2;
     let mut last_scp_err = None;
     for attempt in 1..=KILL_AND_SCP_ATTEMPTS {
+        log::debug!("deploy-check: {host_args:?} kill+scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} starting");
         kill_all_holders_for_redeploy(host_args, remote_kind);
-        match scp_to_remote(host_args, &local_binary, "~/.local/bin/som-srv") {
+        let scp_result = scp_to_remote(host_args, &local_binary, "~/.local/bin/som-srv");
+        log::debug!("deploy-check: {host_args:?} scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} result: {scp_result:?}");
+        match scp_result {
             Ok(()) => {
                 last_scp_err = None;
                 break;
@@ -1666,7 +1784,11 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) 
     }
 
     let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-srv"]);
-    run_remote_command(remote_kind, &chmod_probe)?;
+    log::debug!("deploy-check: {host_args:?} running chmod via {chmod_probe:?}");
+    let chmod_result = run_remote_command(remote_kind, &chmod_probe);
+    log::debug!("deploy-check: {host_args:?} chmod result: {chmod_result:?}");
+    chmod_result?;
+    log::debug!("deploy-check: {host_args:?} deploy completed successfully");
     Ok(())
 }
 
@@ -1798,12 +1920,14 @@ fn kill_all_holders_for_redeploy(host_args: &[String], remote_kind: RemoteKind) 
         }
     };
 
+    log::debug!("deploy-check: {host_args:?} raw som-srv process listing: {output:?}");
     let pids: Vec<String> = output
         .lines()
         .filter_map(|line| line.split_once('\u{1f}'))
         .map(|(pid, _args)| pid.trim().to_string())
         .collect();
     if pids.is_empty() {
+        log::debug!("deploy-check: {host_args:?} no som-srv processes found, nothing to kill");
         return;
     }
     log::info!("killing {} som-srv process(es) on remote host ahead of a version-mismatch redeploy: {pids:?}", pids.len());
@@ -1841,7 +1965,9 @@ done"#
     );
     let quoted_kill_script = shell_quote(&kill_script);
     let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
-    if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
+    let kill_result = run_remote_command(remote_kind, &kill_probe);
+    log::debug!("deploy-check: {host_args:?} kill script result for pids {pids:?}: {kill_result:?}");
+    if let Err(err) = kill_result {
         log::warn!("failed to kill remote som-srv processes ahead of redeploy: {err:#}");
     }
 }
@@ -1855,16 +1981,65 @@ done"#
 /// `ssh <host>` with per-host quirks (ports, keys, users) living in `~/.
 /// ssh/config`, never inline flags (see `terminal_panel.rs`'s test
 /// fixtures / real `settings.json` profiles, all of this shape).
+/// On Windows, `PATH` very commonly resolves `ssh`/`scp` to Git for
+/// Windows' own MSYS-based copies (`Program Files\Git\usr\bin\`) rather
+/// than the real Windows OpenSSH client (`%WINDIR%\System32\OpenSSH\`) —
+/// Git for Windows puts its own `usr\bin` ahead of `System32\OpenSSH` in
+/// `PATH` by default. That MSYS build silently rewrites any argument
+/// that LOOKS like a POSIX path (`~/.local/bin/som-srv`) into a Windows
+/// path (`/c/Users/<user>/.local/bin/som-srv`) BEFORE it ever reaches the
+/// remote host — the same automatic argv path-conversion MSYS2 programs
+/// apply to make Unix-style paths work when calling native Windows
+/// tools, applied here to an argument that was never meant to be
+/// translated at all, since it's meant for the REMOTE machine's own
+/// shell to expand, not this one. Confirmed live (2026-09-15) as the
+/// root cause of a real deploy failure: `chmod +x ~/.local/bin/som-srv`
+/// arrived on the remote host as `chmod +x /c/Users/dnk/.local/bin/
+/// som-srv` — a path that only makes sense on the LOCAL Windows machine,
+/// so `chmod` correctly reported it as not found. The real Windows
+/// OpenSSH client (confirmed live, same repro, same host) does not do
+/// this rewriting at all. Resolving the absolute path to `System32\
+/// OpenSSH\ssh.exe`/`scp.exe` explicitly, rather than trusting whatever
+/// `PATH` happens to resolve `"ssh"`/`"scp"` to, sidesteps the ambiguity
+/// entirely instead of trying to suppress MSYS's rewriting behavior
+/// (env vars like `MSYS_NO_PATHCONV`/`MSYS2_ARG_CONV_EXCL` were tried
+/// live against the MSYS binary directly and did NOT suppress it for
+/// this argument shape — not a reliable fix). Falls back to the bare
+/// `"ssh"`/`"scp"` name (let `PATH` resolve it) if the expected
+/// `System32\OpenSSH` binary isn't present, matching every other
+/// platform's behavior unchanged.
+#[cfg(target_os = "windows")]
+fn windows_openssh_binary(name: &str) -> std::path::PathBuf {
+    let candidate = std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
+        .join("System32")
+        .join("OpenSSH")
+        .join(format!("{name}.exe"));
+    if candidate.is_file() { candidate } else { std::path::PathBuf::from(name) }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_openssh_binary(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(name)
+}
+
 fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path: &str) -> anyhow::Result<()> {
     let Some(host) = host_args.last() else {
         anyhow::bail!("scp_to_remote called with empty host_args");
     };
     let destination = format!("{host}:{remote_path}");
-    let output = util::command::new_std_command("scp")
+    let local_size = std::fs::metadata(local_path).map(|m| m.len());
+    log::debug!("deploy-check: scp starting, local_path={local_path:?} (size={local_size:?}) -> {destination:?}");
+    let output = util::command::new_std_command(windows_openssh_binary("scp"))
         .arg(local_path)
         .arg(&destination)
         .output()
         .with_context(|| format!("failed to spawn scp to copy {local_path:?} to {destination:?}"))?;
+    log::debug!(
+        "deploy-check: scp finished for {destination:?}: status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     if !output.status.success() {
         anyhow::bail!("scp exited with {:?}: {}", output.status.code(), String::from_utf8_lossy(&output.stderr));
     }
@@ -1877,9 +2052,15 @@ fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path
 /// failure is surfaced as `Err` (e.g. "binary not found yet" for a
 /// brand-new host); callers treat that as "assume out of date, deploy".
 fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Result<String> {
+    // `wsl.exe` has no MSYS-path-rewriting concern (it isn't an MSYS
+    // binary at all) — only the `ssh` case needs `windows_openssh_
+    // binary`'s explicit resolution, see that function's own doc comment
+    // for why: Git for Windows' `ssh.exe` silently rewrites POSIX-looking
+    // arguments (`~/.local/bin/som-srv`) into Windows paths before they
+    // ever reach the remote host, which real Windows OpenSSH does not do.
     let program = match remote_kind {
-        RemoteKind::Ssh => "ssh",
-        RemoteKind::Wsl => "wsl",
+        RemoteKind::Ssh => windows_openssh_binary("ssh"),
+        RemoteKind::Wsl => std::path::PathBuf::from("wsl"),
         RemoteKind::Local => anyhow::bail!("run_remote_command called with RemoteKind::Local"),
     };
     // `util::command::new_std_command`, NOT a bare `std::process::Command::
@@ -1892,13 +2073,14 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     // for every `tmux: true` profile, local and remote alike, since this
     // deploy check's every-tab-open version probe is what's actually
     // spawning it).
-    let output = util::command::new_std_command(program)
+    let output = util::command::new_std_command(&program)
         .args(args)
         .output()
         .with_context(|| format!("failed to spawn {program:?} for remote deploy check"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "{program} exited with {:?}: {}",
+            "{} exited with {:?}: {}",
+            program.display(),
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );

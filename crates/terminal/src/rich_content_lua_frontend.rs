@@ -1,5 +1,5 @@
 //! Lua *frontend* runtime — see `SRP_LUA.md`'s "Phase 1" section for the
-//! full design context. Where `som_srv::lua` (in `crates/som_srv`) is the
+//! full design context. Where `somsrv::lua` (in `crates/somsrv`) is the
 //! backend that ORIGINATES markdown content, this module is what Som
 //! itself runs to decide how to interpret/shape a `ContentType::Markdown`
 //! payload BEFORE handing it to [`crate::rich_content_markdown_player`]
@@ -16,7 +16,7 @@
 
 use mlua::{Lua, LuaOptions, StdLib};
 
-/// Same allow-list `som_srv::lua::phase1_stdlib` uses on the backend side
+/// Same allow-list `somsrv::lua::phase1_stdlib` uses on the backend side
 /// — see that function's own doc comment for why NOT `Lua::new()`'s
 /// default (`StdLib::ALL_SAFE` includes `io`, confirmed by direct test,
 /// not the "safe" a casual reading of the name suggests). The frontend

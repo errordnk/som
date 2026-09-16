@@ -234,39 +234,6 @@ impl EventListener for ZedListener {
     }
 }
 
-/// Where `rich_content_cache::RichContentCache` writes progressively-
-/// arriving files. In tests, `paths::config_dir()` would point at a real
-/// user's `~/.config/som/` (it's a process-global `OnceLock`, not
-/// test-aware — see `paths::config_dir`'s own implementation) — every
-/// test run would otherwise write real files there and tests running in
-/// parallel with the same session/file id would collide. `std::env::
-/// temp_dir()` here mirrors the existing test-fixture pattern already
-/// used for `somcat_*_test_fixture.png` elsewhere in this file's test
-/// module.
-fn rich_content_cache_dir() -> std::path::PathBuf {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        let dir = std::env::temp_dir().join("som_rich_content_cache_runtime");
-        // Propagated to `som-srv`/`somcat` child processes this test
-        // spawns (inherited automatically — `std::process::Command`
-        // clones the parent's environment unless told otherwise) via
-        // `som_srv::srv_cache::SrvCache::default_cache_dir`'s own
-        // `SOM_RICH_CONTENT_CACHE_DIR` override — see that function's
-        // doc comment for why a real separate binary otherwise has no
-        // way to learn about this test-only directory at all.
-        // SAFETY: test-only, no other thread reads/writes process env
-        // vars concurrently with this in this codebase's test suite.
-        unsafe {
-            std::env::set_var("SOM_RICH_CONTENT_CACHE_DIR", &dir);
-        }
-        dir
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    {
-        paths::config_dir().join("media_cache")
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalBounds {
     pub cell_width: Pixels,
@@ -500,7 +467,7 @@ impl TerminalBuilder {
             child_exited: None,
             keyboard_input_sent: false,
             last_pty_grid_size: None,
-            rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+            rich_content_cache: rich_content_cache::RichContentCache::new(),
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -720,12 +687,12 @@ impl TerminalBuilder {
 
             let pty_info = PtyProcessInfo::new(&pty);
 
-            // Detects a `som_srv`-wrapped profile by shape — either a
+            // Detects a `somsrv`-wrapped profile by shape — either a
             // remote (`ssh`/`wsl`) profile, where `wrap_remote_command_
-            // args` always inserts the literal `~/.local/bin/som-srv`
+            // args` always inserts the literal `~/.local/bin/somsrv`
             // argument (the same key `rebuild_tmux_shell_with_fresh_pane_
             // id` uses), or a LOCAL `tmux: true` profile, where `tmux_
-            // wrapped_shell`'s `RemoteKind::Local` branch makes `som-srv
+            // wrapped_shell`'s `RemoteKind::Local` branch makes `somsrv
             // .exe` itself the PROGRAM (not one of its args) — checking
             // `args` alone misses this case entirely. Only these go
             // through the double-pty (`-tt` remote + Windows ConPTY)
@@ -734,8 +701,8 @@ impl TerminalBuilder {
             // capability queries on the real PTY itself (see `is_tmux_
             // relay_shell`'s second use below, in `process_event`).
             let is_tmux_relay_shell = shell_params.as_ref().is_some_and(|params| {
-                params.program.contains("som-srv")
-                    || params.args.as_ref().is_some_and(|args| args.iter().any(|arg| arg.contains("som-srv")))
+                params.program.contains("somsrv")
+                    || params.args.as_ref().is_some_and(|args| args.iter().any(|arg| arg.contains("somsrv")))
             });
 
             //And connect them together
@@ -819,7 +786,7 @@ impl TerminalBuilder {
                 child_exited: None,
                 keyboard_input_sent: false,
                 last_pty_grid_size: None,
-                rich_content_cache: rich_content_cache::RichContentCache::new(rich_content_cache_dir()),
+                rich_content_cache: rich_content_cache::RichContentCache::new(),
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -1216,7 +1183,7 @@ pub struct Terminal {
     rich_content_video_progress: std::cell::RefCell<
         std::collections::HashMap<(u32, u32), std::sync::Arc<rich_content_video_player::VideoTransferProgress>>,
     >,
-    /// One `som-srv` side-channel subscription per KNOWN placement id —
+    /// One `somsrv` side-channel subscription per KNOWN placement id —
     /// "known" meaning "seen in the placeholder grid at least once,"
     /// independent of whether `rich_content_cache` has any bytes for it
     /// yet (which is exactly the gap this exists to close: `rich_content_
@@ -1393,7 +1360,7 @@ impl Terminal {
             }
             // A `tmux: true` RELAY's own `Term` sees the SAME raw PTY
             // bytes its HOLDER already parsed and answered on the real
-            // PTY (som_srv's `RawByteBroadcaster` mirrors bytes to every
+            // PTY (somsrv's `RawByteBroadcaster` mirrors bytes to every
             // connected RELAY before the HOLDER's own event loop finishes
             // handling them). If this RELAY's `Term` ALSO answers, the
             // client program (e.g. `yazi`) receives the query echoed back
@@ -1407,9 +1374,9 @@ impl Terminal {
             // all answer on the SERVER side, against the real PTY, never
             // forwarded to the attaching client to answer a second time.
             // A HOLDER always answers these on the real PTY on its own
-            // (see `som_srv::session`'s permanent pump thread) whether or
+            // (see `somsrv::session`'s permanent pump thread) whether or
             // not any RELAY is attached, so silently dropping them here
-            // (rather than writing to a PTY som-srv treats as a HOLDER-
+            // (rather than writing to a PTY somsrv treats as a HOLDER-
             // facing pipe, not the real shell's PTY) is correct.
             //
             // This does NOT include mode-report bytes that only look like
@@ -1420,7 +1387,7 @@ impl Terminal {
             // Som's behalf. Real tmux solves this the same way: `tty.c`'s
             // `tty_update_mode` re-emits the raw DECSET/DECRST bytes for
             // any mode bit that flipped, entirely SEPARATE from `input.c`'s
-            // `input_reply`. `som_srv::redraw::Redrawer` does the exact
+            // `input_reply`. `somsrv::redraw::Redrawer` does the exact
             // same thing for `TermMode::APP_CURSOR`/mouse-tracking bits —
             // see its `last_app_cursor`/`last_mouse_mode` fields — so by
             // the time any capability query about THOSE modes could even
@@ -1439,7 +1406,7 @@ impl Terminal {
             // Terminal` supplies its own `self.last_content.terminal_
             // bounds` here to build the answer, and a `tmux: true` HOLDER
             // has its own equally-authoritative real pane-size answer
-            // ready via `som_srv::session`'s `pump_last_bounds` (that's
+            // ready via `somsrv::session`'s `pump_last_bounds` (that's
             // what fixed a real `micro`-doesn't-fill-the-pane bug — see
             // that field's doc comment), so answering AGAIN here would
             // just be redundant, not wrong, but skipping it keeps this
@@ -1470,6 +1437,48 @@ impl Terminal {
                     // doc comment for why `clear` needs the real thing).
                     self.rich_content_video_players.borrow_mut().clear();
                     self.rich_content_video_progress.borrow_mut().clear();
+                }
+                self.rich_content_markdown_players.borrow_mut().clear();
+                self.rich_content_markdown_scroll_offsets.borrow_mut().clear();
+                // Tears down every image/GIF/markdown subscription thread
+                // the same way `evict_vanished_image_gif_markdown_
+                // placements` does for the scroll-away case — a real
+                // `clear` is an even more definitive "gone for good" than
+                // scrolling out of view, so it must not leave these
+                // threads/connections running either. `rich_content_srv_
+                // progress` is shared with Video/Audio too, though — only
+                // image/GIF/markdown keys get torn down here (Video/Audio
+                // already have their own `clear` handling above, which
+                // deliberately does NOT touch their `rich_content_srv_
+                // progress` entries — their decode threads keep reading
+                // from the SAME `SrvProgressState` after a fresh player
+                // reopens post-`clear`, unlike image/GIF/markdown which
+                // have no such reopen path once evicted). See `evict_
+                // vanished_image_gif_markdown_placements`'s own doc
+                // comment for why both `stop()` AND `unsubscribe` are
+                // needed (a flag alone can't unblock an already-blocking
+                // `read_message()` call).
+                let image_gif_markdown_keys: Vec<(u32, u32)> = self
+                    .rich_content_cache
+                    .all_known_ids()
+                    .into_iter()
+                    .filter(|&(session_id, file_id)| {
+                        matches!(
+                            self.rich_content_cache.content_type(session_id, file_id),
+                            Some(
+                                rich_content_transport::ContentType::Gif
+                                    | rich_content_transport::ContentType::Jpeg
+                                    | rich_content_transport::ContentType::Png
+                                    | rich_content_transport::ContentType::Markdown
+                            )
+                        )
+                    })
+                    .collect();
+                for &(session_id, file_id) in &image_gif_markdown_keys {
+                    if let Some(state) = self.rich_content_srv_progress.borrow_mut().remove(&(session_id, file_id)) {
+                        state.stop();
+                        rich_content_srv_channel::unsubscribe(session_id, file_id);
+                    }
                 }
                 // Forgets every id `RichContentCache` still remembers —
                 // without this, `all_known_ids()` keeps surfacing them on
@@ -1528,7 +1537,7 @@ impl Terminal {
                 // `tmux: true` HOLDER: this arm answers with the user's
                 // real configured theme color (`cx.theme()`, right below),
                 // while a HOLDER has no GPUI `Theme` to consult and falls
-                // back to a hardcoded Nord Darker color (see `som_srv::
+                // back to a hardcoded Nord Darker color (see `somsrv::
                 // session`'s `ColorRequest` arm). Always answering here —
                 // same as the non-tmux path — means the client sees Som's
                 // actual color even when a HOLDER's own (possibly
@@ -1552,14 +1561,14 @@ impl Terminal {
                 self.register_task_finished(Some(exit_status), cx);
             }
             AlacTermEvent::ApcString(_bytes, _apc_cursor) => {
-                // TODO(som-srv): rich-content chunks used to arrive here,
+                // TODO(somsrv): rich-content chunks used to arrive here,
                 // parsed off the PTY via the now-deleted
                 // `rich_content_transport::{MARKER, parse_envelope}`
                 // APC/base91 envelope format. That format (and the
                 // `Chunk` type `RichContentCache::apply_chunk` used to
                 // take) has been deleted — chunks now arrive via
-                // `som-srv`'s binary side channel instead
-                // (`som_srv::protocol::SrvRequest::PutChunk`), fed to
+                // `somsrv`'s binary side channel instead
+                // (`somsrv::protocol::SrvRequest::PutChunk`), fed to
                 // `RichContentCache::apply_chunk`'s new raw-fields
                 // signature by a background thread that isn't wired up
                 // yet. Until that wiring lands, this arm is a no-op: no
@@ -2003,20 +2012,29 @@ impl Terminal {
         &self,
     ) -> Vec<(u32, u32, std::sync::Arc<gpui::RenderImage>, usize, bool)> {
         let mut players = self.rich_content_players.borrow_mut();
+        let progress = self.rich_content_srv_progress.borrow();
         let mut out = Vec::new();
         for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
-            let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+            let key = (session_id, file_id);
+            let Some(state) = progress.get(&key) else {
                 continue;
             };
-            let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let Some(content_type) = self.rich_content_cache.content_type(session_id, file_id) else {
                 continue;
             };
-            let total_size = self.rich_content_cache.total_size(session_id, file_id);
-            let key = (session_id, file_id);
+            // See `rich_content_markdown_placements`'s identical comment —
+            // `contiguous_len`/`total_size` must come from the SAME
+            // `SrvProgressState` the bytes are read from, not from
+            // `rich_content_cache`'s separately-updated watermark, or the
+            // two can momentarily disagree (empty bytes paired with a
+            // nonzero watermark).
+            state.request_whole_range_once_if_needed(session_id, file_id);
+            let contiguous_len = state.contiguous_len();
+            let total_size = state.total_size();
+            let bytes = state.bytes_received_so_far();
             let existing = players.remove(&key);
             let Some(refreshed) =
-                rich_content_player::refresh_or_create(existing, path, contiguous_len, content_type, total_size)
+                rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size)
             else {
                 continue;
             };
@@ -2039,7 +2057,7 @@ impl Terminal {
         self.rich_content_cache.record_max_row_seen(session_id, file_id, row);
     }
 
-    /// Lazily spawns this placement's `som-srv` progress subscription
+    /// Lazily spawns this placement's `somsrv` progress subscription
     /// (see [`rich_content_srv_channel::spawn_progress_listener`]) the
     /// first time `(session_id, file_id)` is seen, then applies whatever
     /// that background thread has observed so far to `rich_content_cache`
@@ -2080,24 +2098,14 @@ impl Terminal {
             (None, None) => return, // no metadata seen yet, and no entry to update either
         };
 
-        if let Err(err) = self.rich_content_cache.record_progress(
+        self.rich_content_cache.record_progress(
             content_type,
             session_id,
             file_id,
             state.contiguous_len(),
             state.total_size(),
-            metadata.clone(),
-        ) {
-            log::debug!("failed to open som-srv cache file for {session_id:#x}:{file_id:#x}: {err:#}");
-            // The daemon creates its cache file on disk asynchronously
-            // (first `PutChunk` write) — if this call landed before that
-            // happened, `record_progress` fails to open it, and without
-            // restoring the metadata here it would be lost forever
-            // (`take_metadata` is one-shot), permanently stranding this
-            // placement with no `RichContentCache` entry. See `restore_
-            // metadata`'s own doc comment.
-            state.restore_metadata((content_type, metadata));
-        }
+            metadata,
+        );
     }
 
     /// Scans the placeholder grid for every `(session_id, file_id)`
@@ -2165,8 +2173,79 @@ impl Terminal {
             }
         }
 
-        for (session_id, file_id) in ids {
+        for &(session_id, file_id) in &ids {
             self.ensure_rich_content_srv_subscription(session_id, file_id);
+        }
+
+        self.evict_vanished_image_gif_markdown_placements(&ids);
+    }
+
+    /// Drops every in-memory image/GIF/markdown placement whose id is no
+    /// longer present anywhere in the grid (`ids`, the same full
+    /// viewport+scrollback scan [`Self::poll_rich_content_srv_
+    /// subscriptions`] already performs to discover NEW placements) —
+    /// the user's own explicit requirement: once these three content
+    /// types moved off disk onto an in-memory `SrvProgressState` buffer,
+    /// a placement whose placeholder cells are gone for good (scrolled
+    /// out of `scrollback`'s own bounded history, or wiped by a real
+    /// `clear`) must not keep its bytes/decoded frames/rendered text
+    /// resident forever — unlike the old disk-backed design, where a
+    /// forgotten id merely left an orphaned file behind, an in-memory
+    /// leak here directly grows the process's own RSS.
+    ///
+    /// Deliberately narrower than "every id not in `ids`": `Video`/
+    /// `Audio` are excluded outright — see `stop_rich_content_audio_
+    /// playback`/`stop_rich_content_video_playback`'s own doc comments
+    /// for why THEIR teardown is driven by an explicit stop click (or a
+    /// real `clear`, via `stop_all_rich_content_audio_playback`) instead
+    /// of "scrolled out of view": a `somcat` process backing a video/
+    /// audio placement is a genuinely live, still-running pull-model
+    /// responder for as long as playback continues, and scrolling its
+    /// widget out of the viewport (leaving it resident in scrollback,
+    /// same as this method's own full-history scan already treats every
+    /// other placement) must not kill that process out from under
+    /// itself just because the grid scan temporarily didn't include it
+    /// at whatever moment this poll happened to run.
+    fn evict_vanished_image_gif_markdown_placements(&mut self, ids: &std::collections::HashSet<(u32, u32)>) {
+        let vanished: Vec<(u32, u32)> = self
+            .rich_content_cache
+            .all_known_ids()
+            .into_iter()
+            .filter(|key| !ids.contains(key))
+            .filter(|&(session_id, file_id)| {
+                matches!(
+                    self.rich_content_cache.content_type(session_id, file_id),
+                    Some(
+                        rich_content_transport::ContentType::Gif
+                            | rich_content_transport::ContentType::Jpeg
+                            | rich_content_transport::ContentType::Png
+                            | rich_content_transport::ContentType::Markdown
+                    )
+                )
+            })
+            .collect();
+
+        for (session_id, file_id) in vanished {
+            let key = (session_id, file_id);
+            self.rich_content_players.borrow_mut().remove(&key);
+            self.rich_content_markdown_players.borrow_mut().remove(&key);
+            self.rich_content_markdown_scroll_offsets.borrow_mut().remove(&key);
+            if let Some(state) = self.rich_content_srv_progress.borrow_mut().remove(&key) {
+                // Tears down the background subscription thread. `stop()`
+                // alone only sets a flag this thread checks BEFORE its
+                // next blocking `read_message()` call — for an id whose
+                // transfer already finished (the ordinary case here), no
+                // further `Progress` push will ever arrive to let it
+                // notice that flag, so it would otherwise block on that
+                // read forever. `rich_content_srv_channel::unsubscribe`
+                // asks `somsrv` to push `SrvResponse::Unsubscribed` back
+                // on this same connection, which the thread's read loop
+                // recognizes as its cue to return immediately — see both
+                // functions' own doc comments for the full reasoning.
+                state.stop();
+                rich_content_srv_channel::unsubscribe(session_id, file_id);
+            }
+            self.rich_content_cache.remove(session_id, file_id);
         }
     }
 
@@ -2349,6 +2428,7 @@ impl Terminal {
     /// type in this crate.
     pub fn rich_content_markdown_placements(&self) -> Vec<(u32, u32, String)> {
         let mut players = self.rich_content_markdown_players.borrow_mut();
+        let progress = self.rich_content_srv_progress.borrow();
         let mut out = Vec::new();
         for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
             let Some(content_type) = self.rich_content_cache.content_type(session_id, file_id) else {
@@ -2357,13 +2437,23 @@ impl Terminal {
             if content_type != rich_content_transport::ContentType::Markdown {
                 continue;
             }
-            let Some(path) = self.rich_content_cache.path(session_id, file_id) else {
+            let key = (session_id, file_id);
+            let Some(state) = progress.get(&key) else {
                 continue;
             };
-            let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
-            let key = (session_id, file_id);
+            // Use the SAME `SrvProgressState` as the source of both the
+            // bytes and the watermark — `rich_content_cache`'s own
+            // `contiguous_len` is updated from a separate `record_progress`
+            // call and can momentarily lag behind (or race ahead of) what
+            // `state`'s buffer actually holds; mixing the two led to a
+            // real bug where an empty `bytes` slice got paired with a
+            // nonzero cache watermark, rendering (and permanently caching)
+            // an empty string.
+            state.request_whole_range_once_if_needed(session_id, file_id);
+            let contiguous_len = state.contiguous_len();
+            let bytes = state.bytes_received_so_far();
             let existing = players.remove(&key);
-            match rich_content_markdown_player::refresh_or_create(path, contiguous_len, existing) {
+            match rich_content_markdown_player::refresh_or_create(&bytes, contiguous_len, existing) {
                 Ok(Some(player)) => {
                     out.push((session_id, file_id, player.rendered().to_string()));
                     players.insert(key, player);
@@ -2679,11 +2769,11 @@ impl Terminal {
     /// — a monotonically increasing counter, good enough to be useful
     /// for logging/debugging without needing to be globally unique.
     ///
-    /// Sent as `som_srv::protocol::SrvRequest::RequestByteRange` on a
-    /// fresh, one-shot `som-srv` connection (see
-    /// [`rich_content_srv_channel::request_byte_range`]) — `som-srv`
+    /// Sent as `somsrv::protocol::SrvRequest::RequestByteRange` on a
+    /// fresh, one-shot `somsrv` connection (see
+    /// [`rich_content_srv_channel::request_byte_range`]) — `somsrv`
     /// forwards it to whichever client registered as the sender for this
-    /// `(session_id, file_id)` (see `som_srv::srv_cache::
+    /// `(session_id, file_id)` (see `somsrv::srv_cache::
     /// route_byte_range_request`/`register_sender_route`), which answers
     /// by sending more `PutChunk`s covering the requested range, same as
     /// this used to work by building a `rich_content_transport::Query`
@@ -2695,7 +2785,7 @@ impl Terminal {
         let request_id = self.next_query_request_id.get();
         self.next_query_request_id.set(request_id.wrapping_add(1));
         log::trace!(
-            "requesting som-srv byte range (request_id={request_id:#x} session={session_id:#x} \
+            "requesting somsrv byte range (request_id={request_id:#x} session={session_id:#x} \
              file={file_id:#x} offset={offset} len={len})"
         );
         rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
@@ -2781,7 +2871,7 @@ impl Terminal {
             // this key's `SrvProgressState` instead, same source
             // `ensure_rich_content_srv_subscription` itself reads from.
             // Defaults to `total_size` (nothing confirmed from the tail
-            // yet) if no `som-srv` subscription exists yet for this key —
+            // yet) if no `somsrv` subscription exists yet for this key —
             // matches `SrvProgressState`'s own pre-first-push default (0)
             // only in spirit, not value; `total_size` here is deliberately
             // NOT 0, since 0 would incorrectly mean "even the theoretical
@@ -4751,7 +4841,7 @@ impl Terminal {
     /// This terminal's own shell command, as it was originally spawned —
     /// exposed so callers that need to inspect (not just blindly reuse) it
     /// before cloning can do so. Notably, `terminal_view`'s `clone_on_split`
-    /// needs this to detect a `som-srv`-wrapped shell (see
+    /// needs this to detect a `somsrv`-wrapped shell (see
     /// `project_som_tmux` memory) and rebuild it with a fresh pane id rather
     /// than reusing this exact command — `clone_builder` alone always
     /// copies it byte-for-byte, which for a tmux-wrapped shell would
@@ -5181,18 +5271,6 @@ mod tests {
         program: String,
         args: Vec<String>,
     ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
-        // MUST run before `TerminalBuilder::new` below spawns the real
-        // child process (`somcat`, or `som-srv` itself if this is the
-        // first test in the run to need it) — `rich_content_cache_dir`'s
-        // own `SOM_RICH_CONTENT_CACHE_DIR` side effect (see its doc
-        // comment) only reaches a child process spawned AFTER this call,
-        // since `std::process::Command` captures the parent's
-        // environment at spawn time, not by live reference. Calling it
-        // here (rather than relying on `Terminal`'s own constructor,
-        // which runs even later — after `TerminatorBuilder::new` has
-        // already spawned the child) closes that ordering gap.
-        let _ = rich_content_cache_dir();
-
         let (completion_tx, completion_rx) = async_channel::unbounded();
         let builder = cx
             .update(|cx| {
@@ -5904,11 +5982,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Png,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 90,
@@ -5916,9 +5994,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -6061,11 +6137,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Png,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 90,
@@ -6073,9 +6149,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -6209,11 +6283,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Png,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 90,
@@ -6221,9 +6295,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -6365,11 +6437,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Png,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 90,
@@ -6377,9 +6449,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -6481,11 +6551,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Png,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 90,
@@ -6493,9 +6563,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
         window.update_window_entity(&terminal, |terminal, _window, cx| {
@@ -6575,11 +6643,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Jpeg,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 1920,
@@ -6587,9 +6655,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -6760,11 +6826,11 @@ mod tests {
                 terminal.sync(window, cx);
                 terminal
                     .rich_content_cache
-                    .apply_chunk(
+                    .record_progress(
                         rich_content_transport::ContentType::Jpeg,
                         session_id,
                         file_id,
-                        0,
+                        1,
                         1,
                         rich_content_transport::ContentMetadata::Image {
                             width_px: image_width_px,
@@ -6772,9 +6838,7 @@ mod tests {
                             color_bits: 32,
                             is_animated: false,
                         },
-                        &[0u8],
-                    )
-                    .unwrap();
+                    );
             });
             window.run_until_parked();
 
@@ -6877,11 +6941,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Jpeg,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 1920,
@@ -6889,9 +6953,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -7037,11 +7099,11 @@ mod tests {
             terminal.sync(window, cx);
             terminal
                 .rich_content_cache
-                .apply_chunk(
+                .record_progress(
                     rich_content_transport::ContentType::Jpeg,
                     session_id,
                     file_id,
-                    0,
+                    1,
                     1,
                     rich_content_transport::ContentMetadata::Image {
                         width_px: 1920,
@@ -7049,9 +7111,7 @@ mod tests {
                         color_bits: 32,
                         is_animated: false,
                     },
-                    &[0u8],
-                )
-                .unwrap();
+                );
         });
         window.run_until_parked();
 
@@ -7250,13 +7310,13 @@ mod tests {
             let still_running = completion_rx.try_recv().is_err();
 
             // No real paint pass runs in this headless test — this
-            // drives the same `som-srv` subscription/`record_progress`
+            // drives the same `somsrv` subscription/`record_progress`
             // wiring `terminal_view::terminal_element::
             // paint_rich_content_placements` drives every real paint, so
             // `rich_content_cache` actually gets populated below.
             terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
 
-            let (session_id, file_id, path) = terminal.update(cx, |term, _| {
+            let (_session_id, _file_id, bytes) = terminal.update(cx, |term, _| {
                 // Only one file is ever streamed in this test — grab
                 // whatever (session_id, file_id) the cache has recorded
                 // so far, if any chunk has arrived yet.
@@ -7264,13 +7324,15 @@ mod tests {
                     .all_known_ids()
                     .into_iter()
                     .next()
-                    .map(|(s, f)| (s, f, term.rich_content_cache.path(s, f).map(|p| p.to_path_buf())))
+                    .map(|(s, f)| {
+                        let bytes = term.rich_content_srv_progress.borrow().get(&(s, f)).map(|state| state.bytes_received_so_far());
+                        (s, f, bytes)
+                    })
                     .unwrap_or((0, 0, None))
             });
 
-            if let Some(path) = path {
-                let available = terminal.update(cx, |term, _| term.rich_content_cache.contiguous_len(session_id, file_id));
-                if let Ok(Some(decoded)) = rich_content_gif_player::try_decode_progressive(&path, available) {
+            if let Some(bytes) = bytes {
+                if let Ok(Some(decoded)) = rich_content_gif_player::try_decode_progressive(&bytes) {
                     let fc = decoded.frames.len();
                     if fc > 0 && first_partial_frame_count == 0 {
                         first_partial_frame_count = fc;
@@ -7465,6 +7527,141 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_clear_evicts_in_memory_gif_placement_state(cx: &mut TestAppContext) {
+        // Regression test for the explicit user requirement this session
+        // implemented: once image/GIF/markdown moved off disk onto an
+        // in-memory `SrvProgressState` buffer, a placement whose
+        // placeholder cells are gone for good (here: a real `clear`) must
+        // not keep its bytes/decoded frames resident forever — see
+        // `Terminal::evict_vanished_image_gif_markdown_placements`'s own
+        // doc comment. Drives a REAL `somcat --stream` GIF transfer
+        // (real ConPTY, real `somsrv` subscription thread) through to a
+        // decoded placement, then sends the same real `clear` escape
+        // sequence `test_clear_command_hides_placeholder_grid_cells`
+        // already proves erases the placeholder cells themselves, and
+        // confirms `poll_rich_content_srv_subscriptions`'s own eviction
+        // pass actually drops every in-memory map entry for that id
+        // afterward — not just that the widget stops being painted
+        // (which was already true before this session's work, since
+        // painting only ever visits ids still found in the live grid).
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
+
+        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
+        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
+        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
+        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+
+        // Unlike `build_test_terminal_with_arguments`'s default (10,000
+        // lines of scrollback), this test needs `\x1b[2J` to ACTUALLY
+        // remove every placeholder cell from the grid — a real `2J` only
+        // clears the visible screen, never scrollback history (confirmed
+        // live: with the default scrollback, giphy.gif's placeholder grid
+        // is taller than the terminal's default viewport, so several rows
+        // of it were already pushed into scrollback before `clear` ran,
+        // and stayed there — exactly the "still in scrollback" case this
+        // whole eviction feature is explicitly NOT supposed to touch, per
+        // the user's own criterion of "gone for good," not "off-screen").
+        // Zero scrollback makes `2J` a true full-grid wipe, matching what
+        // this test actually wants to exercise: eviction firing once the
+        // placement is unambiguously gone, not eviction firing too early
+        // while it's still legitimately reachable by scrolling up.
+        let (completion_tx, _completion_rx) = async_channel::unbounded();
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    None,
+                    task::Shell::WithArguments {
+                        program: somcat_path.to_string_lossy().into_owned(),
+                        args: vec![giphy_path.to_string_lossy().into_owned()],
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    Some(0),
+                    vec![],
+                    0,
+                    false,
+                    0,
+                    Some(completion_tx),
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+
+        let mut evicted_key: Option<(u32, u32)> = None;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+
+            let placements = terminal.update(cx, |term, _| term.rich_content_placements());
+            if let Some((session_id, file_id, _render_image, _current_frame, _is_animating)) = placements.into_iter().next() {
+                evicted_key = Some((session_id, file_id));
+                break;
+            }
+        }
+        let (session_id, file_id) =
+            evicted_key.expect("rich_content_placements() never returned a placement within the poll budget");
+
+        terminal.update(cx, |term, _| {
+            assert!(
+                term.rich_content_srv_progress.borrow().contains_key(&(session_id, file_id)),
+                "the subscription must exist before clear runs, or this test proves nothing"
+            );
+        });
+
+        // The real escape sequence a shell's `clear` builtin sends —
+        // same bytes `test_clear_command_hides_placeholder_grid_cells`
+        // already confirms erases the placeholder cells from the grid.
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"\x1b[H\x1b[2J", cx);
+        });
+        cx.run_until_parked();
+
+        let mut fully_evicted = false;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+
+            fully_evicted = terminal.update(cx, |term, _| {
+                !term.rich_content_srv_progress.borrow().contains_key(&(session_id, file_id))
+                    && !term.rich_content_players.borrow().contains_key(&(session_id, file_id))
+                    && term.rich_content_cache.content_type(session_id, file_id).is_none()
+            });
+            if fully_evicted {
+                break;
+            }
+        }
+
+        assert!(
+            fully_evicted,
+            "every in-memory map for {session_id:#x}:{file_id:#x} must be empty once its placeholder cells are gone for good"
+        );
+    }
+
+    #[gpui::test]
     async fn test_rich_content_audio_placement_decodes_and_plays_via_a_real_process(cx: &mut TestAppContext) {
         // Audio counterpart to
         // `test_rich_content_placements_reach_the_paint_path_via_a_real_
@@ -7649,8 +7846,8 @@ mod tests {
 
         if !ffmpeg_dlls_extracted() {
             eprintln!(
-                "skipping strict assertion: FFmpeg DLLs not found under ~/.config/som/ffmpeg — \
-                 run Som at least once first, or copy them there manually for this test"
+                "skipping strict assertion: FFmpeg DLLs not found under the data dir's ffmpeg/ \
+                 subdirectory — run Som at least once first, or copy them there manually for this test"
             );
             return;
         }
@@ -7660,8 +7857,16 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     fn ffmpeg_dlls_extracted() -> bool {
+        // Checks the REAL system data dir directly (not `paths::data_dir()`,
+        // which is a process-global `OnceLock` fixed to a fake `cfg!(test)`
+        // path — see that function's own doc comment) — this is real state
+        // on the developer's actual machine, not something a test should
+        // isolate itself from. Mirrors `paths::data_dir()`'s own Windows
+        // branch (`home_dir().join(".local").join("share").join("som")`)
+        // — this test only ever runs on Windows (the only platform Som
+        // ships FFmpeg decoding for today).
         dirs::home_dir()
-            .map(|home| home.join(".config").join("som").join("ffmpeg").join("avcodec-63.dll").is_file())
+            .map(|home| home.join(".local").join("share").join("som").join("ffmpeg").join("avcodec-63.dll").is_file())
             .unwrap_or(false)
     }
 
@@ -8155,21 +8360,21 @@ mod tests {
         );
     }
 
-    /// Finds `som-srv(.exe)` next to whichever `target/debug` this
+    /// Finds `somsrv(.exe)` next to whichever `target/debug` this
     /// test binary itself was built into — mirrors
-    /// `terminal_view::terminal_panel::som_srv_binary_path`'s own
+    /// `terminal_view::terminal_panel::somsrv_binary_path`'s own
     /// resolution logic (that one looks next to `som.exe`; this one looks
     /// next to `target/debug/deps/terminal-<hash>.exe`, one directory
     /// shallower, since `cargo test` binaries live in `deps/` while
     /// `cargo build`'s bin targets land directly in `target/debug/`).
     /// Returns `None` (causing the test to skip, not fail) if the binary
-    /// hasn't been built yet — this test exercises the REAL som-srv
+    /// hasn't been built yet — this test exercises the REAL somsrv
     /// binary as an external process (deliberately, since the whole point is
     /// testing the wire protocol between a real `Terminal`'s PTY and it),
     /// not something `cargo test` builds automatically as a dependency.
-    fn find_som_srv_binary() -> Option<std::path::PathBuf> {
+    fn find_somsrv_binary() -> Option<std::path::PathBuf> {
         let test_exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let binary_name = if cfg!(target_os = "windows") { "som-srv.exe" } else { "som-srv" };
+        let binary_name = if cfg!(target_os = "windows") { "somsrv.exe" } else { "somsrv" };
         for candidate_dir in [test_exe_dir.clone(), test_exe_dir.parent()?.to_path_buf()] {
             let candidate = candidate_dir.join(binary_name);
             if candidate.is_file() {
@@ -8187,7 +8392,7 @@ mod tests {
     /// `feedback_gpui_test_framework_priority` memory for why this is the
     /// preferred way to test Som's UI-adjacent logic).
     ///
-    /// Spawns a REAL `som-srv` RELAY (as this `Terminal`'s own
+    /// Spawns a REAL `somsrv` RELAY (as this `Terminal`'s own
     /// shell command, exactly like a `tmux: true` profile does), lets it
     /// spawn its own detached HOLDER, then writes a single NUL byte via
     /// `Terminal::input` — the same call `on_removed` makes — and asserts
@@ -8200,8 +8405,8 @@ mod tests {
     async fn test_nul_byte_signals_tmux_relay_to_close_for_good(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let Some(server_path) = find_som_srv_binary() else {
-            eprintln!("skipping: som-srv binary not built, run `cargo build -p som_srv` first");
+        let Some(server_path) = find_somsrv_binary() else {
+            eprintln!("skipping: somsrv binary not built, run `cargo build -p somsrv` first");
             return;
         };
 
@@ -8225,7 +8430,7 @@ mod tests {
         // GPUI's deterministic test executor, which fast-forwards its own
         // timers instantly rather than sleeping wall-clock time (there's
         // nothing else scheduled on it to make waiting on it meaningful).
-        // The real `som-srv` RELAY/HOLDER pair are genuine external
+        // The real `somsrv` RELAY/HOLDER pair are genuine external
         // OS processes running on real wall-clock time regardless, so
         // waiting on them requires actually blocking this thread — safe
         // here only because `cx.executor().allow_parking()` was called
@@ -8257,20 +8462,20 @@ mod tests {
         // NOT `paths::logs_dir()` — under `cfg!(test)`,
         // `util::paths::home_dir()` is hardcoded to a fake `C:\Users\zed`
         // fixture home (test isolation, so tests never touch the real
-        // user's actual home directory), but the `som-srv.exe`
+        // user's actual home directory), but the `somsrv.exe`
         // child process spawned above is a separate, non-test binary that
         // has no such override and logs to the REAL home directory. This
         // test needs to read what that real child process actually wrote,
-        // so it computes the log path the same way `som_srv::main`
+        // so it computes the log path the same way `somsrv::main`
         // does when not built under `cfg!(test)` — via `dirs::home_dir()`
-        // directly. A single `som-srv-daemon.log` shared by every pane on
+        // directly. A single `somsrv-daemon.log` shared by every pane on
         // this machine (not a per-pane HOLDER log — that file stopped
         // being written once the shared multi-tenant daemon replaced the
         // old per-pane HOLDER process), so the assertion below also
         // checks the pane id appears in the matched line, in case some
         // other test's session close raced onto the same log first.
         let real_home = dirs::home_dir().expect("failed to determine home directory");
-        let daemon_log_path = real_home.join(".config").join("som").join("logs").join("som-srv-daemon.log");
+        let daemon_log_path = real_home.join(".config").join("som").join("logs").join("somsrv-daemon.log");
         let expected = format!("session for pane {pane_id:?} closed for good");
         let mut daemon_log = String::new();
         for _ in 0..50 {
@@ -8291,7 +8496,7 @@ mod tests {
             .join(".config")
             .join("som")
             .join("logs")
-            .join(format!("som-srv-{profile_name}-{pane_id}-relay.log"));
+            .join(format!("somsrv-{profile_name}-{pane_id}-relay.log"));
         let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
             log_contents.contains("holder handshake"),
@@ -8313,7 +8518,7 @@ mod tests {
     /// code and assuming).
     ///
     /// `#[ignore]`d by default: needs a real, reachable SSH host with
-    /// `~/.local/bin/som-srv` already built there (this test does
+    /// `~/.local/bin/somsrv` already built there (this test does
     /// NOT deploy it — see `ensure_remote_binary_deployed` in
     /// `terminal_panel.rs` for that, which is Som's own production path, not
     /// this test's job) and its log files live on THAT machine, not
@@ -8327,7 +8532,7 @@ mod tests {
         cx.executor().allow_parking();
 
         // Overridable via env var so this same test can be pointed at any
-        // reachable SSH host with `~/.local/bin/som-srv` already built
+        // reachable SSH host with `~/.local/bin/somsrv` already built
         // there (Mac, deb, pi5, ...) without editing this file each time —
         // defaults to `localhost` (a local sshd, e.g. WSL2's own on this
         // dev machine) so the test suite doesn't depend on a specific
@@ -8338,7 +8543,7 @@ mod tests {
 
         // Mirrors `wrap_remote_command_args`'s exact argv shape: the ssh
         // host/flags first, then the remote-side command appended after —
-        // `ssh <host> ~/.local/bin/som-srv <profile> <pane-id>
+        // `ssh <host> ~/.local/bin/somsrv <profile> <pane-id>
         // $SHELL --cursor-shape ...`, letting the remote login shell expand
         // `$SHELL` to whatever the remote user's default shell is.
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
@@ -8346,7 +8551,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/som-srv".to_string(),
+                "~/.local/bin/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "$SHELL".to_string(),
@@ -8416,7 +8621,7 @@ mod tests {
         'outer: for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             for dir in candidate_log_dirs {
-                let holder_log_path = format!("{dir}/som-srv-{profile_name}-{pane_id}-holder.log");
+                let holder_log_path = format!("{dir}/somsrv-{profile_name}-{pane_id}-holder.log");
                 let output = std::process::Command::new("ssh").args([&ssh_host, "cat", &holder_log_path]).output();
                 let content = output.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
                 if content.contains("shell process exited, holder shutting down") {
@@ -8432,9 +8637,9 @@ mod tests {
              RelayInput::Close — got remote holder log: {holder_log:?}"
         );
 
-        let holder_log_path = format!("{holder_log_dir}/som-srv-{profile_name}-{pane_id}-holder.log");
+        let holder_log_path = format!("{holder_log_dir}/somsrv-{profile_name}-{pane_id}-holder.log");
         std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &holder_log_path]).output().ok();
-        let relay_log_path = format!("{holder_log_dir}/som-srv-{profile_name}-{pane_id}-relay.log");
+        let relay_log_path = format!("{holder_log_dir}/somsrv-{profile_name}-{pane_id}-relay.log");
         std::process::Command::new("ssh").args([&ssh_host, "rm", "-f", &relay_log_path]).output().ok();
     }
 
@@ -8457,7 +8662,7 @@ mod tests {
     ///
     /// This test doesn't (yet) pin down WHY any particular key fails if it
     /// does — see `strip_cr_induced_lf`/the NUL-byte-as-Close-signal check
-    /// in `som_srv::relay::run`'s stdin loop, both of which
+    /// in `somsrv::relay::run`'s stdin loop, both of which
     /// inspect raw bytes and are the most likely place an escape sequence
     /// could get mangled — but it gives a fast, repeatable way to check
     /// the full RELAY/HOLDER pipeline against every key at once, on a real
@@ -8477,7 +8682,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/som-srv".to_string(),
+                "~/.local/bin/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "bash".to_string(),
@@ -8563,7 +8768,7 @@ mod tests {
     /// failure as a headless test gets.
     ///
     /// `#[ignore]`d by default: needs WSL installed with
-    /// `~/.local/bin/som-srv` already built there, and `htop`
+    /// `~/.local/bin/somsrv` already built there, and `htop`
     /// installed inside that WSL distro. Run explicitly with:
     /// `cargo test -p terminal test_wsl_htop_f2_opens_setup_screen -- --ignored --nocapture`
     #[cfg(target_os = "windows")]
@@ -8577,7 +8782,7 @@ mod tests {
 
         // Mirrors `wrap_remote_command_args`'s exact argv shape for a
         // `wsl`-classified profile: `wsl.exe --cd ~ -- ~/.local/bin/
-        // som-srv <profile> <pane-id> htop ...` — `RemoteKind::Wsl`
+        // somsrv <profile> <pane-id> htop ...` — `RemoteKind::Wsl`
         // is matched on the program name being `wsl`/`wsl.exe` (see
         // `classify_remote`), same remote-command-appending path as ssh.
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
@@ -8587,7 +8792,7 @@ mod tests {
                 "--cd".to_string(),
                 "~".to_string(),
                 "--".to_string(),
-                "~/.local/bin/som-srv".to_string(),
+                "~/.local/bin/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "htop".to_string(),
@@ -8639,9 +8844,9 @@ mod tests {
 
     /// Same as `test_wsl_htop_f2_opens_setup_screen`, but over a real SSH
     /// connection instead of `wsl.exe` — verifies the new `tmux_backend`
-    /// module (see `SOM_MUX_PLAN.md`'s "som-srv v2" section) against the
+    /// module (see `SOM_MUX_PLAN.md`'s "somsrv v2" section) against the
     /// `RemoteKind::Ssh` path specifically, on a real reachable host with
-    /// the new tmux-wrapping `som-srv` binary already built there.
+    /// the new tmux-wrapping `somsrv` binary already built there.
     ///
     /// `#[ignore]`d by default. Run explicitly with:
     /// `SOM_TEST_SSH_HOST=<host> cargo test -p terminal test_ssh_tmux_backend_htop_f2_opens_setup_screen -- --ignored --nocapture`
@@ -8660,7 +8865,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/som-srv".to_string(),
+                "~/.local/bin/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "htop".to_string(),
@@ -8743,7 +8948,7 @@ mod tests {
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
             "ssh".to_string(),
-            vec![ssh_host.clone(), "~/.local/bin/som-srv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+            vec![ssh_host.clone(), "~/.local/bin/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
         )
         .await;
 
@@ -8807,7 +9012,7 @@ mod tests {
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let output = std::process::Command::new("ssh")
-                .args([&ssh_host, "tmux", "-f", "/home/dnk/.config/som/som-srv.conf", "has-session", "-t", &pane_id])
+                .args([&ssh_host, "tmux", "-f", "/home/dnk/.config/som/somsrv.conf", "has-session", "-t", &pane_id])
                 .output();
             if output.map(|o| !o.status.success()).unwrap_or(false) {
                 session_gone = true;
@@ -8827,13 +9032,13 @@ mod tests {
     /// report, confirmed against the real deployed `som.exe`, is "first
     /// Enter is clean, every one after duplicates a blank line". This test
     /// exists specifically because two prior isolated repros (a
-    /// `som_srv::Session`-only test spawning `ssh` directly, and a
+    /// `somsrv::Session`-only test spawning `ssh` directly, and a
     /// same-shape test against a LOCAL `bash` with no ssh at all) BOTH
     /// stayed clean even after the `alacritty_terminal::EventLoop::
     /// pty_read` per-syscall dedup fix, while the bug still reproduced in
     /// the real Som UI — the working theory is that the race depends on
     /// GPUI's own render/executor contending for the SAME `Term` lock the
-    /// `pty_read` thread needs, which a headless `som_srv::Session` test
+    /// `pty_read` thread needs, which a headless `somsrv::Session` test
     /// (no GPUI at all) can never recreate. This test goes through the
     /// REAL `crates/terminal::Terminal`/`TerminalBuilder` (same code path
     /// `terminal_view` uses for an actual tab, including its own GPUI
@@ -8859,7 +9064,7 @@ mod tests {
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
             "ssh".to_string(),
-            vec![ssh_host.clone(), "~/.local/bin/som-srv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+            vec![ssh_host.clone(), "~/.local/bin/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
         )
         .await;
 
@@ -8962,7 +9167,7 @@ mod tests {
         let args = || {
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/som-srv".to_string(),
+                "~/.local/bin/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "$SHELL".to_string(),

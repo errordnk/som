@@ -1,5 +1,5 @@
-//! Binary side-channel client — connects to the `som-srv` daemon already
-//! running on THIS machine (`som_srv::protocol::daemon_socket_path()`) and
+//! Binary side-channel client — connects to the `somsrv` daemon already
+//! running on THIS machine (`somsrv::protocol::daemon_socket_path()`) and
 //! streams file bytes as `SrvRequest::PutChunk` messages, replacing the
 //! old base91/APC-over-PTY path entirely for this content. See the
 //! `rich_content_transport` module doc comment (`crates/terminal`) for why
@@ -8,20 +8,20 @@
 //!
 //! Deliberately fails hard (returns `Err`, `stream_file`'s caller prints it
 //! and exits non-zero) rather than silently falling back to the slower
-//! PTY/APC path if `som-srv` isn't reachable — a missing/undeployed daemon
+//! PTY/APC path if `somsrv` isn't reachable — a missing/undeployed daemon
 //! is a real setup problem worth surfacing immediately, not a degraded
 //! mode worth hiding behind automatic fallback (see this crate's git
 //! history for the explicit decision behind this).
 
-use som_srv::pipe::PipeConnection;
-use som_srv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse, daemon_socket_path};
+use somsrv::pipe::PipeConnection;
+use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse, daemon_socket_path};
 
 /// A `Srv`-kind connection carries `SrvRequest`s one direction (client ->
 /// daemon: `PutChunk`, `SubscribeProgress`, admin commands) and
 /// `SrvResponse`s the other (daemon -> client: `Handshake`, `Sessions`,
 /// `Progress` pushes) — EXCEPT for `RequestByteRange`, which the daemon
 /// forwards to a `PutChunk`-sending connection VERBATIM as a raw
-/// `SrvRequest` (see `som_srv::server::forward_srv_request`'s doc
+/// `SrvRequest` (see `somsrv::server::forward_srv_request`'s doc
 /// comment) — the daemon has no reason to wrap it in a `SrvResponse`
 /// variant of its own, since the wire framing (length-prefixed JSON) is
 /// identical either way. So a client that sends `PutChunk`s must be
@@ -59,32 +59,32 @@ pub struct SrvChannel {
 impl SrvChannel {
     /// Connects to the local daemon and completes its handshake. Returns a
     /// descriptive error (not a bare I/O error) on failure — this is the
-    /// message a user actually sees when `som-srv` isn't running, so it
+    /// message a user actually sees when `somsrv` isn't running, so it
     /// needs to say what's wrong and hint at the fix, not just "connection
     /// refused".
     pub fn connect() -> Result<Self, String> {
-        // `som_srv::daemon::connect_or_spawn` handles the common case
+        // `somsrv::daemon::connect_or_spawn` handles the common case
         // (daemon not running yet) by spawning it itself, next to this
         // `somcat` binary's own executable — same deploy convention
-        // `terminal_view::terminal_panel::som_srv_binary_path` expects
+        // `terminal_view::terminal_panel::somsrv_binary_path` expects
         // Som proper to find it under. Only a genuinely broken deploy
         // (binary missing entirely) surfaces as an error here.
-        let daemon_binary = som_srv::daemon::binary_path_next_to_current_exe().map_err(|err| {
+        let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe().map_err(|err| {
             format!(
                 "{err:#}\n\
-                 (som-srv should be deployed next to somcat's own executable — \
-                 check `~/.local/bin/som-srv` exists and is executable)"
+                 (somsrv should be deployed next to somcat's own executable — \
+                 check `~/.local/bin/somsrv` exists and is executable)"
             )
         })?;
-        let connection = som_srv::daemon::connect_or_spawn(&daemon_binary).map_err(|err| {
-            format!("failed to connect to the som-srv daemon at {:?}: {err:#}", daemon_socket_path())
+        let connection = somsrv::daemon::connect_or_spawn(&daemon_binary).map_err(|err| {
+            format!("failed to connect to the somsrv daemon at {:?}: {err:#}", daemon_socket_path())
         })?;
         ConnectionKind::Srv.write_to(&connection).map_err(|err| format!("failed to tag connection as Srv: {err:#}"))?;
 
         send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
         match read_any(&connection)? {
             Incoming::Response(SrvResponse::Handshake(_)) => {},
-            other => return Err(format!("expected Handshake as som-srv's first reply, got {other:?}")),
+            other => return Err(format!("expected Handshake as somsrv's first reply, got {other:?}")),
         }
 
         Ok(Self { connection, write_lock: std::sync::Mutex::new(()) })
@@ -101,8 +101,8 @@ impl SrvChannel {
         offset: u64,
         data: Vec<u8>,
         total_size: u64,
-        content_type: som_srv::protocol::ContentType,
-        metadata: som_srv::protocol::ContentMetadata,
+        content_type: somsrv::protocol::ContentType,
+        metadata: somsrv::protocol::ContentMetadata,
     ) -> Result<(), String> {
         let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         send(&self.connection, &SrvRequest::PutChunk { session_id, file_id, offset, data, total_size, content_type, metadata })
@@ -121,7 +121,7 @@ impl SrvChannel {
 
     /// Registers this connection as the DEDICATED target for `SrvRequest::
     /// RequestByteRange` forwarding for `(session_id, file_id)` — see
-    /// `som_srv::protocol::SrvRequest::RegisterRangeResponder`'s own doc
+    /// `somsrv::protocol::SrvRequest::RegisterRangeResponder`'s own doc
     /// comment for why this needs to be a connection separate from
     /// whichever one is sending the sequential `PutChunk` stream.
     pub fn register_range_responder(&self, session_id: u32, file_id: u32) -> Result<(), String> {
@@ -138,37 +138,37 @@ impl std::fmt::Debug for Incoming {
     }
 }
 
-/// Converts `crates/terminal`'s `ContentType` to `som_srv::protocol`'s
+/// Converts `crates/terminal`'s `ContentType` to `somsrv::protocol`'s
 /// own separate (but field-for-field identical) copy — see that type's
-/// own doc comment for why `som_srv` can't just depend on
+/// own doc comment for why `somsrv` can't just depend on
 /// `crates/terminal` directly (GPUI).
-pub fn to_srv_content_type(content_type: terminal::rich_content_transport::ContentType) -> som_srv::protocol::ContentType {
+pub fn to_srv_content_type(content_type: terminal::rich_content_transport::ContentType) -> somsrv::protocol::ContentType {
     use terminal::rich_content_transport::ContentType as T;
     match content_type {
-        T::Gif => som_srv::protocol::ContentType::Gif,
-        T::Audio => som_srv::protocol::ContentType::Audio,
-        T::Markdown => som_srv::protocol::ContentType::Markdown,
-        T::Video => som_srv::protocol::ContentType::Video,
-        T::Jpeg => som_srv::protocol::ContentType::Jpeg,
-        T::Png => som_srv::protocol::ContentType::Png,
+        T::Gif => somsrv::protocol::ContentType::Gif,
+        T::Audio => somsrv::protocol::ContentType::Audio,
+        T::Markdown => somsrv::protocol::ContentType::Markdown,
+        T::Video => somsrv::protocol::ContentType::Video,
+        T::Jpeg => somsrv::protocol::ContentType::Jpeg,
+        T::Png => somsrv::protocol::ContentType::Png,
     }
 }
 
-/// Converts `crates/terminal`'s `ContentMetadata` to `som_srv::protocol`'s
+/// Converts `crates/terminal`'s `ContentMetadata` to `somsrv::protocol`'s
 /// own separate (but field-for-field identical) copy — see
 /// `to_srv_content_type`'s doc comment for why these are two distinct
 /// types rather than one shared one.
-pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetadata) -> som_srv::protocol::ContentMetadata {
+pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetadata) -> somsrv::protocol::ContentMetadata {
     use terminal::rich_content_transport::ContentMetadata as M;
     match metadata {
         M::Image { width_px, height_px, color_bits, is_animated } => {
-            som_srv::protocol::ContentMetadata::Image { width_px, height_px, color_bits, is_animated }
+            somsrv::protocol::ContentMetadata::Image { width_px, height_px, color_bits, is_animated }
         },
         M::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension } => {
-            som_srv::protocol::ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension }
+            somsrv::protocol::ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, extension }
         },
         M::Video { width_px, height_px, fps_numerator, fps_denominator, codec, audio_stream_index, subtitle_stream_index, extension } => {
-            som_srv::protocol::ContentMetadata::Video {
+            somsrv::protocol::ContentMetadata::Video {
                 width_px,
                 height_px,
                 fps_numerator,
@@ -179,33 +179,33 @@ pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetada
                 extension,
             }
         },
-        M::Markdown => som_srv::protocol::ContentMetadata::Markdown,
+        M::Markdown => somsrv::protocol::ContentMetadata::Markdown,
     }
 }
 
-fn to_srv_video_codec(codec: terminal::rich_content_transport::VideoCodec) -> som_srv::protocol::VideoCodec {
+fn to_srv_video_codec(codec: terminal::rich_content_transport::VideoCodec) -> somsrv::protocol::VideoCodec {
     use terminal::rich_content_transport::VideoCodec as C;
     match codec {
-        C::Unknown => som_srv::protocol::VideoCodec::Unknown,
-        C::H264 => som_srv::protocol::VideoCodec::H264,
-        C::H265 => som_srv::protocol::VideoCodec::H265,
-        C::Vp9 => som_srv::protocol::VideoCodec::Vp9,
-        C::Av1 => som_srv::protocol::VideoCodec::Av1,
-        C::Mpeg4 => som_srv::protocol::VideoCodec::Mpeg4,
+        C::Unknown => somsrv::protocol::VideoCodec::Unknown,
+        C::H264 => somsrv::protocol::VideoCodec::H264,
+        C::H265 => somsrv::protocol::VideoCodec::H265,
+        C::Vp9 => somsrv::protocol::VideoCodec::Vp9,
+        C::Av1 => somsrv::protocol::VideoCodec::Av1,
+        C::Mpeg4 => somsrv::protocol::VideoCodec::Mpeg4,
     }
 }
 
 fn send(connection: &PipeConnection, message: &SrvRequest) -> Result<(), String> {
     let payload = serde_json::to_vec(message).map_err(|err| format!("failed to encode SrvRequest: {err}"))?;
-    connection.write_message(&payload).map_err(|err| format!("failed to write to som-srv: {err:#}"))
+    connection.write_message(&payload).map_err(|err| format!("failed to write to somsrv: {err:#}"))
 }
 
 fn read_any(connection: &PipeConnection) -> Result<Incoming, String> {
-    let message = connection.read_message().map_err(|err| format!("failed to read from som-srv: {err:#}"))?;
+    let message = connection.read_message().map_err(|err| format!("failed to read from somsrv: {err:#}"))?;
     if let Ok(response) = serde_json::from_slice::<SrvResponse>(&message) {
         return Ok(Incoming::Response(response));
     }
     serde_json::from_slice::<SrvRequest>(&message)
         .map(Incoming::Request)
-        .map_err(|err| format!("failed to decode message from som-srv as either SrvResponse or SrvRequest: {err}"))
+        .map_err(|err| format!("failed to decode message from somsrv as either SrvResponse or SrvRequest: {err}"))
 }

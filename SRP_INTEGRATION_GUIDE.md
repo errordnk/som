@@ -9,21 +9,10 @@ design history and decision log instead, see `SRP_PROTOCOL.md` in this
 repository — this document is the external-facing spec extracted from
 that journal, aimed at someone who has never seen Som's source before.
 
-**BREAKING CHANGE (2026-08-27): if you integrated against an earlier
-version of this guide, read "Migrating from the old PTY/base91
-transport" near the end before anything else** — the payload transport
-this guide used to describe (base91-encoded APC envelopes carrying file
-bytes over the same PTY as keystrokes) has been removed from Som
-entirely. Placement geometry (the Unicode-placeholder grid) is unchanged
-— only how file bytes get from your client to Som changed.
-
 The reference implementation this guide walks through lives in
 [`errordnk/yazi`](https://github.com/errordnk/yazi), a fork of the
 [yazi](https://github.com/sxyazi/yazi) terminal file manager, specifically
-`yazi-adapter/src/drivers/srp.rs`. **As of this writing, that reference
-implementation still speaks the OLD (removed) transport and needs to be
-migrated** — read this guide as the target to migrate it to, not as an
-accurate description of its current state.
+`yazi-adapter/src/drivers/srp/`.
 
 ## Why a protocol integration, not just "print an image"
 
@@ -36,7 +25,7 @@ speaking Kitty to it. Two real, unavoidable reasons:
    payloads and multi-second display latency — acceptable for a single
    screenshot, not for smooth animation. SRP streams the source file's
    raw bytes over a dedicated binary channel (no text-safe re-encoding
-   overhead at all — see "Transport: the som-srv binary side-channel"
+   overhead at all — see "Transport: the somsrv binary side-channel"
    below), progressively, rather than re-encoding every frame to PNG
    first.
 2. **Windows ConPTY is not a transparent byte pipe for a PTY child
@@ -64,7 +53,7 @@ actually expects — matching it exactly is not optional.
 ## Detecting that you're running inside Som
 
 Som sets `SOM_WINDOW_ID` (any local terminal spawn, and any remote
-session reached through `som-srv`) to the PID of the Som process, the
+session reached through `somsrv`) to the PID of the Som process, the
 same role `KITTY_WINDOW_ID` plays for Kitty. Presence of the variable —
 not its specific value — is the capability signal:
 
@@ -84,7 +73,7 @@ SRP has exactly one receiving implementation (Som itself), so the
 environment variable is the whole detection story. If `SOM_WINDOW_ID`
 isn't set, don't attempt an SRP transfer; Som isn't there to receive it.
 
-## Two channels: PTY (control) and som-srv (payload)
+## Two channels: PTY (control) and somsrv (payload)
 
 SRP now has two genuinely separate transports, each carrying a different
 kind of data:
@@ -94,28 +83,28 @@ kind of data:
    "Placement: the Unicode-placeholder grid technique" below) — real
    Unicode text, printed exactly the way any other program's output
    would be. No file bytes, ever.
-2. **The `som-srv` binary side-channel** — a separate connection (named
+2. **The `somsrv` binary side-channel** — a separate connection (named
    pipe on Windows, Unix domain socket elsewhere) to a small daemon,
-   `som-srv`, that Som deploys and runs on whichever machine your client
+   `somsrv`, that Som deploys and runs on whichever machine your client
    process is actually running on (the SAME machine — if your client is
    reached over SSH, this is a LOCAL socket on the remote end, not a
    connection back to wherever Som's own window is; see "Where is
-   `som-srv`" below). Carries the raw file payload, plus a small
+   `somsrv`" below). Carries the raw file payload, plus a small
    typed request/response protocol for the one direction that flows
    Som → client (byte-range seek requests — see "Answering byte-range
    requests" below).
 
 Both channels are required for a working integration: without the PTY
 grid, Som never learns your placement exists at all; without the
-`som-srv` connection, there's no payload to show.
+`somsrv` connection, there's no payload to show.
 
-## Transport: the som-srv binary side-channel
+## Transport: the somsrv binary side-channel
 
-### Where is `som-srv`
+### Where is `somsrv`
 
-Som deploys a small daemon binary, `som-srv`, next to itself: locally,
+Som deploys a small daemon binary, `somsrv`, next to itself: locally,
 in the same directory as Som's own executable; on a remote host reached
-over SSH, in `~/.local/bin/som-srv` (deployed automatically the first
+over SSH, in `~/.local/bin/somsrv` (deployed automatically the first
 time a `tmux: true` — or now, any — profile on that host needs it). This
 is the SAME daemon that also implements Som's tmux-style persistent-session
 functionality — the binary side-channel is just one of its jobs, not a
@@ -123,23 +112,23 @@ separate process you need to find or start yourself.
 
 The daemon listens on a fixed, well-known local address:
 
-- Windows: named pipe `\\.\pipe\som-srv`
+- Windows: named pipe `\\.\pipe\somsrv`
 - Unix (macOS/Linux, including the remote end of an SSH session): Unix
-  domain socket `/tmp/som-srv-<uid>.sock` (per-uid, so multiple users on
+  domain socket `/tmp/somsrv-<uid>.sock` (per-uid, so multiple users on
   a shared machine each get their own daemon and session registry)
 
 **Your client connects to this LOCAL address on whatever machine it's
 actually running on** — never to Som directly, never over the network
 itself. If Som is local, that's the same machine. If Som reached your
-client over SSH, `som-srv` is running on the remote end (deployed there
+client over SSH, `somsrv` is running on the remote end (deployed there
 the same way), and your client connects to the socket on THAT machine —
-`som-srv` itself bridges back to Som over the SSH connection Som
+`somsrv` itself bridges back to Som over the SSH connection Som
 already has open, entirely transparently to your client.
 
 If the daemon isn't running yet when your client tries to connect,
 spawn it yourself (detached, so it outlives your own process) and
-retry — this is exactly what Som's own clients do (`som_srv::daemon::
-connect_or_spawn`). Find the `som-srv(.exe)` binary next to your own
+retry — this is exactly what Som's own clients do (`somsrv::daemon::
+connect_or_spawn`). Find the `somsrv(.exe)` binary next to your own
 client's executable (the deploy convention every Som-side client
 follows) or, if you can't find it there, treat SRP support as
 unavailable for this run rather than trying to embed/fetch a copy
@@ -149,7 +138,7 @@ yourself.
 
 Length-prefixed JSON frames over the pipe/socket connection (no text-safe
 encoding needed at all — this is a raw local IPC channel, not a PTY, so
-none of the ConPTY-codepage concerns from the old transport apply here).
+none of the ConPTY-codepage concerns apply here).
 The two message enums:
 
 ```rust
@@ -188,9 +177,8 @@ need to parse `Progress` yourself.
    negotiation your client needs to branch on).
 3. Read the daemon's own `SrvResponse::Handshake` reply.
 4. Send `PutChunk` messages, one per chunk, sequentially, `offset`
-   tracking the running byte position — the same "just stream the raw
-   file bytes, unmodified, chunk by chunk" model the old transport used,
-   minus the base91 encoding step.
+   tracking the running byte position — the model is simply "stream the
+   raw file bytes, unmodified, chunk by chunk", with no encoding step.
 5. For content with no seek concept (a static image, an unanimated
    GIF... actually GIF/JPEG/PNG in general): close the connection once
    every chunk is sent, exit.
@@ -214,9 +202,7 @@ for "the first message looks different."
 
 ### `ContentMetadata`
 
-Same fields, same meaning as the pre-2026-08-27 transport — only the
-wire encoding changed (JSON struct field instead of a fixed-width binary
-layout):
+Carried as a JSON struct field alongside the rest of the handshake:
 
 ```rust
 enum ContentMetadata {
@@ -244,7 +230,7 @@ long time to finish.
 
 ### Session and file ids
 
-Unchanged from the old transport: `session_id`/`file_id` are both
+`session_id`/`file_id` are both
 sender-assigned 32-bit values, masked to 24 bits (`& 0xFF_FFFF`, clamped
 to a minimum of 1 — 0 is reserved as "no id"). The reference
 implementation derives both from the current Unix timestamp in
@@ -270,7 +256,7 @@ below), which only have 24 bits of RGB to work with per channel.
 is not just a latency nicety anymore — it's a correctness requirement.
 Som only subscribes to a given `(session_id, file_id)`'s progress once
 it has seen that id in the placeholder grid; if your client streams an
-entire small file and closes its `som-srv` connection before Som has had
+entire small file and closes its `somsrv` connection before Som has had
 a chance to print/see the grid and subscribe, Som may never learn the
 transfer happened at all (the daemon does replay the current watermark
 to a late subscriber as a best-effort mitigation, but relying on that
@@ -280,7 +266,7 @@ its image/GIF branch streamed first and printed the grid last, which
 worked fine under the old always-on-PTY transport but broke silently
 under the new one; reordering it (grid first) fixed it.
 
-For audio/video specifically, Som's own clients ALSO keep the `som-srv`
+For audio/video specifically, Som's own clients ALSO keep the `somsrv`
 connection open after the initial sequential stream (see "Answering
 byte-range requests" below) — for images/GIF with no seek concept, close
 the connection once the last chunk is sent.
@@ -313,11 +299,11 @@ mechanism, not the whole design surface.
 
 **You don't need a new response shape.** `SrvRequest::RequestByteRange
 { session_id, file_id, offset, len }` arrives unsolicited on your
-client's already-open `som-srv` connection (the same one it used to send
+client's already-open `somsrv` connection (the same one it used to send
 `PutChunk`s — see "Connection lifecycle" above). Answer it with ordinary
 `PutChunk` message(s) covering `[offset, offset + len)` of the file,
 `offset` set to the real file offset the range starts at (not
-offset-from-zero the way the initial stream's first chunk was). `som-srv`'s
+offset-from-zero the way the initial stream's first chunk was). `somsrv`'s
 receiving cache already tolerates a chunk landing at an arbitrary,
 out-of-sequence offset (needed for ordinary out-of-order delivery
 robustness regardless of byte-range queries) — no new receiving-side
@@ -331,13 +317,12 @@ starting offset instead of 0.
 
 ### Your process needs to still be alive when a seek happens
 
-If your client closes its `som-srv` connection immediately after the
+If your client closes its `somsrv` connection immediately after the
 initial sequential stream finishes (the simplest, and for small files
 entirely correct, shape), there's nothing left to answer a byte-range
 request with — the daemon has nowhere to forward it to, and Som simply
-won't get a response (surfacing as "no more progress for that range,"
-the same silent gap the old transport's unanswered `Query` also
-tolerated — not a new failure mode). For a client that wants to support
+won't get a response (surfacing as "no more progress for that range" —
+a silent gap, not an error). For a client that wants to support
 seeking into a large, still-transferring (or even fully-transferred but
 since exited) file, keep the process running and the connection open
 for as long as you're willing to keep answering. Som's own clients keep
@@ -384,8 +369,8 @@ whoever's actually listening.
 
 ## Placement: the Unicode-placeholder grid technique
 
-**Unchanged from the old transport** — this always lived on the PTY, and
-still does. This is the part that makes SRP (and Kitty's own "Unicode
+This part lives on the PTY, as real terminal text. It's also what makes
+SRP (and Kitty's own "Unicode
 placeholders" extension, which SRP reuses the encoding scheme from)
 genuinely different from most terminal graphics protocols: **the image
 isn't anchored to a pixel or cell position tracked out-of-band from the
@@ -552,8 +537,8 @@ client, both already solved in Som's own `somcat` reference client
 (`crates/somcat/src/raw_mode.rs`/`main.rs`'s `write_raw_stdout`) — worth
 knowing about even if you're implementing in a different language, since
 the underlying causes are platform behavior, not Rust-specific. Both are
-about the PLACEHOLDER GRID text now (the only thing still on the PTY) —
-neither applies to the `som-srv` connection, which is a plain local
+about the PLACEHOLDER GRID text (the only part that goes over the PTY) —
+neither applies to the `somsrv` connection, which is a plain local
 socket/pipe with no console/codepage involvement at all.
 
 1. **`std::io::Stdout::flush()` can hang indefinitely.** Rust's
@@ -576,62 +561,26 @@ socket/pipe with no console/codepage involvement at all.
    handle, which many legacy Windows console configurations don't have
    on by default).
 
-## Migrating from the old PTY/base91 transport
-
-If your integration currently implements the transport this guide used
-to describe (before 2026-08-27) — base91-encoded `ESC _ S ... ESC \`
-chunk envelopes carrying file payload over the PTY, and `ESC _ Q ...
-ESC \` query envelopes for byte-range seeks — here's what changed and
-what to do about it:
-
-**Delete entirely, no longer needed:**
-- base91 encode/decode.
-- The chunk-envelope header/marker/separator format (`ESC _ S ...`).
-- The query-envelope format (`ESC _ Q ...`) and its background
-  stdin-reading thread.
-- The `STDOUT_WRITE_LOCK`-style synchronization your client needed once
-  it had two threads (main stream + query responder) both writing to
-  stdout — the `som-srv` connection is a separate channel from stdout
-  now, so this concurrency concern moves there instead (see below), but
-  the stdout-specific lock itself is gone.
-
-**Add:**
-- A `som-srv` client: connect to the local daemon (spawn it if not
-  running — see "Where is `som-srv`" above), send `Handshake`, then
-  `PutChunk` per chunk instead of building/writing envelopes.
-- For audio/video: keep the `som-srv` connection open, read it in a
-  background thread/task for `RequestByteRange`, answer with more
-  `PutChunk`s — same overall shape as the old query-responder thread,
-  just reading a different connection instead of stdin.
-
-**Unchanged, keep exactly as-is:**
-- Placeholder-grid printing (still real PTY text, still needs to happen
-  BEFORE the transfer now more than ever — see "Order matters" above).
-- `CSI 16 t`/`CSI 18 t` cell-geometry queries, if your client uses them.
-- Metadata extraction (format-header probing).
-- Windows `SetConsoleOutputCP`/raw-`WriteFile` handling for the grid text.
-- Session/file id derivation.
-
 ## Worked example: the yazi driver
 
 The reference implementation, `yazi-adapter/src/drivers/srp/` in
 [`errordnk/yazi`](https://github.com/errordnk/yazi), has been migrated
-to the current `som-srv` transport (2026-09-02) and now has full parity
+to the current `somsrv` transport (2026-09-02) and now has full parity
 with `somcat`, not just images/GIF:
 
 - **Transport**: `srp/protocol.rs`, `srp/pipe.rs`, `srp/daemon.rs`, and
-  `srp/srv_channel.rs` are a hand-kept, client-only port of `som_srv::
-  protocol`/`som_srv::pipe`/`som_srv::daemon`/`somcat`'s own `srv_
+  `srp/srv_channel.rs` are a hand-kept, client-only port of `somsrv::
+  protocol`/`somsrv::pipe`/`somsrv::daemon`/`somcat`'s own `srv_
   channel.rs` — see `protocol.rs`'s own doc comment for why this is a
-  port rather than a dependency on the `som_srv` crate (it pulls in
+  port rather than a dependency on the `somsrv` crate (it pulls in
   `alacritty_terminal`/`smol`/`sysinfo`/`zlog`, all Som-internal and
   unwanted in a general-purpose file manager's dependency tree). Unlike
-  `somcat` (which finds `som-srv` next to its own executable, since the
+  `somcat` (which finds `somsrv` next to its own executable, since the
   two are built and deployed together), this driver has no such
-  relationship to `som-srv` at all — it looks for it at the fixed path
-  `~/.local/bin/som-srv[.exe]` instead (`daemon.rs`), spawning it
+  relationship to `somsrv` at all — it looks for it at the fixed path
+  `~/.local/bin/somsrv[.exe]` instead (`daemon.rs`), spawning it
   detached if not already running, same retry-then-give-up shape as
-  `som_srv::daemon::connect_or_spawn`.
+  `somsrv::daemon::connect_or_spawn`.
 - **Images/GIF** (`srp/mod.rs`'s `show_image`): unchanged in spirit from
   before the migration — reads the whole (typically small) file into
   memory, probes its header (`metadata.rs`), prints the placeholder
@@ -677,6 +626,6 @@ with `somcat`, not just images/GIF:
 If you're integrating SRP into a different application, the yazi driver
 is a useful reference for both the transport port (`srp/protocol.rs`
 through `srp/srv_channel.rs`) and the geometry/detection pieces — follow
-this guide's `som-srv` sections for the wire protocol itself, and treat
+this guide's `somsrv` sections for the wire protocol itself, and treat
 `srp/mod.rs` as a worked example of wiring video/audio through it
 end-to-end, not just images.

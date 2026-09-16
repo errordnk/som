@@ -1,19 +1,17 @@
 //! Progressive GIF decoding for Som's own rich-content protocol — reads
-//! however many contiguous bytes [`crate::rich_content_cache::RichContentCache`]
-//! currently reports as available and tries to decode as many frames as
-//! that prefix supports, without waiting for the whole file. Re-tried on
-//! every new chunk arrival; a decode failure caused by the file simply
-//! being incomplete so far is expected and silent (not an error to
-//! surface), while a genuinely malformed GIF is reported once and then
-//! not retried pointlessly forever.
+//! however many contiguous bytes [`crate::rich_content_srv_channel::
+//! SrvProgressState`] currently reports as available and tries to
+//! decode as many frames as that prefix supports, without waiting for
+//! the whole file. Re-tried on every new chunk arrival; a decode failure
+//! caused by the file simply being incomplete so far is expected and
+//! silent (not an error to surface), while a genuinely malformed GIF is
+//! reported once and then not retried pointlessly forever.
 //!
-//! This is the source-of-truth-is-a-file counterpart to
+//! Same "accumulate, then make frames available" shape as
 //! `crate::kitty_graphics_store`'s in-memory `PendingFrames`/`DecodedImage`
-//! — same "accumulate, then make frames available" shape, but reading
-//! bytes off disk through `image`'s own GIF decoder instead of parsing
+//! — both read through `image`'s own GIF decoder rather than parsing
 //! Kitty's `a=f`/`a=a` command stream frame-by-frame.
 
-use std::path::Path;
 use std::time::Duration;
 
 use image::AnimationDecoder as _;
@@ -34,26 +32,19 @@ pub struct DecodedPrefix {
     pub complete: bool,
 }
 
-/// Tries to decode as many complete frames as possible from the first
-/// `available_len` bytes of the file at `path`. Returns `Ok(None)` when
-/// there isn't enough data yet for even a valid GIF header/first frame —
-/// this is the expected, silent "try again once more bytes arrive" case,
-/// NOT a `Result::Err`. Returns `Err` only for a file that's actually
-/// malformed in a way more data arriving wouldn't fix (e.g. it doesn't
-/// start with a GIF signature at all).
-///
-/// Reads through a `Take`-limited file handle rather than the whole file,
-/// so a caller polling this on every chunk doesn't pay for re-reading
-/// bytes beyond the current watermark that the decoder can't use yet
-/// anyway (a partial trailing frame past `available_len` would just
-/// error out again).
-pub fn try_decode_progressive(path: &Path, available_len: u64) -> Result<Option<DecodedPrefix>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-    // `AnimationDecoder`/`GifDecoder` require `BufRead`, not just `Read` —
-    // `BufReader` wraps the length-limited `Take` handle to satisfy that.
-    let limited = std::io::BufReader::new(std::io::Read::take(file, available_len));
-
-    let decoder = match GifDecoder::new(limited) {
+/// Tries to decode as many complete frames as possible from `bytes` (the
+/// first `contiguous_len` bytes already received, per the caller).
+/// Returns `Ok(None)` when there isn't enough data yet for even a valid
+/// GIF header/first frame — this is the expected, silent "try again once
+/// more bytes arrive" case, NOT a `Result::Err`. Returns `Err` only for
+/// a file that's actually malformed in a way more data arriving wouldn't
+/// fix (e.g. it doesn't start with a GIF signature at all).
+pub fn try_decode_progressive(bytes: &[u8]) -> Result<Option<DecodedPrefix>, String> {
+    // `AnimationDecoder` needs `BufRead + Seek` — `std::io::Cursor` gives
+    // both over a plain `&[u8]` with no copy, and `bytes` is already
+    // exactly "the available prefix" (no `Take`/length-limiting wrapper
+    // needed the way the old file-backed version required).
+    let decoder = match GifDecoder::new(std::io::Cursor::new(bytes)) {
         Ok(decoder) => decoder,
         // A truncated header (not enough bytes yet for even the fixed
         // GIF signature/logical screen descriptor) surfaces as
@@ -133,56 +124,40 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"))
     }
 
-    fn write_temp_gif(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("som_rich_content_gif_player_test_{name}_{}.gif", std::process::id()));
-        std::fs::write(&path, bytes).unwrap();
-        path
-    }
-
     #[test]
     fn empty_prefix_returns_none_not_error() {
-        let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("empty_prefix", &bytes);
-        let result = try_decode_progressive(&path, 0).unwrap();
+        let result = try_decode_progressive(&[]).unwrap();
         assert!(result.is_none(), "zero available bytes must be Ok(None), not an error");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn tiny_prefix_before_any_full_frame_returns_none_not_error() {
         let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("tiny_prefix", &bytes);
         // 32 bytes is enough for the GIF signature + logical screen
         // descriptor but nowhere near a full first frame's compressed
         // image data for this fixture.
-        let result = try_decode_progressive(&path, 32).unwrap();
+        let result = try_decode_progressive(&bytes[..32]).unwrap();
         assert!(result.is_none(), "a header-only prefix must be Ok(None), not an error, until a full frame lands");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn full_file_decodes_all_frames_and_reports_complete() {
         let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("full", &bytes);
-        let result = try_decode_progressive(&path, bytes.len() as u64).unwrap().expect("full file must decode");
+        let result = try_decode_progressive(&bytes).unwrap().expect("full file must decode");
         assert_eq!(result.frames.len(), 47, "giphy.gif fixture is known to have 47 frames");
         assert!(result.complete, "decoding the entire file must report complete=true");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn partial_prefix_decodes_some_frames_and_reports_incomplete() {
         let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("partial", &bytes);
         // Half the file: enough for several frames, but the file is cut
         // off mid-stream, not at the trailer byte.
-        let half = (bytes.len() / 2) as u64;
-        let result = try_decode_progressive(&path, half).unwrap().expect("half the file must yield some frames");
+        let half = bytes.len() / 2;
+        let result = try_decode_progressive(&bytes[..half]).unwrap().expect("half the file must yield some frames");
         assert!(result.frames.len() > 0, "a partial prefix should still decode at least one frame");
         assert!(result.frames.len() < 47, "a partial prefix must not report every frame the full file has");
         assert!(!result.complete, "a truncated prefix must not report complete=true");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -193,12 +168,11 @@ mod tests {
         // polling this on every chunk arrival must never see time run
         // backward.
         let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("growing", &bytes);
 
         let mut last_frame_count = 0usize;
         let steps = [bytes.len() / 10, bytes.len() / 4, bytes.len() / 2, bytes.len() * 3 / 4, bytes.len()];
         for &available in &steps {
-            if let Some(decoded) = try_decode_progressive(&path, available as u64).unwrap() {
+            if let Some(decoded) = try_decode_progressive(&bytes[..available]).unwrap() {
                 assert!(
                     decoded.frames.len() >= last_frame_count,
                     "frame count must never decrease as more bytes become available (was {last_frame_count}, now {})",
@@ -208,25 +182,19 @@ mod tests {
             }
         }
         assert_eq!(last_frame_count, 47, "the final, full-length attempt must reach all 47 frames");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn not_a_gif_at_all_is_a_real_error() {
-        let path = write_temp_gif("not_a_gif", b"this is definitely not a GIF file, no signature here");
-        let result = try_decode_progressive(&path, 54);
+        let result = try_decode_progressive(b"this is definitely not a GIF file, no signature here");
         assert!(result.is_err(), "non-GIF content must be a real error, not Ok(None)");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn frame_delay_converts_to_a_nonzero_duration() {
         let bytes = giphy_gif_bytes();
-        let path = write_temp_gif("delay", &bytes);
-        let decoded = try_decode_progressive(&path, bytes.len() as u64).unwrap().unwrap();
+        let decoded = try_decode_progressive(&bytes).unwrap().unwrap();
         let first = &decoded.frames[0];
         assert!(frame_delay(first) > Duration::ZERO, "giphy.gif's frames must have a real, nonzero display delay");
-        std::fs::remove_file(&path).ok();
     }
 }

@@ -85,8 +85,10 @@ use smallvec::SmallVec;
 /// (the dominant cost for H264/HEVC), which `sws_scale`'s own CPU cost
 /// does not share.
 /// Extracts the embedded decode-only FFmpeg shared libs (avcodec/avformat/
-/// avutil/swresample/swscale) to `~/.config/som/ffmpeg/` on first run and
-/// adds that directory to the process's DLL search path, so `ffmpeg-next`'s
+/// avutil/swresample/swscale) to `paths::data_dir().join("ffmpeg")` (an
+/// installed runtime dependency, not configuration — see `paths::data_dir`'s
+/// own doc comment) on first run and adds that directory to the process's
+/// DLL search path, so `ffmpeg-next`'s
 /// FFI calls resolve them without requiring a system FFmpeg install.
 ///
 /// Shared between `som.exe` (which needs this for its own embedded-video
@@ -101,7 +103,7 @@ use smallvec::SmallVec;
 /// what's already on disk).
 ///
 /// Also copies each DLL next to the running process's own `.exe` (not just
-/// `AddDllDirectory`'ing `~/.config/som/ffmpeg/`) — confirmed live that
+/// `AddDllDirectory`'ing the data-dir copy) — confirmed live that
 /// `somcat.exe` crashes with `STATUS_DLL_NOT_FOUND` before a single line of
 /// `main()` runs (no stderr, no extracted directory) when only
 /// `AddDllDirectory` is used: unlike `som.exe` (whose FFmpeg calls are only
@@ -129,7 +131,7 @@ pub fn ensure_ffmpeg_extracted_and_wired() {
     }
 
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
-    let ffmpeg_dir = paths::config_dir().join("ffmpeg");
+    let ffmpeg_dir = paths::data_dir().join("ffmpeg");
     for file_name in
         ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
     {
@@ -144,7 +146,7 @@ pub fn ensure_ffmpeg_extracted_and_wired() {
         // version of this function skipped extraction outright whenever
         // ANY file already existed at `target`, which silently kept a
         // stale DLL in place across every later upgrade until someone
-        // manually deleted `~/.config/som/ffmpeg/` — confirmed live as
+        // manually deleted the data-dir copy — confirmed live as
         // video audio staying silent for an entire debugging session
         // despite the newly built DLL correctly containing the needed
         // decoders, because the STALE one on disk was still the one
@@ -389,7 +391,7 @@ const OUTPUT_CHANNELS: u16 = 2;
 #[derive(Default)]
 pub struct VideoTransferProgress {
     contiguous_len: AtomicU64,
-    /// See `som_srv::protocol::SrvResponse::Progress::tail_available_from`'s
+    /// See `somsrv::protocol::SrvResponse::Progress::tail_available_from`'s
     /// own doc comment — lets [`GrowingFileStream::read`] serve a
     /// `SeekFrom::End`-derived read once the specific tail region has
     /// arrived, without waiting for `contiguous_len` to grow all the way
@@ -400,7 +402,7 @@ pub struct VideoTransferProgress {
     tail_available_from: AtomicU64,
     /// Out-of-order byte ranges that have arrived (via an explicit
     /// `RequestByteRange` seek response) but haven't yet been folded into
-    /// either watermark above — see `som_srv::protocol::SrvResponse::
+    /// either watermark above — see `somsrv::protocol::SrvResponse::
     /// Progress::pending_ranges`'s own doc comment. Lets
     /// [`GrowingFileStream::read`] serve a mid-file seek's target
     /// directly once ITS specific range has arrived, instead of only
@@ -468,7 +470,7 @@ struct LatestFrame {
 /// module's own top-level doc comment for why this exists instead of
 /// `ffmpeg::format::input(path)`'s plain file-path open, and see
 /// `SrvProgressState`'s own doc comment for why there's no on-disk file
-/// behind any of this anymore (`som-srv` no longer persists chunks to
+/// behind any of this anymore (`somsrv` no longer persists chunks to
 /// disk at all — a full on-disk copy per playback previously exhausted
 /// real disk space on a large-enough file and blocked it from playing).
 ///
@@ -828,7 +830,7 @@ fn run_decode_loop(
     // fixtures fail probing entirely ("Could not find codec parameters
     // ... unspecified pixel format") — those containers' probes lean on
     // the extension hint more heavily. There is no on-disk `Path` to
-    // derive this from anymore (`SrvCache`'s own doc comment: `som-srv`
+    // derive this from anymore (`SrvCache`'s own doc comment: `somsrv`
     // no longer persists chunks to disk at all).
     let extension = loop {
         if stop.load(Ordering::Relaxed) {
@@ -2551,7 +2553,7 @@ mod tests {
     ///
     /// Runs against a real, large (16GB+) local file specifically
     /// because that's what the original live report used — `GrowingFileStream`
-    /// behaves identically whether the file arrived via `som-srv`
+    /// behaves identically whether the file arrived via `somsrv`
     /// streaming or (as here) already sits fully on disk, so a local
     /// open reproduces the same bug without needing a live transfer.
     /// Skipped (not failed) if the specific movie file isn't present on

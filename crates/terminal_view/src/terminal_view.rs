@@ -962,27 +962,43 @@ fn subscribe_for_terminal_events(
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SpawnFailed(message) => {
                     use workspace::notifications::{
-                        NotificationId, simple_message_notification::MessageNotification,
+                        NotificationId, NotificationScope, NotificationSeverity,
+                        simple_message_notification::MessageNotification,
                     };
                     let message = message.clone();
+                    // Tab-scoped, not global — this failure belongs to
+                    // THIS terminal tab specifically (a bad `$SHELL`, a
+                    // local spawn error) and should disappear/reappear as
+                    // the user switches away from/back to it, same
+                    // reasoning as `terminal_panel.rs`'s deploy-failure
+                    // handling (see `PendingTerminalTab::set_error`'s own
+                    // doc comment for the fuller rationale, 2026-09-15).
+                    let item_id = cx.entity_id();
                     terminal_view
                         .workspace
                         .update(cx, |workspace, cx| {
-                            let id = NotificationId::Named("som-terminal-spawn-failed".into());
-                            workspace.show_notification(id, cx, move |cx| {
-                                let message2 = message.clone();
-                                let message3 = message.clone();
-                                cx.new(|cx| {
-                                    MessageNotification::new(message2, cx)
-                                        .primary_message("Copy")
-                                        .primary_on_click(move |_window, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                message3.clone(),
-                                            ));
-                                        })
-                                        .show_suppress_button(false)
-                                })
-                            });
+                            let id = NotificationId::Named(format!("som-terminal-spawn-failed-{}", item_id.as_u64()).into());
+                            workspace.show_scoped_notification(
+                                id,
+                                NotificationScope::Tab(item_id),
+                                NotificationSeverity::Error,
+                                cx,
+                                move |cx| {
+                                    let message2 = message.clone();
+                                    let message3 = message.clone();
+                                    cx.new(|cx| {
+                                        MessageNotification::new(message2, cx)
+                                            .severity(NotificationSeverity::Error)
+                                            .primary_message("Copy")
+                                            .primary_on_click(move |_window, cx| {
+                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                    message3.clone(),
+                                                ));
+                                            })
+                                            .show_suppress_button(false)
+                                    })
+                                },
+                            );
                         })
                         .ok();
                 }

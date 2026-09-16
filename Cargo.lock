@@ -7313,7 +7313,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "som_key"
+name = "somcat"
+version = "0.1.0"
+dependencies = [
+ "ffmpeg-next",
+ "image",
+ "libc",
+ "markdown_line_count",
+ "serde_json",
+ "somsrv",
+ "symphonia",
+ "terminal",
+ "windows 0.61.3",
+]
+
+[[package]]
+name = "somkey"
 version = "0.1.0"
 dependencies = [
  "gpui",
@@ -7322,7 +7337,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "som_srv"
+name = "somsrv"
 version = "0.5.0"
 dependencies = [
  "alacritty_terminal",
@@ -7335,6 +7350,7 @@ dependencies = [
  "mlua",
  "nix 0.29.0",
  "paths",
+ "rust-embed",
  "serde",
  "serde_json",
  "smol",
@@ -7342,21 +7358,6 @@ dependencies = [
  "uuid",
  "windows 0.61.3",
  "zlog",
-]
-
-[[package]]
-name = "somcat"
-version = "0.1.0"
-dependencies = [
- "ffmpeg-next",
- "image",
- "libc",
- "markdown_line_count",
- "serde_json",
- "som_srv",
- "symphonia",
- "terminal",
- "windows 0.61.3",
 ]
 
 [[package]]
@@ -7986,7 +7987,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
- "som_srv",
+ "somsrv",
  "symphonia",
  "sysinfo 0.37.2",
  "task",
@@ -8037,7 +8038,7 @@ dependencies = [
  "serde_json",
  "settings",
  "shellexpand",
- "som_srv",
+ "somsrv",
  "task",
  "terminal",
  "theme",

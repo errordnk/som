@@ -1752,7 +1752,7 @@ fn paint_rich_content_placements(
     // (`ShapedLine::paint`, used by the audio widget branch). `update`
     // (not `read`) is required here because scanning the placeholder
     // grid also calls `ensure_rich_content_srv_subscription`, which
-    // lazily spawns this placement's `som-srv` progress subscription and
+    // lazily spawns this placement's `somsrv` progress subscription and
     // applies any progress already observed to `RichContentCache` — both
     // need `&mut Terminal`.
     // The stopped-video stand-in image (`dna.png`) needs a variant that
@@ -1789,7 +1789,7 @@ fn paint_rich_content_placements(
         // only the decoded in-image offset lets every visible cell agree
         // on the same absolute origin regardless of how much of the image
         // is currently clipped.
-        // Every placement seen in the placeholder grid needs a `som-srv`
+        // Every placement seen in the placeholder grid needs a `somsrv`
         // subscription, regardless of whether `rich_content_cache` has
         // any bytes for it yet — see `Terminal::
         // ensure_rich_content_srv_subscription`'s own doc comment for
@@ -2359,11 +2359,34 @@ fn paint_rich_content_markdown_widget(
     let display_line = origin_line + layout.display_offset as i32;
     let num_lines = layout.dimensions.num_lines() as i32;
 
-    let laid_out = crate::markdown_styling::layout_markdown(rendered_text);
-    let placement_rows = laid_out.len().max(1) as i32;
-
     let columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
     let width = cell_width * columns;
+    let base_font_size = line_height;
+    let prose_family: gpui::SharedString = MARKDOWN_PROSE_FONT_FAMILY.into();
+    let mono_family: gpui::SharedString = layout.base_text_style.font_family.clone();
+    let link_color = gpui::rgba(0x89b4faff).into();
+    let quote_bar_color = gpui::rgba(0x585b70ff);
+
+    // Word-wrap at the placement's actual available width, minus the
+    // block-quote indent (the narrowest a wrapped line's own text can
+    // actually occupy) — see `markdown_styling::layout_markdown`'s own
+    // doc comment for the wrap pass this feeds. Font-aware (proportional
+    // prose can't be wrapped by counting characters), using the base
+    // (non-heading-scaled) prose font — a real, if imperfect, compromise
+    // for headings (which render larger and could in principle wrap
+    // slightly earlier than this predicts) rather than a second wrapper
+    // per heading level.
+    let prose_font = Font {
+        family: prose_family.clone(),
+        features: gpui::FontFeatures::default(),
+        fallbacks: None,
+        weight: gpui::FontWeight::NORMAL,
+        style: gpui::FontStyle::Normal,
+    };
+    let wrap_width = (width - cell_width).max(gpui::px(1.0));
+    let mut line_wrapper = window.text_system().line_wrapper(prose_font, base_font_size);
+    let laid_out = crate::markdown_styling::layout_markdown(rendered_text, Some((&mut line_wrapper, wrap_width)));
+    let placement_rows = laid_out.len().max(1) as i32;
 
     // The rows of the FULL placement (0..placement_rows) that fall
     // within the visible screen (0..num_lines) right now — clamped on
@@ -2382,12 +2405,6 @@ fn paint_rich_content_markdown_widget(
     let bounds = Bounds::new(position, gpui::size(width, visible_row_count as f32 * line_height));
 
     window.paint_quad(fill(bounds, rich_content_widget_bg()));
-
-    let base_font_size = line_height;
-    let prose_family: gpui::SharedString = MARKDOWN_PROSE_FONT_FAMILY.into();
-    let mono_family: gpui::SharedString = layout.base_text_style.font_family.clone();
-    let link_color = gpui::rgba(0x89b4faff).into();
-    let quote_bar_color = gpui::rgba(0x585b70ff);
 
     // `scroll_offset_lines` shifts which lines of `laid_out` map to
     // `first_visible_row`, independent of the placement's on-screen

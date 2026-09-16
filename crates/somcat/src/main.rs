@@ -5,8 +5,8 @@
 //! default).
 //!
 //! Bulk payload bytes and byte-range query/response travel over
-//! `som-srv`'s binary side channel (`srv_channel::SrvChannel`,
-//! `som_srv::protocol::SrvRequest::PutChunk`/`RequestByteRange`) — the
+//! `somsrv`'s binary side channel (`srv_channel::SrvChannel`,
+//! `somsrv::protocol::SrvRequest::PutChunk`/`RequestByteRange`) — the
 //! OLD APC/base91-over-PTY transport (`terminal::rich_content_transport`'s
 //! `Chunk`/`build_envelope`/`Query`) has been deleted entirely, no
 //! fallback. The placeholder-grid control handshake (`print_placeholder_
@@ -25,7 +25,7 @@ use terminal::kitty_graphics_placeholder;
 /// Chunk size for one piece of a progressive file transfer — large enough
 /// to be efficient, small enough to keep per-piece overhead low.
 /// Unchanged from the old APC-over-PTY transport's own chunk size —
-/// still a reasonable piece size for `som_srv::protocol::SrvRequest::
+/// still a reasonable piece size for `somsrv::protocol::SrvRequest::
 /// PutChunk` messages over a real binary side channel, though there's no
 /// longer an escape-sequence-parser or ConPTY codepage concern driving
 /// this number the way there was on the PTY path; revisit if profiling
@@ -721,7 +721,7 @@ fn new_ids() -> SrpIds {
 }
 
 /// Streams `bytes` to Som's rich-content pipeline over `channel` — the
-/// binary side-channel to `som-srv` (`SrvChannel::connect`), replacing
+/// binary side-channel to `somsrv` (`SrvChannel::connect`), replacing
 /// the old APC/base91-over-PTY transport entirely (see `terminal::
 /// rich_content_transport`'s module doc comment for why that transport
 /// existed and no longer does). Content-type-agnostic: the caller picks
@@ -746,7 +746,7 @@ fn stream_bytes(
 /// size (not `bytes.len()`), since a range response still needs to
 /// declare the file's real total size, same as the initial sequential
 /// stream does. `content_type`/`metadata` travel on every `PutChunk` —
-/// see `som_srv::protocol::SrvRequest::PutChunk`'s own doc comment for
+/// see `somsrv::protocol::SrvRequest::PutChunk`'s own doc comment for
 /// why.
 #[allow(clippy::too_many_arguments)]
 fn send_range_chunks(
@@ -866,7 +866,7 @@ fn spawn_byte_range_responder_from_disk(
                 return;
             }
             match channel.read_incoming() {
-                Ok(srv_channel::Incoming::Request(som_srv::protocol::SrvRequest::RequestByteRange {
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::RequestByteRange {
                     session_id,
                     file_id,
                     offset,
@@ -874,7 +874,7 @@ fn spawn_byte_range_responder_from_disk(
                 })) if (session_id, file_id) == ids => {
                     let _ = send_range_chunks_from_disk(&channel, &file, content_type, metadata.clone(), ids, total_size, offset, len);
                 },
-                Ok(srv_channel::Incoming::Request(som_srv::protocol::SrvRequest::EndPlayback { session_id, file_id }))
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::EndPlayback { session_id, file_id }))
                     if (session_id, file_id) == ids =>
                 {
                     ended_for_thread.store(true, Ordering::Release);
@@ -894,7 +894,7 @@ fn spawn_byte_range_responder_from_disk(
 /// measured bug: a 15GB movie file used to take ~15 minutes to start
 /// playing in Som, because the OLD `stream_file` read the entire file
 /// into a `Vec<u8>` before a single `PutChunk` went out, and every
-/// downstream stage (`som-srv`'s cache writer, `RichContentCache`,
+/// downstream stage (`somsrv`'s cache writer, `RichContentCache`,
 /// `Terminal::rich_content_video_placements`'s open gate, `GrowingFileStream`'s
 /// FFmpeg probe) was ALREADY fully progressive and ready to start playing
 /// from the very first byte — the whole-file read was the only actual
@@ -925,7 +925,7 @@ fn spawn_byte_range_responder_from_disk(
 /// playback has definitively ended, one of three ways, all funneled
 /// through the same exit path below:
 /// 1. **Natural end of content.** Som reaches EOF during decode and tells
-///    `som-srv` to relay [`som_srv::protocol::SrvRequest::EndPlayback`]
+///    `somsrv` to relay [`somsrv::protocol::SrvRequest::EndPlayback`]
 ///    back down THIS responder connection (mirrors `RequestByteRange`'s
 ///    own existing Som -> daemon -> registered-responder routing, see
 ///    `RegisterRangeResponder`'s doc comment) — handled in the responder
@@ -945,7 +945,7 @@ fn spawn_byte_range_responder_from_disk(
 /// from_disk_interruptible`'s own `Ok(SendOutcome::Completed)` returned
 /// well before Som had even finished subscribing), after which `somcat`
 /// exited and closed every connection — leaving Som's own in-memory
-/// buffer (bounded on purpose, see `som_srv::srv_cache::CacheEntry::
+/// buffer (bounded on purpose, see `somsrv::srv_cache::CacheEntry::
 /// recent_bytes`'s own doc comment) with nowhere near enough of the file
 /// to decode from, and no live sender left to ask for more. A small file
 /// (or a slow enough network) happened to let subscription win the race
@@ -983,7 +983,7 @@ fn stream_file_from_disk(
         spawn_byte_range_responder_from_disk(shared_file.clone(), content_type, metadata.clone(), ids, total_size)?;
 
     // The ONE proactive push this function still does: just enough of the
-    // file's own FRONT for `som-srv` to create its cache entry (`total_
+    // file's own FRONT for `somsrv` to create its cache entry (`total_
     // size`/`content_type`/`metadata`, needed before Som has anything to
     // subscribe TO at all — see `SrvCache::put_chunk`'s own doc comment)
     // and for FFmpeg's format probe to have a real shot at succeeding
@@ -1076,7 +1076,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 
     let ids = new_ids();
 
-    // One connection to som-srv's binary side channel for this whole
+    // One connection to somsrv's binary side channel for this whole
     // transfer — see `srv_channel::SrvChannel`'s own doc comment for why
     // this fails hard (not a silent fallback to the old PTY transport,
     // which no longer exists) if the daemon isn't reachable.
@@ -1198,7 +1198,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     // video already needed and got (see those branches' own comments for
     // the full reasoning), and for image/GIF specifically not just a
     // "starts playing sooner" nicety but a correctness requirement now:
-    // `som_srv::srv_cache::SrvCache::subscribe`'s own doc comment states
+    // `somsrv::srv_cache::SrvCache::subscribe`'s own doc comment states
     // its progress pushes are only ever delivered to subscribers already
     // registered at push time (no replay of missed progress) — Som only
     // ever subscribes once it's seen this placement's id in the

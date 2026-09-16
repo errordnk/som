@@ -5,14 +5,14 @@
 //!
 //! # History: this module used to carry payload bytes over the PTY too
 //!
-//! Until the `som-srv` daemon existed, this module ALSO defined a full
+//! Until the `somsrv` daemon existed, this module ALSO defined a full
 //! binary envelope format (`Chunk`, `build_envelope`/`parse_envelope`,
 //! `base91_encode`/`base91_decode`, a `Query`/`QueryType` request-response
 //! mechanism) that shipped actual file bytes and Som -> client byte-range
 //! requests through APC escape sequences (`ESC _ S ... ESC \`) on the same
 //! PTY the shell itself uses. That machinery is gone — deleted, not
-//! deprecated — now that `som-srv` (see `crates/som_srv`, specifically
-//! `som_srv::protocol::SrvRequest::PutChunk` and `::RequestByteRange`)
+//! deprecated — now that `somsrv` (see `crates/somsrv`, specifically
+//! `somsrv::protocol::SrvRequest::PutChunk` and `::RequestByteRange`)
 //! carries payload bytes and byte-range requests over its own binary side
 //! channel instead. The reasoning below is kept as HISTORICAL CONTEXT: it
 //! explains a real, hard-won constraint of Windows ConPTY that still
@@ -57,7 +57,7 @@
 //! protocol's or `alacritty_terminal`'s control — the only way to survive
 //! it is to never put a byte `>= 0x80` (or any other value the codepage
 //! machinery might reinterpret) on the wire at all. This is exactly why
-//! bulk payload bytes no longer travel over the PTY at all — `som-srv`'s
+//! bulk payload bytes no longer travel over the PTY at all — `somsrv`'s
 //! side channel is a real binary pipe with no console codepage in the
 //! middle — and why anything that DOES still travel over the PTY (the
 //! placeholder-grid handshake) must keep using printable-text-safe
@@ -117,7 +117,7 @@ pub enum ContentMetadata {
     /// dimensions (not anything about the file's compressed byte size).
     /// 0/0 means unknown, same "0 = unknown, not empty" convention a
     /// transfer's total-size field uses elsewhere in this pipeline (see
-    /// `som_srv::protocol::SrvRequest::PutChunk`'s `total_size` field).
+    /// `somsrv::protocol::SrvRequest::PutChunk`'s `total_size` field).
     ///
     /// Sent explicitly by the client (parsed from the source file's own
     /// header before streaming — see `crates/somcat`'s `stream_file`)
@@ -160,7 +160,7 @@ pub enum ContentMetadata {
         /// — passed through to `symphonia`'s format probe as a hint (via
         /// `Hint::with_extension`). Needed now that there is no on-disk
         /// file/`Path` a decoder could otherwise infer this from at all
-        /// (`SrvCache`'s own doc comment: `som-srv` no longer persists
+        /// (`SrvCache`'s own doc comment: `somsrv` no longer persists
         /// chunks to disk) — confirmed live as necessary for some
         /// containers, whose probe can be ambiguous without it (see
         /// `ContentMetadata::Video::extension`'s own doc comment for the
@@ -201,7 +201,7 @@ pub enum ContentMetadata {
         /// (`ffmpeg::format::input_from_stream_with_interrupt`'s own
         /// `format_name`/filename-hint parameter). Needed now that there
         /// is no on-disk file/`Path` `GrowingFileStream` could otherwise
-        /// derive this from (`SrvCache`'s own doc comment: `som-srv` no
+        /// derive this from (`SrvCache`'s own doc comment: `somsrv` no
         /// longer persists chunks to disk at all). Confirmed live as
         /// load-bearing, not cosmetic: a fixed generic hint (e.g.
         /// `"placement.video"` for every file regardless of real

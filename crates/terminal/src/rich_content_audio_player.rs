@@ -64,8 +64,8 @@ const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
 /// `GrowingFileStream::read` — an earlier version of this reader only
 /// ever waited passively, relying on `Terminal::request_audio_byte_range`
 /// (an explicit user seek) to be the sole source of on-demand fetches.
-/// That leaves a real gap `som-srv`'s own `SrvCache::subscribe` doc
-/// comment calls out explicitly: `som-srv` no longer retains any chunk's
+/// That leaves a real gap `somsrv`'s own `SrvCache::subscribe` doc
+/// comment calls out explicitly: `somsrv` no longer retains any chunk's
 /// bytes once forwarded, so a subscriber arriving after a transfer has
 /// already fully streamed through (confirmed live: a short/fast file,
 /// e.g. this module's own `tone.flac` test fixture, can finish streaming

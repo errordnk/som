@@ -1200,7 +1200,7 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
 
         // The notification above only fires while some view holds an active
         // NSTextInputContext (e.g. a text field with IME support) — apps
-        // that only read raw key/modifiers events, like som-key, never
+        // that only read raw key/modifiers events, like somkey, never
         // trigger it even though the OS layout genuinely changed. TIS's own
         // distributed notification fires unconditionally on every layout
         // switch (keypress-driven or via the input-source menu), so we

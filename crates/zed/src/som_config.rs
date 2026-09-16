@@ -173,13 +173,28 @@ pub struct TabProfile {
     pub icon: Option<String>,
     pub shell: Option<String>,
     pub home: Option<String>,
-    /// Opt-in to som-srv: the tab's terminal(s) run inside a detached
-    /// `som-srv` process that survives Som closing, instead of a
+    /// Opt-in to somsrv: the tab's terminal(s) run inside a detached
+    /// `somsrv` process that survives Som closing, instead of a
     /// plain PTY owned directly by Som. Defaults to `false` (explicit
     /// opt-in) for now; the long-term direction is to default this to
     /// `true` everywhere it's supported, keeping the field only as an
     /// explicit opt-out.
     pub tmux: bool,
+    /// Independent opt-in to the SRP (rich content) side of `somsrv` —
+    /// see `workspace::TabProfile::srp`'s own doc comment for the full
+    /// policy (2026-09-15: `tmux`/`srp`/`lua` are three independent
+    /// feature flags that all share the same underlying SRP connection
+    /// attempt, `terminal_view::terminal_panel`'s `wants_srp`).
+    pub srp: bool,
+    /// Independent opt-in to Lua scripting over `somsrv` — see `srp`'s
+    /// doc comment above.
+    pub lua: bool,
+    /// Explicit remote OS for this profile's SSH/WSL host — `"win"`,
+    /// `"mac"`, or `"lnx"` (default). Picks which pre-built `somsrv`
+    /// binary `terminal_panel::ensure_remote_binary_deployed` uploads;
+    /// see `workspace::RemoteOs`'s own doc comment for why this
+    /// replaced a `uname`-based guess (2026-09-15).
+    pub os: String,
     /// Marks this profile as the one opened by `Ctrl+N`/the `+` button/
     /// the very first tab on a fresh install, instead of `tabs[0]`. At
     /// most one profile may set this — `parse_with_defaults` rejects
@@ -584,6 +599,7 @@ impl SomConfig {
                 let msg3 = msg.clone();
                 cx.new(|cx| {
                     MessageNotification::new(msg2, cx)
+                        .severity(workspace::notifications::NotificationSeverity::Error)
                         .primary_message("Copy")
                         .primary_on_click(move |_window, cx| {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg3.clone()));

@@ -437,6 +437,9 @@ fn main() {
                     icon: t.icon.clone(),
                     home: t.home.clone(),
                     tmux: t.tmux,
+                    srp: t.srp,
+                    lua: t.lua,
+                    os: workspace::RemoteOs::parse(&t.os),
                     default: t.default,
                 }
             })
@@ -787,7 +790,7 @@ fn parse_url_arg(arg: &str, _cx: &App) -> String {
 fn ensure_conpty_extracted_and_wired() {
     use gpui::AssetSource;
 
-    let conpty_dir = paths::config_dir().join("conpty");
+    let conpty_dir = paths::data_dir().join("conpty");
     for (asset_path, file_name) in
         [("conpty/conpty.dll", "conpty.dll"), ("conpty/OpenConsole.exe", "OpenConsole.exe")]
     {

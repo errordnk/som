@@ -125,6 +125,31 @@ cargo check -p som 2>&1 | tail -20
 - macOS/Linux ignore all of the above — `ffmpeg-sys-next` only probes
   vcpkg under MSVC and otherwise uses system pkg-config (brew / apt).
 
+## On-disk layout (client machine) — `crates/paths/src/paths.rs`
+
+Three separate directories, never mixed:
+
+- **`config_dir()`** — `~/.config/som` on Windows/Linux/FreeBSD (`%APPDATA%\Som`-style
+  path is NOT used; Som deliberately uses `~/.config` on Windows too). **JSON only**:
+  `settings.json`, `db.json`, themes. Nothing binary ever goes here.
+- **`data_dir()`** — `~/.local/share/som` on Windows (matches the Linux/FreeBSD XDG
+  `$XDG_DATA_HOME/som` convention one category over; macOS uses `~/Library/Application
+  Support/Som`). Runtime-extracted **binary artifacts**: embedded FFmpeg DLLs
+  (`ensure_ffmpeg_extracted_and_wired`, `crates/terminal/src/rich_content_video_player.rs`)
+  and ConPTY (`ensure_conpty_extracted_and_wired`, `crates/zed/src/main.rs`) both extract
+  here, under `data_dir().join("ffmpeg")`/`data_dir().join("conpty")`.
+- **`state_dir()`**/**`logs_dir()`** — `~/.local/state/som` on Windows (same XDG category
+  Linux/FreeBSD already uses via `dirs::state_dir()`). Logs (`logs_dir()` = `state_dir()
+  .join("logs")`) and other transient application state live here — never under `data_dir()`.
+
+`temp_dir()` (`~/.cache/som`) is separate again — genuinely disposable scratch space,
+currently unused for anything persistent (no media cache; `somsrv`'s rich-content
+transport is fully in-memory, see `SRP_PROTOCOL.md`).
+
+When adding a new on-disk artifact, pick the category by what it actually is — a JSON
+settings file, a downloaded/extracted binary, or transient log/state data — don't default
+to `config_dir()` just because it's the most commonly referenced one.
+
 ## Typical investigation pattern
 
 To check if a crate is in som's production dependency tree:

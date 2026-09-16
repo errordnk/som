@@ -13,7 +13,7 @@ path = "src/main.rs"
 image.workspace = true
 terminal.workspace = true
 symphonia.workspace = true
-som_srv.workspace = true
+somsrv.workspace = true
 serde_json.workspace = true
 markdown_line_count.workspace = true
 

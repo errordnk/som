@@ -14,6 +14,18 @@
 //! other loading indicator in the tab's own content — per explicit
 //! feedback, the titlebar's drag-zone spinner (`workspace::
 //! SomRestoreActivity`) is the ONLY loading indicator for this work.
+//!
+//! Also stays in place (never replaced) when tab setup hits a FATAL error
+//! before a shell could even be spawned (an SSH/WSL `tmux: true`
+//! profile's `somsrv` deploy check failing hard, or `tmux_wrapped_shell`
+//! itself failing) — in that case the caller in `terminal_panel.rs`
+//! simply never calls `replace_item_at` for this placeholder and instead
+//! surfaces the failure as a `Tab`-scoped toast (`show_somsrv_error`)
+//! pointed at this placeholder's own `EntityId`. This widget itself has
+//! no error-rendering concept of its own — every user-facing error in
+//! Som is a toast (bottom-right, with a Copy button and a close button),
+//! never text baked into a tab's body, per explicit user direction
+//! (2026-09-15).
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render,

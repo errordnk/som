@@ -439,9 +439,56 @@ pub struct TabProfile {
     /// See `som_config::TabProfile::tmux` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub tmux: bool,
+    /// See `som_config::TabProfile::srp` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub srp: bool,
+    /// See `som_config::TabProfile::lua` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub lua: bool,
+    /// The remote host's OS for this profile's SSH/WSL shell, used by
+    /// `terminal_view::terminal_panel::ensure_remote_binary_deployed` to
+    /// pick which pre-built `somsrv` binary to upload — explicit and
+    /// user-configured (`settings.json`'s `os: "win"|"mac"|"lnx"`), NOT
+    /// detected via a `uname` probe (2026-09-15 redesign: a remote-
+    /// platform guess added round-trip latency and its own failure mode
+    /// for no real benefit once every profile can just say what it is).
+    pub os: RemoteOs,
     /// See `som_config::TabProfile::default` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub default: bool,
+}
+
+/// The three remote platforms Som ships a pre-built `somsrv` for (see
+/// `somsrv::protocol::platform_dir_name` / `assets/srv/{platform}/`) —
+/// `"lnx"` is `TabProfile::os`'s default (a real remote SSH/WSL target
+/// is far more often Linux than Windows or macOS in practice, per
+/// explicit user direction 2026-09-15) so a profile with no `os` field
+/// at all still deploys something reasonable rather than silently
+/// guessing Windows for what's usually a Linux box. `Lnx` always means
+/// `linux-amd` — `linux-arm` stays permanently unsupported, so there is
+/// no separate arm variant to choose here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteOs {
+    Win,
+    Mac,
+    #[default]
+    Lnx,
+}
+
+impl RemoteOs {
+    /// Parses `settings.json`'s `os` string field — anything unrecognized
+    /// (including the empty string a profile with no `os` key at all
+    /// parses to) falls back to `Lnx`, matching this type's own
+    /// `Default`, rather than rejecting the whole config: an `os` typo
+    /// is far less disruptive as "assume Linux" than as a hard config
+    /// parse error.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "win" => Self::Win,
+            "mac" => Self::Mac,
+            _ => Self::Lnx,
+        }
+    }
 }
 
 /// Global list of tab profiles loaded from som config (name, shell, etc).
@@ -700,7 +747,7 @@ mod som_restore_activity_tests {
 }
 
 #[cfg(test)]
-mod som_srv_sessions_tests {
+mod somsrv_sessions_tests {
     use super::*;
     use gpui::TestAppContext;
 
@@ -1551,15 +1598,15 @@ pub struct Workspace {
     /// reconstruct `som_db.json`'s "x.y" tab entries without guessing the
     /// profile back from a possibly-ambiguous or user-renamed tab title.
     som_tab_profile_index: std::collections::HashMap<gpui::EntityId, usize>,
-    /// `som-srv` pane ids for tmux tabs (main pane + splits, main
+    /// `somsrv` pane ids for tmux tabs (main pane + splits, main
     /// first), keyed by the *main* item's `EntityId` — mirrors
     /// `som_tab_profile_index`. A pane id is just a UUID string used as
-    /// that pane's `som-srv` pipe name (see `project_som_tmux`
+    /// that pane's `somsrv` pipe name (see `project_som_tmux`
     /// memory, "Обновление 17"/19) — NOT a protocol session id to `Attach`
     /// with anymore (that concept is gone along with the old JSON IPC
     /// protocol). Populated by `terminal_view` right after creating a tmux
     /// tab (it generates the pane id itself before ever invoking
-    /// `som-srv`), since `workspace` can't name anything
+    /// `somsrv`), since `workspace` can't name anything
     /// tmux-specific itself (dependency points the other way). Read back in
     /// `som_persist_db_json` to fill db.json's `tmux_sessions` field, so a
     /// later launch reuses the same pane id (and thus reconnects to the
@@ -4253,7 +4300,7 @@ impl Workspace {
     }
 
     /// Records `pane_ids` (main pane + splits, main first) as the
-    /// `som-srv` pane ids backing `item`'s tab, so a later
+    /// `somsrv` pane ids backing `item`'s tab, so a later
     /// `som_persist_db_json` call can write them into db.json's
     /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
     pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, pane_ids: Vec<String>) {
@@ -5847,7 +5894,7 @@ impl Workspace {
     /// the process) triggers NONE of those, so without an explicit quit-time
     /// flush, `db.json` is only ever as fresh as the last such action. This
     /// is the confirmed root cause of a reported bug: a `htop`/`micro`
-    /// process (running in a `som-srv` HOLDER, which itself
+    /// process (running in a `somsrv` HOLDER, which itself
     /// correctly survives Som closing — see `project_som_tmux` memory) was
     /// started, then Som was closed right away with no other action in
     /// between — `db.json` never got the chance to record that tab's
@@ -6134,28 +6181,32 @@ impl Workspace {
         self.update_window_edited(window, cx);
     }
 
-    fn render_notifications(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Div> {
-        if self.notifications.is_empty() {
-            None
-        } else {
-            Some(
-                div()
-                    .absolute()
-                    .right_8()
-                    .bottom_8()
-                    .w_112()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .justify_end()
-                    .gap_2()
-                    .children(
-                        self.notifications
-                            .iter()
-                            .map(|(_, notification)| notification.clone().into_any()),
-                    ),
-            )
+    fn render_notifications(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        // `Tab`-scoped notifications only count as visible while their own
+        // item is the active one — see `NotificationScope`'s own doc
+        // comment. No separate show/hide bookkeeping needed for tab
+        // switches: this filter re-runs on every render, and `cx.notify()`
+        // already fires on tab activation (`pane::Event::ActivateItem`),
+        // so a `Tab`-scoped notification simply falls in/out of this list
+        // as its own tab becomes/stops being active.
+        let active_item_id = self.active_item(cx).map(|item| item.item_id());
+        let mut visible = self.notifications.visible(active_item_id).peekable();
+        if visible.peek().is_none() {
+            return None;
         }
+        Some(
+            div()
+                .absolute()
+                .right_8()
+                .bottom_8()
+                .w_112()
+                .h_full()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .gap_2()
+                .children(visible.map(|(_, _, _, notification)| notification.clone().into_any())),
+        )
     }
 
 
@@ -6547,7 +6598,7 @@ impl Workspace {
             ))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &SuppressNotification, _, cx| {
-                    if let Some((notification_id, _)) = workspace.notifications.pop() {
+                    if let Some((notification_id, ..)) = workspace.notifications.pop() {
                         workspace.suppress_notification(&notification_id, cx);
                     }
                 },
@@ -6952,7 +7003,7 @@ impl Workspace {
 
     pub fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if cx.stop_active_drag(window) {
-        } else if let Some((notification_id, _)) = self.notifications.pop() {
+        } else if let Some((notification_id, ..)) = self.notifications.pop() {
             dismiss_app_notification(&notification_id, cx);
         } else {
             cx.propagate();
@@ -7216,7 +7267,7 @@ impl Render for Workspace {
         let notification_entities = self
             .notifications
             .iter()
-            .map(|(_, notification)| notification.entity_id())
+            .map(|(_, _, _, notification)| notification.entity_id())
             .collect::<Vec<_>>();
         let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
 
@@ -7235,6 +7286,18 @@ impl Render for Workspace {
         // be inset from it.
         let som_window_padding = SomWindowSettings::get(cx);
 
+        // A `Global` + `Error` notification is Som's most severe possible
+        // problem class (something wrong with the whole application, not
+        // one tab) — see `NotificationSeverity::Error`'s own doc comment
+        // for why this gets the strongest, window-level treatment rather
+        // than just another toast in the pile: it must be impossible to
+        // miss, unlike a `Tab`-scoped error (only visible on its own tab)
+        // or a `Warning`/`Info` (toast-only, no border).
+        let has_global_error = self.notifications.iter().any(|(_, scope, severity, _)| {
+            matches!(scope, notifications::NotificationScope::Global)
+                && matches!(severity, notifications::NotificationSeverity::Error)
+        });
+
         div()
             .relative()
             .size_full()
@@ -7247,6 +7310,7 @@ impl Render for Workspace {
             .text_color(colors.text)
             .overflow_hidden()
             .bg(colors.background)
+            .when(has_global_error, |this| this.border_3().border_color(gpui::red()))
             .children(self.titlebar_item.clone())
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {

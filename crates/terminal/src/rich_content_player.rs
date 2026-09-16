@@ -117,29 +117,32 @@ impl RichContentPlayer {
     }
 }
 
-/// Re-decodes `path` if `contiguous_len` has grown since `existing`'s last
-/// decode (or `existing` is `None`), returning the (possibly unchanged)
-/// player to keep. Returns `None` if there still isn't enough data for
-/// even a first frame, or the file isn't decodable content this module
-/// understands.
+/// Re-decodes `bytes` (the first `contiguous_len` bytes already received,
+/// per the caller — the buffer backing this may hold more, so this
+/// function always slices internally rather than trusting `bytes.len()`
+/// to already match) if `contiguous_len` has grown since `existing`'s
+/// last decode (or `existing` is `None`), returning the (possibly
+/// unchanged) player to keep. Returns `None` if there still isn't enough
+/// data for even a first frame, or the file isn't decodable content this
+/// module understands.
 ///
 /// Kept as a free function (not a `RichContentPlayer` method) because
 /// creating and refreshing are the same decision from a caller's
-/// perspective ("give me an up-to-date player for this path, or nothing
-/// yet") — a caller (`Terminal`, see its `rich_content_players` field)
-/// doesn't need to know which case applies.
+/// perspective ("give me an up-to-date player for this placement, or
+/// nothing yet") — a caller (`Terminal`, see its `rich_content_players`
+/// field) doesn't need to know which case applies.
 pub fn refresh_or_create(
     existing: Option<RichContentPlayer>,
-    path: &std::path::Path,
+    bytes: &[u8],
     contiguous_len: u64,
     content_type: ContentType,
     total_size: u64,
 ) -> Option<RichContentPlayer> {
     if let Some(player) = &existing {
         // Already fully decoded and nothing new has arrived — reuse as-is
-        // rather than re-opening/re-parsing the file for no reason. A
-        // `complete` player with MORE bytes now available (a retransmit,
-        // or a second file reusing bytes past the original trailer) is
+        // rather than re-parsing the buffer for no reason. A `complete`
+        // player with MORE bytes now available (a retransmit, or a
+        // second file reusing bytes past the original trailer) is
         // deliberately still treated as "nothing to do" — once a GIF
         // decode reaches its own trailer byte, there is nothing further
         // for this protocol to show from that file.
@@ -148,17 +151,25 @@ pub fn refresh_or_create(
         }
     }
 
+    let prefix = &bytes[..(contiguous_len as usize).min(bytes.len())];
     let decoded = match content_type {
-        ContentType::Gif => rich_content_gif_player::try_decode_progressive(path, contiguous_len),
+        ContentType::Gif => rich_content_gif_player::try_decode_progressive(prefix),
         // JPEG/PNG have no progressive-prefix decode story in the `image`
         // crate (see `rich_content_static_image_player`'s module doc
         // comment) — wait for the whole file rather than attempting (and
-        // failing) a decode on every chunk arrival.
+        // failing) a decode on every chunk arrival. `bytes.len() as u64 <
+        // contiguous_len` covers a late subscriber whose watermark has
+        // already advanced (via a `Progress` push's numbers) ahead of
+        // what its buffer actually holds yet (see `SrvProgressState::
+        // request_whole_range_once_if_needed`'s own doc comment) — without
+        // this, `prefix`'s clamp to `bytes.len()` would silently shrink
+        // below `total_size` and this would try (and fail) to decode a
+        // truncated image as if it were complete.
         ContentType::Jpeg | ContentType::Png => {
-            if total_size == 0 || contiguous_len < total_size {
+            if total_size == 0 || contiguous_len < total_size || (bytes.len() as u64) < contiguous_len {
                 Ok(None)
             } else {
-                rich_content_static_image_player::decode_complete(path).map(Some)
+                rich_content_static_image_player::decode_complete(prefix).map(Some)
             }
         },
         // Not an image format at all — nothing for this player to decode.
@@ -180,16 +191,17 @@ pub fn refresh_or_create(
 mod tests {
     use super::*;
 
-    fn giphy_gif_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif")
+    fn giphy_gif_bytes() -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"))
     }
 
     /// Builds a tiny (2x1px) single-frame GIF with a known solid red
-    /// pixel and a known solid blue pixel, written to a fresh temp file —
+    /// pixel and a known solid blue pixel, encoded straight into memory —
     /// enough to prove [`RichContentPlayer::from_prefix`]'s RGBA->BGRA
     /// swap actually happens, without depending on any real GIF fixture's
     /// specific pixel colors.
-    fn write_two_pixel_gif(name: &str) -> std::path::PathBuf {
+    fn encode_two_pixel_gif() -> Vec<u8> {
         use image::codecs::gif::GifEncoder;
         use image::{Delay, Frame, Rgba, RgbaImage};
 
@@ -198,37 +210,35 @@ mod tests {
         buffer.put_pixel(1, 0, Rgba([0, 0, 255, 255])); // solid blue
         let frame = Frame::from_parts(buffer, 0, 0, Delay::from_numer_denom_ms(100, 1));
 
-        let path = std::env::temp_dir()
-            .join(format!("som_rich_content_player_test_{name}_{}.gif", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
-        let mut encoder = GifEncoder::new(file);
+        let mut bytes = Vec::new();
+        let mut encoder = GifEncoder::new(&mut bytes);
         encoder.encode_frame(frame).unwrap();
         drop(encoder);
-        path
+        bytes
     }
 
     #[test]
     fn refresh_or_create_returns_none_before_any_frame_is_decodable() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, 4, ContentType::Gif, full_len);
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, 4, ContentType::Gif, full_len);
         assert!(player.is_none(), "a handful of header bytes must not produce a player yet");
     }
 
     #[test]
     fn refresh_or_create_produces_a_player_once_a_frame_is_available() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len / 2, ContentType::Gif, full_len);
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, full_len / 2, ContentType::Gif, full_len);
         let player = player.expect("half the file should decode at least one frame");
         assert!(player.render_image().frame_count() > 0);
     }
 
     #[test]
     fn refresh_reuses_existing_player_when_contiguous_len_has_not_grown() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let first = refresh_or_create(None, &path, full_len / 2, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let first = refresh_or_create(None, &bytes, full_len / 2, ContentType::Gif, full_len).unwrap();
         let first_frame_count = first.render_image().frame_count();
         let first_ptr = Arc::as_ptr(first.render_image());
 
@@ -236,19 +246,19 @@ mod tests {
         // re-decode (proven by pointer identity, not just frame count
         // equality, which a fresh decode of the same bytes would also
         // satisfy).
-        let second = refresh_or_create(Some(first), &path, full_len / 2, ContentType::Gif, full_len).unwrap();
+        let second = refresh_or_create(Some(first), &bytes, full_len / 2, ContentType::Gif, full_len).unwrap();
         assert_eq!(Arc::as_ptr(second.render_image()), first_ptr, "must reuse the cached Arc, not re-decode");
         assert_eq!(second.render_image().frame_count(), first_frame_count);
     }
 
     #[test]
     fn refresh_decodes_more_frames_once_contiguous_len_grows() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let first = refresh_or_create(None, &path, full_len / 4, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let first = refresh_or_create(None, &bytes, full_len / 4, ContentType::Gif, full_len).unwrap();
         let first_frame_count = first.render_image().frame_count();
 
-        let second = refresh_or_create(Some(first), &path, full_len / 2, ContentType::Gif, full_len).unwrap();
+        let second = refresh_or_create(Some(first), &bytes, full_len / 2, ContentType::Gif, full_len).unwrap();
         assert!(
             second.render_image().frame_count() >= first_frame_count,
             "more available bytes must never decode fewer frames"
@@ -257,39 +267,39 @@ mod tests {
 
     #[test]
     fn refresh_reaches_all_frames_once_contiguous_len_covers_the_whole_file() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, full_len, ContentType::Gif, full_len).unwrap();
         assert_eq!(player.render_image().frame_count(), 47, "giphy.gif fixture is known to have 47 frames");
         assert!(player.complete);
     }
 
     #[test]
     fn complete_player_is_not_re_decoded_even_if_contiguous_len_grows_further() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let complete = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let complete = refresh_or_create(None, &bytes, full_len, ContentType::Gif, full_len).unwrap();
         let ptr = Arc::as_ptr(complete.render_image());
 
         // Passing a larger contiguous_len than the file's own length
         // (simulating a stale/retransmitted watermark) must not trigger
         // another decode attempt once already complete.
         let still =
-            refresh_or_create(Some(complete), &path, full_len + 1000, ContentType::Gif, full_len).unwrap();
+            refresh_or_create(Some(complete), &bytes, full_len + 1000, ContentType::Gif, full_len).unwrap();
         assert_eq!(Arc::as_ptr(still.render_image()), ptr, "a complete player must never be re-decoded");
     }
 
     #[test]
     fn single_frame_player_is_not_animating() {
-        let path = giphy_gif_path();
+        let bytes = giphy_gif_bytes();
         // A tiny prefix — right at the boundary where only the first
         // frame is decodable — is exactly the regime this checks (as
         // opposed to reasoning about a synthetic single-frame GIF fixture,
         // which this module doesn't otherwise need).
-        let full_len = std::fs::metadata(&path).unwrap().len();
+        let full_len = bytes.len() as u64;
         let mut available = 64u64;
         let player = loop {
-            if let Some(player) = refresh_or_create(None, &path, available, ContentType::Gif, full_len) {
+            if let Some(player) = refresh_or_create(None, &bytes, available, ContentType::Gif, full_len) {
                 break player;
             }
             available += 64;
@@ -302,17 +312,17 @@ mod tests {
 
     #[test]
     fn multi_frame_player_is_animating() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, full_len, ContentType::Gif, full_len).unwrap();
         assert!(player.is_animating(), "the full 47-frame giphy.gif must report as animating");
     }
 
     #[test]
     fn current_frame_advances_past_the_first_frame_delay() {
-        let path = giphy_gif_path();
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len).unwrap();
+        let bytes = giphy_gif_bytes();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, full_len, ContentType::Gif, full_len).unwrap();
 
         let first = player.current_frame();
         assert_eq!(first, 0, "playback must start on frame 0");
@@ -339,15 +349,13 @@ mod tests {
         // 0x00,0x00,0xFF) and blue's do too (0x00,0x00,0xFF ->
         // 0xFF,0x00,0x00) — anything else means the swap either didn't
         // run or ran on the wrong bytes.
-        let path = write_two_pixel_gif("bgra_swap");
-        let full_len = std::fs::metadata(&path).unwrap().len();
-        let player = refresh_or_create(None, &path, full_len, ContentType::Gif, full_len)
+        let bytes = encode_two_pixel_gif();
+        let full_len = bytes.len() as u64;
+        let player = refresh_or_create(None, &bytes, full_len, ContentType::Gif, full_len)
             .expect("tiny fixture must decode fully");
 
-        let bytes = player.render_image().as_bytes(0).expect("frame 0 must have pixel data");
-        assert_eq!(&bytes[0..4], &[0, 0, 255, 255], "solid red RGBA (255,0,0,255) must become BGRA (0,0,255,255)");
-        assert_eq!(&bytes[4..8], &[255, 0, 0, 255], "solid blue RGBA (0,0,255,255) must become BGRA (255,0,0,255)");
-
-        std::fs::remove_file(&path).ok();
+        let rendered = player.render_image().as_bytes(0).expect("frame 0 must have pixel data");
+        assert_eq!(&rendered[0..4], &[0, 0, 255, 255], "solid red RGBA (255,0,0,255) must become BGRA (0,0,255,255)");
+        assert_eq!(&rendered[4..8], &[255, 0, 0, 255], "solid blue RGBA (0,0,255,255) must become BGRA (255,0,0,255)");
     }
 }

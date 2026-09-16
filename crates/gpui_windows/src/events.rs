@@ -1582,7 +1582,7 @@ fn parse_normal_key(
 /// always correspond to their QWERTY physical position regardless of the
 /// active keyboard layout (unlike the *character* a layout produces for
 /// them), which is exactly the property this needs. Covers the keys used
-/// by `som-key`'s drawn layout; returns `None` for anything not in that
+/// by `somkey`'s drawn layout; returns `None` for anything not in that
 /// table rather than guessing.
 fn windows_vkey_to_usb_hid_usage(vkey: VIRTUAL_KEY) -> Option<u32> {
     Some(match vkey {
@@ -1847,7 +1847,7 @@ fn is_virtual_key_pressed(vkey: VIRTUAL_KEY) -> bool {
 /// right), which `MapVirtualKeyW` has no way to consult on its own. Using
 /// `MAPVK_VSC_TO_VK_EX` for Control/Alt would silently always resolve to
 /// the *left* variant, which is exactly the bug this replaced: right Alt
-/// and right Ctrl both lit up the left indicator in `som-key`.
+/// and right Ctrl both lit up the left indicator in `somkey`.
 fn side_for_modifier_key(virtual_key: VIRTUAL_KEY, lparam: LPARAM) -> Option<Side> {
     const EXTENDED_KEY_FLAG: u32 = 1 << 24;
     let is_extended = (lparam.0 as u32 & EXTENDED_KEY_FLAG) != 0;

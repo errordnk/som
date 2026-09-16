@@ -55,7 +55,9 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// This is set once and cached for subsequent calls.
 /// On macOS, this is `~/Library/Application Support/Zed`.
 /// On Linux/FreeBSD, this is `$XDG_DATA_HOME/zed`.
-/// On Windows, this is `%LOCALAPPDATA%\Zed`.
+/// On Windows, this is `~/.local/share/som` — deliberately separate from
+/// `CONFIG_DIR` (`~/.config/som`, JSON-only) so runtime-extracted binary
+/// artifacts (FFmpeg DLLs, ConPTY) never mix with settings/db/theme files.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
@@ -155,7 +157,14 @@ pub fn data_dir() -> &'static PathBuf {
             }
             .join(APP_NAME_LOWERCASE)
         } else if cfg!(target_os = "windows") {
-            home_dir().join(".config").join(APP_NAME_LOWERCASE)
+            // Deliberately NOT `~/.config/som` (that's `config_dir()`,
+            // reserved for JSON — settings/db/themes only, see this
+            // crate's own user-facing rule). Mirrors `state_dir()`'s
+            // existing `~/.local/state/som` pattern one XDG category
+            // over: embedded binary artifacts extracted at runtime
+            // (FFmpeg DLLs, ConPTY) belong here instead, same as
+            // `~/.local/share` already means on Linux/FreeBSD above.
+            home_dir().join(".local").join("share").join(APP_NAME_LOWERCASE)
         } else {
             config_dir().clone() // Fallback
         }
@@ -222,6 +231,13 @@ pub fn logs_dir() -> &'static PathBuf {
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
             home_dir().join("Library/Logs").join(APP_NAME)
+        } else if cfg!(target_os = "windows") {
+            // `state_dir()` (`~/.local/state/som`), not `data_dir()`
+            // (`~/.local/share/som`, reserved for runtime-extracted
+            // binary artifacts like FFmpeg/ConPTY) — logs are transient
+            // application state, same XDG category `~/.local/state`
+            // already implies on Linux/FreeBSD via `dirs::state_dir()`.
+            state_dir().join("logs")
         } else {
             data_dir().join("logs")
         }

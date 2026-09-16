@@ -11,13 +11,72 @@ use std::sync::{Arc, LazyLock};
 use std::{any::TypeId, time::Duration};
 use ui::{CopyButton, Tooltip, prelude::*};
 
+/// How widely a notification applies — orthogonal to [`NotificationSeverity`]
+/// (every notification has both). Determines VISIBILITY, not appearance:
+/// `Tab` notifications are only rendered while their tab is the active
+/// item in the active pane, appearing/disappearing automatically as the
+/// user switches tabs (no imperative show/hide wiring needed — see
+/// `Workspace::render_notifications`'s own filter); `Global` notifications
+/// always render, in every window, regardless of which tab (if any) is
+/// active.
+///
+/// Replaces the earlier ad-hoc approach where a per-tab failure (e.g. an
+/// SSH profile's `somsrv` deploy check failing) surfaced as a plain
+/// global banner indistinguishable from an actually-global problem like a
+/// malformed settings.json, AND could trigger a second, unrelated global
+/// banner once the resulting shell spawn predictably also failed —
+/// confirmed live as a real, reported UX problem (2026-09-15). A `Tab`-
+/// scoped error is now the caller's explicit choice, tied to the item it
+/// actually concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationScope {
+    /// Visible only while `item_id` is the active item of the active pane.
+    Tab(gpui::EntityId),
+    /// Visible always, in every window.
+    Global,
+}
+
+/// How serious a notification is — orthogonal to [`NotificationScope`].
+/// Purely a presentation concern (color/border treatment in
+/// `Workspace::render_notifications`), carries no visibility semantics of
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationSeverity {
+    /// Red. A `Global` + `Error` notification additionally draws a red
+    /// border around the whole window — the strongest, hardest-to-miss
+    /// presentation Som has, reserved for problems that affect the
+    /// entire application (e.g. a malformed settings.json), not a single
+    /// tab's own trouble.
+    Error,
+    /// Yellow.
+    Warning,
+    /// Blue.
+    Info,
+}
+
 #[derive(Default)]
 pub struct Notifications {
-    notifications: Vec<(NotificationId, AnyView)>,
+    notifications: Vec<(NotificationId, NotificationScope, NotificationSeverity, AnyView)>,
+}
+
+impl Notifications {
+    /// The subset of `self` that should actually be ON SCREEN right now,
+    /// given whichever item is currently active — `Global` entries always
+    /// qualify; `Tab(id)` entries only when `id` is the active item.
+    /// `active_item_id` is `None` when the active pane has no items at
+    /// all (a freshly emptied pane) — every `Tab`-scoped notification is
+    /// simply not visible in that state, same as if its tab had been
+    /// closed outright.
+    pub fn visible(&self, active_item_id: Option<gpui::EntityId>) -> impl Iterator<Item = &(NotificationId, NotificationScope, NotificationSeverity, AnyView)> {
+        self.notifications.iter().filter(move |(_, scope, ..)| match scope {
+            NotificationScope::Global => true,
+            NotificationScope::Tab(id) => Some(*id) == active_item_id,
+        })
+    }
 }
 
 impl Deref for Notifications {
-    type Target = Vec<(NotificationId, AnyView)>;
+    type Target = Vec<(NotificationId, NotificationScope, NotificationSeverity, AnyView)>;
 
     fn deref(&self) -> &Self::Target {
         &self.notifications
@@ -67,18 +126,38 @@ impl Workspace {
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications
             .iter()
-            .map(|(id, _)| id)
+            .map(|(id, ..)| id)
             .cloned()
             .collect()
     }
 
+    /// Equivalent to [`Self::show_notification`], scoped to `Global` +
+    /// [`NotificationSeverity::Error`] — the shape almost every EXISTING
+    /// caller wants (an application-wide problem), kept as the short name
+    /// for source compatibility. Use [`Self::show_scoped_notification`]
+    /// directly for anything that isn't a global error (a `Tab`-scoped
+    /// failure, or a `Warning`/`Info` severity).
     pub fn show_notification<V: Notification>(
         &mut self,
         id: NotificationId,
         cx: &mut Context<Self>,
         build_notification: impl FnOnce(&mut Context<Self>) -> Entity<V>,
     ) {
-        self.show_notification_without_handling_dismiss_events(&id, cx, |cx| {
+        self.show_scoped_notification(id, NotificationScope::Global, NotificationSeverity::Error, cx, build_notification);
+    }
+
+    /// Full form of [`Self::show_notification`] — see [`NotificationScope`]/
+    /// [`NotificationSeverity`]'s own doc comments for what each axis
+    /// controls (visibility vs. presentation, independently).
+    pub fn show_scoped_notification<V: Notification>(
+        &mut self,
+        id: NotificationId,
+        scope: NotificationScope,
+        severity: NotificationSeverity,
+        cx: &mut Context<Self>,
+        build_notification: impl FnOnce(&mut Context<Self>) -> Entity<V>,
+    ) {
+        self.show_notification_without_handling_dismiss_events(&id, scope, severity, cx, |cx| {
             let notification = build_notification(cx);
             cx.subscribe(&notification, {
                 let id = id.clone();
@@ -107,6 +186,8 @@ impl Workspace {
     pub(crate) fn show_notification_without_handling_dismiss_events(
         &mut self,
         id: &NotificationId,
+        scope: NotificationScope,
+        severity: NotificationSeverity,
         cx: &mut Context<Self>,
         build_notification: impl FnOnce(&mut Context<Self>) -> AnyView,
     ) {
@@ -115,7 +196,7 @@ impl Workspace {
         }
         self.dismiss_notification(id, cx);
         self.notifications
-            .push((id.clone(), build_notification(cx)));
+            .push((id.clone(), scope, severity, build_notification(cx)));
         cx.notify();
     }
 
@@ -142,7 +223,7 @@ impl Workspace {
     }
 
     pub fn dismiss_notification(&mut self, id: &NotificationId, cx: &mut Context<Self>) {
-        self.notifications.retain(|(existing_id, _)| {
+        self.notifications.retain(|(existing_id, ..)| {
             if existing_id == id {
                 cx.notify();
                 false
@@ -212,9 +293,13 @@ impl Workspace {
             .cloned()
             .collect::<Vec<_>>();
         for (id, build_notification) in app_notifications {
-            self.show_notification_without_handling_dismiss_events(&id, cx, |cx| {
-                build_notification(cx)
-            });
+            self.show_notification_without_handling_dismiss_events(
+                &id,
+                NotificationScope::Global,
+                NotificationSeverity::Error,
+                cx,
+                |cx| build_notification(cx),
+            );
         }
     }
 }
@@ -336,6 +421,12 @@ pub struct NotificationFrame {
     close: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
     contents: Option<AnyElement>,
     suffix: Option<AnyElement>,
+    /// Colors this card's left accent bar — red/yellow/blue for Error/
+    /// Warning/Info (see `NotificationSeverity`'s own doc comment).
+    /// `None` (the default, used by callers that predate severity)
+    /// renders no accent bar at all, same appearance as before this was
+    /// added.
+    severity: Option<NotificationSeverity>,
 }
 
 impl NotificationFrame {
@@ -347,7 +438,13 @@ impl NotificationFrame {
             show_suppress_button: true,
             show_close_button: true,
             close: None,
+            severity: None,
         }
+    }
+
+    pub fn with_severity(mut self, severity: NotificationSeverity) -> Self {
+        self.severity = Some(severity);
+        self
     }
 
     pub fn with_title(mut self, title: Option<impl Into<SharedString>>) -> Self {
@@ -397,12 +494,18 @@ impl RenderOnce for NotificationFrame {
         } else {
             ("close", IconName::Close)
         };
+        let severity_color = self.severity.map(|severity| match severity {
+            NotificationSeverity::Error => gpui::red(),
+            NotificationSeverity::Warning => gpui::yellow(),
+            NotificationSeverity::Info => gpui::blue(),
+        });
 
         v_flex()
             .occlude()
             .p_3()
             .gap_2()
             .elevation_3(cx)
+            .when_some(severity_color, |this, color| this.border_2().border_color(color))
             .child(
                 h_flex()
                     .gap_4()
@@ -505,6 +608,9 @@ pub mod simple_message_notification {
         show_suppress_button: bool,
         title: Option<SharedString>,
         scroll_handle: ScrollHandle,
+        /// `None` (the default) renders with no severity accent bar — see
+        /// `NotificationFrame::severity`'s own doc comment.
+        severity: Option<super::NotificationSeverity>,
     }
 
     impl Focusable for MessageNotification {
@@ -550,7 +656,13 @@ pub mod simple_message_notification {
                 title: None,
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
+                severity: None,
             }
+        }
+
+        pub fn severity(mut self, severity: super::NotificationSeverity) -> Self {
+            self.severity = Some(severity);
+            self
         }
 
         pub fn primary_message<S>(mut self, message: S) -> Self
@@ -664,7 +776,11 @@ pub mod simple_message_notification {
 
     impl Render for MessageNotification {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            NotificationFrame::new()
+            let mut frame = NotificationFrame::new();
+            if let Some(severity) = self.severity {
+                frame = frame.with_severity(severity);
+            }
+            frame
                 .with_title(self.title.clone())
                 .with_content(
                     div()
@@ -832,6 +948,8 @@ pub fn show_app_notification<V: Notification + 'static>(
                             workspace.update(cx, |workspace, cx| {
                                 workspace.show_notification_without_handling_dismiss_events(
                                     &id,
+                                    NotificationScope::Global,
+                                    NotificationSeverity::Error,
                                     cx,
                                     |cx| build_notification(cx),
                                 );

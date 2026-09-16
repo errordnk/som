@@ -13,11 +13,11 @@ database, react to input, and reshape themselves at request time, the
 same way a real web app's backend/frontend split works. Lua is the
 scripting layer for both halves of that split:
 
-- **`som-srv` = the Lua *backend*.** It already sits on the
+- **`somsrv` = the Lua *backend*.** It already sits on the
   network/filesystem side of the architecture (see "Where this sits in
   the existing architecture" below) — a natural place for scripts that
   query a database, hit an HTTP API, or otherwise produce content that
-  becomes an SRP payload. `som-srv` is a demon process without GPUI, so
+  becomes an SRP payload. `somsrv` is a demon process without GPUI, so
   nothing it does can touch rendering — Lua here is pure data/logic.
 - **Som = the Lua *frontend*.** Som is the GPUI process — it owns
   painting, layout, and the terminal's rich-content widgets. Lua here
@@ -34,17 +34,17 @@ images/audio/video — see `SRP_PROTOCOL.md`), not HTTP.
 
 Confirmed by direct code reading (2026-09-02), not assumption:
 
-- `som-srv`'s `SrvRequest::PutChunk` is, TODAY, only ever sent by an
+- `somsrv`'s `SrvRequest::PutChunk` is, TODAY, only ever sent by an
   external client (`somcat`, the yazi driver) that already has bytes to
-  push — `handle_srv_request` in `crates/som_srv/src/server.rs` (loop
+  push — `handle_srv_request` in `crates/somsrv/src/server.rs` (loop
   starting ~line 305) only ever *reads* `PutChunk` off the wire and
-  writes it to `SrvCache`; nothing in `som-srv` itself originates
+  writes it to `SrvCache`; nothing in `somsrv` itself originates
   content. This is the gap Lua-as-backend fills: a `.lua` script run
-  BY `som-srv` becomes a new, internal source of `PutChunk`s, alongside
+  BY `somsrv` becomes a new, internal source of `PutChunk`s, alongside
   the existing external-client path — the wire format and the
   `SrvCache`/progress-tracking downstream of it don't change at all.
 - `ContentType::Markdown` / `ContentMetadata::Markdown` already exist
-  end-to-end in the protocol and cache layers — `crates/som_srv/src/
+  end-to-end in the protocol and cache layers — `crates/somsrv/src/
   protocol.rs:673,714`, `crates/terminal/src/rich_content_transport.rs:
   75,186` — and are already threaded through `SrvCache`/
   `RichContentCache`'s `extension_for()` (writes a `.md` file to disk)
@@ -61,7 +61,7 @@ Confirmed by direct code reading (2026-09-02), not assumption:
   but was never connected to the `rich_content_*` pipeline. Phase 1
   wires it in as the actual paint step for `ContentType::Markdown`
   placements.
-- Neither `som-srv` nor `crates/terminal` links any Lua crate today
+- Neither `somsrv` nor `crates/terminal` links any Lua crate today
   (confirmed via `Cargo.toml`/`Cargo.lock` grep — zero hits for `mlua`/
   `rlua`/`lua-src`). yazi (`C:\home\dnk\yazi-fork-work`) already depends
   on `mlua 0.12` with `features = ["anyhow", "async", "error-send",
@@ -71,7 +71,7 @@ Confirmed by direct code reading (2026-09-02), not assumption:
 ## Runtime choice: mlua
 
 Same crate yazi already uses (`mlua`) — one Lua ecosystem across the
-whole project (Som, som-srv, and the yazi fork). `som_srv`'s own
+whole project (Som, somsrv, and the yazi fork). `somsrv`'s own
 `Cargo.toml` pins `mlua = { version = "0.10", features = ["lua54",
 "vendored", "send"] }` (yazi itself is on `mlua 0.12`/`lua55` — the
 version gap is fine, the API this project actually uses is stable
@@ -81,7 +81,7 @@ across both).
 earlier draft of this document claimed `Lua::new()` already omits `io`/
 `os` and that yazi's own sandboxing relies on that default. That's
 wrong. Live-tested directly against `crate::lua::run_script` in
-`crates/som_srv/src/lua.rs`: `mlua::Lua::new()` is defined (confirmed by
+`crates/somsrv/src/lua.rs`: `mlua::Lua::new()` is defined (confirmed by
 reading `mlua`'s own `state.rs`) as `Lua::new_with(StdLib::ALL_SAFE,
 LuaOptions::default())`, and `StdLib::ALL_SAFE` (per mlua's own
 `stdlib.rs`) is every standard library EXCEPT `DEBUG`/`FFI` — which
@@ -93,7 +93,7 @@ looked like the same thing until an actual `io.open(...)` call inside a
 test proved otherwise (`run_script_has_no_io_library_available`, which
 failed against the first draft of this code and passes now).
 
-**Actual sandboxing (`som-srv`'s `crate::lua::phase1_stdlib()`):**
+**Actual sandboxing (`somsrv`'s `crate::lua::phase1_stdlib()`):**
 `Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH |
 StdLib::UTF8 | StdLib::COROUTINE, LuaOptions::default())` — an explicit
 allow-list, not a default. Excludes `IO`, `OS`, and `PACKAGE`
@@ -110,10 +110,10 @@ by widening `StdLib` back toward `ALL_SAFE`.
 Scope, deliberately narrow — get the transport and both runtimes wired
 and PROVEN live before growing the API surface:
 
-1. **`som-srv` executes a `.lua` script and produces a `ContentType::
+1. **`somsrv` executes a `.lua` script and produces a `ContentType::
    Markdown` payload.** New `SrvRequest` variant (or an admin-style
    one-shot invocation — see open question below) that names a script
-   path; `som-srv` runs it in a fresh `mlua::Lua` VM, takes its single
+   path; `somsrv` runs it in a fresh `mlua::Lua` VM, takes its single
    string return value as the markdown source, and streams it out as
    ordinary `PutChunk`s — reusing 100% of the existing chunking/
    `SrvCache`/progress machinery images and video already go through.
@@ -129,7 +129,7 @@ and PROVEN live before growing the API surface:
    terminal's rich-content widget. Phase 1 doesn't yet let scripts
    control layout/widgets beyond "here is the markdown text to show" —
    see "Phase 2" for where that grows.
-3. **Verification**: a real `.lua` file, executed by a real `som-srv`
+3. **Verification**: a real `.lua` file, executed by a real `somsrv`
    daemon, its output landing as real rendered markdown in a real Som
    terminal window — the same live-test discipline every other SRP
    content type in this project has gone through (see `SRP_PROTOCOL.md`/
@@ -139,7 +139,7 @@ and PROVEN live before growing the API surface:
 works end to end
 
 Landed and live-tested:
-- `som-srv` backend (`SrvRequest::RunLuaScript`, `crates/som_srv/src/
+- `somsrv` backend (`SrvRequest::RunLuaScript`, `crates/somsrv/src/
   lua.rs`): runs a script, streams its markdown return value through
   `SrvCache::put_chunk` — same path/`SrvResponse::Progress` machinery
   real `PutChunk` senders use. Explicitly sandboxed (`phase1_stdlib()`
@@ -182,7 +182,7 @@ Landed and live-tested:
   to `bottommost_line()`, matching alacritty's own `Line` convention
   (0 = top of current viewport, negative = scrollback). Without this,
   a placement whose grid never happened to be on-screen during a paint
-  pass would never even get a `som-srv` subscription, permanently
+  pass would never even get a `somsrv` subscription, permanently
   stranding it. `paint_rich_content_markdown_widget` clips to whatever
   ROWS of the placement are currently visible rather than requiring the
   whole thing on-screen at once. A companion race (`RichContentCache::
@@ -268,11 +268,11 @@ surface:
 
 ## Phase 3 (backend data access): databases and network
 
-This is the part that makes `som-srv` a real backend, not just a
+This is the part that makes `somsrv` a real backend, not just a
 text-templating engine:
 
 - **Design direction (2026-09-02): Rust crates as bindings, not raw
-  socket/FFI access from Lua.** `som-srv` links real Rust DB client
+  socket/FFI access from Lua.** `somsrv` links real Rust DB client
   crates (e.g. `sqlx`/`mysql_async` for MySQL, `redis` for Redis) and
   exposes a thin Lua API (`db.query(...)`, `redis.get(...)`/`redis.set(
   ...)`) — connection pooling, protocol handling, and TLS all live in
@@ -286,18 +286,18 @@ text-templating engine:
   should grow one subsection per binding as they land (e.g. "### MySQL
   binding", "### Redis binding"), with the Rust crate chosen, the Lua
   API shape, and the connection-lifecycle model (per-script connection?
-  a shared pool `som-srv` owns across all scripts?) documented at that
+  a shared pool `somsrv` owns across all scripts?) documented at that
   point, not speculated here ahead of implementation.
 
 ## Open questions (track here, resolve before the relevant phase lands)
 
-- **How does a client ask `som-srv` to run a specific script?** A new
+- **How does a client ask `somsrv` to run a specific script?** A new
   `SrvRequest` variant naming a script path/id (mirrors `PutChunk`'s
   own shape), vs. an admin-style one-shot command (mirrors `--list-
   sessions`/`--kill-session`'s pattern in `main.rs`) — not yet decided,
   resolve when Phase 1's script-invocation entry point is actually
   implemented.
-- **Script discovery/storage**: a fixed directory `som-srv` watches
+- **Script discovery/storage**: a fixed directory `somsrv` watches
   (mirrors yazi's `preset!()`-embedded `.lua` files), vs. scripts
   submitted inline over the wire, vs. both. Not needed for Phase 1's
   single hardcoded verification script; resolve before Phase 2 needs
@@ -316,10 +316,10 @@ text-templating engine:
   but-dead transport path, `crates/markdown`'s `Markdown`/
   `MarkdownElement` as the actual paint step). Phase 3's DB-access shape
   (Rust-crate bindings, not raw Lua socket access) decided ahead of
-  implementation per explicit user requirement that som-srv's Lua
+  implementation per explicit user requirement that somsrv's Lua
   backend must be able to write to MySQL/Redis/etc.
-- **2026-09-02**: `som-srv`'s backend runtime landed
-  (`SrvRequest::RunLuaScript`, `crates/som_srv/src/lua.rs`) — corrected
+- **2026-09-02**: `somsrv`'s backend runtime landed
+  (`SrvRequest::RunLuaScript`, `crates/somsrv/src/lua.rs`) — corrected
   the "Runtime choice" section's sandboxing claim after a real test
   (`io.open(...)` inside a script) proved `Lua::new()`'s default DOES
   load `io`; switched to an explicit `StdLib` allow-list

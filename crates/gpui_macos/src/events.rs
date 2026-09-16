@@ -523,7 +523,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
 /// Usage ID (Usage Page 0x07, Keyboard/Keypad) — the layout-independent
 /// physical key identity. This mapping is fixed by Apple's ADB->USB HID
 /// translation table and is the same across every Mac keyboard layout.
-/// Covers the keys used by `som-key`'s drawn layout; returns `None` for
+/// Covers the keys used by `somkey`'s drawn layout; returns `None` for
 /// anything not in that table rather than guessing.
 fn macos_key_code_to_usb_hid_usage(key_code: CGKeyCode) -> Option<u32> {
     Some(match key_code {

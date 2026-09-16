@@ -990,7 +990,7 @@ pub(super) fn keystroke_from_xkb(
 /// to its USB HID Usage ID (Usage Page 0x07, Keyboard/Keypad) — the
 /// layout-independent physical key identity. xkb keycodes are evdev
 /// scancode + 8 by convention, hence the subtraction at the call site.
-/// Covers the keys used by `som-key`'s drawn layout; returns `None` for
+/// Covers the keys used by `somkey`'s drawn layout; returns `None` for
 /// anything not in that table rather than guessing.
 fn evdev_scancode_to_usb_hid_usage(evdev: u32) -> Option<u32> {
     Some(match evdev {

@@ -85,9 +85,9 @@ impl TerminalPanel {
         let working_directory = profile_home.or_else(|| default_working_directory(workspace, cx));
         let local = action.local;
 
-        if !is_shell_override && profile.as_ref().is_some_and(|p| p.tmux) {
+        if !is_shell_override && profile.as_ref().is_some_and(wants_srp) {
             let profile = profile.unwrap();
-            let cwd = working_directory.clone().map(|p| p.to_string_lossy().to_string());
+            let cwd = working_directory.clone().map(|p| p.to_string_lossy().to_string()).map(PathBuf::from);
             let pane_id = uuid::Uuid::new_v4().to_string();
             // Same placeholder-tab approach as `restore_som_tabs`'s Phase
             // 0 (see that function's doc comment) — a new SSH `tmux: true`
@@ -103,100 +103,97 @@ impl TerminalPanel {
             let placeholder = cx.new(|cx| PendingTerminalTab::new(tab_name.clone(), tab_icon.clone(), cx));
             let placeholder_item_id = placeholder.entity_id();
             workspace.add_item_to_main_pane(Box::new(placeholder), profile_index, window, cx);
-            // Remote (ssh/wsl) profiles need a blocking deploy check (git
-            // pull + rebuild on the far side if the version there doesn't
-            // match this Som build — see `ensure_remote_binary_deployed`'s
-            // doc comment) BEFORE the terminal is created at all, since
-            // `tmux_wrapped_shell`'s remote path assumes the binary at
-            // `~/.local/bin/som-srv` is already current. That check
-            // runs real blocking child processes, so it can't happen inline
-            // here on GPUI's main thread — spawn it, then create the
-            // terminal (same as the local path) once it's done. A local
-            // profile has no remote binary to check at all, so `deploy_check`
-            // below is just `None`, skipping straight to terminal creation.
             let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
             let remote_kind = classify_remote(&remote_program);
             let terminal_settings = TerminalSettings::get_global(cx);
             let cursor_shape = terminal_settings.cursor_shape;
             let scrollback = terminal_settings.max_scroll_history_lines;
             let cell_pixel_size = approximate_cell_pixel_size(terminal_settings);
+            let window_handle = window.window_handle();
             // Drives the titlebar's drag-zone spinner (see `workspace::
-            // SomRestoreActivity`'s doc comment) for a new tab's deploy
-            // check + terminal creation, same as `restore_som_tabs` already
-            // does for restore-on-launch — `begin` here, `end` once the
-            // whole inner future below resolves (success, deploy failure,
-            // or tmux_wrapped_shell failure alike), via the wrapping
-            // `async move` rather than duplicating `end()` at every one of
-            // that future's several early-return points.
+            // SomRestoreActivity`'s doc comment) for a new tab's connect
+            // attempt, same as `restore_som_tabs` already does for
+            // restore-on-launch — `begin` here, `end` once the whole
+            // inner future below resolves.
             workspace::SomRestoreActivity::begin(cx);
             cx.spawn_in(window, async move |workspace, cx| {
                 let result: anyhow::Result<()> = async {
-                    if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
-                        let host_args = host_args.clone();
-                        let deploy_result = cx
-                            .background_spawn(async move { ensure_remote_binary_deployed(&host_args, remote_kind) })
-                            .await;
-                        if let Err(err) = deploy_result {
-                            log::warn!("remote som-srv deploy check failed: {err:#}");
-                            // A failed deploy check is FATAL, not best-
-                            // effort — stopping right here, rather than
-                            // forging ahead into `tmux_wrapped_shell`/
-                            // spawning a shell command that (with no
-                            // `som-srv` binary reachable on the remote
-                            // host) is guaranteed to immediately fail too,
-                            // is the actual fix for a real, reported UX
-                            // problem: continuing anyway used to produce a
-                            // SECOND, much less specific "terminal tab
-                            // exited immediately (code 127)" notification
-                            // on top of this one, for the same underlying
-                            // cause — two overlapping technical messages
-                            // read as confusing noise, not two separate
-                            // facts (2026-09-15). The tab stays in place
-                            // (empty placeholder) and the explanation
-                            // surfaces as a `Tab`-scoped toast — see
-                            // `show_som_srv_error`'s own doc comment.
-                            let message = human_readable_deploy_error(&profile.name, &err);
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    show_som_srv_error(workspace, placeholder_item_id, message, cx);
-                                })
-                                .ok();
-                            return anyhow::Ok(());
-                        }
+                    let profile_for_open = profile.clone();
+                    let (item_id, srp_pane_id) = Self::open_srp_or_plain_ssh(
+                        workspace.clone(),
+                        window_handle,
+                        cx,
+                        placeholder_item_id,
+                        profile_for_open,
+                        pane_id,
+                        cwd,
+                        cursor_shape,
+                        scrollback,
+                        cell_pixel_size,
+                        tab_name,
+                        tab_icon,
+                        profile_index,
+                    )
+                    .await?;
+                    if let Some(pane_id) = srp_pane_id {
+                        workspace.update(cx, |workspace, _cx| {
+                            workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                        })?;
                     }
 
-                    let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size) {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            log::error!("failed to set up tmux profile {:?}: {err:#}", profile.name);
-                            // Same "stop at the first fatal error" shape as
-                            // the deploy-check failure above.
-                            let message = format!("Failed to set up tmux profile {:?}: {err:#}", profile.name);
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    show_som_srv_error(workspace, placeholder_item_id, message, cx);
-                                })
-                                .ok();
-                            return anyhow::Ok(());
-                        }
-                    };
-
-                    let task = workspace.update_in(cx, |workspace, window, cx| {
-                        Self::replace_center_terminal_named(
-                            workspace,
-                            placeholder_item_id,
-                            tab_name,
-                            tab_icon,
-                            profile_index,
-                            window,
-                            cx,
-                            move |project, cx| project.create_terminal_with_program_and_args(cwd.map(PathBuf::from), program, args, cx),
-                        )
-                    })?;
-                    let (item_id, _terminal) = task.await?;
-                    workspace.update(cx, |workspace, _cx| {
-                        workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
-                    })?;
+                    // Background mtime-based deploy/redeploy check — runs
+                    // strictly AFTER the tab has already opened (SRP or
+                    // fallback plain SSH, either way), never blocking it.
+                    // Fire-and-forget: the spawned task still awaits its
+                    // own background_spawn'd blocking work and surfaces a
+                    // toast either way (see `show_somsrv_toast`'s doc
+                    // comment).
+                    if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+                        let host_args = host_args.clone();
+                        let profile_name = profile.name.clone();
+                        let profile_os = profile.os;
+                        cx.spawn({
+                            let workspace = workspace.clone();
+                            async move |cx| {
+                                let deploy_result = cx
+                                    .background_spawn({
+                                        let host_args = host_args.clone();
+                                        async move { ensure_remote_binary_deployed(&host_args, remote_kind, profile_os) }
+                                    })
+                                    .await;
+                                match deploy_result {
+                                    Ok(true) => {
+                                        let message = format!(
+                                            "Redeployed somsrv on the \"{profile_name}\" server — restart this tab to use it, or keep working as-is."
+                                        );
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                show_somsrv_toast(
+                                                    workspace,
+                                                    placeholder_item_id,
+                                                    "redeployed",
+                                                    workspace::notifications::NotificationSeverity::Info,
+                                                    message,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        log::warn!("background somsrv deploy check failed for {host_args:?}: {err:#}");
+                                        let message = human_readable_deploy_error(&profile_name, &err);
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                show_somsrv_error(workspace, placeholder_item_id, message, cx);
+                                            })
+                                            .ok();
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+                    }
                     anyhow::Ok(())
                 }
                 .await;
@@ -382,33 +379,161 @@ impl TerminalPanel {
         let project = workspace.project().downgrade();
         cx.spawn_in(window, async move |workspace, cx| {
             let terminal = project.update(cx, create_terminal)?.await?;
-
             let item_id = workspace.update_in(cx, |workspace, window, cx| {
-                let terminal_view = cx.new(|cx| {
-                    TerminalView::new_with_title_and_icon(
-                        terminal.clone(),
-                        workspace.weak_handle(),
-                        workspace.database_id(),
-                        workspace.project().downgrade(),
-                        tab_name.clone(),
-                        tab_icon.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                let item_id = terminal_view.entity_id();
-                if let Some(profile_index) = profile_index {
-                    workspace.set_profile_index_for_item(item_id, profile_index);
-                }
-                if let Some(main_pane) = workspace.panes().first().cloned() {
-                    main_pane.update(cx, |pane, cx| {
-                        pane.replace_item_at(placeholder_item_id, Box::new(terminal_view), window, cx);
-                    });
-                }
-                item_id
+                Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &terminal, tab_name, tab_icon, profile_index, window, cx)
             })?;
             Ok((item_id, terminal.downgrade()))
         })
+    }
+
+    /// The second half of `replace_center_terminal_named` — wraps an
+    /// ALREADY-CREATED `Entity<Terminal>` into a `TerminalView` and swaps
+    /// it into `placeholder_item_id`'s position. Split out so `open_srp_
+    /// or_plain_ssh` can create the `Entity<Terminal>` itself first,
+    /// subscribe to its events BEFORE any `TerminalView` exists (closing
+    /// the race window where an instant `Event::SpawnFailed` could fire
+    /// before anything is listening), and only wrap it into a real pane
+    /// item once it's known whether to keep this one or fall back to a
+    /// freshly-created plain-SSH terminal instead.
+    fn wrap_terminal_into_pane(
+        workspace: &mut Workspace,
+        placeholder_item_id: gpui::EntityId,
+        terminal: &Entity<Terminal>,
+        tab_name: Option<String>,
+        tab_icon: Option<String>,
+        profile_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> gpui::EntityId {
+        let terminal_view = cx.new(|cx| {
+            TerminalView::new_with_title_and_icon(
+                terminal.clone(),
+                workspace.weak_handle(),
+                workspace.database_id(),
+                workspace.project().downgrade(),
+                tab_name,
+                tab_icon,
+                window,
+                cx,
+            )
+        });
+        let item_id = terminal_view.entity_id();
+        if let Some(profile_index) = profile_index {
+            workspace.set_profile_index_for_item(item_id, profile_index);
+        }
+        if let Some(main_pane) = workspace.panes().first().cloned() {
+            main_pane.update(cx, |pane, cx| {
+                pane.replace_item_at(placeholder_item_id, Box::new(terminal_view), window, cx);
+            });
+        }
+        item_id
+    }
+
+    /// Opens an SSH/WSL `tmux`/`srp`/`lua` profile's tab, trying the real
+    /// SRP-wrapped connection FIRST and transparently falling back to a
+    /// plain SSH shell if it doesn't come up within 5 seconds — see this
+    /// session's plan doc (`Som-srv deploy/SRP-connect redesign`) for the
+    /// full policy this implements (2026-09-15): Som never pre-flights
+    /// whether `somsrv` exists on the remote host before trying; it just
+    /// tries the real thing and reacts to what actually happens.
+    ///
+    /// The SRP attempt's own `Entity<Terminal>` is created and subscribed
+    /// to FIRST, before it's wrapped into any visible `TerminalView` —
+    /// this closes the race window where an instant spawn failure (`ssh`
+    /// connecting, trying to exec a `somsrv` that doesn't exist on the
+    /// remote host, and exiting within milliseconds) could fire before
+    /// anything is listening for it. `Terminal::register_task_finished`
+    /// already emits `Event::SpawnFailed` for exactly this shape (a
+    /// nonzero exit before any keyboard input — see that function's own
+    /// doc comment in `crates/terminal/src/terminal.rs`) and `Event::
+    /// CloseTerminal` for a clean-but-early exit; either one arriving
+    /// within the 5s window is treated as "SRP didn't come up," anything
+    /// else (including the timeout itself elapsing with the terminal
+    /// still alive) is treated as success — a working SRP session simply
+    /// never emits either of those events this early.
+    ///
+    /// On success, this returns the SRP terminal's own `(EntityId,
+    /// pane_id)`- callers should record `pane_id` via `set_tmux_sessions_
+    /// for_item`. On fallback, `wrap_terminal_into_pane` is called a
+    /// SECOND time with a freshly-created plain-SSH terminal, replacing
+    /// the (still technically live, if oddly behaving) SRP attempt's own
+    /// item at the same tab position — no error toast for this path, this
+    /// is expected, ordinary first-connection behavior. Returns `None`
+    /// for `pane_id` in the fallback case, since a plain shell has no
+    /// tmux session to record.
+    async fn open_srp_or_plain_ssh(
+        workspace: WeakEntity<Workspace>,
+        window_handle: gpui::AnyWindowHandle,
+        cx: &mut gpui::AsyncApp,
+        placeholder_item_id: gpui::EntityId,
+        profile: workspace::TabProfile,
+        pane_id: String,
+        cwd: Option<PathBuf>,
+        cursor_shape: CursorShape,
+        scrollback: Option<usize>,
+        cell_pixel_size: Option<(u16, u16)>,
+        tab_name: Option<String>,
+        tab_icon: Option<String>,
+        profile_index: Option<usize>,
+    ) -> anyhow::Result<(gpui::EntityId, Option<String>)> {
+        let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size)?;
+
+        let project = window_handle.update(cx, |_, _, cx| {
+            workspace.upgrade().map(|workspace| workspace.read(cx).project().downgrade())
+        })?.ok_or_else(|| anyhow::anyhow!("workspace gone before SRP connect could start"))?;
+        let cwd_for_srp = cwd.clone();
+        let terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_with_program_and_args(cwd_for_srp, program, args, cx)
+            })?
+            .await?;
+
+        // Subscribed BEFORE this terminal is wrapped into any visible
+        // `TerminalView` — see this function's own doc comment.
+        let (failure_tx, failure_rx) = futures::channel::oneshot::channel::<terminal::Event>();
+        let failure_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(failure_tx)));
+        let subscription = window_handle.update(cx, |_, _, cx| {
+            cx.subscribe(&terminal, move |_terminal, event, _cx| {
+                if matches!(event, terminal::Event::SpawnFailed(_) | terminal::Event::CloseTerminal)
+                    && let Some(tx) = failure_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(event.clone());
+                }
+            })
+        })?;
+
+        let srp_came_up = match gpui::FutureExt::with_timeout(failure_rx, std::time::Duration::from_secs(5), cx.background_executor()).await {
+            Ok(Ok(early_event)) => {
+                log::debug!("SRP connect for pane {pane_id:?} failed early: {early_event:?}");
+                false
+            }
+            Ok(Err(_)) => true, // sender dropped without firing — subscription outlived the terminal cleanly
+            Err(gpui::Timeout) => true, // 5s elapsed with no early failure signal
+        };
+        drop(subscription);
+
+        if srp_came_up {
+            let item_id = window_handle.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &terminal, tab_name, tab_icon, profile_index, window, cx)
+                })
+            })??;
+            return Ok((item_id, Some(pane_id)));
+        }
+
+        log::info!("SRP connect for pane {pane_id:?} did not come up within 5s, falling back to plain SSH");
+        let (plain_program, plain_args) = plain_ssh_shell(&profile)?;
+        let plain_terminal = project
+            .update(cx, |project, cx| {
+                project.create_terminal_with_program_and_args(cwd, plain_program, plain_args, cx)
+            })?
+            .await?;
+        let item_id = window_handle.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &plain_terminal, tab_name, tab_icon, profile_index, window, cx)
+            })
+        })??;
+        Ok((item_id, None))
     }
 
     /// Restores tabs and their split panes from `~/.config/som/db.json` at
@@ -569,13 +694,13 @@ impl TerminalPanel {
                     .map(|dir| PathBuf::from(dir.to_string()))
                     .filter(|dir| dir.is_dir());
 
-                if profile.tmux {
+                if wants_srp(&profile) {
                     // Splits aren't supported for tmux tabs yet, so there's
                     // only ever the one pane_id to restore, never extras —
                     // see `set_tmux_sessions_for_item`'s doc comment (still
                     // named for the OLD session_id-based design, now
                     // repurposed to store the pane_id used as this pane's
-                    // `som-srv` pipe name — see `project_som_tmux`
+                    // `somsrv` pipe name — see `project_som_tmux`
                     // memory, "Обновление 17"/19).
                     let pane_id = tab
                         .tmux_sessions
@@ -584,19 +709,13 @@ impl TerminalPanel {
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                    // The ENTIRE rest of this tab's setup — deploy check,
-                    // orphan cleanup, terminal creation, tmux_sessions
+                    // The ENTIRE rest of this tab's setup — SRP connect
+                    // attempt, deploy check, orphan cleanup, tmux_sessions
                     // bookkeeping — runs inside ONE `cx.spawn`, pushed into
                     // `tab_creations` immediately, so THIS tab's (possibly
-                    // slow, real SSH round-trip) deploy check can never
+                    // slow, real SSH round-trip) connect attempt can never
                     // block the `for` loop from moving on to the NEXT
-                    // tab's restore. Before this, the deploy check/orphan
-                    // cleanup below were awaited directly in the loop body
-                    // — with N SSH `tmux: true` tabs, total restore time
-                    // was the SUM of every host's round-trip, not the
-                    // slowest one, exactly the concurrency Phase 1's own
-                    // doc comment already promised but this one branch
-                    // didn't actually deliver.
+                    // tab's restore.
                     let (remote_program, host_args) =
                         project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
                     let remote_kind = classify_remote(&remote_program);
@@ -606,96 +725,32 @@ impl TerminalPanel {
                     let cwd = cwd.clone();
                     let tab_profile_index = tab.profile_index;
                     let created = cx.spawn(async move |cx| {
-                        if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
-                            // `ensure_remote_binary_deployed`/`kill_orphaned_
-                            // holders` are SYNCHRONOUS, blocking functions
-                            // (real `ssh`/`scp` child processes via
-                            // `std::process::Command::output()`) — running
-                            // them directly on THIS `cx.spawn`'s foreground
-                            // executor would block that executor's thread
-                            // for the whole SSH round-trip, starving every
-                            // OTHER tab's `cx.spawn` task of a chance to
-                            // progress too (confirmed: without `background_
-                            // spawn` here, two tabs' deploy-checks ran
-                            // fully back-to-back, not concurrently, even
-                            // though each already had its own `cx.spawn`).
-                            // `cx.background_spawn` moves the blocking work
-                            // onto a real background thread pool instead.
-                            let deploy_result = cx
-                                .background_spawn({
-                                    let host_args = host_args.clone();
-                                    let live_pane_ids = live_pane_ids.clone();
-                                    async move {
-                                        let deploy_result = ensure_remote_binary_deployed(&host_args, remote_kind);
-                                        // Piggybacks on the SSH round-trip
-                                        // the deploy check above already
-                                        // pays for — see `kill_orphaned_
-                                        // holders`'s doc comment.
-                                        kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
-                                        deploy_result
-                                    }
-                                })
-                                .await;
-                            if let Err(err) = deploy_result {
-                                log::warn!("remote som-srv deploy check failed on restore: {err:#}");
-                                // Same "stop at the first fatal error,
-                                // show it as a Tab-scoped toast instead of
-                                // forging ahead into a doomed shell spawn"
-                                // shape as `new_terminal`'s identical
-                                // check — see `show_som_srv_error`'s own
-                                // doc comment for the full rationale
-                                // (2026-09-15).
-                                let message = human_readable_deploy_error(&profile.name, &err);
-                                window_handle
-                                    .update(cx, |_, _, cx| {
-                                        workspace.update(cx, |workspace, cx| {
-                                            show_som_srv_error(workspace, placeholder_item_id, message, cx);
-                                        })
-                                    })
-                                    .ok();
-                                return anyhow::Ok(placeholder_item_id);
-                            }
-                        }
-
-                        let (cursor_shape, scrollback, cell_pixel_size) = window_handle
+                        let (cwd, cursor_shape, scrollback, cell_pixel_size) = window_handle
                             .update(cx, |_, _, cx| {
                                 let settings = TerminalSettings::get_global(cx);
-                                (settings.cursor_shape, settings.max_scroll_history_lines, approximate_cell_pixel_size(settings))
+                                let cwd = cwd.clone().or_else(|| {
+                                    workspace.upgrade().and_then(|workspace| default_working_directory(workspace.read(cx), cx))
+                                });
+                                (cwd, settings.cursor_shape, settings.max_scroll_history_lines, approximate_cell_pixel_size(settings))
                             })
-                            .unwrap_or((CursorShape::default(), None, None));
-                        let (program, args) = match tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size) {
-                            Ok(pair) => pair,
-                            Err(err) => {
-                                log::error!("failed to set up tmux profile {:?} on restore: {err:#}", profile.name);
-                                let message = format!("Failed to set up tmux profile {:?}: {err:#}", profile.name);
-                                window_handle
-                                    .update(cx, |_, _, cx| {
-                                        workspace.update(cx, |workspace, cx| {
-                                            show_som_srv_error(workspace, placeholder_item_id, message, cx);
-                                        })
-                                    })
-                                    .ok();
-                                return anyhow::Ok(placeholder_item_id);
-                            }
-                        };
-                        let created = window_handle.update(cx, |_, window, cx| {
-                            workspace.update(cx, |workspace, cx| {
-                                let cwd = cwd.clone().or_else(|| default_working_directory(workspace, cx));
-                                Self::replace_center_terminal_named(
-                                    workspace,
-                                    placeholder_item_id,
-                                    Some(profile.name.clone()),
-                                    profile.icon.clone(),
-                                    Some(tab_profile_index),
-                                    window,
-                                    cx,
-                                    move |project, cx| {
-                                        project.create_terminal_with_program_and_args(cwd, program, args, cx)
-                                    },
-                                )
-                            })
-                        })??;
-                        let (item_id, _terminal) = created.await?;
+                            .unwrap_or((cwd.clone(), CursorShape::default(), None, None));
+
+                        let (item_id, srp_pane_id) = Self::open_srp_or_plain_ssh(
+                            workspace.clone(),
+                            window_handle,
+                            cx,
+                            placeholder_item_id,
+                            profile.clone(),
+                            pane_id,
+                            cwd,
+                            cursor_shape,
+                            scrollback,
+                            cell_pixel_size,
+                            Some(profile.name.clone()),
+                            profile.icon.clone(),
+                            Some(tab_profile_index),
+                        )
+                        .await?;
                         // Restored tabs never otherwise call
                         // `set_tmux_sessions_for_item` — without this,
                         // `pane_id` above (correctly reused from
@@ -708,23 +763,84 @@ impl TerminalPanel {
                         // forgetting the association on every restore.
                         // Confirmed root cause of a reported bug: a
                         // `htop`/`micro` process running in a
-                        // `som-srv` HOLDER survives Som closing
+                        // `somsrv` HOLDER survives Som closing
                         // (the whole point of the HOLDER/RELAY design —
                         // see `project_som_tmux` memory), but the tab
                         // that opens on the NEXT launch gets a
                         // brand-new `pane_id` instead of reattaching to
                         // that same still-alive HOLDER, since db.json
                         // never remembered which pane_id this tab was
-                        // actually using. Uses `window_handle.update`
-                        // (not `workspace.update` directly) since
-                        // `Workspace::set_tmux_sessions_for_item` needs
-                        // a `Context<Workspace>`, only obtainable
-                        // through the window.
-                        window_handle.update(cx, |_, _, cx| {
-                            workspace.update(cx, |workspace, _cx| {
-                                workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                        // actually using. Only meaningful if this attempt
+                        // actually came up via SRP — a plain-SSH fallback
+                        // has no tmux session to record.
+                        if let Some(pane_id) = srp_pane_id {
+                            window_handle.update(cx, |_, _, cx| {
+                                workspace.update(cx, |workspace, _cx| {
+                                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                                })
+                            })??;
+                        }
+
+                        // Background mtime-based deploy/redeploy check +
+                        // orphan cleanup — both run in the background,
+                        // detached, strictly AFTER this tab has already
+                        // opened (SRP or fallback plain SSH). Neither
+                        // blocks this tab's own open.
+                        if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+                            let host_args = host_args.clone();
+                            let live_pane_ids = live_pane_ids.clone();
+                            let profile_name = profile.name.clone();
+                            let profile_os = profile.os;
+                            cx.spawn({
+                                let workspace = workspace.clone();
+                                async move |cx| {
+                                    let deploy_result = cx
+                                        .background_spawn({
+                                            let host_args = host_args.clone();
+                                            async move {
+                                                let deploy_result = ensure_remote_binary_deployed(&host_args, remote_kind, profile_os);
+                                                kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
+                                                deploy_result
+                                            }
+                                        })
+                                        .await;
+                                    match deploy_result {
+                                        Ok(true) => {
+                                            let message = format!(
+                                                "Redeployed somsrv on the \"{profile_name}\" server — restart this tab to use it, or keep working as-is."
+                                            );
+                                            window_handle
+                                                .update(cx, |_, _, cx| {
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        show_somsrv_toast(
+                                                            workspace,
+                                                            placeholder_item_id,
+                                                            "redeployed",
+                                                            workspace::notifications::NotificationSeverity::Info,
+                                                            message,
+                                                            cx,
+                                                        );
+                                                    })
+                                                })
+                                                .ok();
+                                        }
+                                        Ok(false) => {}
+                                        Err(err) => {
+                                            log::warn!("background somsrv deploy check failed for {host_args:?}: {err:#}");
+                                            let message = human_readable_deploy_error(&profile_name, &err);
+                                            window_handle
+                                                .update(cx, |_, _, cx| {
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        show_somsrv_error(workspace, placeholder_item_id, message, cx);
+                                                    })
+                                                })
+                                                .ok();
+                                        }
+                                    }
+                                }
                             })
-                        })??;
+                            .detach();
+                        }
                         anyhow::Ok(item_id)
                     });
                     tab_creations.push((db_index, tab.extra_splits, created));
@@ -1055,7 +1171,7 @@ fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
 /// Where a `tmux: true` profile's shell actually runs — determines which of
 /// the two wrapping strategies in `tmux_wrapped_shell` applies. See
 /// `project_som_tmux` memory ("Обновление 18"): a local shell gets WRAPPED
-/// (Som's own PTY child becomes `som-srv.exe` acting as the RELAY),
+/// (Som's own PTY child becomes `somsrv.exe` acting as the RELAY),
 /// but `ssh`/`wsl` profiles get their REMOTE-SIDE command appended instead —
 /// the `ssh`/`wsl` process itself, unmodified, IS the transport (its own
 /// stdin/stdout tunnel bytes to/from wherever the shell actually runs), so
@@ -1085,7 +1201,7 @@ fn classify_remote(program: &str) -> RemoteKind {
 /// [16t` ("report cell pixel size") answer from being the previous
 /// hardcoded `1x1` (which made `yazi`'s own image-scaling logic downscale
 /// every image to a handful of pixels before Som ever saw it — see
-/// `som_srv::bounds::SessionBounds::cell_width`'s doc comment for the
+/// `somsrv::bounds::SessionBounds::cell_width`'s doc comment for the
 /// full history), without the complexity/regression risk of threading a
 /// live value through from the real render (that approach was tried and
 /// reverted — see `project_som_tmux` memory).
@@ -1108,7 +1224,7 @@ fn approximate_cell_pixel_size(settings: &TerminalSettings) -> Option<(u16, u16)
 }
 
 /// Serializes Som's own `CursorShape` setting into the plain string
-/// `som-srv` parses back out (`crate::session::parse_cursor_shape`
+/// `somsrv` parses back out (`crate::session::parse_cursor_shape`
 /// in that crate, deliberately NOT sharing this enum type — see that
 /// function's doc comment for why) — passed via `--cursor-shape` so the
 /// HOLDER's own `alacritty_terminal::Term` (which now OWNS the cursor shape
@@ -1124,7 +1240,7 @@ fn cursor_shape_arg(shape: CursorShape) -> &'static str {
     }
 }
 
-/// Substitutes a `som-srv`-wrapped command in for a `tmux: true`
+/// Substitutes a `somsrv`-wrapped command in for a `tmux: true`
 /// profile's own shell — see `project_som_tmux` memory ("Обновление 16"-19)
 /// for the full design. Som's own terminal creation path never learns
 /// anything happened; it just gets a different program/args than the
@@ -1134,7 +1250,7 @@ fn cursor_shape_arg(shape: CursorShape) -> &'static str {
 /// `pane_id` is generated by the CALLER (fresh `Uuid::new_v4()` for a new
 /// tab, or a saved one from db.json for restore) — the daemon never
 /// invents one; see `RelayInput::Register`'s doc comment
-/// (`som_srv::protocol`) for how this identifies a session in the shared
+/// (`somsrv::protocol`) for how this identifies a session in the shared
 /// daemon's registry.
 ///
 /// `cursor_shape`/`scrollback` mirror Som's own `TerminalSettings` — passed
@@ -1146,6 +1262,25 @@ fn cursor_shape_arg(shape: CursorShape) -> &'static str {
 /// doc comment for why) — silently ignored for `Ssh`/`Wsl` since the HOLDER
 /// there runs on a different machine, rendering nothing itself, where
 /// Som's own local font metrics have no meaning.
+/// Whether this profile wants an SRP-wrapped remote connection at all —
+/// `tmux`/`srp`/`lua` are three independent feature flags (session
+/// persistence, rich content, Lua scripting respectively) that all ride
+/// on the SAME underlying SRP connection attempt, so any one of them
+/// being set is enough to try it (2026-09-15).
+fn wants_srp(profile: &workspace::TabProfile) -> bool {
+    profile.tmux || profile.srp || profile.lua
+}
+
+/// Builds the SRP-wrapped `(program, args)` for an SSH/WSL profile that
+/// wants SRP (`wants_srp` is `true`) — see `open_srp_or_plain_ssh`'s doc
+/// comment for how the caller actually decides whether the resulting
+/// connection succeeded or needs falling back to plain SSH; this
+/// function only builds the command, it never probes anything first
+/// (2026-09-15 redesign: no more pre-flight `remote_somsrv_exists`
+/// check — SRP either comes up on this exact connection or it doesn't,
+/// discovered live). Ignored for `RemoteKind::Local`, which always has
+/// its own `somsrv_binary_path()` binary available (it ships inside Som
+/// itself, nothing to deploy).
 fn tmux_wrapped_shell(
     profile: &workspace::TabProfile,
     pane_id: &str,
@@ -1156,19 +1291,18 @@ fn tmux_wrapped_shell(
     let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
     match classify_remote(&program) {
         RemoteKind::Local => {
-            let server_path = som_srv_binary_path()?;
+            let server_path = somsrv_binary_path()?;
             let wrapped_args =
                 wrap_command_args(&profile.name, pane_id, program, args, cursor_shape, scrollback, cell_pixel_size);
             Ok((server_path.to_string_lossy().to_string(), wrapped_args))
         }
         kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
-            let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback, kind);
             // Same MSYS-vs-real-OpenSSH `PATH` ambiguity as `run_remote_
             // command`/`scp_to_remote` — see `windows_openssh_binary`'s
             // own doc comment. This is the interactive PTY process
             // itself (not a one-shot probe/scp), so it matters just as
             // much here: an `ssh` resolved to Git for Windows' MSYS copy
-            // would rewrite the remote-side `som-srv` invocation's own
+            // would rewrite the remote-side `somsrv` invocation's own
             // POSIX-looking arguments the exact same way it rewrote the
             // deploy check's `chmod` path, before this fix.
             let program = if matches!(kind, RemoteKind::Ssh) {
@@ -1176,20 +1310,54 @@ fn tmux_wrapped_shell(
             } else {
                 program
             };
-            Ok((program, wrapped_args))
+            if wants_srp(profile) {
+                let wrapped_args = wrap_remote_command_args(&profile.name, pane_id, args, cursor_shape, scrollback, kind);
+                Ok((program, wrapped_args))
+            } else {
+                // Plain `ssh host` (or `wsl [flags] --`) with NO explicit
+                // remote command — sshd starts this client's own real
+                // login shell directly (no `somsrv`/SRP involved at
+                // all). `args` here is just `host_args` (`ssh`'s own
+                // flags/hostname, or `wsl`'s own flags) since `parse_
+                // shell_command` never had a `somsrv` wrapper to strip
+                // in the first place for a profile that names a plain
+                // shell.
+                Ok((program, args))
+            }
+        }
+    }
+}
+
+/// Same shape as `tmux_wrapped_shell`, but always builds the plain
+/// (non-SRP) command regardless of `wants_srp(profile)` — used by
+/// `open_srp_or_plain_ssh`'s fallback path once an SRP attempt has
+/// already timed out or failed, where the caller needs the plain form
+/// specifically rather than whatever the profile's own flags would
+/// otherwise pick.
+fn plain_ssh_shell(profile: &workspace::TabProfile) -> anyhow::Result<(String, Vec<String>)> {
+    let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+    match classify_remote(&program) {
+        RemoteKind::Local => anyhow::bail!("plain_ssh_shell is only meaningful for SSH/WSL profiles"),
+        kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
+            let program = if matches!(kind, RemoteKind::Ssh) {
+                windows_openssh_binary(&program).to_string_lossy().into_owned()
+            } else {
+                program
+            };
+            Ok((program, args))
         }
     }
 }
 
 /// The actual argv construction, split out from `tmux_wrapped_shell` so it
-/// can be unit-tested without touching the filesystem (`som_srv_
+/// can be unit-tested without touching the filesystem (`somsrv_
 /// binary_path` looks up a real file next to `current_exe()`, which under
 /// `cargo test` resolves to `target/debug/deps/`, not `target/debug/` —
 /// same constraint other tests in this codebase have hit).
 ///
 /// `--cursor-shape`/`--scrollback` are appended AFTER the program's own args
 /// rather than before the positional `profile`/`pane-id`/`program` — order
-/// doesn't matter to `som-srv`'s own arg parser (each flag consumes
+/// doesn't matter to `somsrv`'s own arg parser (each flag consumes
 /// its value via `iter.next()` regardless of what's already been seen), so
 /// putting them last avoids having to touch the positional-fill logic at all.
 fn wrap_command_args(
@@ -1216,7 +1384,7 @@ fn wrap_command_args(
     wrapped_args
 }
 
-/// Appends the REMOTE-side `som-srv` invocation after an `ssh`/`wsl`
+/// Appends the REMOTE-side `somsrv` invocation after an `ssh`/`wsl`
 /// profile's own args (host, flags, `--cd ~`, etc.) — both `ssh host <cmd>`
 /// and `wsl [flags] -- <cmd>` hand everything after their own arguments to
 /// a shell on the far side, so this is what that far shell actually runs.
@@ -1233,7 +1401,7 @@ fn wrap_command_args(
 ///
 /// No client identity is threaded through here — a freshly-spawned
 /// HOLDER's `--client-id` comes from the REMOTE RELAY's own `$SSH_CLIENT`
-/// (see `som_srv::protocol::ssh_client_ip`'s doc comment), read entirely
+/// (see `somsrv::protocol::ssh_client_ip`'s doc comment), read entirely
 /// on the far side once `ssh` has already connected; there's nothing this
 /// Windows-side command-line builder could usefully pass down instead (it
 /// has no reliable view of what source IP sshd will see this connection
@@ -1250,7 +1418,7 @@ fn wrap_remote_command_args(
     // `-tt` (force pseudo-terminal allocation, doubled so it applies even
     // though this process's own stdin isn't a tty from ssh's point of
     // view) for SSH profiles specifically. Without a remote pty, `ssh host
-    // <explicit command>` gives the remote `som-srv` RELAY plain pipes
+    // <explicit command>` gives the remote `somsrv` RELAY plain pipes
     // for stdin/stdout — no `TIOCGWINSZ` to read the real size from and no
     // SSH window-change channel — so the remote shell was permanently
     // stuck at the RELAY's 80x24 fallback regardless of the real pane
@@ -1265,7 +1433,7 @@ fn wrap_remote_command_args(
     if let RemoteKind::Ssh = remote_kind {
         wrapped_args.insert(0, "-tt".to_string());
     }
-    wrapped_args.push("~/.local/bin/som-srv".to_string());
+    wrapped_args.push("~/.local/bin/somsrv".to_string());
     wrapped_args.push(profile_name.to_string());
     wrapped_args.push(pane_id.to_string());
     wrapped_args.push("$SHELL".to_string());
@@ -1276,12 +1444,12 @@ fn wrap_remote_command_args(
         wrapped_args.push(scrollback.to_string());
     }
     // `--` then `-l`: a login-shell flag passed through to `$SHELL` itself
-    // (`som-srv`'s own arg parser treats everything after `--` as extra
+    // (`somsrv`'s own arg parser treats everything after `--` as extra
     // args for the spawned program, see `main.rs`'s `Args` doc comment).
     // A plain (non-tmux) SSH profile gets this for free — Som runs a bare
     // `ssh host` with no explicit command, which makes sshd start a REAL
     // login shell itself (that's also what prints the MOTD banner). A
-    // `tmux: true` profile's `ssh host ~/.local/bin/som-srv ...` is an
+    // `tmux: true` profile's `ssh host ~/.local/bin/somsrv ...` is an
     // EXPLICIT remote command, which sshd never treats as a login session
     // for — so `$SHELL` was starting as a plain non-login shell, silently
     // skipping `.bash_profile`/`.profile` (only `.bashrc` still ran) and
@@ -1292,7 +1460,7 @@ fn wrap_remote_command_args(
     wrapped_args
 }
 
-/// Detects whether `shell` is a `som-srv`-wrapped command (built by
+/// Detects whether `shell` is a `somsrv`-wrapped command (built by
 /// `wrap_command_args`/`wrap_remote_command_args`) and, if so, returns an
 /// equivalent `Shell` with a FRESH `pane_id` substituted in place of the
 /// original — everything else (profile, program/args, cursor-shape/
@@ -1327,7 +1495,7 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<(Shell, St
     match classify_remote(program) {
         RemoteKind::Local => {
             // wrap_command_args: [profile, pane_id, original_program, ...]
-            if !program.contains("som-srv") || args.len() < 2 {
+            if !program.contains("somsrv") || args.len() < 2 {
                 return None;
             }
             let mut new_args = args.clone();
@@ -1338,8 +1506,8 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<(Shell, St
             ))
         }
         RemoteKind::Ssh | RemoteKind::Wsl => {
-            // wrap_remote_command_args: [...host_args, "~/.local/bin/som-srv", profile, pane_id, "$SHELL", ...]
-            let server_pos = args.iter().position(|a| a.contains("som-srv"))?;
+            // wrap_remote_command_args: [...host_args, "~/.local/bin/somsrv", profile, pane_id, "$SHELL", ...]
+            let server_pos = args.iter().position(|a| a.contains("somsrv"))?;
             let pane_id_pos = server_pos + 2;
             if pane_id_pos >= args.len() {
                 return None;
@@ -1356,7 +1524,7 @@ pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<(Shell, St
 
 /// Builds the argv for running `remote_program` on the far side of an
 /// `ssh`/`wsl` profile's OWN connection args — e.g. for `ssh 192.168.50.5`
-/// this gives `["192.168.50.5", "~/.local/bin/som-srv", "--version"]`,
+/// this gives `["192.168.50.5", "~/.local/bin/somsrv", "--version"]`,
 /// which `ssh` hands to a shell on the far end exactly like the real relay
 /// invocation does (`wrap_remote_command_args`). Shared by the deploy-check
 /// path so it builds the SAME kind of command line, not a parallel one that
@@ -1400,7 +1568,7 @@ fn shell_quote(script: &str) -> String {
 
 /// Tears down every session the daemon on the far end of an SSH `tmux:
 /// true` profile is holding for THIS SAME client machine (matched by
-/// `client_id`, mirroring `som_srv::protocol::ssh_client_id`'s
+/// `client_id`, mirroring `somsrv::protocol::ssh_client_id`'s
 /// `<user>@<ip>` shape) whose `pane_id` isn't in `live_pane_ids` — i.e. a
 /// session for a pane that isn't (or is no longer) in THIS client's
 /// `db.json` at all, so nothing running on this machine will EVER try to
@@ -1409,7 +1577,7 @@ fn shell_quote(script: &str) -> String {
 /// on that same "we're already paying for one SSH connection to this host
 /// anyway" moment rather than adding a second one).
 ///
-/// Uses `som_srv::admin`'s `--list-sessions`/`--kill-session` CLI
+/// Uses `somsrv::admin`'s `--list-sessions`/`--kill-session` CLI
 /// subcommands (run over SSH via `run_remote_command`, same as the
 /// `--version` deploy-check probe) rather than a `ps`-grep — the OLD
 /// per-pane-HOLDER architecture had one OS process per session, with
@@ -1437,7 +1605,7 @@ fn shell_quote(script: &str) -> String {
 /// THIS machine's `db.json` and would look orphaned by pane_id alone, even
 /// though it's perfectly live from that other machine's point of view.
 ///
-/// Best-effort: a failure here (host unreachable, `som-srv` too old to
+/// Best-effort: a failure here (host unreachable, `somsrv` too old to
 /// understand `--list-sessions`) is logged and swallowed rather than
 /// propagated — this is housekeeping, not something that should block a
 /// tab from restoring.
@@ -1448,60 +1616,25 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
     if !matches!(remote_kind, RemoteKind::Ssh) {
         return;
     }
-    // Reproduces the EXACT `<user>@<ip>` shape `som_srv::protocol::
-    // ssh_client_id` builds on the RELAY side — `whoami` + `$SSH_CLIENT`
-    // together, over THIS SAME SSH connection, so sshd reports the exact
-    // same source IP any OTHER invocation from this same client machine
-    // (i.e. a RELAY registering a session) already got and passed down as
-    // its own `client_id`.
-    let client_id_script = r#"echo "SOM_CLIENT_ID:$(whoami)@$SSH_CLIENT""#;
-    let quoted_client_id_script = shell_quote(client_id_script);
-    let client_id_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_client_id_script]);
-    let client_id_output = match run_remote_command(remote_kind, &client_id_probe) {
-        Ok(output) => output,
-        Err(err) => {
-            log::warn!("failed to read this connection's client-id for orphan cleanup, skipping: {err:#}");
-            return;
-        }
-    };
-    // Prefixed with a marker rather than trusting this to be the FIRST
-    // line of output — a login shell (`sh -lc`, i.e. `-l`) can run profile
-    // scripts (`.bashrc`/`.profile`/version-manager init like `fnm`/`nvm`)
-    // that print their OWN unrelated lines to stdout first (confirmed live
-    // against a real `ssh localhost` WSL2 setup).
-    let Some(marker_line) = client_id_output.lines().find(|line| line.starts_with("SOM_CLIENT_ID:")) else {
-        log::warn!("unexpected output from client-id probe, skipping: {client_id_output:?}");
+    let Some(this_client_id) = read_this_client_id(host_args, remote_kind) else {
         return;
     };
-    let Some(this_client_id) = marker_line["SOM_CLIENT_ID:".len()..].split_whitespace().next() else {
-        // Not actually an SSH connection from sshd's point of view (no
-        // `$SSH_CLIENT`) — shouldn't happen for a real `tmux: true` SSH
-        // profile, but if it ever does there's no safe way to tell which
-        // sessions belong to this client, so skip cleanup entirely rather
-        // than guess.
-        return;
-    };
-    // An empty `$SSH_CLIENT` collapses to a bare `user@` (whoami succeeded,
-    // sshd didn't set the var) — just as unable to safely identify this
-    // client's sessions as the "no $SSH_CLIENT at all" case above.
-    if this_client_id.ends_with('@') {
-        return;
-    }
+    let this_client_id = this_client_id.as_str();
 
-    let list_script = format!("~/.local/bin/som-srv --list-sessions {}", shell_quote(this_client_id));
+    let list_script = format!("~/.local/bin/somsrv --list-sessions {}", shell_quote(this_client_id));
     let quoted_list_script = shell_quote(&list_script);
     let list_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_list_script]);
     let sessions_json = match run_remote_command(remote_kind, &list_probe) {
         Ok(output) => output,
         Err(err) => {
-            log::warn!("failed to list remote som-srv sessions for orphan cleanup, skipping: {err:#}");
+            log::warn!("failed to list remote somsrv sessions for orphan cleanup, skipping: {err:#}");
             return;
         }
     };
-    let sessions: Vec<som_srv::protocol::SessionInfo> = match serde_json::from_str(sessions_json.trim()) {
+    let sessions: Vec<somsrv::protocol::SessionInfo> = match serde_json::from_str(sessions_json.trim()) {
         Ok(sessions) => sessions,
         Err(err) => {
-            log::warn!("failed to parse som-srv --list-sessions output, skipping: {err:#} (output: {sessions_json:?})");
+            log::warn!("failed to parse somsrv --list-sessions output, skipping: {err:#} (output: {sessions_json:?})");
             return;
         }
     };
@@ -1510,13 +1643,13 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
     if orphaned_pane_ids.is_empty() {
         return;
     }
-    log::info!("killing {} orphaned som-srv session(s) not in db.json: {orphaned_pane_ids:?}", orphaned_pane_ids.len());
+    log::info!("killing {} orphaned somsrv session(s) not in db.json: {orphaned_pane_ids:?}", orphaned_pane_ids.len());
     for pane_id in orphaned_pane_ids {
-        let kill_script = format!("~/.local/bin/som-srv --kill-session {} {}", shell_quote(this_client_id), shell_quote(pane_id));
+        let kill_script = format!("~/.local/bin/somsrv --kill-session {} {}", shell_quote(this_client_id), shell_quote(pane_id));
         let quoted_kill_script = shell_quote(&kill_script);
         let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
         if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
-            log::warn!("failed to kill orphaned som-srv session {pane_id:?}: {err:#}");
+            log::warn!("failed to kill orphaned somsrv session {pane_id:?}: {err:#}");
         }
     }
 }
@@ -1526,7 +1659,7 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
 /// in `live_pane_ids`. Pulled out of `kill_orphaned_holders` itself so
 /// this filtering logic can be unit-tested without an actual SSH
 /// round-trip.
-fn orphaned_pane_ids<'a>(sessions: &'a [som_srv::protocol::SessionInfo], live_pane_ids: &[String]) -> Vec<&'a str> {
+fn orphaned_pane_ids<'a>(sessions: &'a [somsrv::protocol::SessionInfo], live_pane_ids: &[String]) -> Vec<&'a str> {
     sessions
         .iter()
         .map(|session| session.pane_id.as_str())
@@ -1534,7 +1667,7 @@ fn orphaned_pane_ids<'a>(sessions: &'a [som_srv::protocol::SessionInfo], live_pa
         .collect()
 }
 
-/// Shows a `som-srv` deploy/setup failure as a toast, bottom-right,
+/// Shows a `somsrv` deploy/setup failure as a toast, bottom-right,
 /// scoped to ONE tab — visible only while `tab_item_id` is the active
 /// item, disappearing/reappearing as the user switches away from/back to
 /// the broken tab, with a "Copy" button (full technical detail) and a
@@ -1563,34 +1696,53 @@ fn orphaned_pane_ids<'a>(sessions: &'a [som_srv::protocol::SessionInfo], live_pa
 fn human_readable_deploy_error(profile_name: &str, err: &anyhow::Error) -> String {
     let detail = format!("{err:#}");
     let reason = if detail.contains("No such file or directory") {
-        "the som-srv program wasn't found on the server after copying it there"
+        "the somsrv program wasn't found on the server after copying it there"
     } else if detail.contains("Permission denied") {
-        "the server refused permission while setting up som-srv"
-    } else if detail.contains("no embedded som-srv binary for") {
-        "Som doesn't have a som-srv build for that server's platform"
+        "the server refused permission while setting up somsrv"
+    } else if detail.contains("no embedded somsrv binary for") {
+        "Som doesn't have a somsrv build for that server's platform"
     } else if detail.contains("failed to spawn") {
         "couldn't even start ssh/scp — check that they're installed and on your PATH"
     } else if detail.contains("scp exited with") {
-        "copying som-srv to the server failed"
+        "copying somsrv to the server failed"
     } else {
         "couldn't reach or set up the server"
     };
     format!("Couldn't set up the \"{profile_name}\" tab: {reason}.\n\nDetails:\n{detail}")
 }
 
-fn show_som_srv_error(workspace: &mut Workspace, tab_item_id: gpui::EntityId, message: String, cx: &mut Context<Workspace>) {
-    use workspace::notifications::{
-        NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
-    };
+fn show_somsrv_error(workspace: &mut Workspace, tab_item_id: gpui::EntityId, message: String, cx: &mut Context<Workspace>) {
+    use workspace::notifications::NotificationSeverity;
+    show_somsrv_toast(workspace, tab_item_id, "error", NotificationSeverity::Error, message, cx);
+}
+
+/// Same toast shape as `show_somsrv_error` (Tab-scoped, "Copy" + close
+/// button, per-tab `NotificationId` so it doesn't clobber a different
+/// tab's toast), but for the background deploy check's SUCCESS case — see
+/// `ensure_remote_binary_deployed`'s call sites (2026-09-15): a tab opens
+/// immediately without waiting on this check at all, so its result (a
+/// redeploy happened, or nothing needed doing) has nowhere else to
+/// surface. `id_kind` (e.g. `"error"`/`"redeployed"`) keeps the two
+/// notification IDs distinct per tab so a later error doesn't silently
+/// replace an earlier success toast still on screen, or vice versa.
+fn show_somsrv_toast(
+    workspace: &mut Workspace,
+    tab_item_id: gpui::EntityId,
+    id_kind: &str,
+    severity: workspace::notifications::NotificationSeverity,
+    message: String,
+    cx: &mut Context<Workspace>,
+) {
+    use workspace::notifications::{NotificationId, NotificationScope, simple_message_notification::MessageNotification};
 
     let message = format!("Som: {message}");
-    let id = NotificationId::Named(format!("som-srv-deploy-error-{}", tab_item_id.as_u64()).into());
-    workspace.show_scoped_notification(id, NotificationScope::Tab(tab_item_id), NotificationSeverity::Error, cx, move |cx| {
+    let id = NotificationId::Named(format!("somsrv-deploy-{id_kind}-{}", tab_item_id.as_u64()).into());
+    workspace.show_scoped_notification(id, NotificationScope::Tab(tab_item_id), severity, cx, move |cx| {
         let message2 = message.clone();
         let message3 = message.clone();
         cx.new(|cx| {
             MessageNotification::new(message2, cx)
-                .severity(NotificationSeverity::Error)
+                .severity(severity)
                 .primary_message("Copy")
                 .primary_on_click(move |_window, cx| {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(message3.clone()));
@@ -1600,14 +1752,14 @@ fn show_som_srv_error(workspace: &mut Workspace, tab_item_id: gpui::EntityId, me
     });
 }
 
-/// Ensures `~/.local/bin/som-srv` on the far side of an `ssh`/`wsl`
+/// Ensures `~/.local/bin/somsrv` on the far side of an `ssh`/`wsl`
 /// tmux profile is present and matches THIS Som build's version — see
 /// `project_som_tmux` memory for the full policy this implements. Runs
 /// entirely on a background thread (blocking `ssh`/`wsl`/`scp` child
 /// processes) — callers must not call this from GPUI's main thread.
 ///
 /// Deploy mechanism is `scp` of a PRE-BUILT binary from `~/.config/som/
-/// srv/{platform}/som-srv` (see `som_srv::protocol::platform_binaries_
+/// srv/{platform}/somsrv` (see `somsrv::protocol::platform_binaries_
 /// dir`) — NOT `git pull && cargo build` on the remote machine, which is
 /// what this used to do. That approach needed a full clone of this
 /// repository AND a working Rust toolchain already present on every single
@@ -1619,37 +1771,47 @@ fn show_som_srv_error(workspace: &mut Workspace, tab_item_id: gpui::EntityId, me
 /// it isn't really a separate "remote platform" needing its own packaged
 /// binary (same machine, same architecture Som itself just built for).
 ///
-/// UNLIKE the old approach, this one is NOT safe to run while an old
-/// HOLDER is still alive on the remote host: overwriting a running Linux
-/// binary in place via `cp`/`scp`'s destination-truncate semantics fails
-/// outright (`ETXTBSY`, confirmed by direct reproduction — ordinary Unix
-/// "safe to replace a running executable" semantics only hold for an
-/// atomic rename onto a NEW inode, not an in-place truncate-and-rewrite).
-/// So a version mismatch now means: kill every `som-srv` process this
-/// account owns on that host FIRST (`kill_all_holders_for_redeploy`),
-/// THEN `scp` the new binary in. Every live pane on every client currently
+/// UNLIKE the old approach, this never overwrites the LIVE `somsrv`
+/// binary in place — `cp`/`scp`'s destination-truncate semantics fail
+/// outright against a running executable (`ETXTBSY`, confirmed by direct
+/// reproduction — ordinary Unix "safe to replace a running executable"
+/// semantics only hold for an atomic rename onto a NEW inode, not an
+/// in-place truncate-and-rewrite). Redesigned (2026-09-15) so Som's side
+/// does no killing of any process at all: this function only `scp`s the
+/// new binary to a SEPARATE path (`~/.local/bin/somsrv.new`) and drops a
+/// marker file once it's fully in place — `somsrv` itself notices that
+/// marker on its NEXT client connection and handles the entire cutover
+/// (closing every live connection, renaming `.new` over its own running
+/// binary — which Unix allows even while it's executing, since a
+/// filename is just a directory entry pointing at an inode, not the
+/// inode itself — deleting the marker, and restarting itself) — see
+/// `crate::server::check_and_apply_pending_redeploy` on the `somsrv`
+/// side for that half. Every live pane on every client currently
 /// attached to that host (this account's own tabs AND, if sharing an
 /// account across machines, any other client's) loses its connection and
-/// reconnects to a brand new HOLDER on next use — an accepted, explicit
+/// reconnects to a brand new daemon on next use — an accepted, explicit
 /// tradeoff (long-running remote sessions are exactly what tmux:true
 /// exists to preserve across a LOCAL Som restart, but a version bump is
-/// disruptive by nature here; the alternative, a remote compile, was both
-/// slower AND already had its own ETXTBSY-shaped failure mode against a
-/// live HOLDER — see `project_bugs` memory).
+/// disruptive by nature here). An earlier version of this had Som itself
+/// `kill -9` every `somsrv` process on the host before `scp`ing over the
+/// live binary path directly — reverted the same day in favor of this
+/// design specifically so Som's side never needs to decide when it's
+/// "safe" to kill anything; `somsrv` alone knows when it's actually
+/// between requests and safe to tear itself down.
 /// Per-host mutexes so two tabs pointed at the SAME remote host never run
 /// `ensure_remote_binary_deployed` concurrently — each entry is keyed on
 /// `host_args.join(" ")` (the exact `ssh`/`wsl` argv, e.g. `"usa"`), so
 /// different hosts still deploy fully in parallel. Without this, two tabs
 /// restored from `db.json` for the same host (or a new tab opened while
 /// another to the same host is still connecting) both independently see
-/// "version mismatch", both kill the remote's `som-srv` processes, and
+/// "version mismatch", both kill the remote's `somsrv` processes, and
 /// both `scp` the new binary to the SAME destination path AT THE SAME
 /// TIME — `scp` is not atomic against a concurrent second `scp` to the
 /// same destination, so this could in principle corrupt the resulting
 /// file, and even when it doesn't, it needlessly doubles the wall-clock
 /// cost of every affected tab's open (confirmed live: two `usa` tabs
 /// open together both logged their own "redeploying" and "killing N
-/// som-srv process(es)" lines seconds apart, race-restarting each
+/// somsrv process(es)" lines seconds apart, race-restarting each
 /// other's redeploy). A plain `Mutex` (not `RwLock`) is correct here —
 /// every caller needs EXCLUSIVE access for the whole deploy-check-then-
 /// maybe-redeploy sequence, there's no read-only variant of this
@@ -1667,309 +1829,252 @@ fn deploy_lock_for_host(host_args: &[String]) -> std::sync::Arc<std::sync::Mutex
         .clone()
 }
 
-fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<()> {
+/// Fast, single-round-trip check of whether `~/.local/bin/somsrv` exists
+/// (and is executable) on the far side of an SSH/WSL `tmux: true` profile
+/// — deliberately NOT a version check against the CURRENT build (that's
+/// Returns `Ok(true)` when a redeploy actually happened (so callers can
+/// surface a "redeployed, restart the tab to use it" toast), `Ok(false)`
+/// when the remote was already current and nothing was done.
+///
+/// 2026-09-15 redesign: no `--version` handshake anywhere in this
+/// function anymore, and no `uname` probing either — this is deliberately
+/// as dumb as possible now, per explicit user direction. `os` comes
+/// straight from the profile's own explicit `settings.json` field
+/// (`workspace::RemoteOs` — no heuristics, no asking the remote what it
+/// is), and "does this need deploying" is answered purely by comparing
+/// file mtimes: the remote `~/.local/bin/somsrv`'s mtime (via a `stat`
+/// probe, `None` if the file doesn't exist or the probe fails for any
+/// reason) against the LOCAL embedded/cached copy's own mtime. If the
+/// local copy is newer, copy it over; otherwise do nothing. This function
+/// runs strictly in the background, AFTER a tab has already opened
+/// (successfully via SRP or falled back to plain SSH) — see
+/// `open_srp_or_plain_ssh`'s doc comment — so it never blocks anything a
+/// user is looking at.
+fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, os: workspace::RemoteOs) -> anyhow::Result<bool> {
     // Held for this entire function's body (see `deploy_lock_for_host`'s
     // doc comment) — a second concurrent call for the SAME host blocks
-    // here until the first one finishes, then re-runs its OWN version
-    // probe and almost certainly finds the first call already brought the
-    // host up to date, so it returns immediately via the early `Ok(())`
+    // here until the first one finishes, then re-runs its OWN mtime probe
+    // and almost certainly finds the first call already brought the host
+    // up to date, so it returns immediately via the early `Ok(false)`
     // below instead of redeploying a second time.
     let host_lock = deploy_lock_for_host(host_args);
     let _guard = host_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let local_version = som_srv::protocol::HandshakeInfo::current().version;
-
-    let version_probe = wrap_remote_probe_args(host_args, "~/.local/bin/som-srv", &["--version"]);
-    log::debug!("deploy-check: probing remote version for {host_args:?} via {version_probe:?}");
-    let version_probe_output = run_remote_command(remote_kind, &version_probe);
-    log::debug!("deploy-check: version probe raw result for {host_args:?}: {version_probe_output:?}");
-    let remote_info = version_probe_output
-        .ok()
-        .and_then(|output| {
-            let parsed = serde_json::from_str::<som_srv::protocol::HandshakeInfo>(output.trim());
-            if let Err(err) = &parsed {
-                log::debug!("deploy-check: failed to parse version probe output {output:?} for {host_args:?}: {err:#}");
-            }
-            parsed.ok()
-        });
-    log::debug!("deploy-check: parsed remote_info for {host_args:?}: {remote_info:?}");
-
-    if remote_info.as_ref().map(|info| info.version.as_str()) == Some(local_version.as_str()) {
-        log::debug!("deploy-check: {host_args:?} already up to date at version {local_version:?}, skipping redeploy");
-        return Ok(()); // already up to date, nothing to do
-    }
-
-    log::info!(
-        "som-srv on remote host is {:?} (local build is {local_version:?}) — redeploying",
-        remote_info.as_ref().map(|info| &info.version)
-    );
 
     // WSL is the same machine/architecture Som itself was just built for —
     // no separate pre-built platform binary to `scp` in, so it keeps the
     // original remote-build path (still cheap: WSL's own repo clone,
     // usually already warm from Som's own dev use, and no network hop).
+    // Always rebuilds unconditionally when it runs — it never depended on
+    // a version/mtime comparison to decide whether to run in the first
+    // place, before or after this redesign.
     if let RemoteKind::Wsl = remote_kind {
         let deploy_script =
-            "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p som_srv) && mkdir -p ~/.local/bin && cp target/release/som-srv ~/.local/bin/som-srv";
+            "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv) && mkdir -p ~/.local/bin && cp target/release/somsrv ~/.local/bin/somsrv";
         let quoted_deploy_script = shell_quote(deploy_script);
         let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_deploy_script]);
         run_remote_command(remote_kind, &deploy_probe)?;
-        return Ok(());
+        return Ok(true);
     }
 
-    // The remote's own handshake tells us exactly which pre-built binary
-    // to send when `~/.local/bin/som-srv` already exists there (even an
-    // old/incompatible one, since `HandshakeInfo` has been part of the
-    // wire format since before this deploy mechanism existed). A genuinely
-    // FIRST-ever deploy (nothing at that path yet — the actual `usa`
-    // real-world case this fixes) has no `remote_info` at all: falling
-    // back to THIS (Windows) machine's own `current_platform()` here was a
-    // real, confirmed bug — it deployed a Windows .exe to a real Debian
-    // `usa` host ("cannot execute binary file: Exec format error"), since
-    // there's no reason at all a remote SSH server shares Som's own local
-    // platform. `uname_platform` below asks the remote directly instead —
-    // `uname` exists on every Unix `ssh` could plausibly be reaching (WSL
-    // is handled separately, above, before this point is ever reached).
-    let (os, arch) = match remote_info {
-        Some(info) => (info.os, info.arch),
-        None => uname_platform(host_args, remote_kind)?,
+    let (os, arch) = remote_os_to_platform(os);
+
+    // "Local mtime" is THIS running `som.exe`'s own file mtime — not some
+    // separately-cached extracted copy. There is no on-disk cache of the
+    // embedded `somsrv` at all anymore (2026-09-15 simplification): the
+    // embedded bytes are read directly from `assets::Assets` (already
+    // resident in this process's own memory, part of `som.exe` itself)
+    // and written straight to a throwaway temp file only when an actual
+    // upload is about to happen, deleted right after — see `embedded_
+    // somsrv_bytes`'s own doc comment. Som's own build/release process
+    // already keeps `assets/srv/{platform}/somsrv` in lockstep with
+    // Som's own version (`scripts/update_somsrv_binaries.sh`), so `som.exe`'s
+    // own mtime is a faithful proxy for "how new is the somsrv build
+    // embedded inside me" without needing a separate cached file's mtime
+    // at all.
+    let local_mtime = std::env::current_exe()
+        .and_then(|exe| std::fs::metadata(exe))
+        .and_then(|metadata| metadata.modified())
+        .context("failed to read this running som.exe's own mtime")?;
+
+    let remote_mtime = remote_binary_mtime(host_args, remote_kind, os);
+    log::debug!("deploy-check: {host_args:?} local_mtime={local_mtime:?} remote_mtime={remote_mtime:?}");
+
+    let needs_deploy = match remote_mtime {
+        Some(remote_mtime) => local_mtime > remote_mtime,
+        None => true, // nothing there (or unreadable) — always deploy
     };
-    log::debug!("deploy-check: {host_args:?} resolved platform os={os:?} arch={arch:?}");
-    let Some(local_binary) = ensure_embedded_binary_available(os, arch, &local_version) else {
-        anyhow::bail!(
-            "no embedded som-srv binary for {os:?}/{arch:?} — unsupported platform, falling back to plain (non-tmux) behavior"
-        );
-    };
-    log::debug!("deploy-check: {host_args:?} using local binary at {local_binary:?}");
-
-    // Kill every som-srv process (RELAY and HOLDER alike) this account
-    // owns on this host BEFORE overwriting the binary file in place — see
-    // this function's own doc comment for why (`ETXTBSY` against a live
-    // HOLDER). Every live pane on this host reconnects to a fresh HOLDER
-    // on next use; an accepted, explicit tradeoff for a version bump.
-    //
-    // Retried up to `KILL_AND_SCP_ATTEMPTS` times as a whole (kill THEN
-    // scp, not scp alone) — `kill_all_holders_for_redeploy` already kills
-    // with SIGKILL and waits for every pid to actually disappear from `ps`
-    // in the SAME ssh session, but that wait is itself best-effort/bounded
-    // (2s) and best-effort on the LISTING step too (a failed `ps` probe
-    // just skips cleanup rather than blocking), so a single kill+scp pass
-    // can still occasionally lose the race against a slow-to-exit or
-    // freshly-respawned process. Re-running the whole pair (not just scp)
-    // means a second attempt also re-lists and re-kills anything still
-    // alive, rather than retrying scp against a binary the first attempt
-    // never actually got out of the way.
-    const KILL_AND_SCP_ATTEMPTS: u32 = 2;
-    let mut last_scp_err = None;
-    for attempt in 1..=KILL_AND_SCP_ATTEMPTS {
-        log::debug!("deploy-check: {host_args:?} kill+scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} starting");
-        kill_all_holders_for_redeploy(host_args, remote_kind);
-        let scp_result = scp_to_remote(host_args, &local_binary, "~/.local/bin/som-srv");
-        log::debug!("deploy-check: {host_args:?} scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} result: {scp_result:?}");
-        match scp_result {
-            Ok(()) => {
-                last_scp_err = None;
-                break;
-            }
-            Err(err) => {
-                log::warn!("scp attempt {attempt}/{KILL_AND_SCP_ATTEMPTS} failed for {host_args:?}: {err:#}");
-                last_scp_err = Some(err);
-            }
-        }
-    }
-    if let Some(err) = last_scp_err {
-        return Err(err.context(format!(
-            "failed to deploy som-srv to {host_args:?} after {KILL_AND_SCP_ATTEMPTS} kill+scp attempts"
-        )));
+    if !needs_deploy {
+        log::debug!("deploy-check: {host_args:?} remote somsrv is already at least as new as the local copy, skipping");
+        return Ok(false);
     }
 
-    let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/som-srv"]);
-    log::debug!("deploy-check: {host_args:?} running chmod via {chmod_probe:?}");
-    let chmod_result = run_remote_command(remote_kind, &chmod_probe);
-    log::debug!("deploy-check: {host_args:?} chmod result: {chmod_result:?}");
-    chmod_result?;
-    log::debug!("deploy-check: {host_args:?} deploy completed successfully");
-    Ok(())
+    let staged_binary = stage_embedded_somsrv_to_temp_file(os, arch)?;
+
+    // `remote_mtime.is_none()` means nothing usable is at `~/.local/bin/
+    // somsrv` at all (missing, or the `stat` probe itself failed) — there
+    // is no running daemon to hand a careful cutover to, so the `.new` +
+    // marker + `somsrvupd` dance below would never get applied (nothing
+    // would ever connect over SRP to notice the marker in the first
+    // place). Write directly to the final path instead — safe precisely
+    // because there is no running process that could be executing it out
+    // from under this write.
+    if remote_mtime.is_none() {
+        let result = (|| -> anyhow::Result<()> {
+            // A genuinely fresh host has no `~/.local/bin` at all yet —
+            // `scp` doesn't create intermediate directories on its own,
+            // so without this the very first-ever deploy to a brand new
+            // host fails outright.
+            let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "~/.local/bin"]);
+            run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create ~/.local/bin on {host_args:?}"))?;
+            scp_to_remote(host_args, &staged_binary, "~/.local/bin/somsrv")
+                .with_context(|| format!("failed to upload somsrv to {host_args:?}"))?;
+            let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv"]);
+            run_remote_command(remote_kind, &chmod_probe).with_context(|| format!("failed to chmod somsrv on {host_args:?}"))?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&staged_binary);
+        result?;
+        log::debug!("deploy-check: {host_args:?} first-ever deploy completed directly (no running daemon to hand off from)");
+        return Ok(true);
+    }
+
+    // Uploads to `~/.local/bin/somsrv.new` — a BRAND NEW path, never the
+    // live `somsrv` binary itself — so this never touches (and can never
+    // hit `ETXTBSY` against) whatever's currently executing on the
+    // remote host. No kill of any kind happens on Som's side: the actual
+    // cutover — closing every live connection, replacing the running
+    // binary with `.new`, and restarting itself — is entirely `somsrv`'s
+    // OWN responsibility, triggered the next time ANY client connects and
+    // finds the marker file below. See `crate::server`'s `check_and_
+    // apply_pending_redeploy` for that side.
+    let result = (|| -> anyhow::Result<()> {
+        scp_to_remote(host_args, &staged_binary, "~/.local/bin/somsrv.new")
+            .with_context(|| format!("failed to upload somsrv.new to {host_args:?}"))?;
+
+        let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv.new"]);
+        run_remote_command(remote_kind, &chmod_probe).with_context(|| format!("failed to chmod somsrv.new on {host_args:?}"))?;
+
+        // The marker file itself — `somsrv`'s connection-accept loop
+        // checks for exactly this path (`server::REDEPLOY_MARKER_NAME`)
+        // before handling each new connection. Written LAST, only after
+        // `.new` is fully in place and executable, so `somsrv` never
+        // observes "marker present, but `.new` still mid-transfer or not
+        // yet +x" — the marker being there is the one-and-only signal
+        // that a complete, ready-to-apply redeploy is waiting.
+        let touch_marker_script = "touch ~/.local/bin/somsrv.redeploy-pending";
+        let quoted_touch_script = shell_quote(touch_marker_script);
+        let touch_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_touch_script]);
+        run_remote_command(remote_kind, &touch_probe).with_context(|| format!("failed to write the redeploy marker on {host_args:?}"))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staged_binary);
+    result?;
+
+    log::debug!("deploy-check: {host_args:?} deploy staged successfully (somsrv will apply it on next connection)");
+    Ok(true)
 }
 
-/// Looks up Som's own embedded copy of `som-srv` for a remote `(os, arch)`
-/// (see `crates/assets/src/assets.rs`'s `#[include = "srv/..."]` entries —
-/// kept current by `scripts/update-srv-binaries.sh`, a manually-run,
-/// pre-release step, NOT something that runs at build time) and extracts
-/// it to Som's local `~/.config/som/srv/{platform}/` cache if missing or
-/// stale, returning that path. `None` for an unsupported platform (today:
-/// anything other than windows-amd/macos-arm/linux-amd — linux-arm in
-/// particular stays permanently unsupported) — callers treat this exactly
-/// like the old "no pre-built binary on disk" case: log and fall back to
-/// plain (non-tmux) behavior for that profile.
-fn ensure_embedded_binary_available(
-    os: som_srv::protocol::Os,
-    arch: som_srv::protocol::Arch,
-    local_version: &str,
-) -> Option<std::path::PathBuf> {
-    let exe_suffix = if let som_srv::protocol::Os::Windows = os { ".exe" } else { "" };
-    let asset_path = format!("srv/{}/som-srv{exe_suffix}", som_srv::protocol::platform_dir_name(os, arch));
-    let embedded_bytes = assets::Assets.load(&asset_path).ok().flatten();
-    som_srv::protocol::ensure_embedded_binary_extracted(os, arch, embedded_bytes.as_deref(), local_version)
+/// Writes Som's own embedded `somsrv` copy for `(os, arch)` (see
+/// `crates/assets/src/assets.rs`'s `#[include = "srv/..."]` entries, kept
+/// current by `scripts/update_somsrv_binaries.sh`, a manually-run, pre-
+/// release step) to a fresh file under the OS temp directory — `scp`
+/// needs a real path on disk, but there is no reason for that path to
+/// persist any longer than the single upload that needs it (2026-09-15
+/// simplification: this used to extract into a permanent `~/.config/som/
+/// srv/{platform}/` cache, re-used across calls and compared by version;
+/// now that redeploy decisions are purely mtime-based, keeping a
+/// permanent cache around serves no purpose — every call that actually
+/// needs to upload writes a fresh temp copy and the caller deletes it
+/// right after). Callers are responsible for deleting the returned path
+/// once the upload attempt (success or failure) is done.
+fn stage_embedded_somsrv_to_temp_file(os: somsrv::protocol::Os, arch: somsrv::protocol::Arch) -> anyhow::Result<std::path::PathBuf> {
+    let exe_suffix = if let somsrv::protocol::Os::Windows = os { ".exe" } else { "" };
+    let asset_path = format!("srv/{}/somsrv{exe_suffix}", somsrv::protocol::platform_dir_name(os, arch));
+    let bytes = assets::Assets
+        .load(&asset_path)
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("no embedded somsrv binary for {os:?}/{arch:?} at {asset_path:?} — unsupported platform"))?;
+
+    let temp_path = std::env::temp_dir().join(format!("somsrv-deploy-{}{exe_suffix}", std::process::id()));
+    std::fs::write(&temp_path, bytes.as_ref()).with_context(|| format!("failed to write embedded somsrv to {temp_path:?}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to make {temp_path:?} executable"))?;
+    }
+    Ok(temp_path)
 }
 
-/// Asks the remote host directly what platform it is via `uname -s`/`uname
-/// -m`, for the one case `HandshakeInfo` can't help with: a host that has
-/// NO `som-srv` at `~/.local/bin/` yet at all (a genuinely first-ever
-/// deploy). Every real SSH `tmux: true` profile target is some Unix (this
-/// codebase's four supported platforms are Windows/macOS/Linux-amd64/
-/// Linux-arm64, but a Windows SSH SERVER is exotic enough not to special-
-/// case here — `uname` simply isn't present there, and that failure
-/// surfaces as an ordinary `Err`, same as any other unreachable-probe
-/// case).
-fn uname_platform(host_args: &[String], remote_kind: RemoteKind) -> anyhow::Result<(som_srv::protocol::Os, som_srv::protocol::Arch)> {
-    // Prefixed with a marker (same technique `kill_orphaned_holders` uses
-    // — see that function's doc comment) rather than trusting `uname -s`/
-    // `uname -m` to be the first two lines of output: a login shell (`-l`)
-    // can run profile scripts that print their OWN unrelated lines to
-    // stdout first (confirmed live: `/usr/local/bin/fnm` on a real `ssh
-    // localhost` WSL2 setup), which would otherwise be silently
-    // misinterpreted as the kernel name itself.
-    let quoted_script = shell_quote(r#"echo "SOM_UNAME:$(uname -s) $(uname -m)""#);
+/// Maps the profile's own explicit `RemoteOs` (from `settings.json`'s
+/// `os` field — no heuristics, see that type's own doc comment) onto the
+/// `(Os, Arch)` pair `ensure_embedded_binary_available` needs — this
+/// codebase's three supported platform combos, `Lnx` always meaning
+/// `linux-amd` (`linux-arm` stays permanently unsupported).
+fn remote_os_to_platform(os: workspace::RemoteOs) -> (somsrv::protocol::Os, somsrv::protocol::Arch) {
+    match os {
+        workspace::RemoteOs::Win => (somsrv::protocol::Os::Windows, somsrv::protocol::Arch::Amd64),
+        workspace::RemoteOs::Mac => (somsrv::protocol::Os::Darwin, somsrv::protocol::Arch::Arm64),
+        workspace::RemoteOs::Lnx => (somsrv::protocol::Os::Linux, somsrv::protocol::Arch::Amd64),
+    }
+}
+
+/// Probes the remote `~/.local/bin/somsrv`'s mtime as Unix epoch seconds
+/// via `stat` — `None` if the file doesn't exist or the probe fails for
+/// any other reason (treated identically to "nothing deployed yet" by
+/// `ensure_remote_binary_deployed`). `stat`'s flags for "mtime as epoch
+/// seconds" differ between GNU/Linux (`-c %Y`) and BSD/macOS (`-f %m`) —
+/// picked from `os` (the profile's own explicit setting, not a guess).
+/// Prefixed with a marker line (same technique `read_this_client_id`
+/// uses) since a login shell can print unrelated profile-script noise
+/// ahead of the real output.
+fn remote_binary_mtime(host_args: &[String], remote_kind: RemoteKind, os: somsrv::protocol::Os) -> Option<std::time::SystemTime> {
+    let stat_flag = match os {
+        somsrv::protocol::Os::Darwin => "-f %m",
+        somsrv::protocol::Os::Windows | somsrv::protocol::Os::Linux => "-c %Y",
+    };
+    let script = format!(r#"echo "SOM_MTIME:$(stat {stat_flag} ~/.local/bin/somsrv 2>/dev/null)""#);
+    let quoted_script = shell_quote(&script);
     let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
-    let output = run_remote_command(remote_kind, &probe)?;
-    parse_uname_platform(&output)
+    let output = run_remote_command(remote_kind, &probe).ok()?;
+    let marker_line = output.lines().find_map(|line| line.strip_prefix("SOM_MTIME:"))?;
+    let epoch_seconds: u64 = marker_line.trim().parse().ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_seconds))
 }
 
-/// Parses `uname_platform`'s marker-prefixed probe output (`SOM_UNAME:
-/// <kernel> <machine>`, possibly preceded by unrelated shell-profile
-/// noise) into `(Os, Arch)`. Pulled out of `uname_platform` itself so this
-/// parsing logic can be unit-tested without an actual SSH round-trip.
-fn parse_uname_platform(output: &str) -> anyhow::Result<(som_srv::protocol::Os, som_srv::protocol::Arch)> {
-    let marker_line = output
-        .lines()
-        .find_map(|line| line.strip_prefix("SOM_UNAME:"))
-        .ok_or_else(|| anyhow::anyhow!("uname probe output had no SOM_UNAME: marker line: {output:?}"))?;
-    let mut fields = marker_line.split_whitespace();
-    let kernel = fields.next().unwrap_or("").trim();
-    let machine = fields.next().unwrap_or("").trim();
-
-    let os = match kernel {
-        "Linux" => som_srv::protocol::Os::Linux,
-        "Darwin" => som_srv::protocol::Os::Darwin,
-        other => anyhow::bail!("unsupported remote kernel {other:?} reported by uname -s"),
-    };
-    let arch = match machine {
-        "x86_64" => som_srv::protocol::Arch::Amd64,
-        "aarch64" | "arm64" => som_srv::protocol::Arch::Arm64,
-        other => anyhow::bail!("unsupported remote machine architecture {other:?} reported by uname -m"),
-    };
-    Ok((os, arch))
-}
-
-/// Kills every `som-srv` process (RELAY and HOLDER alike — a version bump
-/// invalidates the RELAY side too, not just the detached HOLDER) on the far
-/// end of an SSH `tmux: true` profile — called right before `ensure_remote_
-/// binary_deployed` overwrites the binary file in place, since that fails
-/// outright against any process still executing it (`ETXTBSY`, see that
-/// function's doc comment).
-///
-/// Deliberately does NOT scope to `client_id` the way `kill_orphaned_
-/// holders` does — a version mismatch means the file on disk is about to
-/// change out from under EVERY process executing it, this account's own
-/// panes AND (if multiple client machines share this same SSH account,
-/// see `som_srv::protocol::ssh_client_id`'s doc comment) any other
-/// client's too, so there's no "belongs to someone else, leave it" case to
-/// preserve here the way there is for orphan cleanup. What `kill` alone
-/// already can't reach — another OS account's processes — stays untouched
-/// purely because Unix permissions forbid it regardless of any filtering
-/// this function could add; see `ssh_client_id`'s doc comment for why this
-/// is belt-and-suspenders there but not meaningful here.
-///
-/// This is still a plain process-level `ps`-grep-by-binary-name (unlike
-/// `kill_orphaned_holders`, which now goes through `som-srv`'s own
-/// `--list-sessions`/`--kill-session` admin protocol) — deliberately so:
-/// this function's whole point is killing every OS process currently
-/// EXECUTING the binary file about to be overwritten (the shared daemon
-/// itself, AND any RELAY mid-connection to it), which is inherently a
-/// process-table question, not a session-registry one. UNLIKE
-/// `kill_orphaned_holders` (which only ever touches a session whose
-/// pane_id is missing from `db.json`), this kills EVERY matching process
-/// regardless of whether its session is still live — a version mismatch
-/// means every session on this host needs a fresh daemon anyway, live or
-/// not, so there's nothing to preserve by being selective here.
-///
-/// Best-effort, same as `kill_orphaned_holders`: a failure here is logged
-/// and swallowed, and the caller proceeds to `scp` regardless — if the old
-/// process really is still alive and blocking the overwrite, THAT step's
-/// own error will surface and get logged there instead.
-fn kill_all_holders_for_redeploy(host_args: &[String], remote_kind: RemoteKind) {
-    if !matches!(remote_kind, RemoteKind::Ssh) {
-        return;
-    }
-    // Matches every process with `som-srv` somewhere in its command line
-    // (the shared daemon itself, and any RELAY mid-connection to it) —
-    // `"som-sr" "v"` splits the pattern across two concatenated awk string
-    // literals so the contiguous substring "som-srv" never appears
-    // verbatim in this probe's OWN `sh -lc` script text (which `ps -eo
-    // args` would otherwise also match, since a process's command line IS
-    // this script's literal source text).
-    let script = r#"ps -eo pid,args | awk 'index($0, "som-sr" "v") {pid=$1; $1=""; printf "%s\x1f%s\n", pid, $0}'"#;
-    let quoted_script = shell_quote(script);
-    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
-    let output = match run_remote_command(remote_kind, &probe) {
+/// Reproduces the EXACT `<user>@<ip>` shape `somsrv::protocol::
+/// ssh_client_id` builds on the RELAY side — `whoami` + `$SSH_CLIENT`
+/// together, over THIS SAME SSH connection, so sshd reports the exact
+/// same source IP any OTHER invocation from this same client machine
+/// (i.e. a RELAY registering a session) already got and passed down as
+/// its own `client_id`. Used by `kill_orphaned_holders` to scope itself
+/// to only THIS client's own sessions.
+fn read_this_client_id(host_args: &[String], remote_kind: RemoteKind) -> Option<String> {
+    // Prefixed with a marker rather than trusting this to be the FIRST
+    // line of output — a login shell (`sh -lc`, i.e. `-l`) can run profile
+    // scripts (`.bashrc`/`.profile`/version-manager init like `fnm`/`nvm`)
+    // that print their OWN unrelated lines to stdout first (confirmed live
+    // against a real `ssh localhost` WSL2 setup).
+    let client_id_script = r#"echo "SOM_CLIENT_ID:$(whoami)@$SSH_CLIENT""#;
+    let quoted_client_id_script = shell_quote(client_id_script);
+    let client_id_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_client_id_script]);
+    let client_id_output = match run_remote_command(remote_kind, &client_id_probe) {
         Ok(output) => output,
         Err(err) => {
-            log::warn!("failed to list remote som-srv processes for redeploy cleanup, skipping: {err:#}");
-            return;
+            log::warn!("failed to read this connection's client-id: {err:#}");
+            return None;
         }
     };
-
-    log::debug!("deploy-check: {host_args:?} raw som-srv process listing: {output:?}");
-    let pids: Vec<String> = output
-        .lines()
-        .filter_map(|line| line.split_once('\u{1f}'))
-        .map(|(pid, _args)| pid.trim().to_string())
-        .collect();
-    if pids.is_empty() {
-        log::debug!("deploy-check: {host_args:?} no som-srv processes found, nothing to kill");
-        return;
+    let marker_line = client_id_output.lines().find(|line| line.starts_with("SOM_CLIENT_ID:"))?;
+    let this_client_id = marker_line["SOM_CLIENT_ID:".len()..].split_whitespace().next()?;
+    // An empty `$SSH_CLIENT` collapses to a bare `user@` (whoami
+    // succeeded, sshd didn't set the var) — just as unable to safely
+    // identify this client's sessions as no `$SSH_CLIENT` at all.
+    if this_client_id.ends_with('@') {
+        return None;
     }
-    log::info!("killing {} som-srv process(es) on remote host ahead of a version-mismatch redeploy: {pids:?}", pids.len());
-    // Plain `kill` sends SIGTERM, which a process can catch/delay/ignore —
-    // and even a default handler's teardown isn't instantaneous. A `kill`
-    // over one SSH connection followed by a SEPARATE `scp` connection
-    // right after (as `ensure_remote_binary_deployed` does) is a real
-    // race: the kernel hasn't necessarily finished tearing the process
-    // down (and releasing its exec image) by the time the next
-    // connection's `scp` tries to overwrite the same file, and `scp`/`cp`
-    // fail outright against a still-executing binary (`ETXTBSY`,
-    // confirmed live against `usa` — see `project_bugs` memory). `kill
-    // -9` (SIGKILL) instead — uncatchable, unblockable, the kernel tears
-    // the process down immediately with no user-space cleanup step to
-    // wait out. Still followed by a short bounded `kill -0` poll (20 *
-    // 100ms = 2s) IN THE SAME SSH session/script (not a second round-trip
-    // from the Windows side, which would just move the same race to "did
-    // THIS connection's kill finish before THAT connection's scp
-    // started") as defense in depth — SIGKILL removes the process
-    // immediately but the exec image's busy flag is still cleared by the
-    // kernel's own (near-instant, but not appearing "before returning
-    // from kill(2)") teardown, not synchronously with the signal call
-    // itself.
-    let pid_list = pids.join(" ");
-    let kill_script = format!(
-        r#"kill -9 {pid_list} 2>/dev/null || true
-for _ in $(seq 1 20); do
-  still_alive=0
-  for pid in {pid_list}; do
-    kill -0 "$pid" 2>/dev/null && still_alive=1
-  done
-  [ "$still_alive" = 0 ] && break
-  sleep 0.1
-done"#
-    );
-    let quoted_kill_script = shell_quote(&kill_script);
-    let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
-    let kill_result = run_remote_command(remote_kind, &kill_probe);
-    log::debug!("deploy-check: {host_args:?} kill script result for pids {pids:?}: {kill_result:?}");
-    if let Err(err) = kill_result {
-        log::warn!("failed to kill remote som-srv processes ahead of redeploy: {err:#}");
-    }
+    Some(this_client_id.to_string())
 }
 
 /// Copies `local_path` to `host_args`' host at `remote_path` via `scp` —
@@ -1986,16 +2091,16 @@ done"#
 /// than the real Windows OpenSSH client (`%WINDIR%\System32\OpenSSH\`) —
 /// Git for Windows puts its own `usr\bin` ahead of `System32\OpenSSH` in
 /// `PATH` by default. That MSYS build silently rewrites any argument
-/// that LOOKS like a POSIX path (`~/.local/bin/som-srv`) into a Windows
-/// path (`/c/Users/<user>/.local/bin/som-srv`) BEFORE it ever reaches the
+/// that LOOKS like a POSIX path (`~/.local/bin/somsrv`) into a Windows
+/// path (`/c/Users/<user>/.local/bin/somsrv`) BEFORE it ever reaches the
 /// remote host — the same automatic argv path-conversion MSYS2 programs
 /// apply to make Unix-style paths work when calling native Windows
 /// tools, applied here to an argument that was never meant to be
 /// translated at all, since it's meant for the REMOTE machine's own
 /// shell to expand, not this one. Confirmed live (2026-09-15) as the
-/// root cause of a real deploy failure: `chmod +x ~/.local/bin/som-srv`
+/// root cause of a real deploy failure: `chmod +x ~/.local/bin/somsrv`
 /// arrived on the remote host as `chmod +x /c/Users/dnk/.local/bin/
-/// som-srv` — a path that only makes sense on the LOCAL Windows machine,
+/// somsrv` — a path that only makes sense on the LOCAL Windows machine,
 /// so `chmod` correctly reported it as not found. The real Windows
 /// OpenSSH client (confirmed live, same repro, same host) does not do
 /// this rewriting at all. Resolving the absolute path to `System32\
@@ -2056,7 +2161,7 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     // binary at all) — only the `ssh` case needs `windows_openssh_
     // binary`'s explicit resolution, see that function's own doc comment
     // for why: Git for Windows' `ssh.exe` silently rewrites POSIX-looking
-    // arguments (`~/.local/bin/som-srv`) into Windows paths before they
+    // arguments (`~/.local/bin/somsrv`) into Windows paths before they
     // ever reach the remote host, which real Windows OpenSSH does not do.
     let program = match remote_kind {
         RemoteKind::Ssh => windows_openssh_binary("ssh"),
@@ -2088,11 +2193,11 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Finds `som-srv`/`som-srv.exe` next to Som's own
+/// Finds `somsrv`/`somsrv.exe` next to Som's own
 /// executable — the same "binaries live side by side" assumption
 /// `target/debug/` (and any packaged distribution) already guarantees for
 /// Som's other bundled tools. Mirrors the old (now-removed)
-/// `som_srv_client::server_binary_path`, which lived on the GPUI-client
+/// `somsrv_client::server_binary_path`, which lived on the GPUI-client
 /// side of the old JSON-protocol architecture; this is its natural home now
 /// that the substitution happens directly in the shell command instead.
 ///
@@ -2102,8 +2207,8 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
 /// Windows' `pwsh.exe` one; only the `ssh`/`wsl` remote paths are Windows-only
 /// today (those profiles' `shell` settings only make sense from a Windows
 /// Som talking OUT to other machines).
-fn som_srv_binary_path() -> anyhow::Result<PathBuf> {
-    som_srv::daemon::binary_path_next_to_current_exe()
+fn somsrv_binary_path() -> anyhow::Result<PathBuf> {
+    somsrv::daemon::binary_path_next_to_current_exe()
 }
 
 #[cfg(test)]
@@ -2202,7 +2307,7 @@ mod tmux_shell_wrapping_tests {
         // profile.shell == "ssh 192.168.50.5" -> parse_shell_command splits
         // this into program="ssh", args=["192.168.50.5"] upstream. The
         // local program/args Som actually spawns must stay "ssh ..." — the
-        // som-srv invocation goes on the REMOTE side, appended
+        // somsrv invocation goes on the REMOTE side, appended
         // after ssh's own arguments, since ssh hands everything past its
         // own flags/host to a shell on the far end.
         let args =
@@ -2210,7 +2315,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(
             args,
             vec![
-                "-tt", "192.168.50.5", "~/.local/bin/som-srv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
+                "-tt", "192.168.50.5", "~/.local/bin/somsrv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
                 "--", "-l"
             ]
         );
@@ -2232,7 +2337,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(
             args,
             vec![
-                "--cd", "~", "~/.local/bin/som-srv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
+                "--cd", "~", "~/.local/bin/somsrv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
                 "--scrollback", "5000", "--", "-l"
             ]
         );
@@ -2242,14 +2347,14 @@ mod tmux_shell_wrapping_tests {
     fn builds_a_version_probe_using_the_same_host_args_as_the_real_invocation() {
         let args = wrap_remote_probe_args(
             &["192.168.50.5".to_string()],
-            "~/.local/bin/som-srv",
+            "~/.local/bin/somsrv",
             &["--version"],
         );
-        assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/som-srv", "--version"]);
+        assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/somsrv", "--version"]);
     }
 
-    fn session(profile_name: &str, pane_id: &str, client_id: &str) -> som_srv::protocol::SessionInfo {
-        som_srv::protocol::SessionInfo {
+    fn session(profile_name: &str, pane_id: &str, client_id: &str) -> somsrv::protocol::SessionInfo {
+        somsrv::protocol::SessionInfo {
             profile_name: profile_name.to_string(),
             pane_id: pane_id.to_string(),
             client_id: Some(client_id.to_string()),
@@ -2293,65 +2398,6 @@ mod tmux_shell_wrapping_tests {
     }
 
     #[test]
-    fn parses_a_real_debian_x86_64_uname_report() {
-        let (os, arch) = parse_uname_platform("SOM_UNAME:Linux x86_64\n").unwrap();
-        assert_eq!(os, som_srv::protocol::Os::Linux);
-        assert_eq!(arch, som_srv::protocol::Arch::Amd64);
-    }
-
-    #[test]
-    fn parses_a_real_macos_arm64_uname_report() {
-        let (os, arch) = parse_uname_platform("SOM_UNAME:Darwin arm64\n").unwrap();
-        assert_eq!(os, som_srv::protocol::Os::Darwin);
-        assert_eq!(arch, som_srv::protocol::Arch::Arm64);
-    }
-
-    #[test]
-    fn parses_a_linux_aarch64_uname_report() {
-        // `uname -m` on Linux reports "aarch64", NOT "arm64" (that's
-        // macOS's spelling) — regression coverage for accepting both.
-        let (os, arch) = parse_uname_platform("SOM_UNAME:Linux aarch64\n").unwrap();
-        assert_eq!(os, som_srv::protocol::Os::Linux);
-        assert_eq!(arch, som_srv::protocol::Arch::Arm64);
-    }
-
-    #[test]
-    fn ignores_shell_profile_noise_ahead_of_the_marker_line() {
-        // Regression coverage: a login shell (`sh -lc`) can run profile
-        // scripts (version-manager init banners, etc.) that print
-        // unrelated lines to stdout BEFORE this probe's own marker line —
-        // confirmed live against a real `ssh localhost` WSL2 setup
-        // (`/usr/local/bin/fnm` appeared as literal noise ahead of the
-        // real uname output). The marker line must be found regardless of
-        // what precedes it.
-        let (os, arch) = parse_uname_platform("/usr/local/bin/fnm\nSOM_UNAME:Linux x86_64\n").unwrap();
-        assert_eq!(os, som_srv::protocol::Os::Linux);
-        assert_eq!(arch, som_srv::protocol::Arch::Amd64);
-    }
-
-    #[test]
-    fn rejects_output_with_no_marker_line_at_all() {
-        assert!(parse_uname_platform("Linux\nx86_64\n").is_err());
-    }
-
-    #[test]
-    fn rejects_an_unrecognized_kernel_rather_than_guessing() {
-        // Regression test for the real bug this whole function fixes: a
-        // brand-new host with no som-srv yet used to silently fall back
-        // to THIS (Windows) machine's own platform instead of asking the
-        // remote — confirmed live against a real Debian `usa` host, which
-        // got a Windows .exe deployed to it ("Exec format error"). An
-        // unparseable/unexpected uname report must be a hard error, never
-        // a silent guess.
-        assert!(parse_uname_platform("SOM_UNAME:SomeExoticKernel x86_64\n").is_err());
-    }
-
-    #[test]
-    fn rejects_an_unrecognized_architecture_rather_than_guessing() {
-        assert!(parse_uname_platform("SOM_UNAME:Linux riscv64\n").is_err());
-    }
-
-    #[test]
     fn rebuild_gives_a_local_tmux_shell_a_fresh_pane_id_and_nothing_else_changes() {
         let args = wrap_command_args(
             "dnk",
@@ -2363,14 +2409,14 @@ mod tmux_shell_wrapping_tests {
             None,
         );
         let shell = Shell::WithArguments {
-            program: "C:\\som\\som-srv.exe".to_string(),
+            program: "C:\\som\\somsrv.exe".to_string(),
             args,
             title_override: None,
         };
         let (rebuilt, fresh_pane_id) =
             rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("should detect a local tmux-wrapped shell");
         let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
-        assert_eq!(program, "C:\\som\\som-srv.exe");
+        assert_eq!(program, "C:\\som\\somsrv.exe");
         assert_eq!(args[0], "dnk"); // profile unchanged
         assert_ne!(args[1], "original-pane-id"); // pane_id replaced
         assert_eq!(args[1], fresh_pane_id); // and matches the returned pane_id
@@ -2394,7 +2440,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(program, "ssh");
         assert_eq!(args[0], "-tt");
         assert_eq!(args[1], "192.168.50.5");
-        assert_eq!(args[2], "~/.local/bin/som-srv");
+        assert_eq!(args[2], "~/.local/bin/somsrv");
         assert_eq!(args[3], "pi5"); // profile unchanged
         assert_ne!(args[4], "original-pane-id"); // pane_id replaced
         assert_eq!(args[4], fresh_pane_id); // and matches the returned pane_id
@@ -2422,59 +2468,199 @@ mod tmux_shell_wrapping_tests {
     }
 
     /// Real SSH round-trip against `integration_test_ssh_host()` — confirms
-    /// `ensure_remote_binary_deployed` correctly detects a version mismatch
-    /// and successfully redeploys, end to end (version probe → kill any
-    /// live som-srv processes this account owns → scp the right pre-built
-    /// binary in → chmod +x → re-probe confirms the new version). Doesn't
-    /// assert anything about WHICH processes get killed (see `kill_all_
-    /// holders_for_redeploy`'s own doc comment) — this is specifically
-    /// about the deploy mechanism itself succeeding against a real host.
+    /// `ensure_remote_binary_deployed` correctly STAGES a redeploy (2026-
+    /// 09-15 redesign: Som's side no longer kills anything or applies the
+    /// deploy directly — it only `scp`s the new binary to `somsrv.new`
+    /// and drops a marker file; `somsrv` itself, via `somsrvupd`, applies
+    /// the actual cutover asynchronously the next time ANY client
+    /// connects — see `somsrv::daemon::check_and_apply_pending_redeploy`'s
+    /// own doc comment for that half). This test therefore only checks
+    /// the STAGING half: `somsrv.new` exists, is executable, and reports
+    /// the current version when run directly (NOT via `~/.local/bin/
+    /// somsrv`, which is deliberately untouched by this call) — and the
+    /// marker file is present. Applying the staged redeploy end-to-end
+    /// (actually cutting over `~/.local/bin/somsrv` itself) needs a real
+    /// `somsrv` daemon connection cycle, covered separately, not by this
+    /// test.
     ///
-    /// KNOWN LIMITATION on a real dev machine: this manufactures a version
-    /// mismatch by deleting the remote binary, which forces `ensure_remote_
-    /// binary_deployed` down its `ensure_embedded_binary_available` ->
-    /// `som_srv::protocol::ensure_embedded_binary_extracted` lookup —
-    /// under `cfg!(test)`, `paths::config_dir()` resolves against a FAKE
-    /// home directory (`C:\Users\zed\...`/`/home/zed\...`, see `util::
-    /// paths::home_dir`'s own `cfg!(test)` branch) this process typically
-    /// has no permission to create on a real Windows machine (confirmed:
-    /// `New-Item -Path C:\Users\zed` → access denied, even from an
-    /// otherwise fully-privileged dev account — creating an arbitrary
-    /// top-level `C:\Users\<name>` directory needs real admin rights this
-    /// test deliberately does NOT attempt to acquire). Skip this one (`test_
-    /// deploy_is_a_no_op_when_already_current` below covers the OTHER,
-    /// reachable branch) unless that fake config dir is writable in this
-    /// test environment.
+    /// Requires a LIVE, responding `somsrv` daemon on the host already
+    /// (started here via `spawn_test_relay`, same as `test_redeploy_
+    /// applies_end_to_end_via_somsrvupd` below) — `ensure_remote_binary_
+    /// deployed` only takes the `.new` + marker staging path at all when
+    /// `remote_info.is_some()` (see that function's own doc comment,
+    /// 2026-09-15: with nothing live to hand a cutover to, staging would
+    /// be a dead end no connection could ever apply, so it writes
+    /// directly to the final path instead in that case — a DIFFERENT
+    /// code path than the one this test exists to verify).
     ///
-    /// `#[ignore]`d by default: needs a real reachable SSH host with a
-    /// clone of this repo at `~/som` (so `git pull` succeeds) — the
-    /// version mismatch itself is manufactured by this test (deleting
-    /// whatever's currently there), not a precondition. Run explicitly
-    /// with: `cargo test -p terminal_view test_deploy_redeploys_a_version_mismatch -- --ignored --nocapture`
+    /// KNOWN LIMITATION on a real dev machine: this manufactures a
+    /// missing-binary case by deleting whatever's at `somsrv.new` before
+    /// the call, which forces `ensure_remote_binary_deployed` down its
+    /// `ensure_embedded_binary_available` -> `somsrv::protocol::
+    /// ensure_embedded_binary_extracted` lookup — under `cfg!(test)`,
+    /// `paths::config_dir()` resolves against a FAKE home directory
+    /// (`C:\Users\zed\...`/`/home/zed\...`, see `util::paths::home_dir`'s
+    /// own `cfg!(test)` branch) this process typically has no permission
+    /// to create on a real Windows machine (confirmed: `New-Item -Path
+    /// C:\Users\zed` → access denied, even from an otherwise fully-
+    /// privileged dev account — creating an arbitrary top-level
+    /// `C:\Users\<name>` directory needs real admin rights this test
+    /// deliberately does NOT attempt to acquire). Skip this one unless
+    /// that fake config dir is writable in this test environment.
+    ///
+    /// Regression test for the missing `mkdir -p ~/.local/bin` bug: a
+    /// genuinely fresh host (no `~/.local/bin` at all, no `somsrv`
+    /// process running) must still succeed on its FIRST-EVER deploy —
+    /// `scp` doesn't create intermediate directories on its own, so
+    /// without the `mkdir -p` this hits `remote_mtime.is_none()`'s
+    /// direct-write branch and fails outright. Set `SOM_TEST_SSH_HOST`
+    /// to a real host with `~/.local/bin` removed and no `somsrv`
+    /// running before running this.
     #[test]
     #[ignore]
-    fn test_deploy_redeploys_a_version_mismatch() {
+    fn test_first_ever_deploy_creates_local_bin_if_missing() {
         let host_args = integration_test_ssh_host();
 
-        // Manufacture a version mismatch: remove whatever's currently
-        // deployed (if anything) so ensure_remote_binary_deployed sees
-        // `remote_info == None` and takes the real first-deploy path.
-        let cleanup_probe = wrap_remote_probe_args(&host_args, "rm", &["-f", "~/.local/bin/som-srv"]);
-        run_remote_command(RemoteKind::Ssh, &cleanup_probe).expect("failed to clear out the remote binary for this test");
+        let staged = ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx)
+            .expect("first-ever deploy to a directory-less host should succeed, not fail on a missing ~/.local/bin");
+        assert!(staged, "a host with nothing deployed yet must report that a deploy happened");
 
-        ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh).expect("deploy should succeed against a real reachable host");
-
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/som-srv", &["--version"]);
-        let output = run_remote_command(RemoteKind::Ssh, &version_probe).expect("the freshly-deployed binary should run");
-        let info: som_srv::protocol::HandshakeInfo =
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
+        let output = run_remote_command(RemoteKind::Ssh, &version_probe)
+            .expect("the freshly-deployed ~/.local/bin/somsrv should be executable and runnable");
+        let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
-        assert_eq!(info.version, som_srv::protocol::HandshakeInfo::current().version);
+        assert_eq!(info.version, somsrv::protocol::HandshakeInfo::current().version);
+    }
+
+    /// `#[ignore]`d by default: needs a real reachable SSH host with a
+    /// clone of this repo at `~/som` (so `git pull` succeeds, in the WSL
+    /// branch of `ensure_remote_binary_deployed`). Run explicitly with:
+    /// `cargo test -p terminal_view test_deploy_stages_a_redeploy -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_deploy_stages_a_redeploy() {
+        let host_args = integration_test_ssh_host();
+
+        // Clean slate: remove whatever might already be staged from a
+        // previous test run, so a successful `scp` below is unambiguous.
+        let cleanup_probe = wrap_remote_probe_args(
+            &host_args,
+            "rm",
+            &["-f", "~/.local/bin/somsrv.new", "~/.local/bin/somsrv.redeploy-pending"],
+        );
+        run_remote_command(RemoteKind::Ssh, &cleanup_probe).expect("failed to clear out any stale staged files for this test");
+
+        // Ensures a live, responding daemon exists on the host first —
+        // see this test's own doc comment above for why the staging path
+        // this test verifies is only reachable when one is.
+        let warm_up_pane_id = format!("test-deploy-stages-warmup-{}", std::process::id());
+        spawn_test_relay(&host_args, &warm_up_pane_id);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let staged = ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("staging the deploy should succeed against a real reachable host");
+        if !staged {
+            eprintln!("remote host is already at the current version — nothing to stage, test has nothing to verify");
+            return;
+        }
+
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv.new", &["--version"]);
+        let output = run_remote_command(RemoteKind::Ssh, &version_probe).expect("the freshly-staged somsrv.new should be executable and runnable");
+        let info: somsrv::protocol::HandshakeInfo =
+            serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
+        assert_eq!(info.version, somsrv::protocol::HandshakeInfo::current().version);
+
+        let marker_probe = wrap_remote_probe_args(&host_args, "test", &["-f", "~/.local/bin/somsrv.redeploy-pending"]);
+        run_remote_command(RemoteKind::Ssh, &marker_probe).expect("the redeploy marker file should have been written");
+
+        // Cleanup: leave no staged redeploy behind for whatever real
+        // daemon might be running on this test host.
+        run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
+    }
+
+    /// Real SSH round-trip covering the FULL redeploy cycle end to end —
+    /// staging (`ensure_remote_binary_deployed`) AND application (`som-
+    /// srv` noticing the marker via `somsrv::daemon::check_and_apply_
+    /// pending_redeploy`, extracting/spawning `somsrvupd`, which kills the
+    /// old daemon, renames `.new` into place, and starts a fresh one).
+    /// Deliberately verifies every step through the SAME `--version`
+    /// protocol probe `ensure_remote_binary_deployed` itself already
+    /// uses (`~/.local/bin/somsrv --version`) rather than any raw shell
+    /// inspection (`ps`/`ls`/etc) of the remote host — if that protocol
+    /// round-trip fails or reports the wrong version, that IS the
+    /// failure this test needs to catch, and probing it any other way
+    /// would risk passing on a state the real deploy-check code path
+    /// wouldn't actually trust either.
+    ///
+    /// Sequence:
+    /// 1. Ensure SOME `somsrv` is already running as a daemon on the
+    ///    test host (via `spawn_test_relay`, the same real-RELAY-
+    ///    invocation helper other tests already use — this transitively
+    ///    spawns the daemon if nothing was listening yet).
+    /// 2. Stage a redeploy (`ensure_remote_binary_deployed`) — this
+    ///    process's OWN current build is what gets staged, so if the
+    ///    remote already happens to be at this exact version, staging
+    ///    is skipped entirely and this test has nothing left to verify;
+    ///    see the `Ok(false)`-early-return guard below.
+    /// 3. Connect a SECOND real RELAY — this is the trigger:
+    ///    `check_and_apply_pending_redeploy` only runs on the daemon's
+    ///    connection-accept loop, so nothing applies the staged redeploy
+    ///    until some client actually tries to connect.
+    /// 4. Poll `~/.local/bin/somsrv --version` (the ordinary path, NOT
+    ///    `.new`) until it reports the just-staged version — `somsrvupd`'s
+    ///    own cutover (kill old daemon, rename, spawn new daemon) is
+    ///    asynchronous relative to this test process, so this can't be a
+    ///    single immediate assertion.
+    ///
+    /// `#[ignore]`d by default: needs a real reachable SSH host with a
+    /// clone of this repo at `~/som`. Run explicitly with:
+    /// `cargo test -p terminal_view test_redeploy_applies_end_to_end_via_somsrvupd -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_redeploy_applies_end_to_end_via_somsrvupd() {
+        let host_args = integration_test_ssh_host();
+        let warm_up_pane_id = format!("test-redeploy-warmup-{}", std::process::id());
+        spawn_test_relay(&host_args, &warm_up_pane_id);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let staged = ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("staging the deploy should succeed against a real reachable host");
+        if !staged {
+            eprintln!("remote host is already at the current version — nothing to redeploy, test has nothing to verify");
+            return;
+        }
+
+        // Trigger: connect a fresh RELAY so the daemon's accept loop
+        // runs `check_and_apply_pending_redeploy` and notices the
+        // marker this call just staged.
+        let trigger_pane_id = format!("test-redeploy-trigger-{}", std::process::id());
+        spawn_test_relay(&host_args, &trigger_pane_id);
+
+        let expected_version = somsrv::protocol::HandshakeInfo::current().version;
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(output) = run_remote_command(RemoteKind::Ssh, &version_probe) {
+                if let Ok(info) = serde_json::from_str::<somsrv::protocol::HandshakeInfo>(output.trim()) {
+                    if info.version == expected_version {
+                        break; // redeploy applied successfully
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "~/.local/bin/somsrv never reported version {expected_version:?} within the timeout — somsrvupd's takeover did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Real SSH round-trip: confirms `ensure_remote_binary_deployed` is a
     /// true no-op (no kill, no scp) when the remote is already at the
-    /// current version — the common case on every tab open/restore once a
-    /// host has been deployed to once already. Verified by checking the
+    /// current version (so its mtime is at least as new as the local
+    /// embedded copy's own mtime — see `ensure_remote_binary_deployed`'s
+    /// own doc comment for the 2026-09-15 mtime-based redesign this
+    /// verifies) — the common case on every tab open/restore once a host
+    /// has been deployed to once already. Verified by checking the
     /// binary's mtime is unchanged after the call, rather than asserting
     /// on internal call counts (this function has no test-seam for that
     /// and adding one purely for this would be over-engineering for a
@@ -2482,42 +2668,42 @@ mod tmux_shell_wrapping_tests {
     ///
     /// Requires the remote to ALREADY be at the current version before
     /// this test runs (deliberately does NOT call `ensure_remote_binary_
-    /// deployed` itself to set that up first, unlike `test_deploy_
-    /// redeploys_a_version_mismatch` — a version MISMATCH path needs
-    /// `ensure_embedded_binary_available`, which resolves relative to
-    /// `paths::config_dir()`, which under `cfg!(test)` resolves to a fake
-    /// `C:\Users\zed\...`/`/home/zed/...` home directory this process has
-    /// no permission to create on a real dev machine — see `util::paths::
-    /// home_dir`'s own `cfg!(test)` branch. The ALREADY-current path
-    /// returns early, before ever touching that lookup, so it's the one
-    /// case this integration test CAN safely exercise without hitting that
-    /// same wall; deploy the current build to the test host manually first
-    /// — e.g. `scp ~/.config/som/srv/linux-amd/som-srv <host>:~/.local/
-    /// bin/som-srv` — to set up the precondition.
+    /// deployed` itself to set that up first, unlike `test_deploy_stages_
+    /// a_redeploy` — the actual-deploy path needs `ensure_embedded_binary_
+    /// available`, which resolves relative to `paths::config_dir()`,
+    /// which under `cfg!(test)` resolves to a fake `C:\Users\zed\...`/
+    /// `/home/zed/...` home directory this process has no permission to
+    /// create on a real dev machine — see `util::paths::home_dir`'s own
+    /// `cfg!(test)` branch. The ALREADY-current path returns early,
+    /// before ever touching that lookup, so it's the one case this
+    /// integration test CAN safely exercise without hitting that same
+    /// wall; deploy the current build to the test host manually first —
+    /// e.g. `scp ~/.config/som/srv/linux-amd/somsrv <host>:~/.local/
+    /// bin/somsrv` — to set up the precondition.
     ///
     /// `#[ignore]`d by default — same reachability requirement as `test_
-    /// deploy_redeploys_a_version_mismatch`. Run explicitly with:
+    /// deploy_stages_a_redeploy`. Run explicitly with:
     /// `cargo test -p terminal_view test_deploy_is_a_no_op_when_already_current -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn test_deploy_is_a_no_op_when_already_current() {
         let host_args = integration_test_ssh_host();
 
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/som-srv", &["--version"]);
+        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
         let output = run_remote_command(RemoteKind::Ssh, &version_probe)
-            .expect("remote must already have SOME som-srv at ~/.local/bin/som-srv for this test's precondition");
-        let info: som_srv::protocol::HandshakeInfo =
+            .expect("remote must already have SOME somsrv at ~/.local/bin/somsrv for this test's precondition");
+        let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
         assert_eq!(
             info.version,
-            som_srv::protocol::HandshakeInfo::current().version,
+            somsrv::protocol::HandshakeInfo::current().version,
             "test precondition not met: deploy the current build to the test host manually first (see doc comment)"
         );
 
-        let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "~/.local/bin/som-srv"]);
+        let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "~/.local/bin/somsrv"]);
         let mtime_before = run_remote_command(RemoteKind::Ssh, &mtime_probe).expect("stat should succeed");
 
-        ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh).expect("no-op deploy should still report success");
+        ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("no-op deploy should still report success");
 
         let mtime_after = run_remote_command(RemoteKind::Ssh, &mtime_probe).expect("stat should succeed");
         assert_eq!(
@@ -2534,17 +2720,17 @@ mod tmux_shell_wrapping_tests {
     /// pane_id IS in `live_pane_ids` survives — the two behaviors this
     /// function exists to balance (see its own doc comment). Uses the
     /// real `client_id` this account/host pair would actually get (read
-    /// back via `$SSH_CLIENT` + `whoami`, the same way `som_srv::
+    /// back via `$SSH_CLIENT` + `whoami`, the same way `somsrv::
     /// protocol::ssh_client_id` does on the remote side), not a
     /// fabricated one, so this exercises the SAME client-id matching path
     /// production code goes through, not a shortcut around it.
     ///
     /// `#[ignore]`d by default — same reachability requirement as the
-    /// deploy tests above, plus a working `som-srv` binary already at
-    /// `~/.local/bin/som-srv`. Run explicitly with:
+    /// deploy tests above, plus a working `somsrv` binary already at
+    /// `~/.local/bin/somsrv`. Run explicitly with:
     /// `cargo test -p terminal_view test_kill_orphaned_holders_only_kills_the_orphan -- --ignored --nocapture`
 
-    /// Spawns a real RELAY (`som-srv <profile> <pane-id> <program>`,
+    /// Spawns a real RELAY (`somsrv <profile> <pane-id> <program>`,
     /// backgrounded via `nohup ... &`) — the exact same invocation shape
     /// `wrap_remote_command_args` builds for a real `tmux: true` tab. This
     /// registers a session with the shared daemon on the far end
@@ -2553,7 +2739,7 @@ mod tmux_shell_wrapping_tests {
     /// exercising the REAL registration path end to end rather than
     /// reaching into the daemon's registry directly.
     fn spawn_test_relay(host_args: &[String], pane_id: &str) {
-        let spawn_script = format!("nohup ~/.local/bin/som-srv test-orphan-cleanup {pane_id} /bin/sh >/dev/null 2>&1 &");
+        let spawn_script = format!("nohup ~/.local/bin/somsrv test-orphan-cleanup {pane_id} /bin/sh >/dev/null 2>&1 &");
         let quoted_spawn_script = shell_quote(&spawn_script);
         let spawn_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_spawn_script]);
         run_remote_command(RemoteKind::Ssh, &spawn_probe).expect("failed to spawn a test relay");
@@ -2565,11 +2751,11 @@ mod tmux_shell_wrapping_tests {
     /// session identity lives in the daemon's registry, not in any
     /// process's argv.
     fn session_exists(host_args: &[String], client_id: &str, pane_id: &str) -> bool {
-        let list_script = format!("~/.local/bin/som-srv --list-sessions {}", shell_quote(client_id));
+        let list_script = format!("~/.local/bin/somsrv --list-sessions {}", shell_quote(client_id));
         let quoted = shell_quote(&list_script);
         let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted]);
         let output = run_remote_command(RemoteKind::Ssh, &probe).expect("list-sessions probe should succeed");
-        let sessions: Vec<som_srv::protocol::SessionInfo> =
+        let sessions: Vec<somsrv::protocol::SessionInfo> =
             serde_json::from_str(output.trim()).expect("--list-sessions should print valid JSON");
         sessions.iter().any(|session| session.pane_id == pane_id)
     }
@@ -2618,53 +2804,13 @@ mod tmux_shell_wrapping_tests {
 
         // Cleanup: the live one was deliberately spared above, so kill it
         // now that the test is done with it — over SSH, same as the
-        // production `--kill-session` call, NOT `som_srv::admin::
+        // production `--kill-session` call, NOT `somsrv::admin::
         // kill_session` (which would talk to a daemon on THIS machine,
         // not the remote one under test).
-        let cleanup_script = format!("~/.local/bin/som-srv --kill-session {} {}", shell_quote(&client_id), shell_quote(&live_pane_id));
+        let cleanup_script = format!("~/.local/bin/somsrv --kill-session {} {}", shell_quote(&client_id), shell_quote(&live_pane_id));
         let quoted_cleanup_script = shell_quote(&cleanup_script);
         let cleanup_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_cleanup_script]);
         run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
     }
 
-    /// Real SSH round-trip: confirms `kill_all_holders_for_redeploy` kills
-    /// EVERY matching `som-srv` process (daemon and any live RELAY alike)
-    /// regardless of session/client-id status — unlike
-    /// `kill_orphaned_holders`, this function is deliberately
-    /// indiscriminate (see its own doc comment for why: a version
-    /// mismatch means the binary file is about to change out from under
-    /// every process executing it, live or not, this account's own or a
-    /// different client machine sharing the same account). This is still
-    /// a plain `ps`-grep-by-binary-name (unchanged from before the shared-
-    /// daemon rewrite — see that function's own doc comment for why this
-    /// one function stays process-level rather than session-level).
-    ///
-    /// `#[ignore]`d by default — same reachability requirement as the
-    /// other integration tests above. Run explicitly with:
-    /// `cargo test -p terminal_view test_kill_all_holders_for_redeploy_kills_everything -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn test_kill_all_holders_for_redeploy_kills_everything() {
-        let host_args = integration_test_ssh_host();
-        let pane_id = format!("test-redeploy-{}", std::process::id());
-        let client_id = read_back_this_connections_client_id(&host_args);
-
-        spawn_test_relay(&host_args, &pane_id);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Sanity check: the session really is alive before the kill, so a
-        // passing assertion afterward actually proves something.
-        assert!(session_exists(&host_args, &client_id, &pane_id), "test setup: session should be alive");
-
-        kill_all_holders_for_redeploy(&host_args, RemoteKind::Ssh);
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let script = r#"ps -eo args | awk 'index($0, "som-sr" "v")' | wc -l"#;
-        let quoted_script = shell_quote(script);
-        let probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_script]);
-        let output = run_remote_command(RemoteKind::Ssh, &probe).expect("ps probe should succeed");
-        let remaining: u32 =
-            output.lines().rev().find(|line| !line.trim().is_empty()).and_then(|line| line.trim().parse().ok()).unwrap_or(999);
-        assert_eq!(remaining, 0, "every som-srv process (daemon and relay alike) must be killed ahead of a redeploy");
-    }
 }

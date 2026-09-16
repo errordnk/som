@@ -1,0 +1,69 @@
+# NOTE: keep this in lockstep with crates/zed/Cargo.toml's own `version` —
+# HandshakeInfo::current() (protocol.rs) reads THIS crate's own
+# CARGO_PKG_VERSION and treats it as Som's version for the whole
+# deploy-vs-not-deploy decision (see project_som_tmux memory): somsrv
+# always gets redeployed whenever Som's version changes, even if nothing in
+# this crate itself changed, specifically so this number always means "Som
+# build X" rather than "somsrv crate revision Y".
+[package]
+name = "somsrv"
+version = "0.5.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "somsrv"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "somsrv"
+path = "src/main.rs"
+doctest = false
+
+# Tiny standalone updater — see `bin/somsrvupd.rs`'s own module doc
+# comment for the full redeploy protocol this implements. Deliberately
+# its OWN `[[bin]]` target (not a `somsrv` subcommand) so a running
+# `somsrv` daemon can extract/spawn a fresh detached copy of it on every
+# redeploy — see `daemon.rs`'s own doc comment on why the actual rename-
+# the-live-binary step MUST happen from a separate process, never from
+# `somsrv` itself. `somsrv` embeds `somsrvupd`'s ALREADY-COMPILED bytes
+# via `rust-embed` from `embedded-upd/` (see `daemon.rs`'s `EmbeddedUpd`),
+# mirroring exactly how Som's own `assets` crate embeds pre-built
+# `somsrv` copies for each platform — a manual, pre-release step
+# (`scripts/update_somsrv_binaries.sh`), NOT an automatic per-build one:
+# `somsrvupd` must be built and copied into `embedded-upd/` BEFORE
+# `somsrv` itself is built (a plain `cargo build -p somsrv` does not
+# order this for you — the script does).
+[[bin]]
+name = "somsrvupd"
+path = "src/bin/somsrvupd.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+bincode.workspace = true
+futures.workspace = true
+log.workspace = true
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+paths.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+sysinfo.workspace = true
+uuid.workspace = true
+zlog.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix = { workspace = true, features = ["term"] }

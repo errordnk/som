@@ -1,55 +1,31 @@
-//! Progressive on-disk cache for Som's own rich-content protocol
-//! ([`crate::rich_content_transport`]) — receives chunks (possibly
-//! out of order, though [`crate::somcat`]'s streaming client always sends
-//! them in offset order today) and writes them to a local file, tracking
-//! how many leading bytes are contiguously present so a decoder can know
-//! it's safe to read up to that point without hitting a hole.
+//! Per-`Terminal` metadata registry for Som's own rich-content protocol
+//! ([`crate::rich_content_transport`]) — tracks the bookkeeping every
+//! `rich_content_*_placements` paint-path method needs to know about a
+//! placement (content type, watermark, natural pixel/audio dimensions,
+//! reserved grid footprint) WITHOUT owning any bytes itself. The actual
+//! bytes for every content type now live in [`crate::rich_content_srv_
+//! channel::SrvProgressState`] — this registry was originally also the
+//! on-disk cache for image/GIF/markdown's chunk bytes (`apply_chunk`
+//! opened and wrote a real file per placement), but that disk-writing
+//! half was removed once those three content types moved onto the same
+//! in-memory buffer video/audio already used, closing the gap that
+//! motivated `somsrv`'s own `media_cache` size-limit watcher in the
+//! first place (a disk cache for bytes that were also being kept
+//! in-memory made the watcher's whole reason to exist redundant).
 //!
 //! Deliberately separate from [`crate::kitty_graphics_store::ImageStore`]
 //! — this protocol doesn't reuse Kitty's in-memory `ImageStore` at all
-//! (see `rich_content_transport`'s module doc comment for why), and its
-//! own state (per-file cache handle + watermark) has a different shape:
-//! bytes-on-disk plus a byte offset, not a `HashMap<u32, DecodedImage>`.
+//! (see `rich_content_transport`'s module doc comment for why).
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
 
-/// One file's progressive-write state: the open handle plus how many
-/// bytes starting from offset 0 are known to be present with no gaps.
-///
-/// `contiguous_len` is only ever advanced by a chunk landing EXACTLY at
-/// the current watermark (`chunk.chunk_offset == contiguous_len`) — an
-/// out-of-order or gapped chunk is still written to disk at its own
-/// offset (so it doesn't need to be re-sent once the gap-filling chunk
-/// arrives), but does not advance the watermark until the gap closes.
-/// This is what lets a decoder trust "the first `contiguous_len` bytes
-/// are complete and correct" without needing to track individual chunk
-/// ranges itself.
+/// One placement's metadata: content type, watermark, and whatever
+/// per-content-type extras the paint path needs (natural image/audio
+/// dimensions, reserved grid footprint) — no bytes, no file handle.
 struct CacheEntry {
-    /// `None` for `Video`/`Audio` entries created via [`RichContentCache::
-    /// record_progress`] — those content types no longer have an on-disk
-    /// file at all (`GrowingFileStream`/the audio decoder's equivalent
-    /// read straight out of `SrvProgressState`'s in-memory buffer
-    /// instead, see that type's own doc comment for why). `Some` for
-    /// every entry [`RichContentCache::apply_chunk`] creates (the OLD
-    /// PTY-parsing write path, still disk-backed) and for `record_
-    /// progress` entries of every OTHER content type (image/GIF/
-    /// markdown), which stay disk-backed in this pass — see the plan
-    /// this change implements for why those are explicitly out of scope.
-    file: Option<File>,
-    path: Option<PathBuf>,
     contiguous_len: u64,
-    /// Out-of-order chunks that landed ahead of the current watermark,
-    /// kept here (not yet counted into `contiguous_len`) until the gap
-    /// before them closes. Keyed by chunk_offset. Expected to stay small
-    /// in practice — `somcat --stream` sends strictly in order — but
-    /// correctness shouldn't depend on that assumption holding for every
-    /// future client.
-    pending_ranges: Vec<(u64, u64)>,
     content_type: ContentType,
     /// `0` means the sender never filled it in — "unknown, don't guess",
     /// not "empty file".
@@ -88,171 +64,26 @@ struct CacheEntry {
     video_audio_stream_index: Option<u32>,
 }
 
-/// Per-terminal-session store of in-progress and completed rich-content
-/// file transfers. One instance lives on `Terminal`, mirroring
+/// Per-terminal-session registry of in-progress and completed rich-content
+/// placements' metadata. One instance lives on `Terminal`, mirroring
 /// `kitty_graphics_store::ImageStore`'s lifetime.
 pub struct RichContentCache {
-    cache_dir: PathBuf,
     entries: HashMap<(u32, u32), CacheEntry>,
 }
 
 impl RichContentCache {
-    /// `cache_dir` is the directory chunks get written under — callers
-    /// pass `paths::config_dir().join("media_cache")` in production (see
-    /// `paths::config_dir`'s existing use in
-    /// `crates/som_srv/src/protocol.rs` for the established pattern of a
-    /// per-purpose subdirectory under the same config root), and a
-    /// throwaway `tempdir` in tests so test runs never touch a real
-    /// user's `~/.config/som/media_cache/`.
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir, entries: HashMap::new() }
+    pub fn new() -> Self {
+        Self { entries: HashMap::new() }
     }
 
-    fn extension_for(content_type: ContentType) -> &'static str {
-        match content_type {
-            ContentType::Gif => "gif",
-            ContentType::Audio => "audio",
-            ContentType::Markdown => "md",
-            ContentType::Video => "video",
-            ContentType::Jpeg => "jpg",
-            ContentType::Png => "png",
-        }
-    }
-
-    /// Applies one chunk: opens (or reuses) the file for
-    /// `(session_id, file_id)`, writes `payload` at `chunk_offset`,
-    /// advances the contiguous watermark as far as newly-arrived data
-    /// allows, and returns the number of contiguous bytes now available
-    /// from the start of the file — the caller (a decoder) reads at most
-    /// this many bytes and knows they're gap-free.
-    ///
-    /// Takes raw fields rather than a single struct — this used to take
-    /// `&rich_content_transport::Chunk`, but that type (along with the
-    /// whole APC/base91 envelope format it was parsed from) was deleted
-    /// once chunks started arriving via `som-srv`'s binary side channel
-    /// instead of the PTY (see `som_srv::protocol::SrvRequest::PutChunk`,
-    /// which carries the same fields this function now takes directly).
-    /// `content_type`/`metadata` are only consulted the FIRST time a given
-    /// `(session_id, file_id)` is seen (to open the cache file and seed
-    /// per-placement metadata) — a caller applying a later chunk for an
-    /// already-known id can pass whatever it has on hand for those two
-    /// (e.g. the same values as the first chunk), since they're ignored
-    /// once the entry already exists.
-    ///
-    /// Errors (directory creation failure, seek/write failure) are
-    /// returned rather than panicking — a single corrupted/failed chunk
-    /// write shouldn't take down the whole terminal session; the caller
-    /// decides whether to drop the chunk and continue or surface the
-    /// error further.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_chunk(
-        &mut self,
-        content_type: ContentType,
-        session_id: u32,
-        file_id: u32,
-        chunk_offset: u64,
-        total_size: u64,
-        metadata: ContentMetadata,
-        payload: &[u8],
-    ) -> std::io::Result<u64> {
-        let key = (session_id, file_id);
-        if !self.entries.contains_key(&key) {
-            std::fs::create_dir_all(&self.cache_dir)?;
-            let ext = Self::extension_for(content_type);
-            let path =
-                self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
-            let file = OpenOptions::new().create(true).write(true).truncate(true).read(true).open(&path)?;
-            self.entries.insert(
-                key,
-                CacheEntry {
-                    file: Some(file),
-                    path: Some(path),
-                    contiguous_len: 0,
-                    pending_ranges: Vec::new(),
-                    content_type,
-                    total_size,
-                    max_column_seen: std::cell::Cell::new(0),
-                    max_row_seen: std::cell::Cell::new(0),
-                    image_size_px: match metadata {
-                        ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
-                            Some((width_px, height_px))
-                        },
-                        _ => None,
-                    },
-                    audio_metadata: match metadata {
-                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, .. } => {
-                            Some((sample_rate, channels, bits_per_sample, duration_ms))
-                        },
-                        _ => None,
-                    },
-                    video_audio_stream_index: match metadata {
-                        ContentMetadata::Video { audio_stream_index, .. } => audio_stream_index,
-                        _ => None,
-                    },
-                },
-            );
-        }
-        let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
-
-        // `apply_chunk` always creates its entry with `Some(file)` just
-        // above — the only way `file` is ever `None` is via `record_
-        // progress`'s Video/Audio branch (see `CacheEntry::file`'s own
-        // doc comment), a path this function never takes.
-        let file = entry.file.as_mut().expect("apply_chunk's own entries always have a file");
-        file.seek(SeekFrom::Start(chunk_offset))?;
-        file.write_all(payload)?;
-
-        let chunk_end = chunk_offset + payload.len() as u64;
-        if chunk_offset <= entry.contiguous_len {
-            // Either exactly at the watermark, or overlapping/behind it
-            // (a retransmit of already-seen data) — either way this
-            // chunk's own bytes extend (or don't move) the watermark.
-            entry.contiguous_len = entry.contiguous_len.max(chunk_end);
-            // A previously-out-of-order chunk might now be contiguous
-            // with the advanced watermark — keep absorbing pending
-            // ranges as long as one starts at (or before) the current
-            // watermark. Small linear scan is fine: `pending_ranges` is
-            // expected to stay tiny (see its own doc comment).
-            loop {
-                let Some(pos) =
-                    entry.pending_ranges.iter().position(|&(offset, _)| offset <= entry.contiguous_len)
-                else {
-                    break;
-                };
-                let (offset, end) = entry.pending_ranges.remove(pos);
-                entry.contiguous_len = entry.contiguous_len.max(end.max(offset));
-            }
-        } else {
-            entry.pending_ranges.push((chunk_offset, chunk_end));
-        }
-
-        Ok(entry.contiguous_len)
-    }
-
-    /// Records a `som_srv::protocol::SrvResponse::Progress` push:
+    /// Records a `somsrv::protocol::SrvResponse::Progress` push:
     /// updates `contiguous_len`/`total_size`/metadata for `(session_id,
-    /// file_id)` WITHOUT writing any payload bytes to disk itself.
-    ///
-    /// For `Video`/`Audio`, there is no cache FILE to open at all
-    /// anymore — `som-srv` no longer persists chunks to disk for any
-    /// content type (see `som_srv::srv_cache::SrvCache`'s own doc
-    /// comment), and those two content types' decoders
-    /// (`GrowingFileStream`/the audio decoder's equivalent) read
-    /// directly out of `SrvProgressState`'s in-memory buffer instead of
-    /// ever consulting this cache's `path()` — so this method only
-    /// tracks bookkeeping (watermarks, `video_audio_stream_index`, etc.)
-    /// for those two, never touching the filesystem.
-    ///
-    /// For every OTHER content type (image/GIF/markdown — still
-    /// disk-backed in this pass, see the plan this implements for why),
-    /// `som-srv` no longer writes any content type to disk either —
-    /// `RichContentCache::apply_chunk` (the OLD PTY-parsing write path)
-    /// is the only thing that still creates a file on disk for image/
-    /// GIF/markdown today. A `record_progress` entry for one of those
-    /// content types opens that SAME file if `apply_chunk` already
-    /// created it, or fails (same tolerance as before — see this
-    /// method's own call site in `Terminal::ensure_rich_content_srv_
-    /// subscription`) if nothing has written it yet.
+    /// file_id)` — pure bookkeeping, no bytes ever touch this registry.
+    /// The FIRST push for a given key seeds `content_type`/the per-
+    /// content-type metadata extras; every later push for the same key
+    /// only advances `contiguous_len`/`total_size` (a real sender's
+    /// metadata never actually changes mid-transfer, see `somsrv::
+    /// protocol::SrvRequest::PutChunk`'s own doc comment).
     pub fn record_progress(
         &mut self,
         content_type: ContentType,
@@ -261,73 +92,39 @@ impl RichContentCache {
         contiguous_len: u64,
         total_size: u64,
         metadata: ContentMetadata,
-    ) -> std::io::Result<()> {
+    ) {
         let key = (session_id, file_id);
-        if !self.entries.contains_key(&key) {
-            let (file, path) = if matches!(content_type, ContentType::Video | ContentType::Audio) {
-                (None, None)
-            } else {
-                let ext = Self::extension_for(content_type);
-                let path = self.cache_dir.join(format!("{session_id:08x}-{file_id:08x}.{ext}"));
-                let file = OpenOptions::new().read(true).open(&path)?;
-                (Some(file), Some(path))
-            };
-            self.entries.insert(
-                key,
-                CacheEntry {
-                    file,
-                    path,
-                    contiguous_len: 0,
-                    pending_ranges: Vec::new(),
-                    content_type,
-                    total_size,
-                    max_column_seen: std::cell::Cell::new(0),
-                    max_row_seen: std::cell::Cell::new(0),
-                    image_size_px: match metadata {
-                        ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
-                            Some((width_px, height_px))
-                        },
-                        _ => None,
-                    },
-                    audio_metadata: match metadata {
-                        ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, .. } => {
-                            Some((sample_rate, channels, bits_per_sample, duration_ms))
-                        },
-                        _ => None,
-                    },
-                    video_audio_stream_index: match metadata {
-                        ContentMetadata::Video { audio_stream_index, .. } => audio_stream_index,
-                        _ => None,
-                    },
+        self.entries.entry(key).or_insert_with(|| CacheEntry {
+            contiguous_len: 0,
+            content_type,
+            total_size,
+            max_column_seen: std::cell::Cell::new(0),
+            max_row_seen: std::cell::Cell::new(0),
+            image_size_px: match metadata {
+                ContentMetadata::Image { width_px, height_px, .. } if width_px > 0 && height_px > 0 => {
+                    Some((width_px, height_px))
                 },
-            );
-        }
+                _ => None,
+            },
+            audio_metadata: match metadata {
+                ContentMetadata::Audio { sample_rate, channels, bits_per_sample, duration_ms, .. } => {
+                    Some((sample_rate, channels, bits_per_sample, duration_ms))
+                },
+                _ => None,
+            },
+            video_audio_stream_index: match metadata {
+                ContentMetadata::Video { audio_stream_index, .. } => audio_stream_index,
+                _ => None,
+            },
+        });
         let entry = self.entries.get_mut(&key).expect("just inserted above if absent");
-        // `contiguous_len` only ever moves forward — `som-srv` is the
-        // single source of truth for this value (it tracks the exact
-        // same gap-tolerant watermark `apply_chunk` used to compute
-        // locally), so a later push always reflects at least as much
-        // progress as an earlier one; `max` here is just defense against
-        // a hypothetical out-of-order delivery of `Progress` pushes
-        // themselves, not an expected case.
+        // `contiguous_len` only ever moves forward — `somsrv` is the
+        // single source of truth for this value, so a later push always
+        // reflects at least as much progress as an earlier one; `max`
+        // here is just defense against a hypothetical out-of-order
+        // delivery of `Progress` pushes themselves, not an expected case.
         entry.contiguous_len = entry.contiguous_len.max(contiguous_len);
         entry.total_size = total_size;
-        Ok(())
-    }
-
-    /// The on-disk path for a given file, if any chunk for it has arrived
-    /// yet AND this content type is still disk-backed (image/GIF/
-    /// markdown — `None` for `Video`/`Audio` entries even once they
-    /// exist, since those two no longer have a file at all, see
-    /// [`CacheEntry::file`]'s own doc comment). A decoder for a
-    /// disk-backed content type reads from this path directly (up to
-    /// [`Self::contiguous_len`] bytes) rather than through this store —
-    /// mirrors the "receiver reads bytes off disk itself" model the whole
-    /// progressive-copy design is built around, instead of routing
-    /// decoded pixel data back through an in-memory store the way
-    /// `ImageStore` does for Kitty.
-    pub fn path(&self, session_id: u32, file_id: u32) -> Option<&std::path::Path> {
-        self.entries.get(&(session_id, file_id))?.path.as_deref()
     }
 
     /// The `ContentType` the first chunk for this id declared — decoding
@@ -370,7 +167,7 @@ impl RichContentCache {
     /// stopped, then `clear`, and the video's own audio track started
     /// playing again with no picture visible anywhere). The underlying
     /// on-disk cache file is deliberately left alone (not deleted) —
-    /// `som-srv`'s own `SrvCache` is the source of truth for the bytes
+    /// `somsrv`'s own `SrvCache` is the source of truth for the bytes
     /// themselves; this only forgets Som's in-memory bookkeeping about
     /// that same id, mirroring how `clear` already only erases the
     /// terminal's own grid, not any process actually still running.
@@ -482,127 +279,85 @@ mod tests {
     use super::*;
     use crate::rich_content_transport::ContentType;
 
-    /// Thin wrapper around [`RichContentCache::apply_chunk`] fixing every
-    /// argument except the four that vary across this module's test cases
-    /// — mirrors the old `Chunk`-struct-building test helper this replaced
-    /// once `apply_chunk` started taking raw fields instead of a
-    /// `rich_content_transport::Chunk` (see that method's own doc comment
-    /// for why).
-    fn apply_test_chunk(cache: &mut RichContentCache, session_id: u32, file_id: u32, offset: u64, payload: &[u8]) -> std::io::Result<u64> {
-        cache.apply_chunk(
-            ContentType::Gif,
-            session_id,
-            file_id,
-            offset,
-            0,
-            crate::rich_content_transport::ContentMetadata::Image {
-                width_px: 0,
-                height_px: 0,
-                color_bits: 0,
-                is_animated: false,
-            },
-            payload,
-        )
-    }
-
-    fn temp_cache_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("som_rich_content_cache_test_{name}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_metadata() -> ContentMetadata {
+        ContentMetadata::Image { width_px: 0, height_px: 0, color_bits: 0, is_animated: false }
     }
 
     #[test]
-    fn sequential_chunks_advance_watermark_and_write_correct_bytes() {
-        let dir = temp_cache_dir("sequential");
-        let mut cache = RichContentCache::new(dir.clone());
+    fn record_progress_seeds_content_type_and_advances_watermark() {
+        let mut cache = RichContentCache::new();
 
-        let len1 = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
-        assert_eq!(len1, 6);
-        let len2 = apply_test_chunk(&mut cache, 1, 1, 6, b"world").unwrap();
-        assert_eq!(len2, 11);
+        cache.record_progress(ContentType::Gif, 1, 1, 6, 100, test_metadata());
+        assert_eq!(cache.content_type(1, 1), Some(ContentType::Gif));
+        assert_eq!(cache.contiguous_len(1, 1), 6);
+        assert_eq!(cache.total_size(1, 1), 100);
 
-        let path = cache.path(1, 1).unwrap().to_path_buf();
-        let on_disk = std::fs::read(&path).unwrap();
-        assert_eq!(on_disk, b"hello world");
-        assert_eq!(cache.contiguous_len(1, 1), 11);
-
-        std::fs::remove_dir_all(&dir).ok();
+        cache.record_progress(ContentType::Gif, 1, 1, 50, 100, test_metadata());
+        assert_eq!(cache.contiguous_len(1, 1), 50);
     }
 
     #[test]
-    fn out_of_order_chunk_writes_but_does_not_advance_watermark_until_gap_closes() {
-        let dir = temp_cache_dir("out_of_order");
-        let mut cache = RichContentCache::new(dir.clone());
+    fn record_progress_never_moves_the_watermark_backward() {
+        let mut cache = RichContentCache::new();
 
-        // Chunk 2 (offset 6) arrives before chunk 1 (offset 0) — write
-        // succeeds, but the watermark must stay at 0 since bytes 0..6
-        // are still missing.
-        let len_after_second = apply_test_chunk(&mut cache, 1, 1, 6, b"world").unwrap();
-        assert_eq!(len_after_second, 0, "watermark must not advance past a gap");
+        cache.record_progress(ContentType::Gif, 1, 1, 50, 100, test_metadata());
+        assert_eq!(cache.contiguous_len(1, 1), 50);
 
-        // Now the gap-filling chunk arrives — watermark should jump all
-        // the way to the end, absorbing the already-written pending range.
-        let len_after_first = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
-        assert_eq!(len_after_first, 11, "watermark must absorb the pending range once the gap closes");
-
-        let path = cache.path(1, 1).unwrap().to_path_buf();
-        let on_disk = std::fs::read(&path).unwrap();
-        assert_eq!(on_disk, b"hello world", "bytes on disk must be correct regardless of arrival order");
-
-        std::fs::remove_dir_all(&dir).ok();
+        // A later push reporting a SMALLER contiguous_len than already
+        // observed — defense against a hypothetical out-of-order
+        // `Progress` push, not an expected case (see `record_progress`'s
+        // own doc comment).
+        cache.record_progress(ContentType::Gif, 1, 1, 10, 100, test_metadata());
+        assert_eq!(cache.contiguous_len(1, 1), 50, "watermark must never move backward");
     }
 
     #[test]
     fn different_session_or_file_ids_use_separate_cache_entries() {
-        let dir = temp_cache_dir("separate_entries");
-        let mut cache = RichContentCache::new(dir.clone());
+        let mut cache = RichContentCache::new();
 
-        apply_test_chunk(&mut cache, 1, 1, 0, b"first").unwrap();
-        apply_test_chunk(&mut cache, 2, 1, 0, b"second-session").unwrap();
-        apply_test_chunk(&mut cache, 1, 2, 0, b"second-file").unwrap();
+        cache.record_progress(ContentType::Gif, 1, 1, 5, 5, test_metadata());
+        cache.record_progress(ContentType::Gif, 2, 1, 14, 14, test_metadata());
+        cache.record_progress(ContentType::Gif, 1, 2, 11, 11, test_metadata());
 
         assert_eq!(cache.contiguous_len(1, 1), 5);
         assert_eq!(cache.contiguous_len(2, 1), 14);
         assert_eq!(cache.contiguous_len(1, 2), 11);
-        assert_ne!(cache.path(1, 1), cache.path(2, 1));
-        assert_ne!(cache.path(1, 1), cache.path(1, 2));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn unknown_session_file_pair_reports_zero_and_no_path() {
-        let dir = temp_cache_dir("unknown");
-        let cache = RichContentCache::new(dir.clone());
+    fn unknown_session_file_pair_reports_zero_and_no_content_type() {
+        let cache = RichContentCache::new();
         assert_eq!(cache.contiguous_len(99, 99), 0);
-        assert!(cache.path(99, 99).is_none());
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(cache.content_type(99, 99).is_none());
     }
 
     #[test]
-    fn retransmitted_chunk_at_or_behind_watermark_does_not_move_watermark_backward() {
-        let dir = temp_cache_dir("retransmit");
-        let mut cache = RichContentCache::new(dir.clone());
+    fn remove_forgets_the_entry_entirely() {
+        let mut cache = RichContentCache::new();
+        cache.record_progress(ContentType::Png, 1, 1, 10, 10, test_metadata());
+        assert!(cache.content_type(1, 1).is_some());
 
-        apply_test_chunk(&mut cache, 1, 1, 0, b"hello world").unwrap();
-        assert_eq!(cache.contiguous_len(1, 1), 11);
+        cache.remove(1, 1);
 
-        // Re-apply the first half again (offset 0, shorter payload) —
-        // watermark must not regress even though this chunk's own
-        // `chunk_end` (6) is less than the current watermark (11).
-        let len = apply_test_chunk(&mut cache, 1, 1, 0, b"hello ").unwrap();
-        assert_eq!(len, 11, "watermark must never move backward on a retransmit");
-
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(cache.content_type(1, 1).is_none());
+        assert_eq!(cache.contiguous_len(1, 1), 0);
+        assert!(cache.all_known_ids().is_empty());
     }
 
     #[test]
-    fn extension_matches_content_type() {
-        let dir = temp_cache_dir("extension");
-        let mut cache = RichContentCache::new(dir.clone());
-        apply_test_chunk(&mut cache, 1, 1, 0, b"x").unwrap();
-        let path = cache.path(1, 1).unwrap();
-        assert_eq!(path.extension().unwrap(), "gif");
-        std::fs::remove_dir_all(&dir).ok();
+    fn image_size_px_is_seeded_from_the_first_progress_push_only() {
+        let mut cache = RichContentCache::new();
+        let metadata = ContentMetadata::Image { width_px: 90, height_px: 60, color_bits: 32, is_animated: false };
+        cache.record_progress(ContentType::Png, 1, 1, 10, 10, metadata);
+        assert_eq!(cache.image_size_px(1, 1), Some((90, 60)));
+
+        // A later push with different metadata must NOT overwrite the
+        // dimensions already seeded — a real sender's own metadata never
+        // actually changes mid-transfer (see `record_progress`'s own doc
+        // comment), so this only matters for a malformed/adversarial
+        // later push, which must not corrupt an already-correct value.
+        let different_metadata = ContentMetadata::Image { width_px: 1, height_px: 1, color_bits: 32, is_animated: false };
+        cache.record_progress(ContentType::Png, 1, 1, 10, 10, different_metadata);
+        assert_eq!(cache.image_size_px(1, 1), Some((90, 60)));
     }
 }

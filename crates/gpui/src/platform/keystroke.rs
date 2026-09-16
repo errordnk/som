@@ -39,7 +39,7 @@ pub struct Keystroke {
     /// Deliberately excluded from `PartialEq`/`Eq`/`Hash` (see the manual
     /// impls below): keymap matching and every existing binding must keep
     /// working exactly as before, independent of which physical "1" was
-    /// pressed. Purely informational, for tools like `som-key`.
+    /// pressed. Purely informational, for tools like `somkey`.
     #[serde(default)]
     pub is_numpad: bool,
 
@@ -532,7 +532,7 @@ pub struct Modifiers {
     /// existing binding (`"ctrl-c"`, etc.) must keep working exactly as
     /// before, independent of which physical Ctrl/Shift/Cmd/Alt was
     /// pressed. This field is purely informational, for tools like
-    /// `som-key` that need to tell left-Shift from right-Shift.
+    /// `somkey` that need to tell left-Shift from right-Shift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side: Option<Side>,
 }
@@ -772,7 +772,7 @@ pub struct Numlock {
 /// keyboards mostly lack a physical Scroll Lock key, and the OS state can
 /// still be toggled (e.g. a Print Screen/Scroll Lock combo key, or a
 /// software toggle), but it has no effect on typed characters the way
-/// capslock/numlock do — this exists purely so tools like `som-key` can
+/// capslock/numlock do — this exists purely so tools like `somkey` can
 /// show the indicator, not because any keybinding logic depends on it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize, Hash, JsonSchema)]
 pub struct Scrolllock {

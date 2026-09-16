@@ -45,21 +45,23 @@ use rust_embed::RustEmbed;
 // placement the same way `current_frame()` already reuses a single
 // `Arc<RenderImage>` across repeated paints.
 #[include = "images/dna.png"]
-// Pre-built som-srv binaries for every remote platform Som's `tmux: true`
+// Pre-built somsrv binaries for every remote platform Som's `tmux: true`
 // profiles support (Windows amd64, macOS arm64, Linux amd64 — NOT
-// linux-arm, which stays permanently unsupported) — see `som_srv::
-// protocol::ensure_embedded_binary_extracted`, which writes these bytes out
-// to `~/.config/som/srv/{platform}/` on demand. Kept up to date by
-// `scripts/update-srv-binaries.sh` (dev-only, manually run before a
+// linux-arm, which stays permanently unsupported) — see
+// `terminal_view::terminal_panel::stage_embedded_somsrv_to_temp_file`,
+// which writes these bytes out to a throwaway temp file for the duration
+// of a single `scp` deploy (no permanent on-disk cache). Kept up to date
+// by `scripts/update-somsrv-binaries.sh` (dev-only, manually run before a
 // release), not built here or in CI.
-#[include = "srv/windows-amd/som-srv.exe"]
-#[include = "srv/macos-arm/som-srv"]
-#[include = "srv/linux-amd/som-srv"]
+#[include = "srv/windows-amd/somsrv.exe"]
+#[include = "srv/macos-arm/somsrv"]
+#[include = "srv/linux-amd/somsrv"]
 // The Windows Terminal project's improved ConPTY backend — see `crates/zed/
 // build.rs`'s doc comment for where these are downloaded from (a pinned
 // nupkg version) and `crates/zed/src/main.rs`'s startup extraction, which
-// writes these bytes out to `~/.config/som/conpty/` (never next to som.exe
-// itself, so Som stays runnable from an arbitrary/read-only directory) and
+// writes these bytes out to `paths::data_dir().join("conpty")` (never
+// next to som.exe itself, so Som stays runnable from an arbitrary/read-
+// only directory) and
 // points `SetDllDirectoryW` there before any terminal is created. Refreshed
 // manually by copying `target/release/{conpty.dll,OpenConsole.exe}` here
 // whenever build.rs's pinned `conpty_url` version bumps — not automated.
@@ -72,7 +74,7 @@ use rust_embed::RustEmbed;
 // selection for the exact list and why) rather than FFmpeg's full
 // default catalog of several hundred codecs/formats/filters/encoders.
 // Built natively per-platform (never cross-compiled — see
-// `project_som_tmux`'s same rule for som-srv binaries). Windows built
+// `project_som_tmux`'s same rule for somsrv binaries). Windows built
 // via vcpkg's MSVC port (`cl.exe`, not MinGW) so no GNU toolchain is
 // required on the dev machine.
 //
@@ -82,8 +84,9 @@ use rust_embed::RustEmbed;
 // other embedded asset in this crate, and DLL machine code compresses
 // well under zstd — worth the one-time decompression cost at startup
 // (see `decompress_zst` below) to keep that weight out of `som.exe`
-// itself. Lazily extracted-and-decompressed to `~/.config/som/ffmpeg/`
-// by `ensure_ffmpeg_extracted_and_wired` in `crates/zed/src/main.rs`,
+// itself. Lazily extracted-and-decompressed to `paths::data_dir().join(
+// "ffmpeg")` by `ensure_ffmpeg_extracted_and_wired` in `crates/terminal/
+// src/rich_content_video_player.rs`,
 // same lazy-extraction pattern `conpty/` above uses, just with a
 // decompression step in between. macOS/Linux builds not yet added.
 //

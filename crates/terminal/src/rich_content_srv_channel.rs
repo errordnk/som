@@ -1,6 +1,6 @@
-//! Som's side of the `som-srv` binary side-channel: a background OS
+//! Som's side of the `somsrv` binary side-channel: a background OS
 //! thread per `(session_id, file_id)` placement, connecting to the local
-//! `som-srv` daemon, subscribing to `SrvResponse::Progress` pushes, and
+//! `somsrv` daemon, subscribing to `SrvResponse::Progress` pushes, and
 //! forwarding `SrvRequest::RequestByteRange` when playback needs to seek
 //! past what's arrived sequentially. Mirrors `rich_content_audio_player`'s
 //! own `AudioTransferProgress` shape exactly (a plain `Arc`-shared,
@@ -17,7 +17,7 @@
 //! itself already knew `content_type`/`ContentMetadata` before this
 //! thread's data ever mattered (they arrived via the OLD APC/`Chunk`
 //! parsing, in the SAME UI-thread call that also updated
-//! `RichContentCache`). Now that chunks/metadata arrive over `som-srv`
+//! `RichContentCache`). Now that chunks/metadata arrive over `somsrv`
 //! instead, `content_type`/`ContentMetadata` themselves have to travel
 //! from this background thread to the UI thread too — hence the
 //! `Mutex<Option<(ContentType, ContentMetadata)>>` here, checked once per
@@ -25,7 +25,7 @@
 //! to `RichContentCache::record_progress` the first time it's non-`None`.
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
-use som_srv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
+use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,12 +62,12 @@ use std::sync::{Mutex, MutexGuard};
 const CONSUMED_RETENTION_WINDOW: u64 = 256 * 1024 * 1024;
 
 /// Shared, thread-safe state for one `(session_id, file_id)` placement's
-/// `som-srv` side-channel connection — see this module's own doc comment
+/// `somsrv` side-channel connection — see this module's own doc comment
 /// for the full reasoning.
 #[derive(Default)]
 pub struct SrvProgressState {
     contiguous_len: AtomicU64,
-    /// See `som_srv::protocol::SrvResponse::Progress::tail_available_from`'s
+    /// See `somsrv::protocol::SrvResponse::Progress::tail_available_from`'s
     /// own doc comment — defaults to 0 (not `total_size`) until the first
     /// `Progress` push arrives, same "nothing known yet" convention
     /// `contiguous_len`'s own 0 default already uses; `total_size()`
@@ -75,10 +75,10 @@ pub struct SrvProgressState {
     /// tail-availability check (`total_size > 0 && tail_available_from
     /// <= total_size`) can't false-positive on this default pair.
     tail_available_from: AtomicU64,
-    /// See `som_srv::protocol::SrvResponse::Progress::pending_ranges`'s
+    /// See `somsrv::protocol::SrvResponse::Progress::pending_ranges`'s
     /// own doc comment — the latest snapshot from the most recent
     /// `Progress` push, overwritten wholesale on each push (not merged
-    /// locally) since `som-srv` is the single source of truth for this
+    /// locally) since `somsrv` is the single source of truth for this
     /// list.
     pending_ranges: Mutex<Vec<(u64, u64)>>,
     total_size: AtomicU64,
@@ -87,7 +87,7 @@ pub struct SrvProgressState {
     /// `Some`, seeding `RichContentCache`'s entry for this key; every
     /// later push updates `contiguous_len`/`total_size` above but leaves
     /// this alone; content type/metadata are established once, not
-    /// tracked as a live-changing value (see `som_srv::protocol::
+    /// tracked as a live-changing value (see `somsrv::protocol::
     /// SrvRequest::PutChunk`'s own doc comment: a real sender's metadata
     /// never actually changes mid-transfer).
     metadata: Mutex<Option<(ContentType, ContentMetadata)>>,
@@ -107,7 +107,7 @@ pub struct SrvProgressState {
     stop_playback_requested: AtomicBool,
     /// The actual bytes this placement has received so far, forward-only
     /// — replaces what used to be a full on-disk copy of the source file
-    /// (`som-srv`'s `SrvCache` no longer persists chunks to disk at all,
+    /// (`somsrv`'s `SrvCache` no longer persists chunks to disk at all,
     /// see that module's own doc comment for the incident that motivated
     /// this: a 16GB video's disk-cache copy exhausted real disk space and
     /// the file simply never played). `buffer_start_offset` is the
@@ -150,6 +150,10 @@ pub struct SrvProgressState {
     /// that genuinely doesn't know the extension sends, not "not seen
     /// yet."
     extension: Mutex<Option<String>>,
+    /// Set once [`Self::request_whole_range_once_if_needed`] has fired a
+    /// `RequestByteRange` for this placement — see that method's own doc
+    /// comment for the race it closes and why this must only fire once.
+    whole_range_requested: AtomicBool,
 }
 
 impl SrvProgressState {
@@ -209,7 +213,7 @@ impl SrvProgressState {
 
     /// Appends one chunk's bytes at `chunk_offset` — called by [`run`]
     /// for every `SrvResponse::Progress` push, mirroring exactly what
-    /// `som-srv`'s own `SrvCache::put_chunk` forwards. Chunks that land
+    /// `somsrv`'s own `SrvCache::put_chunk` forwards. Chunks that land
     /// contiguously at (or behind) the buffer's own current tail are
     /// appended normally. A chunk landing AHEAD of the tail is normally
     /// dropped (an ordinary sequential chunk racing ahead of where this
@@ -278,7 +282,7 @@ impl SrvProgressState {
     /// to `data.len()`, the entire buffer populated at offset 0) — lets
     /// `rich_content_video_player`/`rich_content_audio_player`'s own unit
     /// tests exercise a real decoder against a real fixture without
-    /// standing up an actual `som-srv` connection, mirroring what
+    /// standing up an actual `somsrv` connection, mirroring what
     /// `open_test_player`'s old `std::fs::read`-a-fixture-then-pass-a-
     /// path shape used to do before there was no path to pass anymore.
     /// Test-only convenience: sets just the extension, for a test that
@@ -335,7 +339,7 @@ impl SrvProgressState {
     /// disk on this dev machine reads a 16GB file fast enough (page-cache
     /// hit, several GB/s) that an unthrottled version of this loop grew
     /// this test's own process to multiple GB of RAM — nowhere near a
-    /// real `som-srv` daemon's behavior (which paces `PutChunk`s to
+    /// real `somsrv` daemon's behavior (which paces `PutChunk`s to
     /// actual network/read throughput, never blasts a whole file through
     /// as fast as a local disk allows), so an unthrottled test helper was
     /// exercising a code path production never hits.
@@ -418,23 +422,6 @@ impl SrvProgressState {
         self.lock_metadata().take()
     }
 
-    /// Puts metadata back after a failed [`Self::take_metadata`] consumer
-    /// — needed because `RichContentCache::record_progress` opens the
-    /// `som-srv` cache FILE on disk the first time it sees a given id,
-    /// and that file is written by the daemon asynchronously; if `Terminal::
-    /// ensure_rich_content_srv_subscription` calls it before the daemon
-    /// has created the file yet, `record_progress` fails and — without
-    /// this — the metadata `take_metadata` already consumed would be lost
-    /// forever (it's a one-shot `Option`), permanently stranding this
-    /// placement: no `RichContentCache` entry ever gets created, so
-    /// `rich_content_markdown_placements`/equivalents never see it.
-    /// Confirmed live: a markdown file whose placeholder grid scrolled
-    /// off-screen before the daemon's cache file existed hit exactly this
-    /// race and never rendered.
-    pub fn restore_metadata(&self, metadata: (ContentType, ContentMetadata)) {
-        *self.lock_metadata() = Some(metadata);
-    }
-
     fn lock_metadata(&self) -> MutexGuard<'_, Option<(ContentType, ContentMetadata)>> {
         self.metadata.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -450,10 +437,66 @@ impl SrvProgressState {
     pub fn take_stop_playback_requested(&self) -> bool {
         self.stop_playback_requested.swap(false, Ordering::AcqRel)
     }
+
+    /// Copies out every contiguous byte received so far (up to
+    /// [`Self::contiguous_len`]), starting from `buffer_start_offset` —
+    /// the byte-slice equivalent of [`Self::read_buffered`] for callers
+    /// that want a plain `Vec<u8>` to decode against (image/GIF/markdown
+    /// decoders all expect a `&[u8]`/`Read`, not a fixed-size-buffer
+    /// fill), rather than a caller-supplied buffer of a specific size.
+    /// Used only for content types that are small enough in practice
+    /// (images, GIFs, markdown) that a full copy per refresh check is
+    /// cheap — video/audio never call this, they use `read_buffered`'s
+    /// zero-copy-into-caller-buffer shape via `GrowingFileStream` instead.
+    pub fn bytes_received_so_far(&self) -> Vec<u8> {
+        let buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        let start = self.buffer_start_offset.load(Ordering::Acquire);
+        let contiguous_len = self.contiguous_len();
+        if contiguous_len <= start {
+            return Vec::new();
+        }
+        let len = ((contiguous_len - start) as usize).min(buffer.len());
+        buffer.iter().take(len).copied().collect()
+    }
+
+    /// Fires a one-time `SrvRequest::RequestByteRange` for the WHOLE file
+    /// (`0..total_size`) if this placement's watermark says bytes have
+    /// arrived (`contiguous_len() > 0`) but the local buffer is actually
+    /// empty — the exact gap `somsrv::srv_cache::SrvCache::subscribe`'s
+    /// own doc comment describes: a late subscriber (Som noticing a
+    /// placeholder only after `somcat` already finished streaming a
+    /// small/fast image, GIF, or markdown file and disconnected) gets a
+    /// watermark-only replay with no actual bytes, since this buffer
+    /// (unlike the old on-disk `RichContentCache` path) has nothing to
+    /// read until it's told to fetch. Image/GIF/markdown have no seek
+    /// widget and therefore no other path that would ever issue this
+    /// request on their behalf the way `GrowingFileStream::read` does for
+    /// video/audio's on-demand fetches — this is the ONE-TIME equivalent
+    /// for a whole-file catch-up instead of a fixed-size on-demand
+    /// window. Gated by `whole_range_requested` so a placement that
+    /// legitimately has zero bytes yet (a real transfer still in
+    /// progress) doesn't get spammed with a redundant request on every
+    /// poll — one request is enough; the reply arrives as an ordinary
+    /// `Progress` push on the existing subscription connection.
+    pub fn request_whole_range_once_if_needed(&self, session_id: u32, file_id: u32) {
+        let contiguous_len = self.contiguous_len();
+        if contiguous_len == 0 {
+            return;
+        }
+        let buffer_len = self.buffer.lock().unwrap_or_else(|p| p.into_inner()).len() as u64;
+        if buffer_len > 0 {
+            return;
+        }
+        if self.whole_range_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let total_size = self.total_size().max(contiguous_len);
+        request_byte_range(session_id, file_id, 0, total_size);
+    }
 }
 
-fn to_terminal_content_type(content_type: som_srv::protocol::ContentType) -> ContentType {
-    use som_srv::protocol::ContentType as T;
+fn to_terminal_content_type(content_type: somsrv::protocol::ContentType) -> ContentType {
+    use somsrv::protocol::ContentType as T;
     match content_type {
         T::Gif => ContentType::Gif,
         T::Audio => ContentType::Audio,
@@ -464,8 +507,8 @@ fn to_terminal_content_type(content_type: som_srv::protocol::ContentType) -> Con
     }
 }
 
-fn to_terminal_metadata(metadata: som_srv::protocol::ContentMetadata) -> ContentMetadata {
-    use som_srv::protocol::ContentMetadata as M;
+fn to_terminal_metadata(metadata: somsrv::protocol::ContentMetadata) -> ContentMetadata {
+    use somsrv::protocol::ContentMetadata as M;
     match metadata {
         M::Image { width_px, height_px, color_bits, is_animated } => {
             ContentMetadata::Image { width_px, height_px, color_bits, is_animated }
@@ -495,17 +538,17 @@ fn to_terminal_metadata(metadata: som_srv::protocol::ContentMetadata) -> Content
 /// content type, matching the "empty means unknown" convention `Video`/
 /// `Audio`'s own `extension` field already uses for a sender that
 /// genuinely doesn't know it.
-fn extension_from_metadata(metadata: &som_srv::protocol::ContentMetadata) -> String {
-    use som_srv::protocol::ContentMetadata as M;
+fn extension_from_metadata(metadata: &somsrv::protocol::ContentMetadata) -> String {
+    use somsrv::protocol::ContentMetadata as M;
     match metadata {
         M::Video { extension, .. } | M::Audio { extension, .. } => extension.clone(),
         M::Image { .. } | M::Markdown => String::new(),
     }
 }
 
-fn to_terminal_video_codec(codec: som_srv::protocol::VideoCodec) -> crate::rich_content_transport::VideoCodec {
+fn to_terminal_video_codec(codec: somsrv::protocol::VideoCodec) -> crate::rich_content_transport::VideoCodec {
     use crate::rich_content_transport::VideoCodec as C;
-    use som_srv::protocol::VideoCodec as T;
+    use somsrv::protocol::VideoCodec as T;
     match codec {
         T::Unknown => C::Unknown,
         T::H264 => C::H264,
@@ -517,7 +560,7 @@ fn to_terminal_video_codec(codec: som_srv::protocol::VideoCodec) -> crate::rich_
 }
 
 /// Spawns the background thread for one `(session_id, file_id)`
-/// placement: connects to the local `som-srv` daemon, sends
+/// placement: connects to the local `somsrv` daemon, sends
 /// `SrvRequest::SubscribeProgress`, then loops reading `SrvResponse::
 /// Progress` pushes and applying them to `state` for as long as the
 /// connection stays open and `state.stop()` hasn't been called.
@@ -534,19 +577,19 @@ pub fn spawn_progress_listener(session_id: u32, file_id: u32) -> Arc<SrvProgress
     let thread_state = state.clone();
     std::thread::spawn(move || {
         if let Err(err) = run(session_id, file_id, &thread_state) {
-            log::debug!("som-srv progress listener for {session_id:#x}:{file_id:#x} ended: {err:#}");
+            log::debug!("somsrv progress listener for {session_id:#x}:{file_id:#x} ended: {err:#}");
         }
     });
     state
 }
 
 /// Sends `SrvRequest::RequestByteRange` on a FRESH, one-shot connection
-/// to `som-srv` — deliberately not reusing `spawn_progress_listener`'s
+/// to `somsrv` — deliberately not reusing `spawn_progress_listener`'s
 /// long-lived subscription connection, since that connection's whole
 /// thread is parked in a blocking read waiting for `Progress` pushes and
 /// has no opportunity to also write a request without a second thread's
 /// worth of coordination for a request that's sent rarely (only on an
-/// explicit seek). `som-srv` accepts `RequestByteRange` on any `Srv`-kind
+/// explicit seek). `somsrv` accepts `RequestByteRange` on any `Srv`-kind
 /// connection, not just the one that sent `SubscribeProgress` (see
 /// `server::handle_srv_request`'s match arms — the two aren't tied to
 /// the same connection at the protocol level), so a short-lived
@@ -575,7 +618,7 @@ pub fn spawn_progress_listener(session_id: u32, file_id: u32) -> Arc<SrvProgress
 pub fn request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) {
     std::thread::spawn(move || {
         if let Err(err) = try_request_byte_range(session_id, file_id, offset, len) {
-            log::debug!("failed to send som-srv RequestByteRange for {session_id:#x}:{file_id:#x}: {err:#}");
+            log::debug!("failed to send somsrv RequestByteRange for {session_id:#x}:{file_id:#x}: {err:#}");
         }
     });
 }
@@ -600,7 +643,7 @@ fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) 
 pub fn end_playback(session_id: u32, file_id: u32) {
     std::thread::spawn(move || {
         if let Err(err) = try_end_playback(session_id, file_id) {
-            log::debug!("failed to send som-srv EndPlayback for {session_id:#x}:{file_id:#x}: {err:#}");
+            log::debug!("failed to send somsrv EndPlayback for {session_id:#x}:{file_id:#x}: {err:#}");
         }
     });
 }
@@ -608,6 +651,32 @@ pub fn end_playback(session_id: u32, file_id: u32) {
 fn try_end_playback(session_id: u32, file_id: u32) -> anyhow::Result<()> {
     let connection = connect_and_handshake()?;
     send(&connection, &SrvRequest::EndPlayback { session_id, file_id })?;
+    Ok(())
+}
+
+/// Tells `somsrv` to push `SrvResponse::Unsubscribed` to whichever
+/// connection currently subscribes to `(session_id, file_id)` — see
+/// `SrvRequest::UnsubscribeProgress`'s own doc comment for why: it's the
+/// only way to unblock that connection's OWN blocking `read_message()`
+/// call from the outside, needed so [`run`]'s background thread actually
+/// exits once [`SrvProgressState::stop`] has been called for an evicted
+/// image/GIF/markdown placement, rather than leaking a thread blocked
+/// forever waiting for a `Progress` push that will never arrive (the
+/// transfer has virtually always already finished by the time eviction
+/// fires for these content types). Same fire-and-forget-on-a-background-
+/// thread shape as [`end_playback`]/[`request_byte_range`] — the caller
+/// has no return value to wait for.
+pub fn unsubscribe(session_id: u32, file_id: u32) {
+    std::thread::spawn(move || {
+        if let Err(err) = try_unsubscribe(session_id, file_id) {
+            log::debug!("failed to send somsrv UnsubscribeProgress for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
+}
+
+fn try_unsubscribe(session_id: u32, file_id: u32) -> anyhow::Result<()> {
+    let connection = connect_and_handshake()?;
+    send(&connection, &SrvRequest::UnsubscribeProgress { session_id, file_id })?;
     Ok(())
 }
 
@@ -625,11 +694,21 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             SrvResponse::Progress { session_id: response_session, file_id: response_file, contiguous_len, tail_available_from, pending_ranges, total_size, content_type, metadata, chunk_offset, chunk_data }
                 if response_session == session_id && response_file == file_id =>
             {
-                state.contiguous_len.store(contiguous_len, Ordering::Release);
                 state.tail_available_from.store(tail_available_from, Ordering::Release);
                 *state.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()) = pending_ranges;
                 state.total_size.store(total_size, Ordering::Release);
                 state.append_chunk(chunk_offset, &chunk_data);
+                // Store `contiguous_len` LAST, after the bytes it
+                // describes are already in `buffer` — `read_buffered`/
+                // `bytes_received_so_far` trust `contiguous_len()` as the
+                // upper bound of what's safe to read, so publishing it
+                // before `append_chunk` finishes would let a concurrent
+                // reader observe a watermark ahead of the actual buffered
+                // bytes (confirmed live: this exact ordering produced an
+                // empty markdown render cached forever, since `contiguous_
+                // len` alone gates `RichContentMarkdownPlayer::refresh_or_
+                // create`'s re-render).
+                state.contiguous_len.store(contiguous_len, Ordering::Release);
                 let mut extension_guard = state.extension.lock().unwrap_or_else(|p| p.into_inner());
                 if extension_guard.is_none() {
                     *extension_guard = Some(extension_from_metadata(&metadata));
@@ -645,30 +724,42 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             {
                 state.stop_playback_requested.store(true, Ordering::Release);
             },
+            // The daemon's direct reply to our own `UnsubscribeProgress`
+            // (see that variant's own doc comment) — this connection is
+            // done; return immediately rather than looping back to
+            // `state.stop.load(...)` first (harmless either way since
+            // `stop()` is always called before `unsubscribe()` fires, but
+            // this makes the actual reason for returning explicit at the
+            // call site that triggered it).
+            SrvResponse::Unsubscribed { session_id: response_session, file_id: response_file }
+                if response_session == session_id && response_file == file_id =>
+            {
+                return Ok(());
+            },
             _ => continue, // unrelated response — ignore, keep waiting
         }
     }
 }
 
-fn connect_and_handshake() -> anyhow::Result<som_srv::pipe::PipeConnection> {
-    // Same spawn-if-not-running convention every other `som-srv` client
+fn connect_and_handshake() -> anyhow::Result<somsrv::pipe::PipeConnection> {
+    // Same spawn-if-not-running convention every other `somsrv` client
     // in this codebase uses (`somcat::srv_channel::SrvChannel::connect`,
-    // `som_srv::relay`'s own RELAY-side connect) — the daemon binary is
-    // expected next to Som's own executable (see `som_srv::daemon::
+    // `somsrv::relay`'s own RELAY-side connect) — the daemon binary is
+    // expected next to Som's own executable (see `somsrv::daemon::
     // binary_path_next_to_current_exe`'s doc comment for why this one
     // function is shared rather than three independent copies).
-    let daemon_binary = som_srv::daemon::binary_path_next_to_current_exe()?;
-    let connection = som_srv::daemon::connect_or_spawn(&daemon_binary)?;
+    let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe()?;
+    let connection = somsrv::daemon::connect_or_spawn(&daemon_binary)?;
     ConnectionKind::Srv.write_to(&connection)?;
     send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
     let message = connection.read_message()?;
     match serde_json::from_slice::<SrvResponse>(&message)? {
         SrvResponse::Handshake(_) => Ok(connection),
-        other => anyhow::bail!("expected Handshake as som-srv's first reply, got {other:?}"),
+        other => anyhow::bail!("expected Handshake as somsrv's first reply, got {other:?}"),
     }
 }
 
-fn send(connection: &som_srv::pipe::PipeConnection, message: &SrvRequest) -> anyhow::Result<()> {
+fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(message)?;
     connection.write_message(&payload)?;
     Ok(())

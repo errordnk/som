@@ -14,7 +14,7 @@ use windows::Win32::UI::{
 /// subset of keys with a layout-dependent printed character — letters,
 /// digits, and the OEM symbol keys. Used by `key_for_physical` to answer
 /// "what does this physical key print under the *current* layout" without
-/// requiring an actual keypress, which is what lets `som-key` redraw every
+/// requiring an actual keypress, which is what lets `somkey` redraw every
 /// key's label the instant the layout changes instead of only after the
 /// user has pressed it again.
 fn usb_hid_usage_to_windows_vkey(usb_hid_usage: u32) -> Option<VIRTUAL_KEY> {

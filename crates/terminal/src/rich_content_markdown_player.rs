@@ -34,14 +34,12 @@ impl RichContentMarkdownPlayer {
     pub fn rendered(&self) -> &str { &self.rendered }
 }
 
-/// Builds (or refreshes) a [`RichContentMarkdownPlayer`] from `path`,
-/// reading exactly `contiguous_len` bytes (never more — bytes past that
-/// watermark haven't necessarily arrived yet, same gap-tolerance every
-/// other rich-content decode path in this crate already respects) and
-/// running them through [`crate::rich_content_lua_frontend::render`].
-/// Returns `existing` unchanged (`Ok(Some(_))`, cloned-free — the caller
-/// already owns it) if `contiguous_len` hasn't grown since the last call,
-/// same short-circuit `RichContentPlayer::refresh` uses for images.
+/// Builds (or refreshes) a [`RichContentMarkdownPlayer`] from `bytes`
+/// (already sliced to `contiguous_len` by the caller) and running them
+/// through [`crate::rich_content_lua_frontend::render`]. Returns
+/// `existing` unchanged (`Ok(Some(_))`, cloned-free — the caller already
+/// owns it) if `contiguous_len` hasn't grown since the last call, same
+/// short-circuit `RichContentPlayer::refresh` uses for images.
 ///
 /// A non-UTF-8 prefix (a chunk boundary landing mid-codepoint, since
 /// markdown bytes stream in arbitrary-sized pieces same as every other
@@ -50,7 +48,7 @@ impl RichContentMarkdownPlayer {
 /// same way an incomplete GIF frame doesn't fail decoding, it just
 /// doesn't advance past the last complete frame.
 pub fn refresh_or_create(
-    path: &std::path::Path,
+    bytes: &[u8],
     contiguous_len: u64,
     existing: Option<RichContentMarkdownPlayer>,
 ) -> anyhow::Result<Option<RichContentMarkdownPlayer>> {
@@ -62,9 +60,22 @@ pub fn refresh_or_create(
     if contiguous_len == 0 {
         return Ok(None);
     }
+    // `bytes` can momentarily hold FEWER than `contiguous_len` bytes — a
+    // late `SrvProgressState` subscriber's watermark is set from a
+    // `Progress` push's numbers while the actual bytes are still in
+    // flight via a separately-requested `RequestByteRange` reply (see
+    // `SrvProgressState::request_whole_range_once_if_needed`'s own doc
+    // comment for the exact race this covers). Treat this exactly like
+    // "not enough valid content yet" — the same tolerance already
+    // applied below for a mid-codepoint UTF-8 split — rather than
+    // rendering (and permanently caching, via `rendered_through`) a
+    // truncated or empty prefix as if it were the real, final content.
+    if (bytes.len() as u64) < contiguous_len {
+        return Ok(existing);
+    }
 
-    let bytes = read_prefix(path, contiguous_len)?;
-    let Ok(source) = std::str::from_utf8(&bytes) else {
+    let prefix = &bytes[..(contiguous_len as usize).min(bytes.len())];
+    let Ok(source) = std::str::from_utf8(prefix) else {
         return Ok(existing_clone(existing.as_ref().unwrap_or(&RichContentMarkdownPlayer { rendered: String::new(), rendered_through: 0 })));
     };
     let rendered = crate::rich_content_lua_frontend::render(source)?;
@@ -75,59 +86,30 @@ fn existing_clone(existing: &RichContentMarkdownPlayer) -> Option<RichContentMar
     Some(RichContentMarkdownPlayer { rendered: existing.rendered.clone(), rendered_through: existing.rendered_through })
 }
 
-fn read_prefix(path: &std::path::Path, len: u64) -> anyhow::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn refresh_or_create_renders_a_complete_markdown_file() {
-        let dir = std::env::temp_dir().join(format!("som_markdown_player_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.md");
-        std::fs::write(&path, "# Hello\n\nWorld.").unwrap();
-
-        let player = refresh_or_create(&path, 15, None).unwrap().unwrap();
+        let bytes = b"# Hello\n\nWorld.";
+        let player = refresh_or_create(bytes, bytes.len() as u64, None).unwrap().unwrap();
         assert_eq!(player.rendered(), "# Hello\n\nWorld.");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn refresh_or_create_skips_redecoding_when_contiguous_len_unchanged() {
-        let dir = std::env::temp_dir().join(format!("som_markdown_player_test2_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.md");
-        std::fs::write(&path, "hello").unwrap();
-
-        let first = refresh_or_create(&path, 5, None).unwrap().unwrap();
-        // Overwrite the file on disk — if refresh_or_create actually
-        // re-read it despite contiguous_len being unchanged, this would
-        // show up in the result.
-        std::fs::write(&path, "CHANGED").unwrap();
-        let second = refresh_or_create(&path, 5, Some(first)).unwrap().unwrap();
+        let first = refresh_or_create(b"hello", 5, None).unwrap().unwrap();
+        // A DIFFERENT byte slice, but the SAME contiguous_len — if
+        // refresh_or_create actually re-read it despite contiguous_len
+        // being unchanged, this would show up in the result.
+        let second = refresh_or_create(b"CHANGED", 5, Some(first)).unwrap().unwrap();
         assert_eq!(second.rendered(), "hello");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn refresh_or_create_returns_none_for_zero_contiguous_len() {
-        let dir = std::env::temp_dir().join(format!("som_markdown_player_test3_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.md");
-        std::fs::write(&path, "hello").unwrap();
-
-        let result = refresh_or_create(&path, 0, None).unwrap();
+        let result = refresh_or_create(b"hello", 0, None).unwrap();
         assert!(result.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

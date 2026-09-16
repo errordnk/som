@@ -127,7 +127,16 @@ impl InlineState {
 /// Tables/footnotes/task-list checkboxes render as plain text for now —
 /// full grid/checkbox rendering is a later pass, not blocking on this
 /// one landing.
-pub fn layout_markdown(source: &str) -> Vec<LaidOutLine> {
+///
+/// `wrap` is `None` for callers that don't have a `Window`/`LineWrapperHandle`
+/// on hand (unit tests, anything measuring layout without painting) — in
+/// that case, one `LaidOutLine` per source paragraph/block is returned
+/// exactly as before, unwrapped. When `Some((wrapper, available_width))`,
+/// every paragraph-shaped line whose spans would exceed `available_width`
+/// is split into multiple `LaidOutLine`s via `wrap_paragraph_line` — see
+/// that function's own doc comment for why only paragraph/list/quote text
+/// gets this treatment (headings/code blocks/rules do not).
+pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle, gpui::Pixels)>) -> Vec<LaidOutLine> {
     let parsed = parse_markdown_with_options(source, false, false, false);
     let mut lines: Vec<LaidOutLine> = Vec::new();
     let mut current = LaidOutLine::default();
@@ -339,7 +348,109 @@ pub fn layout_markdown(source: &str) -> Vec<LaidOutLine> {
         finish_line(&mut lines, &mut current, heading_level, in_code_block, in_block_quote_depth > 0);
     }
 
+    let Some((wrapper, available_width)) = wrap else {
+        return lines;
+    };
     lines
+        .into_iter()
+        .flat_map(|line| wrap_paragraph_line(line, wrapper, available_width))
+        .collect()
+}
+
+/// Splits `line` into one or more `LaidOutLine`s so no line's rendered
+/// width exceeds `available_width` — word-wrapping via GPUI's own
+/// `LineWrapper` (font-aware: proportional prose text can't be wrapped
+/// by counting characters, see `crates/gpui/src/text_system/line_wrapper.
+/// rs`'s own doc comment), the same primitive GPUI's built-in `Text`
+/// element uses internally for ordinary proportional text.
+///
+/// Only wraps prose-shaped lines: rules (`is_rule`) and code block lines
+/// (`is_code_block`) are returned unchanged — a rule has no text to wrap
+/// at all, and code block lines are meant to be read as literal
+/// source (wrapping would visually break indentation/alignment a reader
+/// relies on, the same reason no code editor soft-wraps a code block by
+/// default). Headings, list items, and block quotes DO wrap — a long
+/// heading or list item is exactly as likely to overflow a narrow pane
+/// as an ordinary paragraph.
+///
+/// Continuation lines (every line after the first produced from one
+/// source line) intentionally do NOT repeat `heading_level`/list-marker-
+/// style metadata beyond what's already baked into the first span's own
+/// text (e.g. the bullet/number prefix) — they inherit the same `is_code_
+/// block`/`is_block_quote` flags as the original line (so a wrapped
+/// block-quote's continuation still gets its left bar) but always render
+/// at the same left edge as the first line (no hanging indent) — the
+/// simplest behavior with no strong existing precedent to match in this
+/// codebase (see this module's own doc comment for the "keep it simple"
+/// call this follows).
+fn wrap_paragraph_line(line: LaidOutLine, wrapper: &mut gpui::LineWrapperHandle, available_width: gpui::Pixels) -> Vec<LaidOutLine> {
+    if line.is_rule || line.is_code_block || line.spans.is_empty() {
+        return vec![line];
+    }
+
+    // Flatten this line's spans into one text buffer with byte-offset
+    // boundaries, mirroring exactly how `paint_rich_content_markdown_
+    // widget` already concatenates spans into one shaped line for
+    // painting — `wrap_line` operates on a single flat string, not a
+    // list of styled spans, so wrapping has to happen at this same flat-
+    // text level and then be mapped back onto span boundaries.
+    let mut text = String::new();
+    let mut span_ends = Vec::with_capacity(line.spans.len());
+    for span in &line.spans {
+        text.push_str(&span.text);
+        span_ends.push(text.len());
+    }
+
+    let boundaries: Vec<usize> =
+        wrapper.wrap_line(&[gpui::LineFragment::text(&text)], available_width).map(|boundary| boundary.ix).collect();
+    if boundaries.is_empty() {
+        return vec![line];
+    }
+
+    let mut result = Vec::with_capacity(boundaries.len() + 1);
+    let mut cut_start = 0usize;
+    let mut span_cursor = 0usize; // index into `line.spans`/`span_ends` of the first span not yet fully consumed
+    let mut span_offset = 0usize; // byte offset into the CURRENT span's own text already consumed by earlier cuts
+
+    for cut_end in boundaries.into_iter().chain(std::iter::once(text.len())) {
+        if cut_end <= cut_start {
+            continue;
+        }
+        let mut spans = Vec::new();
+        let mut remaining = cut_end - cut_start;
+        while remaining > 0 && span_cursor < line.spans.len() {
+            let span = &line.spans[span_cursor];
+            let span_text_len = span.text.len() - span_offset;
+            let take = remaining.min(span_text_len);
+            let piece = &span.text[span_offset..span_offset + take];
+            if !piece.is_empty() {
+                spans.push(StyledSpan { text: piece.to_string(), ..span.clone() });
+            }
+            span_offset += take;
+            remaining -= take;
+            if span_offset >= span.text.len() {
+                span_cursor += 1;
+                span_offset = 0;
+            }
+        }
+        // Trim a single leading space left over from where `wrap_line`
+        // broke on a space boundary — the space itself did its job
+        // (marking where the wrap could happen) and shouldn't become a
+        // visible leading gap on the continuation line.
+        if let Some(first) = spans.first_mut() {
+            first.text = first.text.trim_start_matches(' ').to_string();
+        }
+        result.push(LaidOutLine {
+            spans,
+            heading_level: line.heading_level,
+            is_rule: false,
+            is_code_block: false,
+            is_block_quote: line.is_block_quote,
+        });
+        cut_start = cut_end;
+    }
+
+    if result.is_empty() { vec![line] } else { result }
 }
 
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {
@@ -376,9 +487,71 @@ fn event_text(event: &MarkdownEvent, source: &str, range: &std::ops::Range<usize
 mod tests {
     use super::*;
 
+    fn build_wrapper(font_size: gpui::Pixels) -> (gpui::TestAppContext, gpui::LineWrapperHandle) {
+        let dispatcher = gpui::TestDispatcher::new(0);
+        let cx = gpui::TestAppContext::build(dispatcher, None);
+        let wrapper = cx.update(|cx| cx.text_system().line_wrapper(gpui::font("Helvetica"), font_size));
+        (cx, wrapper)
+    }
+
+    #[test]
+    fn unwrapped_paragraph_fitting_the_width_stays_one_line() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let lines = layout_markdown("short line", Some((&mut wrapper, gpui::px(500.))));
+        assert_eq!(lines.len(), 1, "a short paragraph well within the width must not be split");
+    }
+
+    #[test]
+    fn long_paragraph_wraps_into_multiple_lines_at_word_boundaries() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let long_text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+        let lines = layout_markdown(long_text, Some((&mut wrapper, gpui::px(72.))));
+        assert!(lines.len() > 1, "a long paragraph exceeding the width must wrap into multiple lines");
+        // Word boundaries preserved — no line's flattened text splits a
+        // word in half (every line's text, once whitespace-trimmed,
+        // consists of whole "wwww"-shaped tokens from the source).
+        for line in &lines {
+            let flat: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+            for word in flat.split_whitespace() {
+                assert!(long_text.contains(word), "wrapped line contains a word not in the source: {word:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_span_styling_across_the_split() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let text = "plain plain plain **bold bold bold bold** plain plain plain plain";
+        let lines = layout_markdown(text, Some((&mut wrapper, gpui::px(72.))));
+        assert!(lines.len() > 1, "expected this to wrap given the narrow width");
+        assert!(
+            lines.iter().flat_map(|l| &l.spans).any(|s| s.emphasis == SpanEmphasis::Bold),
+            "a bold span split across a wrap boundary must still carry its emphasis on both sides"
+        );
+    }
+
+    #[test]
+    fn rules_and_code_blocks_are_never_wrapped() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let lines = layout_markdown(
+            "```\nthis is a long line of code that would exceed the width if wrapped\n```",
+            Some((&mut wrapper, gpui::px(72.))),
+        );
+        let code_lines: Vec<_> = lines.iter().filter(|l| l.is_code_block).collect();
+        assert_eq!(code_lines.len(), 1, "a code block line must never be split by word-wrap");
+    }
+
+    #[test]
+    fn short_markdown_is_unaffected_by_wrapping() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let with_wrap = layout_markdown("# Title\n\nshort paragraph", Some((&mut wrapper, gpui::px(500.))));
+        let without_wrap = layout_markdown("# Title\n\nshort paragraph", None);
+        assert_eq!(with_wrap.len(), without_wrap.len(), "short markdown that fits should render identically wrapped or not");
+    }
+
     #[test]
     fn plain_paragraph_produces_one_line_no_emphasis() {
-        let lines = layout_markdown("Hello world.");
+        let lines = layout_markdown("Hello world.", None);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 1);
         assert_eq!(lines[0].spans[0].text, "Hello world.");
@@ -387,14 +560,14 @@ mod tests {
 
     #[test]
     fn heading_sets_level_and_bold() {
-        let lines = layout_markdown("# Title");
+        let lines = layout_markdown("# Title", None);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].heading_level, Some(1));
     }
 
     #[test]
     fn bold_and_italic_markers_produce_separate_spans() {
-        let lines = layout_markdown("plain **bold** *italic*");
+        let lines = layout_markdown("plain **bold** *italic*", None);
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
         assert!(spans.iter().any(|s| s.text.contains("bold") && s.emphasis == SpanEmphasis::Bold));
@@ -403,21 +576,21 @@ mod tests {
 
     #[test]
     fn bold_italic_combination_produces_bolditalic() {
-        let lines = layout_markdown("***both***");
+        let lines = layout_markdown("***both***", None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.iter().any(|s| s.emphasis == SpanEmphasis::BoldItalic));
     }
 
     #[test]
     fn inline_code_is_monospace() {
-        let lines = layout_markdown("some `code` here");
+        let lines = layout_markdown("some `code` here", None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.iter().any(|s| s.text == "code" && s.monospace));
     }
 
     #[test]
     fn fenced_code_block_produces_monospace_lines_matching_source() {
-        let lines = layout_markdown("```\nline one\nline two\n```");
+        let lines = layout_markdown("```\nline one\nline two\n```", None);
         let code_lines: Vec<_> = lines.iter().filter(|l| l.is_code_block).collect();
         assert_eq!(code_lines.len(), 2);
         assert_eq!(code_lines[0].spans[0].text, "line one");
@@ -426,7 +599,7 @@ mod tests {
 
     #[test]
     fn unordered_list_items_get_bullet_prefix() {
-        let lines = layout_markdown("- one\n- two");
+        let lines = layout_markdown("- one\n- two", None);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].spans[0].text.starts_with('•'));
         assert!(lines[1].spans[0].text.starts_with('•'));
@@ -434,7 +607,7 @@ mod tests {
 
     #[test]
     fn ordered_list_items_get_numbered_prefix() {
-        let lines = layout_markdown("1. first\n2. second");
+        let lines = layout_markdown("1. first\n2. second", None);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].spans[0].text.starts_with("1."));
         assert!(lines[1].spans[0].text.starts_with("2."));
@@ -442,33 +615,33 @@ mod tests {
 
     #[test]
     fn horizontal_rule_produces_a_dedicated_line() {
-        let lines = layout_markdown("above\n\n---\n\nbelow");
+        let lines = layout_markdown("above\n\n---\n\nbelow", None);
         assert!(lines.iter().any(|l| l.is_rule));
     }
 
     #[test]
     fn blockquote_lines_are_marked() {
-        let lines = layout_markdown("> quoted text");
+        let lines = layout_markdown("> quoted text", None);
         assert!(lines.iter().any(|l| l.is_block_quote && !l.spans.is_empty()));
     }
 
     #[test]
     fn link_text_is_marked_as_link() {
-        let lines = layout_markdown("[click here](https://example.com)");
+        let lines = layout_markdown("[click here](https://example.com)", None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.iter().any(|s| s.is_link && s.text == "click here"));
     }
 
     #[test]
     fn strikethrough_is_marked() {
-        let lines = layout_markdown("~~gone~~");
+        let lines = layout_markdown("~~gone~~", None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.iter().any(|s| s.strikethrough));
     }
 
     #[test]
     fn blank_line_between_paragraphs_is_preserved() {
-        let lines = layout_markdown("first\n\nsecond");
+        let lines = layout_markdown("first\n\nsecond", None);
         assert!(lines.iter().any(|l| l.spans.is_empty() && !l.is_rule));
     }
 }

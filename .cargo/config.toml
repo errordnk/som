@@ -1,5 +1,5 @@
 # FFmpeg for the `ffmpeg-next` / `ffmpeg-sys-next` crates (used by
-# `crates/terminal` and `crates/somcat`) is provided by a local vcpkg
+# `crates/terminal` and `crates/somsrp`) is provided by a local vcpkg
 # tree, probed at build time by the `vcpkg` crate. That probe needs
 # `VCPKG_ROOT` pointing at a tree that contains:
 #   - a `.vcpkg-root` marker file,

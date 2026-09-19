@@ -1,6 +1,6 @@
-//! `somcat` — a minimal terminal image/audio viewer for Som.
+//! `somsrp` — a minimal terminal image/audio viewer for Som.
 //!
-//! Usage: `somcat <file>` or `somcat --srp <file>` (the flag is an explicit
+//! Usage: `somsrp <file>` or `somsrp --srp <file>` (the flag is an explicit
 //! synonym for the default, for anyone who'd rather not rely on an implicit
 //! default).
 //!
@@ -33,7 +33,7 @@ use terminal::kitty_graphics_placeholder;
 const CHUNK_SIZE: usize = 65536;
 
 fn main() {
-    // somcat links ffmpeg-next/ffmpeg-sys-next directly (see `video_metadata`
+    // somsrp links ffmpeg-next/ffmpeg-sys-next directly (see `video_metadata`
     // below) — as its own OS process, it needs the same DLL-search-path
     // wiring `som.exe` does for its embedded video playback, since the two
     // are independent processes and neither's DLL search path is inherited
@@ -55,8 +55,8 @@ fn main() {
     // such heuristic fallback: subtitles default to OFF (`None`) unless
     // explicitly requested, matching every other player-widget's own
     // opt-in convention. Both parsed here (not left to the flags'
-    // position relative to `--srp`/the path) so `somcat -a 1 -s 0 --srp
-    // file.mkv`, `somcat --srp -a 1 file.mkv -s 0`, and every other
+    // position relative to `--srp`/the path) so `somsrp -a 1 -s 0 --srp
+    // file.mkv`, `somsrp --srp -a 1 file.mkv -s 0`, and every other
     // ordering all work identically — these are modifier flags, not
     // positional.
     let mut audio_stream_index: Option<u32> = None;
@@ -66,7 +66,7 @@ fn main() {
     while let Some(arg) = iter.next() {
         if arg == "-a" || arg == "-s" {
             let Some(value) = iter.next() else {
-                eprintln!("usage: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] [--srp] <file>");
+                eprintln!("usage: somsrp [-a <audio-stream-index>] [-s <subtitle-stream-index>] [--srp] <file>");
                 std::process::exit(2);
             };
             let parsed = value.parse::<u32>();
@@ -74,7 +74,7 @@ fn main() {
                 ("-a", Ok(index)) => audio_stream_index = Some(index),
                 ("-s", Ok(index)) => subtitle_stream_index = Some(index),
                 (flag, Err(_)) => {
-                    eprintln!("somcat: {flag} expects a non-negative integer stream index, got {value:?}");
+                    eprintln!("somsrp: {flag} expects a non-negative integer stream index, got {value:?}");
                     std::process::exit(2);
                 },
                 _ => unreachable!(),
@@ -88,8 +88,8 @@ fn main() {
     let path_arg = if explicit_srp { positional.get(1) } else { positional.first() };
     let Some(&path) = path_arg else {
         eprintln!(
-            "usage: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] <file>  \
-             (or: somcat [-a <audio-stream-index>] [-s <subtitle-stream-index>] --srp <file>)"
+            "usage: somsrp [-a <audio-stream-index>] [-s <subtitle-stream-index>] <file>  \
+             (or: somsrp [-a <audio-stream-index>] [-s <subtitle-stream-index>] --srp <file>)"
         );
         std::process::exit(2);
     };
@@ -119,13 +119,13 @@ fn main() {
     // turned out to be silent/invisible rather than the transport itself
     // being broken.
     std::panic::set_hook(Box::new(|info| {
-        eprint!("somcat: panicked: {info}\r\n");
+        eprint!("somsrp: panicked: {info}\r\n");
     }));
 
     let result = stream_file(path, audio_stream_index, subtitle_stream_index);
     drop(raw_guard);
     if let Err(err) = result {
-        eprintln!("somcat: failed to stream {path}: {err}");
+        eprintln!("somsrp: failed to stream {path}: {err}");
         std::process::exit(1);
     }
 }
@@ -173,7 +173,7 @@ fn static_image_metadata(bytes: &[u8]) -> Result<(u32, u32, bool), String> {
 /// container/stream headers without decoding any audio frames.
 /// Decoding and playback both happen on Som's side (it's the only
 /// process guaranteed to be local to the user's speakers, even when this
-/// process is running on a remote SSH host) — `somcat` only needs enough
+/// process is running on a remote SSH host) — `somsrp` only needs enough
 /// to fill `ContentMetadata::Audio` accurately before the first chunk
 /// goes out, same "metadata travels on every chunk" pattern used for
 /// images.
@@ -231,7 +231,7 @@ fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
 /// parameters from the header alone) without decoding a single frame.
 /// `terminal` already links `ffmpeg-next` on Windows (the only platform
 /// with an embedded FFmpeg today — see `crates/assets/src/assets.rs`'s
-/// own doc comment), and `somcat` already depends on `terminal`, so
+/// own doc comment), and `somsrp` already depends on `terminal`, so
 /// this needs no new dependency of its own.
 ///
 /// Reads through a plain `std::fs::File` wrapped in FFmpeg's custom-
@@ -268,7 +268,7 @@ fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
 /// candidate closes this gap without needing per-container attachment-
 /// flag parsing. MUST match `crates/terminal/src/rich_content_video_
 /// player.rs`'s identical `best_video_stream` byte-for-byte (this crate
-/// has no dependency access to that one's private fn) — both `somcat`'s
+/// has no dependency access to that one's private fn) — both `somsrp`'s
 /// own probe here AND Som's real decode thread need to agree on which
 /// stream is "the video," or a probe here could report a different
 /// codec/resolution than what actually plays.
@@ -337,7 +337,7 @@ fn video_metadata(
 /// cell_size_pixels`, answered through `Terminal::process_event`'s
 /// `TextAreaSizeRequest` arm) answer within milliseconds; not answering at
 /// all within this timeout means the terminal doesn't support the query,
-/// same fallback-on-silence assumption `somcat`'s old Kitty capability
+/// same fallback-on-silence assumption `somsrp`'s old Kitty capability
 /// query used.
 ///
 /// This is why `main()` puts stdin in raw mode for the whole process
@@ -499,13 +499,13 @@ fn print_video_placeholder_grid(session_id: u32, file_id: u32, width_px: u32, he
     print_placeholder_grid_with_cell_dims(session_id, file_id, columns, picture_rows + 1)
 }
 
-/// Prints a placeholder grid of an EXPLICIT `columns`x`rows` cell footprint
-/// — used for audio, which has no pixel dimensions to derive a footprint
-/// from at all (unlike images/GIF). Som paints its own fixed-size
-/// play/pause/seek-bar widget into whatever footprint this placeholder
-/// grid reserves, the same way it paints decoded image pixels into an
-/// image's own reserved footprint — see `paint_rich_content_placements`'s
-/// audio branch in `terminal_element.rs`.
+/// Fallback footprint for audio, used only if `query_cell_count()` gets no
+/// reply at all (see `print_placeholder_grid_with_cell_dims`'s own doc
+/// comment — audio's REAL reservation is now always the whole terminal;
+/// Som's paint path centers a compact fixed-size play/pause/seek-bar
+/// widget within that full-terminal footprint, matching this SAME 40x1
+/// figure via its own mirrored constant — see `paint_rich_content_media_
+/// widget`'s doc comment in `terminal_element.rs` for that side).
 const AUDIO_WIDGET_COLUMNS: u32 = 40;
 const AUDIO_WIDGET_ROWS: u32 = 1;
 
@@ -537,81 +537,60 @@ fn print_audio_placeholder_grid(session_id: u32, file_id: u32) -> Result<(), Str
 /// approximate reserved area.
 const MARKDOWN_MAX_COLUMNS: u32 = 9999;
 
-fn print_markdown_placeholder_grid(session_id: u32, file_id: u32, bytes: &[u8]) -> Result<(), String> {
-    // The RENDERED row count (`markdown_line_count::count_rendered_lines`),
-    // not the raw file's newline count — markdown source formatting
-    // (extra blank lines, list item density, etc.) doesn't map 1:1 onto
-    // rendered rows, so reserving `bytes`' own `\n` count left a real,
-    // visible gap between the widget's actual painted content and the
-    // shell's next prompt (confirmed live: a 354-line source file with
-    // several blank-line-heavy sections rendered to far fewer than 354
-    // rows, leaving that many blank reserved rows dangling below the
-    // widget). This crate exists specifically so `somcat` and `terminal_
-    // view::markdown_styling::layout_markdown` count rows the same way
-    // without `somcat` linking the GPUI-dependent `markdown` crate.
-    let source = String::from_utf8_lossy(bytes);
-    // `.max(1)`: an empty/whitespace-only document still needs a
-    // one-row placeholder to open a widget for at all — `count_rendered_
-    // lines` itself returns 0 for empty input (matching `layout_markdown`
-    // exactly), the floor is this caller's own concern, not that
-    // function's.
-    let line_count = markdown_line_count::count_rendered_lines(&source).max(1);
-    // Full document height, NOT clamped to the terminal's current visible
-    // rows — a document taller than the viewport is expected to scroll
-    // (into the terminal's own scrollback, same as any other long output),
-    // not to have its bottom silently cut off. Only the column count is
-    // clamped, independently of rows (NOT `print_placeholder_grid_with_
-    // cell_dims`'s aspect-ratio-preserving scale, which is correct for
-    // images but was wrong here: with a 354-line file and
-    // `MARKDOWN_MAX_COLUMNS` = 9999, that scale factor collapsed `rows`
-    // down to single digits before this fix — see git history).
+/// Prints the INITIAL, minimal placeholder grid for a live markdown
+/// placement — just `MARKDOWN_INITIAL_ROWS` row(s), enough for Som to
+/// discover the id and open a subscription, NOT a predicted final
+/// height. Markdown used to reserve its whole predicted row count up
+/// front (`markdown_line_count::count_rendered_lines`, a lightweight
+/// GPUI-free approximation of `layout_markdown`'s block-level logic) —
+/// removed entirely: that crate could mirror `layout_markdown`'s BLOCK
+/// structure but never its real word-wrap (word-wrap needs real font
+/// metrics and the terminal's actual current pixel width, neither
+/// knowable to a plain CLI at the moment it's invoked), so its
+/// prediction drifted from the real painted height by an amount that
+/// SCALED with document size — confirmed live as visible overlap with
+/// the shell's next prompt. The caller (`stream_file`'s markdown branch)
+/// now keeps this placement's `somsrp` process alive afterward,
+/// registers it as a range-style responder, and grows this SAME grid
+/// row by row on demand via `SrvRequest::GrowMarkdownRows` — see that
+/// variant's own doc comment for the full replacement design. Returns
+/// `(columns, initial_rows)` so the caller can track this placement's
+/// own running row count for subsequent growth calls.
+const MARKDOWN_INITIAL_ROWS: u32 = 1;
+
+fn print_markdown_placeholder_grid(session_id: u32, file_id: u32) -> Result<(u32, u32), String> {
+    // Full terminal width, NOT clamped further — matches the OLD
+    // behavior's column choice exactly (`print_placeholder_grid_with_
+    // cell_dims`'s aspect-ratio scale is for images, wrong here for the
+    // same reason it always was: a real word-wrapped document has no
+    // fixed aspect ratio to preserve).
     let columns = query_cell_count().map(|(c, _)| c).unwrap_or(MARKDOWN_MAX_COLUMNS).min(MARKDOWN_MAX_COLUMNS).max(1);
-    // Bypasses `print_placeholder_grid_with_cell_dims`'s row clamp —
-    // deliberately, per the doc comment above: markdown height is never
-    // trimmed to fit the current viewport, only wired straight to `write_
-    // placeholder_grid_rows`. A document taller than the terminal scrolls
-    // into scrollback like any other long output; Som's own paint path is
-    // responsible for finding placeholder cells there (not just in the
-    // visible viewport) and for widget-local scrolling via Scroll Lock.
-    write_placeholder_grid_rows(session_id, file_id, columns, line_count)
+    write_placeholder_grid_rows(session_id, file_id, columns, MARKDOWN_INITIAL_ROWS)?;
+    Ok((columns, MARKDOWN_INITIAL_ROWS))
 }
 
-fn print_placeholder_grid_with_cell_dims(
-    session_id: u32,
-    file_id: u32,
-    mut columns: u32,
-    mut rows: u32,
-) -> Result<(), String> {
-    // `columns`/`rows` above (for the image caller) assume the image's
-    // terminal cell's pixel dimensions share the same unit — true at DPI
-    // scale 1.0, false on a scaled (e.g. 4K) display where `cell_width`
-    // came back in GPUI's logical pixels while `width_px` is the image
-    // file's physical pixel count. When that mismatch makes the grid wider
-    // than the terminal actually is, the real terminal wraps it mid-row,
-    // scrambling every placeholder cell's decoded (row, column). Query the
-    // terminal's own character grid size and scale the whole placement
-    // down (preserving aspect ratio) to fit both axes, rather than
-    // trusting the pixel-based math alone. Height is clamped to
-    // `terminal_rows - 1`, not `terminal_rows`, so a placement always
-    // leaves at least one real row free below it for the shell's next
-    // prompt — a placement that filled the screen edge-to-edge would push
-    // that prompt out of view entirely until the user scrolled, which
-    // defeats the whole point of printing it inline.
-    if let Some((terminal_columns, terminal_rows)) = query_cell_count() {
-        if columns > terminal_columns {
-            let scale = terminal_columns as f64 / columns as f64;
-            columns = terminal_columns.max(1);
-            rows = ((rows as f64 * scale).floor() as u32).max(1);
-        }
-        let max_rows = terminal_rows.saturating_sub(1).max(1);
-        if rows > max_rows {
-            let scale = max_rows as f64 / rows as f64;
-            rows = max_rows;
-            columns = ((columns as f64 * scale).floor() as u32).max(1);
-        }
-    }
-
-    write_placeholder_grid_rows(session_id, file_id, columns, rows)
+/// Reserves a placeholder grid spanning the terminal's ENTIRE current
+/// size, regardless of `columns`/`rows`' own aspect-ratio-derived values —
+/// top-level content now always occupies the whole terminal (Som's paint
+/// path centers/letterboxes the real decoded content within that
+/// full-terminal box via `fit_into_box`, never stretching it past its own
+/// natural size). `columns`/`rows` are kept as PARAMETERS (not dropped
+/// from the signature) only as the fallback used when `query_cell_count()`
+/// gets no reply at all — the old aspect-derived footprint is still a
+/// reasonable guess in that case, better than guessing a terminal size
+/// outright.
+///
+/// This replaces the OLD behavior of scaling `columns`/`rows` down to fit
+/// within the terminal while clamping height to `terminal_rows - 1` (one
+/// row deliberately left free for the shell's next prompt) — that
+/// reservation no longer leaves room for a prompt at all, which is
+/// intentional: the shell's prompt now only reappears after the user
+/// presses Ctrl+C (see `stream_file`'s image/GIF branch, which now joins
+/// video/audio/markdown's existing live-process wait loop instead of
+/// exiting immediately once its bytes are streamed).
+fn print_placeholder_grid_with_cell_dims(session_id: u32, file_id: u32, columns: u32, rows: u32) -> Result<(), String> {
+    let (columns, rows) = query_cell_count().unwrap_or((columns.max(1), rows.max(1)));
+    write_placeholder_grid_rows(session_id, file_id, columns.max(1), rows.max(1))
 }
 
 // Hard `\r\n` between rows: the terminal's own soft-wrap reflow always
@@ -624,22 +603,68 @@ fn print_placeholder_grid_with_cell_dims(
 // between resizes rather than relying on wrap behavior this protocol
 // doesn't want.
 fn write_placeholder_grid_rows(session_id: u32, file_id: u32, columns: u32, rows: u32) -> Result<(), String> {
+    write_placeholder_grid_rows_from(session_id, file_id, columns, 0, rows)
+}
+
+/// Same as [`write_placeholder_grid_rows`], but encodes rows starting
+/// from `start_row` instead of always `0` — needed by a LIVE markdown
+/// placement growing its own reservation after the fact (see
+/// `SrvRequest::GrowMarkdownRows`'s own doc comment): a second call must
+/// continue the SAME placement's row numbering from where the first call
+/// left off, or the new cells decode as overlapping `row=0..N` and
+/// corrupt `Terminal::markdown_placement_origins`'s `max_row` scan
+/// (which reads `decoded_row` directly off each cell's own diacritics).
+/// Every existing caller still passes `start_row: 0` via the wrapper
+/// above — this function only exists as a separate entry point so that
+/// distinction is explicit at each call site rather than an easily
+/// mis-passed extra argument on the common case.
+///
+/// `encode_cell` returns `None` once `row >= 297` (the diacritics table
+/// has exactly 297 entries — see that function's own doc comment) —
+/// rows at/past that limit are silently skipped rather than panicking,
+/// the same tolerance the inner loop already had for a column past
+/// its own limit. A markdown document long enough to hit this genuinely
+/// cannot reserve any more real placeholder cells; the widget can still
+/// PAINT further rows (painted height never depended on the placeholder
+/// grid's own row count, see `paint_rich_content_markdown_widget`'s
+/// design), only grid-cell-based row discovery/scroll-lock hit-testing
+/// stops growing past this point.
+fn write_placeholder_grid_rows_from(session_id: u32, file_id: u32, columns: u32, start_row: u32, rows: u32) -> Result<(), String> {
     let mut text = String::new();
     let (sr, sg, sb) = id_to_rgb(session_id);
     let (fr, fg, fb) = id_to_rgb(file_id);
     text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-    for row in 0..rows {
+    for offset in 0..rows {
+        let row = start_row + offset;
         for column in 0..columns {
             if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
                 text.extend(cell);
             }
         }
-        if row + 1 < rows {
+        if offset + 1 < rows {
             text.push_str("\r\n");
         }
     }
     text.push_str("\x1b[0m\r\n");
     write_raw_stdout(text.as_bytes())
+}
+
+/// Clears the real terminal and homes the cursor to (row 0, column 0)
+/// before printing a top-level (non-markdown) placeholder grid — `CSI 2J`
+/// (clear entire screen) + `CSI H` (cursor home), both standard ANSI,
+/// already relied upon elsewhere in this codebase's terminal handling.
+/// Needed now that a top-level placement's placeholder grid always spans
+/// the WHOLE terminal (see `print_placeholder_grid_with_cell_dims`'s own
+/// doc comment): Som derives a placement's on-screen origin from wherever
+/// its `(row=0, column=0)` placeholder cell actually sits in the real
+/// terminal grid — homing the cursor first guarantees that's the
+/// terminal's own real top-left corner, with no change needed to that
+/// origin-detection logic on Som's side. Markdown does NOT call this —
+/// markdown's own placement stays left/top-anchored wherever the cursor
+/// was at invocation time, unaffected by this change.
+fn clear_screen_and_home_cursor() {
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 /// Raw mode (`raw_mode::enable`) clears `ENABLE_PROCESSED_INPUT` on
@@ -650,21 +675,25 @@ fn write_placeholder_grid_rows(session_id: u32, file_id: u32, columns: u32, rows
 /// otherwise kill this process. With it off, Ctrl+C arrives as an
 /// ordinary `0x03` byte on stdin like any other byte, and every stdin-
 /// reading loop here needs to check for it explicitly and exit, or a
-/// user's Ctrl+C while `somcat` is still streaming (or waiting on a
+/// user's Ctrl+C while `somsrp` is still streaming (or waiting on a
 /// range query) does nothing at all. Unix's raw mode (`cfmakeraw`) has
 /// the same effect (`ISIG` is cleared), so this applies on both.
 const ETX: u8 = 0x03;
 
 /// Set by [`spawn_ctrlc_watcher`]'s background thread the instant it sees
-/// `ETX` on stdin — checked by [`stream_file_from_disk`]'s own wait loop
-/// to know when to stop answering `RequestByteRange` and exit. Before
-/// this, stdin was only ever read for the two short, one-shot
-/// placeholder-grid handshakes (`query_cell_size_px`/`query_cell_count`),
-/// both of which complete and return well before a large video/audio
-/// file's transfer even starts — nothing was left listening on stdin
-/// during the part of the run that can actually take minutes, so `ETX`'s
-/// own doc comment ("every stdin-reading loop here needs to check for it
-/// explicitly") was true in spirit but incomplete in practice.
+/// `ETX`, `ESC`, or `q`/`Q` on stdin — checked by [`stream_file_from_disk`]'s
+/// own wait loop to know when to stop answering `RequestByteRange` and
+/// exit. Named after Ctrl+C specifically (the first of the three exit
+/// keys this project supported) rather than something more generic —
+/// left as-is since renaming it now would touch every call site for a
+/// purely cosmetic reason. Before this flag existed at all, stdin was
+/// only ever read for the two short, one-shot placeholder-grid
+/// handshakes (`query_cell_size_px`/`query_cell_count`), both of which
+/// complete and return well before a large video/audio file's transfer
+/// even starts — nothing was left listening on stdin during the part of
+/// the run that can actually take minutes, so `ETX`'s own doc comment
+/// ("every stdin-reading loop here needs to check for it explicitly")
+/// was true in spirit but incomplete in practice.
 static CTRL_C_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Spawns a background thread that blocks reading stdin one byte at a
@@ -678,6 +707,25 @@ static CTRL_C_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// placeholder grid before starting the long transfer (see each
 /// branch's own "placeholder grid FIRST" comment), so calling this right
 /// before handing off to `stream_bytes`/`stream_file_from_disk` is safe.
+/// `ESC` (`0x1b`) — one of the three keys that end a live full-terminal
+/// widget's wait loop (see [`spawn_ctrlc_watcher`]'s own doc comment for
+/// why all three share `CTRL_C_REQUESTED` rather than each getting a
+/// separate flag). A bare `ESC` byte here is unambiguous: this watcher
+/// never negotiates terminal capabilities or reads query replies while
+/// it's running (those one-shot reads already completed before this
+/// spawns), so there's no CSI/SS3 escape SEQUENCE this could be mistaken
+/// for the start of — every byte arriving here is a real keypress.
+const ESC: u8 = 0x1b;
+
+/// Watches stdin for any of the three keys that end a live full-terminal
+/// widget's wait loop — `Ctrl+C` (`ETX`), `Escape`, or `q`/`Q` — matching
+/// the same exit convention `vim`/`top`/`mc` already use for a full-
+/// screen view: not every user reaches for Ctrl+C first, and Escape/q are
+/// the more natural instinct for "close this and get my prompt back" in
+/// a pager-like UI. All three set the SAME [`CTRL_C_REQUESTED`] flag
+/// (not a differently-named one) — nothing downstream needs to
+/// distinguish which key was pressed, they're fully equivalent once this
+/// flag is set.
 fn spawn_ctrlc_watcher() {
     std::thread::spawn(|| {
         let mut stdin = std::io::stdin();
@@ -686,7 +734,7 @@ fn spawn_ctrlc_watcher() {
             match stdin.read(&mut byte) {
                 Ok(0) => return, // stdin closed
                 Ok(_) => {
-                    if byte[0] == ETX {
+                    if byte[0] == ETX || byte[0] == ESC || byte[0] == b'q' || byte[0] == b'Q' {
                         CTRL_C_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
                         return;
                     }
@@ -703,7 +751,7 @@ fn spawn_ctrlc_watcher() {
 type SrpIds = (u32, u32);
 
 /// Derives a fresh `(session_id, file_id)` pair for a new SRP transfer.
-/// Both are time-derived so two separate `somcat` invocations rarely
+/// Both are time-derived so two separate `somsrp` invocations rarely
 /// collide on the receiving side's `(session_id, file_id)` cache key.
 /// Masked to 24 bits — this process encodes each id into a placeholder
 /// cell's RGB color (`id_to_rgb` above) for image placements, which only
@@ -841,7 +889,7 @@ fn send_range_chunks_from_disk(
 /// widget's own stop icon) — setting the returned `ended` flag instead of
 /// answering it, letting [`stream_file_from_disk`]'s own wait loop notice
 /// and exit. See that function's own doc comment for the full "why does
-/// `somcat` need to know this at all" reasoning.
+/// `somsrp` need to know this at all" reasoning.
 fn spawn_byte_range_responder_from_disk(
     file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
     content_type: terminal::rich_content_transport::ContentType,
@@ -888,6 +936,73 @@ fn spawn_byte_range_responder_from_disk(
     Ok((stop, ended, handle))
 }
 
+/// Keeps a live markdown placement's `somsrp` process holding the
+/// terminal in the foreground (exactly like `spawn_byte_range_responder_
+/// from_disk` already does for audio/video's pull-model responder),
+/// growing its OWN placeholder grid on demand instead of answering byte-
+/// range requests — see `SrvRequest::GrowMarkdownRows`'s own doc comment
+/// for why this replaced the old `markdown_line_count`-predicted up-
+/// front reservation entirely.
+///
+/// Registers via `SrvRequest::RegisterMarkdownGrower` — DELIBERATELY NOT
+/// the same `RegisterRangeResponder` message the audio/video responder
+/// uses, even though both are "somsrp says where to send me things for
+/// this id": reusing that registration made a late-subscriber
+/// `RequestByteRange` catch-up silently vanish into this thread (which
+/// doesn't understand it) instead of falling through to `somsrv`'s
+/// recent-bytes fallback — confirmed live as the reason markdown never
+/// rendered at all in an early version of this design. `somsrv` routes
+/// `GrowMarkdownRows` here through its own dedicated `markdown_grower_
+/// routes` table, entirely separate from `range_response_routes`.
+///
+/// Tracks this placement's own running row count (`columns` never
+/// changes after the initial grid — only rows grow) so each successive
+/// `GrowMarkdownRows` continues the SAME placement's row numbering via
+/// `write_placeholder_grid_rows_from`'s `start_row`, never restarting
+/// from row 0 (which would corrupt `Terminal::markdown_placement_
+/// origins`'s `max_row` scan — see that function's own doc comment).
+fn spawn_markdown_grower(
+    ids: SrpIds,
+    initial_columns: u32,
+    initial_rows: u32,
+) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (session_id, file_id) = ids;
+    let channel = srv_channel::SrvChannel::connect()?;
+    channel.register_markdown_grower(session_id, file_id)?;
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut printed_rows = initial_rows;
+        loop {
+            if stop_for_thread.load(Ordering::Relaxed) {
+                return;
+            }
+            match channel.read_incoming() {
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::GrowMarkdownRows {
+                    session_id,
+                    file_id,
+                    additional_rows,
+                })) if (session_id, file_id) == ids => {
+                    if write_placeholder_grid_rows_from(session_id, file_id, initial_columns, printed_rows, additional_rows).is_ok() {
+                        printed_rows += additional_rows;
+                    }
+                },
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::EndPlayback { session_id, file_id }))
+                    if (session_id, file_id) == ids =>
+                {
+                    return;
+                },
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+    Ok((stop, handle))
+}
+
 /// Streams `path` (a video or audio file) to Som over SRP by reading it
 /// in [`CHUNK_SIZE`]-sized pieces off disk, instead of [`std::fs::read`]-
 /// ing the whole file into memory first — the fix for a real, live-
@@ -908,19 +1023,19 @@ fn spawn_byte_range_responder_from_disk(
 /// both operate on an in-memory byte slice) and are typically small
 /// enough that this was never the bottleneck those formats have.
 ///
-/// Streams `path` PULL-STYLE: `somcat` never proactively pushes the file
+/// Streams `path` PULL-STYLE: `somsrp` never proactively pushes the file
 /// forward — it sends one small announcing chunk (and, for video, a tail
 /// fetch), registers itself as the byte-range responder, then holds the
 /// terminal in the foreground (exactly like `cat`/`less` would) answering
 /// `SrvRequest::RequestByteRange` on demand for as long as playback can
 /// still ask for more. This is deliberate, not a leftover from the old
-/// design: the user's own model here is that `somcat` occupies the
+/// design: the user's own model here is that `somsrp` occupies the
 /// terminal the whole time content is playing, the same way `cat`ing a
 /// file keeps the shell busy until the file is exhausted — a prompt
 /// appearing while video/audio is still playing would let the user run a
-/// new command (or start ANOTHER `somcat` against the same placement)
+/// new command (or start ANOTHER `somsrp` against the same placement)
 /// while this one is still the thing feeding it, which is exactly the
-/// confusing double-control state this design avoids. `somcat` only
+/// confusing double-control state this design avoids. `somsrp` only
 /// returns — thus only lets the shell print its next prompt — once
 /// playback has definitively ended, one of three ways, all funneled
 /// through the same exit path below:
@@ -932,7 +1047,7 @@ fn spawn_byte_range_responder_from_disk(
 ///    thread's read loop below, same as any other routed request.
 /// 2. **User pressed stop / closed the placement in Som.** Same
 ///    `EndPlayback` message, sent by `Terminal::stop_rich_content_*`
-///    instead of the decode-EOF path — from `somcat`'s side these two
+///    instead of the decode-EOF path — from `somsrp`'s side these two
 ///    cases are indistinguishable and don't need to be: either way,
 ///    nothing is going to ask for more bytes again.
 /// 3. **User pressed Ctrl+C in the terminal itself.** Caught by
@@ -943,7 +1058,7 @@ fn spawn_byte_range_responder_from_disk(
 /// files specifically: on a fast local named pipe, a full sequential pass
 /// over a real 16GB movie completed in ~2 SECONDS (`send_range_chunks_
 /// from_disk_interruptible`'s own `Ok(SendOutcome::Completed)` returned
-/// well before Som had even finished subscribing), after which `somcat`
+/// well before Som had even finished subscribing), after which `somsrp`
 /// exited and closed every connection — leaving Som's own in-memory
 /// buffer (bounded on purpose, see `somsrv::srv_cache::CacheEntry::
 /// recent_bytes`'s own doc comment) with nowhere near enough of the file
@@ -955,7 +1070,7 @@ fn spawn_byte_range_responder_from_disk(
 /// other network video player) don't have this race at all because they
 /// never push proactively either — the client always asks for exactly
 /// the segment/range it currently needs, same principle this function now
-/// follows: `somcat` holds the file open and answers on demand for as
+/// follows: `somsrp` holds the file open and answers on demand for as
 /// long as the process runs, instead of racing to finish a one-shot send
 /// before anyone's ready to receive it.
 fn stream_file_from_disk(
@@ -1033,7 +1148,7 @@ fn stream_file_from_disk(
 /// audio has no pixel dimensions to derive one from. Either way, Som
 /// decodes the cached bytes and paints into that reserved footprint
 /// itself — a decoded image frame for images/GIF, an inline play/pause/
-/// seek-bar widget for audio — `somcat`'s job ends once the bytes are on
+/// seek-bar widget for audio — `somsrp`'s job ends once the bytes are on
 /// the wire and the footprint is reserved.
 ///
 /// Content type is inferred from the file extension: `.gif`, `.jpg`/
@@ -1050,12 +1165,80 @@ fn stream_file_from_disk(
 /// ConPTY are concerned, so there's nothing to reconcile.
 ///
 /// For audio: decoding and playback both happen on Som's side, not
-/// here. `somcat` (this process) can be running on a remote SSH host
+/// here. `somsrp` (this process) can be running on a remote SSH host
 /// while Som — and the user's actual speakers — are local; playback has
 /// to happen wherever Som runs, so this process's only audio-specific
 /// work is probing header metadata (`audio_metadata`) to fill
 /// `ContentMetadata::Audio` accurately before the first chunk goes out.
 fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_index: Option<u32>) -> Result<(), String> {
+    // A URL target's real content type isn't knowable to this process at
+    // all — `somsrv` reads it from the real HTTP `Content-Type` header
+    // once it actually fetches the resource (see `stream_url`'s own doc
+    // comment). Checked before any extension-based dispatch below, since
+    // a URL's own path component might coincidentally end in something
+    // that looks like a recognized extension (or might not have one at
+    // all — query strings, extension-less API endpoints).
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return stream_url(path);
+    }
+    stream_file_impl(path, audio_stream_index, subtitle_stream_index)
+}
+
+/// Streams an `http://`/`https://` URL directly, WITHOUT `somsrp` ever
+/// reading the resource itself — `somsrv` does that server-side via
+/// `SrvRequest::FetchResource` (`crates/somsrv/src/http_fetch.rs`'s
+/// `fetch_and_stream`/`fetch_network`, which already reads the URL's real
+/// HTTP `Content-Type` header and streams into the cache on its own).
+/// This is why `somsrp` can't classify content type from a URL the way it
+/// does for a local file's extension: it genuinely doesn't know, and
+/// won't ever need to — the placeholder grid it prints is already
+/// content-type-agnostic under the full-terminal reservation model (see
+/// `print_placeholder_grid_with_cell_dims`'s own doc comment), so there's
+/// nothing about the grid's size that would need to differ once the real
+/// type is known anyway.
+fn stream_url(url: &str) -> Result<(), String> {
+    let (session_id, file_id) = new_ids();
+
+    // One connection for the `FetchResource` request AND to hold the
+    // terminal open afterward — unlike `stream_file`'s branches, there's
+    // no bulk byte stream THIS process sends at all (that's entirely
+    // `somsrv`'s job now), so there's no separate "drop the sender
+    // connection" step needed the way markdown/image's live-process
+    // branches have (see those branches' own doc comments for why THEY
+    // need an explicit early drop — this process was never a `PutChunk`
+    // sender in the first place, so `SrvCache`'s `sender_routes` table
+    // never has an entry for this connection to begin with).
+    let channel = srv_channel::SrvChannel::connect()?;
+
+    clear_screen_and_home_cursor();
+    // Content-type-agnostic footprint: the full terminal, same as every
+    // other top-level (non-markdown) content type now reserves — see
+    // `print_placeholder_grid_with_cell_dims`'s own doc comment. The
+    // `columns`/`rows` fallback values passed here (used only if `query_
+    // cell_count()` gets no reply at all) are arbitrary since there's no
+    // known aspect ratio to fall back to for a URL of unknown type —
+    // `AUDIO_WIDGET_COLUMNS`/`AUDIO_WIDGET_ROWS` are reused here purely as
+    // an existing "small, sane default" constant, not because this is
+    // audio-specific.
+    print_placeholder_grid_with_cell_dims(session_id, file_id, AUDIO_WIDGET_COLUMNS, AUDIO_WIDGET_ROWS)?;
+
+    channel.request_fetch_resource(session_id, file_id, url.to_string())?;
+    drop(channel);
+
+    // Same live-process model every other top-level content type now
+    // uses (see `print_placeholder_grid_with_cell_dims`'s doc comment for
+    // why the prompt no longer reappears immediately) — `somsrv` itself
+    // determines the real content type and streams bytes on its own; this
+    // process has nothing further to do but hold the terminal open until
+    // the user is done looking.
+    spawn_ctrlc_watcher();
+    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream_index: Option<u32>) -> Result<(), String> {
     use terminal::rich_content_transport::{ContentMetadata, ContentType};
 
     let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
@@ -1093,6 +1276,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         // yet, Som has no id to open a player for at all — see the video
         // branch below for the same reasoning, confirmed live for that
         // content type; audio adopted the same order first.
+        clear_screen_and_home_cursor();
         print_audio_placeholder_grid(session_id, file_id)?;
 
         // Streams off disk in bounded chunks rather than reading the
@@ -1164,6 +1348,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         // this made playback of a real several-minutes movie clip look
         // like it "never starts," when transport (not decode, which is
         // itself fully progressive) was the actual bottleneck.
+        clear_screen_and_home_cursor();
         print_video_placeholder_grid(session_id, file_id, width_px, height_px)?;
 
         return stream_file_from_disk(path, channel, content_type, metadata, ids);
@@ -1171,17 +1356,63 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 
     if content_type == ContentType::Markdown {
         let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
-        let metadata = ContentMetadata::Markdown;
+        // Absolute, not `std::env::current_dir()` verbatim — `path` may
+        // itself be relative to somsrp's cwd, and the resulting base_dir
+        // is later used by `somsrv` (a DIFFERENT process, possibly with a
+        // different cwd) to resolve a markdown-embedded link's own
+        // relative path, so it must stand on its own.
+        let base_dir = std::path::Path::new(path)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let metadata = ContentMetadata::Markdown { base_dir };
         let (session_id, file_id) = ids;
 
         // Placeholder grid FIRST, streaming SECOND — same reordering
         // every other content type already needs (see e.g. the video
         // branch's own comment for the full reasoning: without a
         // placeholder printed yet, Som has no id to open a markdown
-        // player for at all).
-        print_markdown_placeholder_grid(session_id, file_id, &bytes)?;
+        // player for at all). Prints only `MARKDOWN_INITIAL_ROWS` up
+        // front now — see that constant's own doc comment for why the
+        // old predicted-row-count reservation was removed.
+        let (columns, initial_rows) = print_markdown_placeholder_grid(session_id, file_id)?;
 
-        return stream_bytes(&channel, &bytes, content_type, metadata, ids);
+        stream_bytes(&channel, &bytes, content_type, metadata, ids)?;
+
+        // Explicitly closed here, not left open for the rest of this
+        // live process's life — `somsrv` auto-registers this connection
+        // as `(session_id, file_id)`'s `sender_routes` entry the moment
+        // the first `PutChunk` arrives (see `server.rs`'s `PutChunk` arm),
+        // and `SrvCache::route_byte_range_request` treats a successful
+        // WRITE to that route as "handled," never falling through to
+        // `serve_from_recent_bytes`. Every OTHER content type's sender
+        // connection already closes right after streaming (the process
+        // exits), so a late-subscriber `RequestByteRange` naturally finds
+        // the write failing and falls through — markdown's process no
+        // longer exits here (it now holds the terminal open, see below),
+        // so without this explicit drop the connection stays open with
+        // NOTHING reading it, and `route_byte_range_request` would judge
+        // it "still alive" forever, silently swallowing every catch-up
+        // request instead of ever reaching the in-memory fallback —
+        // confirmed live as a markdown placement that never rendered at
+        // all despite `somsrv` genuinely holding its bytes.
+        drop(channel);
+
+        // Unlike every other content type, markdown now holds the
+        // terminal open afterward (same live-process model audio/video
+        // already use) so Som can grow this placement's placeholder grid
+        // on demand as `layout_markdown`'s real word-wrapped row count
+        // becomes known — see `spawn_markdown_grower`'s own doc comment.
+        spawn_ctrlc_watcher();
+        let (stop, handle) = spawn_markdown_grower(ids, columns, initial_rows)?;
+        while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(handle);
+        return Ok(());
     }
 
     let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
@@ -1210,8 +1441,24 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     // `rich_content_placements()` never see a placement at all for a GIF
     // small enough to finish streaming near-instantly.
     let (session_id, file_id) = ids;
+    clear_screen_and_home_cursor();
     print_placeholder_grid(session_id, file_id, width_px, height_px)?;
-    stream_bytes(&channel, &bytes, content_type, metadata, ids)
+    stream_bytes(&channel, &bytes, content_type, metadata, ids)?;
+
+    // Image/GIF now joins video/audio/markdown's existing live-process
+    // model — see `print_placeholder_grid_with_cell_dims`'s own doc
+    // comment for why: a full-terminal placement leaves no free row for
+    // the shell's next prompt, so exiting immediately after streaming
+    // (the OLD behavior) would have the prompt print right on top of the
+    // placement's own placeholder cells. The prompt now only reappears
+    // once the user presses Ctrl+C, exactly like video/audio/markdown
+    // already work — same `spawn_ctrlc_watcher` + wait loop shape.
+    drop(channel);
+    spawn_ctrlc_watcher();
+    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to stdout bypassing `std::io::Stdout` entirely — see this

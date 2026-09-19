@@ -29,7 +29,7 @@
 //! ahead of what's been streamed so far.
 //!
 //! Playback is entirely local to wherever Som itself is running, even
-//! when the SRP-sending client (`somcat`) is on a remote SSH host — see
+//! when the SRP-sending client (`somsrp`) is on a remote SSH host — see
 //! this crate's `SRP_INTEGRATION_GUIDE.md` audio section for why: Som is
 //! the only process guaranteed to be physically local to the user's
 //! speakers.
@@ -401,7 +401,7 @@ pub struct RichContentAudioPlayer {
     _stream: Option<cpal::Stream>,
     /// Signals the background decode thread to stop — set on `Drop` so
     /// the thread doesn't keep polling a cache file that no longer has
-    /// a live player watching it. Not joined (same reasoning `somcat`'s
+    /// a live player watching it. Not joined (same reasoning `somsrp`'s
     /// own background query-reader thread uses): a thread parked in a
     /// blocking `sleep` will notice within `DECODE_RETRY_INTERVAL`, and
     /// nothing in this struct's own lifetime needs to wait for that.
@@ -700,7 +700,7 @@ mod tests {
     /// bookkeeping tests need; a live end-to-end test of genuinely
     /// progressive decode-while-streaming lives in `terminal.rs`
     /// (`test_rich_content_audio_placement_decodes_and_plays_via_a_real_
-    /// process`), which drives this through a real `somcat` process and
+    /// process`), which drives this through a real `somsrp` process and
     /// real SRP chunk arrival instead.
     fn open_test_player() -> Option<RichContentAudioPlayer> {
         let path = test_flac_path();

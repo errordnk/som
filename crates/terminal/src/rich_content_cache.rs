@@ -142,7 +142,7 @@ impl RichContentCache {
 
     /// Every `(session_id, file_id)` pair with at least one chunk applied
     /// so far — a caller that doesn't already know the exact id (e.g. a
-    /// test polling for whatever `somcat --stream` happens to be sending)
+    /// test polling for whatever `somsrp --stream` happens to be sending)
     /// uses this to discover it rather than needing the ids threaded
     /// through some other channel.
     pub fn all_known_ids(&self) -> Vec<(u32, u32)> {

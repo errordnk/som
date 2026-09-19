@@ -87,7 +87,7 @@ const IDLE_SHUTDOWN_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// a real, previously-open gap: unlike the old per-pane HOLDER (which
 /// exited naturally when its one shell process died), this shared daemon
 /// used to keep running forever once started, even after every Som
-/// window and every `somcat` process on the machine had long since
+/// window and every `somsrp` process on the machine had long since
 /// closed — confirmed live (2026-09-04) as a stray `somsrv.exe` still
 /// resident well after the Som window that started it had been closed,
 /// requiring a manual `taskkill` before a fresh daemon (or a test run
@@ -95,7 +95,7 @@ const IDLE_SHUTDOWN_DELAY: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// A plain "exit the instant the count hits 0" check is deliberately NOT
 /// what this does: the count legitimately dips to 0 for a moment between
-/// two unrelated connections all the time (e.g. a `somcat` process
+/// two unrelated connections all the time (e.g. a `somsrp` process
 /// finishing its own `RegisterRangeResponder` connection's teardown right
 /// as a brand new one is dialing in — see `ConnectionGuard`'s own doc
 /// comment) — exiting on that instant would kill the daemon out from
@@ -422,12 +422,12 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
     }
 }
 
-/// Handles one `Srv`-kind connection — `somcat` streaming `PutChunk`s,
+/// Handles one `Srv`-kind connection — `somsrp` streaming `PutChunk`s,
 /// Som subscribing to progress, or an admin tool (the `kill_orphaned_
 /// holders`/`kill_all_holders_for_redeploy` replacements) listing/killing
 /// sessions. All requests after the handshake are read in a plain loop —
 /// unlike `handle_relay`, there's no fixed message ORDER to enforce here
-/// (a `somcat` connection sends a stream of `PutChunk`s and nothing else;
+/// (a `somsrp` connection sends a stream of `PutChunk`s and nothing else;
 /// a Som progress connection sends exactly one `SubscribeProgress` then
 /// waits; an admin connection sends one `ListSessions`/`KillSession` and
 /// disconnects) — each request is handled independently as it arrives.
@@ -453,10 +453,10 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
     let mut registered_routes: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
 
     // Every key THIS connection has registered itself as the range
-    // responder for (`RegisterRangeResponder`) — `somcat`'s pull-model
+    // responder for (`RegisterRangeResponder`) — `somsrp`'s pull-model
     // responder connection, one per video/audio playback. Used below, on
     // this function's own exit (any return path: graceful or via `?`),
-    // to detect the Ctrl+C case: the user killed `somcat` directly rather
+    // to detect the Ctrl+C case: the user killed `somsrp` directly rather
     // than Som ever sending `SrvRequest::EndPlayback` for it, so nothing
     // else would otherwise tell Som this placement's source is gone. The
     // reader loop below is wrapped in its own closure specifically so
@@ -501,11 +501,23 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::EndPlayback { session_id, file_id } => {
                 cache.route_end_playback(session_id, file_id);
             }
+            SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows } => {
+                cache.route_grow_markdown_rows(session_id, file_id, additional_rows);
+            }
             SrvRequest::RegisterRangeResponder { session_id, file_id } => {
                 range_responder_keys.insert((session_id, file_id));
                 let connection = connection.clone();
                 let writer = writer.clone();
                 cache.register_range_responder_route(
+                    session_id,
+                    file_id,
+                    Arc::new(move |request| forward_srv_request(&connection, &writer, &request)),
+                );
+            }
+            SrvRequest::RegisterMarkdownGrower { session_id, file_id } => {
+                let connection = connection.clone();
+                let writer = writer.clone();
+                cache.register_markdown_grower_route(
                     session_id,
                     file_id,
                     Arc::new(move |request| forward_srv_request(&connection, &writer, &request)),
@@ -537,6 +549,19 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     log::error!("Lua script for ({session_id:08x}, {file_id:08x}) failed: {err:#}");
                 }
             }
+            SrvRequest::FetchResource { session_id, file_id, target, base_dir } => {
+                if let Err(err) = crate::http_fetch::fetch_and_stream(cache, session_id, file_id, &target, base_dir.as_deref()) {
+                    log::warn!("fetch for ({session_id:08x}, {file_id:08x}) target {target:?} failed: {err:#}");
+                    // Broadcast to every SubscribeProgress subscriber, not
+                    // just this one-shot connection — see
+                    // `SrvCache::notify_fetch_failed`'s own doc comment.
+                    // The direct `send_srv` reply below is kept too: it
+                    // costs nothing, and a hypothetical caller that DOES
+                    // hold this connection open still gets its answer.
+                    cache.notify_fetch_failed(session_id, file_id, err.to_string());
+                    send_srv(&connection, &writer, &SrvResponse::FetchFailed { session_id, file_id, reason: err.to_string() })?;
+                }
+            }
             }
         }
     })();
@@ -545,13 +570,13 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
     // above via `?`) — for every key it was registered as the range
     // responder for, tell Som playback has ended, exactly as if an
     // explicit `SrvRequest::EndPlayback` had arrived first. Covers the
-    // Ctrl+C case specifically: the user killed `somcat` directly, so no
+    // Ctrl+C case specifically: the user killed `somsrp` directly, so no
     // `StopPlayback`/`EndPlayback` message was ever sent by anyone —
     // without this, the placement would sit there forever still showing
     // as "playing" with a dead source behind it, since nothing else
     // would ever tell Som otherwise. The natural-EOF and explicit-stop
-    // cases (Som sends `EndPlayback` itself, `somcat` reacts and exits on
-    // its own) also end up here once `somcat`'s connection subsequently
+    // cases (Som sends `EndPlayback` itself, `somsrp` reacts and exits on
+    // its own) also end up here once `somsrp`'s connection subsequently
     // closes, but `notify_stop_playback` is a no-op if Som already tore
     // the placement down — see that method's own doc comment.
     for (session_id, file_id) in range_responder_keys {
@@ -574,7 +599,7 @@ fn send_srv(connection: &PipeConnection, writer: &Mutex<()>, message: &SrvRespon
 }
 
 /// Writes a daemon-INITIATED `SrvRequest` down a connection that's
-/// normally the SENDER of `SrvRequest`s (`somcat`'s `PutChunk` connection)
+/// normally the SENDER of `SrvRequest`s (`somsrp`'s `PutChunk` connection)
 /// — used ONLY to forward `RequestByteRange` to whichever client
 /// registered itself as the sender route for a given `(session_id,
 /// file_id)` (see `SrvCache::register_sender_route`). The wire framing is
@@ -582,7 +607,7 @@ fn send_srv(connection: &PipeConnection, writer: &Mutex<()>, message: &SrvRespon
 /// same length-prefixed `PipeConnection` messages), so this is otherwise
 /// identical to `send_srv` — kept as a separate function purely so the
 /// name at each call site says which DIRECTION of message is actually
-/// going out, since a `somcat`-side reader loop needs to expect
+/// going out, since a `somsrp`-side reader loop needs to expect
 /// `SrvRequest`s arriving unsolicited on what it otherwise treats as its
 /// own outbound-only connection.
 fn forward_srv_request(connection: &PipeConnection, writer: &Mutex<()>, message: &SrvRequest) -> anyhow::Result<()> {

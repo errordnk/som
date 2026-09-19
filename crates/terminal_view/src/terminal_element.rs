@@ -1451,7 +1451,7 @@ impl Element for TerminalElement {
                     // around to actually redrawing (a background VSync
                     // thread calling `RedrawWindow`) — not synchronous, and
                     // confirmed (live testing a real animated GIF through
-                    // `somcat`) to never actually fire on its own once the
+                    // `somsrp`) to never actually fire on its own once the
                     // window is idle: the same "doesn't repaint until you
                     // press a key" gap already documented for multi-chunk
                     // rich-content transfers in `Terminal::process_event`'s
@@ -1476,9 +1476,9 @@ impl Element for TerminalElement {
                     // sustaining paint -> force_redraw -> paint loop with no
                     // pacing at all, confirmed live to starve the PTY-
                     // reader/event-loop task of CPU time badly enough that a
-                    // single somcat invocation (one 500x500 GIF, 47 frames)
+                    // single somsrp invocation (one 500x500 GIF, 47 frames)
                     // took over a minute end-to-end instead of the ~5-10s
-                    // headless benchmarks (`bench_somcat_*` in
+                    // headless benchmarks (`bench_somsrp_*` in
                     // `crates/terminal/src/terminal.rs`) consistently show
                     // with no competing native repaint loop. `read(cx)`
                     // (immutable), NOT `Entity::update` — going through
@@ -1717,8 +1717,104 @@ pub fn is_blank(cell: &IndexedCell) -> bool {
 /// video branch), so the picture area's padding reads as the same
 /// intentional dark surface the widget row already uses immediately below
 /// it, not a mismatched color.
-fn rich_content_widget_bg() -> gpui::Rgba {
-    gpui::rgba(0x1e1e2eff)
+/// The letterbox/widget-background fill every rich-content paint branch
+/// uses (image/video letterbox margins, audio's controls-row background,
+/// markdown-embedded media's own band) — follows the user's currently
+/// active Som theme (`theme::ActiveTheme`, same source the markdown
+/// widget's own `theme_colors.terminal_background` already reads at its
+/// own call site) rather than a fixed color. Was previously a hardcoded
+/// `0x1e1e2eff` — confirmed broken live on a light theme (Nord Light):
+/// the fill stayed exactly as dark as on a dark theme, a jarring
+/// dark rectangle in an otherwise light UI (see `project_srp_audio_and_
+/// md_browser_roadmap`'s "Planned: theme-aware widget redesign" note).
+fn rich_content_widget_bg(cx: &App) -> gpui::Rgba {
+    cx.theme().colors().terminal_background.into()
+}
+
+/// Shrink-to-fit-but-never-enlarge, aspect-ratio-preserving placement of
+/// an image of `image_size` device pixels centered inside `box_bounds` —
+/// only ever SHRUNK to fit, never enlarged past its own native pixel
+/// size: a source smaller than its footprint shows at native size rather
+/// than being blown up and looking soft/blurry. Shared by both video
+/// picture branches (`paint_rich_content_placements`' video arm) and the
+/// markdown-embedded-image Ready branch (`paint_rich_content_markdown_widget`)
+/// — previously duplicated inline at each of the first two call sites.
+fn fit_into_box(image_size: gpui::Size<gpui::DevicePixels>, box_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let full_width = box_bounds.size.width;
+    let full_height = box_bounds.size.height;
+    let native_width = px(image_size.width.0 as f32);
+    let native_height = px(image_size.height.0 as f32);
+    let image_aspect = image_size.width.0 as f32 / image_size.height.0 as f32;
+    let box_aspect = f32::from(full_width) / f32::from(full_height);
+    let (shrink_to_fit_width, shrink_to_fit_height) =
+        if image_aspect > box_aspect { (full_width, full_width / image_aspect) } else { (full_height * image_aspect, full_height) };
+    let (fit_width, fit_height) =
+        if native_width <= full_width && native_height <= full_height { (native_width, native_height) } else { (shrink_to_fit_width, shrink_to_fit_height) };
+    let fit_position =
+        point(box_bounds.origin.x + (full_width - fit_width) / 2.0, box_bounds.origin.y + (full_height - fit_height) / 2.0);
+    Bounds::new(fit_position, gpui::size(fit_width, fit_height))
+}
+
+/// Computes the box an embedded media row (`crate::markdown_styling::
+/// EmbeddedMedia`) paints into, honoring its `{...}` attrs
+/// (position/width/height) — see `EmbedAttrs`'s own doc comment for the
+/// token grammar these fields come from.
+///
+/// `at` is the row's own top-left paint position (one cell inset from the
+/// widget's left edge is already applied by the `Left` branch below, NOT
+/// by the caller — callers pass the row's raw `at`, same as before this
+/// function existed). `full_width` is the markdown widget's total
+/// rendered width (`cell_width * columns`, before any inset).
+///
+/// With `EmbedAttrs::default()` (no `{}` block was present in the
+/// source), this reproduces the box exactly as it was computed inline
+/// before per-embed attrs existed: full width minus a 1-cell inset on
+/// each side, `EMBEDDED_IMAGE_ROWS` rows tall, left-anchored — a pure
+/// generalization, not a behavior change for existing documents.
+///
+/// Pulled out as a standalone function (rather than left inline in
+/// `paint_rich_content_markdown_widget`) specifically so it's unit-
+/// testable as pure arithmetic, without needing a `Window`.
+fn embed_box_bounds(
+    attrs: &crate::markdown_styling::EmbedAttrs,
+    at: Point<Pixels>,
+    full_width: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> Bounds<Pixels> {
+    let full_available_width = (full_width - cell_width * 2.0).max(cell_width);
+    let box_width = match attrs.width_percent {
+        Some(pct) => (full_available_width * (pct as f32 / 100.0)).max(cell_width),
+        None => full_available_width,
+    };
+    let reserved_rows = crate::markdown_styling::EMBEDDED_IMAGE_ROWS as u32;
+    let box_rows = match attrs.height_rows {
+        // Clamped to the fixed reserved band — `layout_markdown` never
+        // reserves MORE than `EMBEDDED_IMAGE_ROWS` rows regardless of
+        // this attribute (see that constant's own doc comment).
+        Some(rows) => rows.clamp(1, reserved_rows),
+        None => reserved_rows,
+    };
+    let box_height = line_height * box_rows as f32;
+    let box_x = match attrs.position {
+        crate::markdown_styling::EmbedPosition::Left => at.x + cell_width,
+        crate::markdown_styling::EmbedPosition::Center => at.x + cell_width + (full_available_width - box_width) / 2.0,
+        crate::markdown_styling::EmbedPosition::Right => at.x + cell_width + (full_available_width - box_width),
+    };
+    // `at.y` is the top of the FULL reserved band (`EMBEDDED_IMAGE_ROWS`
+    // rows), not just the box's own rows — `vertical_position` shifts a
+    // shorter-than-the-band box within that full band's height, same
+    // relationship `position`/`width_percent` have on the horizontal
+    // axis. A box that already fills the whole band (`height_rows` unset)
+    // has nowhere to shift, same as `Center`/`Right` being invisible at
+    // `width_percent` unset.
+    let full_reserved_height = line_height * reserved_rows as f32;
+    let box_y = match attrs.vertical_position {
+        crate::markdown_styling::EmbedVerticalPosition::Top => at.y,
+        crate::markdown_styling::EmbedVerticalPosition::Middle => at.y + (full_reserved_height - box_height) / 2.0,
+        crate::markdown_styling::EmbedVerticalPosition::Bottom => at.y + (full_reserved_height - box_height),
+    };
+    Bounds::new(point(box_x, box_y), gpui::size(box_width, box_height))
 }
 
 /// Paints Som's own rich-content protocol images/animations
@@ -1757,7 +1853,7 @@ fn paint_rich_content_placements(
     // need `&mut Terminal`.
     // The stopped-video stand-in image (`dna.png`) needs a variant that
     // actually contrasts against whatever it's painted ON — the letterbox
-    // fill `rich_content_widget_bg()` provides, a FIXED color that
+    // fill `rich_content_widget_bg(cx)` provides, a FIXED color that
     // doesn't itself track the active theme. Deriving the choice from
     // this exact color (not from `theme.appearance().is_light()`) keeps
     // the two in sync by construction: whatever color the padding is
@@ -1766,7 +1862,7 @@ fn paint_rich_content_placements(
     // signal that could disagree with it (e.g. a dark widget background
     // against an otherwise light theme, or vice versa).
     let widget_bg_is_light = {
-        let bg = rich_content_widget_bg();
+        let bg = rich_content_widget_bg(cx);
         // Standard relative-luminance weighting (ITU-R BT.601) — cheap
         // and good enough for a binary light/dark contrast decision, not
         // used for anything color-accuracy-sensitive.
@@ -1915,25 +2011,100 @@ fn paint_rich_content_placements(
                 .filter_map(|(session_id, file_id, rendered_text)| {
                     let geometry = *markdown_geometry.get(&(*session_id, *file_id))?;
                     let scroll_offset = terminal_ref.rich_content_markdown_scroll_offset(*session_id, *file_id);
-                    Some((*session_id, *file_id, rendered_text.clone(), geometry, scroll_offset))
+                    // Statuses collected up front, same `&self`-only read
+                    // `terminal_ref` already allows — `markdown_embedded_
+                    // image_states` only touches `RefCell`s, no `&mut`
+                    // needed.
+                    let embedded: std::collections::HashMap<String, terminal::EmbeddedMediaStatus> =
+                        terminal_ref.markdown_embedded_media_states((*session_id, *file_id)).into_iter().collect();
+                    Some((*session_id, *file_id, rendered_text.clone(), geometry, scroll_offset, embedded))
                 })
                 .collect()
         };
-        for (session_id, file_id, rendered_text, geometry, scroll_offset) in markdown_paint_inputs {
+        let mut any_markdown_embedded_image_loading = false;
+        for (session_id, file_id, rendered_text, geometry, scroll_offset, embedded) in markdown_paint_inputs {
+            any_markdown_embedded_image_loading |=
+                embedded.values().any(|status| matches!(status, terminal::EmbeddedMediaStatus::Loading));
+            any_animating |= embedded
+                .values()
+                .any(|status| matches!(status, terminal::EmbeddedMediaStatus::ReadyImage { is_animating: true, .. }));
+            let mut discovered: Vec<String> = Vec::new();
+            // Live terminal column count, NOT `geometry.max_column` — the
+            // latter is derived from the placement's own placeholder-grid
+            // cells (printed once by `somsrp` at stream time and frozen
+            // forever after), so it never grows past whatever the
+            // terminal's width happened to be at that moment. Using it
+            // here made the widget correctly SHRINK when the window
+            // narrowed (the paint path's own viewport clamp independently
+            // limits what's drawn) but never grow back when the window
+            // widened again, since no wider placeholder cells were ever
+            // printed to discover. `layout.dimensions.num_columns()` is
+            // the terminal's real, live column count, recomputed every
+            // paint from the window's actual current pixel bounds.
+            // Clamped to 40..=120 (explicit user-chosen bounds: narrower
+            // doesn't render prose sensibly, wider exceeds a comfortable
+            // reading line length even on an ultrawide window) and capped
+            // by what's actually available to the right of this
+            // placement's own origin column (it doesn't in general start
+            // at column 0).
+            let available_columns = (layout.dimensions.num_columns() as i32 - geometry.origin_column).max(1) as u32;
+            let width_columns = available_columns.clamp(40, 120);
+            let mut real_row_count: Option<u32> = None;
+            let mut embedded_controls_bounds: Vec<(String, Bounds<Pixels>, Option<Bounds<Pixels>>)> = Vec::new();
             if let Some(bounds) = paint_rich_content_markdown_widget(
                 &rendered_text,
-                Some(geometry.max_column),
+                Some(width_columns - 1),
                 scroll_offset,
                 origin,
                 geometry.origin_line,
                 geometry.origin_column,
                 layout,
+                &embedded,
+                &mut discovered,
+                &mut embedded_controls_bounds,
+                &mut real_row_count,
                 window,
                 cx,
             ) {
                 terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
             }
+            if !discovered.is_empty() {
+                terminal.update(cx, |terminal, _cx| {
+                    for dest_url in &discovered {
+                        terminal.ensure_markdown_embedded_media((session_id, file_id), dest_url);
+                    }
+                });
+            }
+            for (dest_url, controls_bounds, seek_bar_bounds) in &embedded_controls_bounds {
+                terminal.read(cx).record_markdown_embedded_controls_bounds(
+                    (session_id, file_id),
+                    dest_url,
+                    *controls_bounds,
+                    *seek_bar_bounds,
+                );
+            }
+            // Grows the live `somsrp` process's placeholder-grid
+            // reservation to match `layout_markdown`'s real row count —
+            // see `Terminal::ensure_markdown_row_reservation`'s own doc
+            // comment for the full design (this replaced the old
+            // `markdown_line_count`-predicted up-front reservation
+            // entirely). `geometry.max_row + 1` seeds the tracked count
+            // the FIRST time this placement is seen — the grid's own
+            // real current row count from the full-grid scan already
+            // run above, not a hardcoded constant.
+            if let Some(real_row_count) = real_row_count {
+                terminal.read(cx).ensure_markdown_row_reservation(session_id, file_id, real_row_count, geometry.max_row + 1);
+            }
         }
+        // Keep repaints coming while ANY embedded image is still in
+        // flight — `SrvProgressState` is poll-only (no push/notify), so
+        // without this a static PNG whose bytes land after the last
+        // paint would sit on "loading" forever with nothing to trigger a
+        // re-check. Reuses the existing animation-frame mechanism rather
+        // than adding new notify plumbing; same repaint cost profile as
+        // one actively-playing GIF, and it stops the moment every fetch
+        // has either completed or failed.
+        any_animating |= any_markdown_embedded_image_loading;
     }
 
     if origins.is_empty() {
@@ -1947,7 +2118,7 @@ fn paint_rich_content_placements(
             audio_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
         {
             let max_column_seen = max_columns_seen.get(&key).copied();
-            if let Some((bounds, bar_bounds, stop_bounds)) = paint_rich_content_media_widget(
+            if let Some((bounds, bar_bounds, stop_bounds)) = paint_top_level_audio_widget(
                 max_column_seen,
                 *position_fraction,
                 *is_playing,
@@ -1982,7 +2153,7 @@ fn paint_rich_content_placements(
         // rows, NOT `max_row_seen + 1`: the placeholder grid's LAST row
         // is reserved for this placement's control widget (see
         // `print_video_placeholder_grid`'s own doc comment for why
-        // `somcat` prints one extra row beyond the picture itself), and
+        // `somsrp` prints one extra row beyond the picture itself), and
         // gets painted separately below via the SAME
         // `paint_rich_content_media_widget` audio already uses — one
         // shared control-row implementation for both content types.
@@ -2046,35 +2217,9 @@ fn paint_rich_content_placements(
                         // resolution, it shows at that native size,
                         // centered, with more padding around it, rather
                         // than being blown up and looking soft/blurry.
-                        window.paint_quad(fill(picture_bounds, rich_content_widget_bg()));
-                        let native_width = px(image_size.width.0 as f32);
-                        let native_height = px(image_size.height.0 as f32);
-                        let image_aspect = image_size.width.0 as f32 / image_size.height.0 as f32;
-                        let box_aspect = f32::from(full_width) / f32::from(full_height);
-                        let (shrink_to_fit_width, shrink_to_fit_height) = if image_aspect > box_aspect {
-                            (full_width, full_width / image_aspect)
-                        } else {
-                            (full_height * image_aspect, full_height)
-                        };
-                        let (fit_width, fit_height) =
-                            if native_width <= full_width && native_height <= full_height {
-                                (native_width, native_height)
-                            } else {
-                                (shrink_to_fit_width, shrink_to_fit_height)
-                            };
-                        let fit_position = point(
-                            picture_position.x + (full_width - fit_width) / 2.0,
-                            picture_position.y + (full_height - fit_height) / 2.0,
-                        );
-                        window
-                            .paint_image(
-                                Bounds::new(fit_position, gpui::size(fit_width, fit_height)),
-                                gpui::Corners::all(Pixels::ZERO),
-                                render_image.clone(),
-                                0,
-                                false,
-                            )
-                            .log_err();
+                        window.paint_quad(fill(picture_bounds, rich_content_widget_bg(cx)));
+                        let fit = fit_into_box(image_size, picture_bounds);
+                        window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), 0, false).log_err();
                     } else {
                         // Same shrink-to-fit-but-never-enlarge, aspect-
                         // ratio-preserving placement the stopped-state
@@ -2093,34 +2238,8 @@ fn paint_rich_content_placements(
                         // background show through the margins, same as it
                         // always has for a footprint estimated from
                         // metadata alone before the real frame arrived.
-                        let native_width = px(image_size.width.0 as f32);
-                        let native_height = px(image_size.height.0 as f32);
-                        let image_aspect = image_size.width.0 as f32 / image_size.height.0 as f32;
-                        let box_aspect = f32::from(full_width) / f32::from(full_height);
-                        let (shrink_to_fit_width, shrink_to_fit_height) = if image_aspect > box_aspect {
-                            (full_width, full_width / image_aspect)
-                        } else {
-                            (full_height * image_aspect, full_height)
-                        };
-                        let (fit_width, fit_height) =
-                            if native_width <= full_width && native_height <= full_height {
-                                (native_width, native_height)
-                            } else {
-                                (shrink_to_fit_width, shrink_to_fit_height)
-                            };
-                        let fit_position = point(
-                            picture_position.x + (full_width - fit_width) / 2.0,
-                            picture_position.y + (full_height - fit_height) / 2.0,
-                        );
-                        window
-                            .paint_image(
-                                Bounds::new(fit_position, gpui::size(fit_width, fit_height)),
-                                gpui::Corners::all(Pixels::ZERO),
-                                render_image.clone(),
-                                0,
-                                false,
-                            )
-                            .log_err();
+                        let fit = fit_into_box(image_size, picture_bounds);
+                        window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), 0, false).log_err();
                     }
                 }
             }
@@ -2230,16 +2349,22 @@ fn paint_rich_content_placements(
             point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
 
         any_animating |= is_animating;
-        terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, Bounds::new(position, size));
-        window
-            .paint_image(
-                Bounds::new(position, size),
-                gpui::Corners::all(Pixels::ZERO),
-                render_image.clone(),
-                current_frame,
-                false,
-            )
-            .log_err();
+        let box_bounds = Bounds::new(position, size);
+        terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, box_bounds);
+        // Letterboxed (shrink-to-fit, never enlarged past the image's own
+        // native pixel size) and centered within the reserved footprint —
+        // same treatment the video branch's picture already gets via
+        // `fit_into_box`, added here now that a top-level placement's
+        // reservation is the whole terminal (any aspect ratio) rather
+        // than a footprint pre-computed to already match the image's own
+        // aspect ratio (which made a direct stretch-to-fill correct
+        // before this change). The reserved area's own background is
+        // painted first so empty letterbox margins read as intentional
+        // padding, not a rendering gap — matches video's stopped-state
+        // branch's identical reasoning.
+        window.paint_quad(fill(box_bounds, rich_content_widget_bg(cx)));
+        let fit = fit_into_box(image_size, box_bounds);
+        window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), current_frame, false).log_err();
     }
 
     any_animating
@@ -2248,7 +2373,7 @@ fn paint_rich_content_placements(
 /// Paints one media placement's (audio OR video) inline control row —
 /// play/pause glyph, current elapsed time, a seek-bar fill, total
 /// duration time, and a stop glyph — filling exactly the cell footprint
-/// the sending client's placeholder grid describes (`somcat`'s
+/// the sending client's placeholder grid describes (`somsrp`'s
 /// `AUDIO_WIDGET_COLUMNS`x`AUDIO_WIDGET_ROWS` for audio, or the video
 /// picture's own column count plus one extra reserved row for video —
 /// see `print_video_placeholder_grid`'s own doc comment; this function
@@ -2287,7 +2412,7 @@ fn paint_rich_content_placements(
 /// markdown placement's reserved footprint (`max_row_seen`, coming from
 /// `Terminal::markdown_placement_origins`'s full-grid — scrollback
 /// included — scan) can be, and often is, TALLER than the terminal's
-/// visible height: `somcat` reserves exactly as many rows as the
+/// visible height: `somsrp` reserves exactly as many rows as the
 /// document has lines (see `print_markdown_placeholder_grid`'s doc
 /// comment), with no clamp to the current viewport. So this function
 /// (1) clips painting to whatever ROWS of the placement are currently
@@ -2321,6 +2446,26 @@ fn markdown_span_font(family: gpui::SharedString, span: &crate::markdown_styling
     }
 }
 
+/// Font-size multiplier for a markdown heading level — level 1 biggest,
+/// scaling down toward level 6, capped so a heading never exceeds twice
+/// the base row height. Shared between the row-height computation (see
+/// `paint_rich_content_markdown_widget`'s `row_heights`) and the actual
+/// font-size used to shape the line — the two MUST agree, or a heading
+/// would be shaped at one size but advance the cursor by another,
+/// reintroducing exactly the overflow-onto-the-next-placement bug this
+/// per-row-height model exists to fix.
+fn markdown_heading_scale(heading_level: Option<u8>) -> f32 {
+    match heading_level {
+        Some(1) => 1.6,
+        Some(2) => 1.45,
+        Some(3) => 1.3,
+        Some(4) => 1.15,
+        Some(5) => 1.05,
+        Some(_) => 1.0,
+        None => 1.0,
+    }
+}
+
 /// Real markdown styling: parses+lays out `rendered_text` via
 /// `crate::markdown_styling::layout_markdown` (headings, bold/italic,
 /// lists, code blocks/spans, links, block quotes, strikethrough, rules
@@ -2332,13 +2477,13 @@ fn markdown_span_font(family: gpui::SharedString, span: &crate::markdown_styling
 ///
 /// The row count actually painted comes from `layout_markdown`'s own
 /// output (`laid_out.len()`), NOT `max_row_seen`/the placeholder grid's
-/// `\n`-based line count from `somcat` — real markdown layout changes
+/// `\n`-based line count from `somsrp` — real markdown layout changes
 /// how many visual rows the content needs (headings/lists/code blocks
-/// don't map 1:1 to source lines), so `somcat`'s grid is only a
+/// don't map 1:1 to source lines), so `somsrp`'s grid is only a
 /// generously-sized reservation, not a used-as-truth row count. Som
 /// decides the real height itself, after it already has the source
 /// text (see `SRP_LUA.md`'s "Phase 2" section for why this is simpler
-/// than a new query/response round trip to tell `somcat` the exact
+/// than a new query/response round trip to tell `somsrp` the exact
 /// count up front). `max_column_seen` still comes from the grid — width
 /// tracks the terminal's own column count reliably, only height does
 /// not.
@@ -2351,6 +2496,24 @@ fn paint_rich_content_markdown_widget(
     origin_line: i32,
     origin_column: i32,
     layout: &LayoutState,
+    embedded: &std::collections::HashMap<String, terminal::EmbeddedMediaStatus>,
+    discovered: &mut Vec<String>,
+    // Each embedded audio/video's controls-row bounds painted this frame
+    // (`dest_url`, whole controls-row bounds, optional seek-bar bounds) —
+    // the caller records these onto `Terminal` via `record_markdown_
+    // embedded_controls_bounds` so `handle_markdown_embedded_media_click`
+    // can hit-test against them outside the paint pass, same "written
+    // during paint, read during input handling" split every other rich-
+    // content hit-test rectangle in this codebase already uses.
+    embedded_controls_bounds: &mut Vec<(String, Bounds<Pixels>, Option<Bounds<Pixels>>)>,
+    // The real `layout_markdown` row count for this paint, written out
+    // regardless of whether any of it is currently visible (`laid_out.
+    // len()`, not `visible_row_count`) — the caller uses this to keep
+    // the live `somsrp` process backing this placement's placeholder
+    // grid reservation growing via `Terminal::ensure_markdown_row_
+    // reservation`. `None` on an early return (nothing visible this
+    // paint) — the caller must not treat that as "0 rows needed."
+    real_row_count: &mut Option<u32>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Bounds<Pixels>> {
@@ -2364,6 +2527,14 @@ fn paint_rich_content_markdown_widget(
     let base_font_size = line_height;
     let prose_family: gpui::SharedString = MARKDOWN_PROSE_FONT_FAMILY.into();
     let mono_family: gpui::SharedString = layout.base_text_style.font_family.clone();
+    // Background/foreground follow the user's currently active Som theme
+    // (`theme::ActiveTheme`, same source `terminal_element.rs`'s own
+    // ordinary terminal-grid rendering already reads at lines 1006/1084)
+    // rather than a fixed dark-theme-only color — a markdown document
+    // read in a light theme was otherwise unreadably dark-on-dark.
+    let theme_colors = cx.theme().colors();
+    let widget_bg: gpui::Rgba = theme_colors.terminal_background.into();
+    let text_color: gpui::Hsla = theme_colors.terminal_foreground;
     let link_color = gpui::rgba(0x89b4faff).into();
     let quote_bar_color = gpui::rgba(0x585b70ff);
 
@@ -2384,9 +2555,23 @@ fn paint_rich_content_markdown_widget(
         style: gpui::FontStyle::Normal,
     };
     let wrap_width = (width - cell_width).max(gpui::px(1.0));
-    let mut line_wrapper = window.text_system().line_wrapper(prose_font, base_font_size);
+    let mut line_wrapper = window.text_system().line_wrapper(prose_font.clone(), base_font_size);
     let laid_out = crate::markdown_styling::layout_markdown(rendered_text, Some((&mut line_wrapper, wrap_width)));
     let placement_rows = laid_out.len().max(1) as i32;
+    *real_row_count = Some(laid_out.len() as u32);
+
+    // Each row's REAL painted height — a heading renders taller than
+    // `line_height` (see `markdown_heading_scale`), so advancing the
+    // cursor by a fixed `line_height` per row (the old behavior) let
+    // every row below a heading creep downward, visibly overflowing
+    // into whatever the terminal printed right after this placement
+    // (confirmed live: a single `# H1` pushed the shell's next prompt up
+    // by roughly the extra height one scaled heading adds). Embedded-
+    // image rows (including their spacer rows) always advance by exactly
+    // `line_height` regardless of heading level — an image can't appear
+    // inside a heading's own text (`layout_markdown` never nests them).
+    let row_heights: Vec<gpui::Pixels> =
+        laid_out.iter().map(|line| line_height * markdown_heading_scale(line.heading_level)).collect();
 
     // The rows of the FULL placement (0..placement_rows) that fall
     // within the visible screen (0..num_lines) right now — clamped on
@@ -2402,16 +2587,138 @@ fn paint_rich_content_markdown_widget(
         origin.x + origin_column as f32 * cell_width,
         origin.y + (display_line + first_visible_row) as f32 * line_height,
     );
-    let bounds = Bounds::new(position, gpui::size(width, visible_row_count as f32 * line_height));
-
-    window.paint_quad(fill(bounds, rich_content_widget_bg()));
 
     // `scroll_offset_lines` shifts which lines of `laid_out` map to
     // `first_visible_row`, independent of the placement's on-screen
     // position — Scroll Lock moves this without touching `display_line`.
     let skip = scroll_offset_lines as usize + first_visible_row as usize;
-    for (index, line) in laid_out.iter().skip(skip).take(visible_row_count as usize).enumerate() {
-        let at = point(position.x, position.y + index as f32 * line_height);
+    let visible_rows = &laid_out[skip.min(laid_out.len())..(skip + visible_row_count as usize).min(laid_out.len())];
+    let visible_row_heights = &row_heights[skip.min(row_heights.len())..(skip + visible_row_count as usize).min(row_heights.len())];
+    // Real total painted height of what's actually on screen right now —
+    // NOT `visible_row_count as f32 * line_height`, which undershoots the
+    // fill whenever a visible heading is taller than one base row (the
+    // background would otherwise stop short of the heading's own real
+    // bottom edge, and the NEXT placement/prompt would show through the
+    // gap).
+    let total_height: gpui::Pixels = visible_row_heights.iter().copied().sum();
+    let bounds = Bounds::new(position, gpui::size(width, total_height));
+
+    window.paint_quad(fill(bounds, widget_bg));
+
+    let mut at_y = position.y;
+    for (line, row_height) in visible_rows.iter().zip(visible_row_heights.iter()) {
+        let at = point(position.x, at_y);
+        at_y += *row_height;
+
+        if let Some(image) = &line.embedded_media {
+            // Box geometry honors the embed's `{...}` attrs (position/
+            // width/height) — see `embed_box_bounds`'s own doc comment.
+            // With no attrs block (`EmbedAttrs::default()`), this
+            // reproduces the old fixed full-width-minus-insets,
+            // EMBEDDED_IMAGE_ROWS-tall box exactly.
+            let box_bounds = embed_box_bounds(&image.attrs, at, width, cell_width, line_height);
+            discovered.push(image.dest_url.clone());
+            match embedded.get(&image.dest_url) {
+                Some(terminal::EmbeddedMediaStatus::ReadyImage { render_image, frame_index, .. }) => {
+                    let fit = fit_into_box(render_image.size(*frame_index), box_bounds);
+                    window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), *frame_index, false).log_err();
+                },
+                Some(terminal::EmbeddedMediaStatus::Failed(reason)) => {
+                    window.paint_quad(fill(box_bounds, gpui::rgba(0x3a2a2aff)));
+                    let border = gpui::rgba(0x8a4a4aff);
+                    let thickness = gpui::px(1.0);
+                    window.paint_quad(fill(Bounds::new(box_bounds.origin, gpui::size(box_bounds.size.width, thickness)), border));
+                    window.paint_quad(fill(
+                        Bounds::new(point(box_bounds.origin.x, box_bounds.bottom() - thickness), gpui::size(box_bounds.size.width, thickness)),
+                        border,
+                    ));
+                    window.paint_quad(fill(Bounds::new(box_bounds.origin, gpui::size(thickness, box_bounds.size.height)), border));
+                    window.paint_quad(fill(
+                        Bounds::new(point(box_bounds.right() - thickness, box_bounds.origin.y), gpui::size(thickness, box_bounds.size.height)),
+                        border,
+                    ));
+                    let label = if image.alt.is_empty() {
+                        format!("⚠ {} — {reason}", image.dest_url)
+                    } else {
+                        format!("⚠ {} — {reason}", image.alt)
+                    };
+                    let run = TextRun { len: label.len(), font: prose_font.clone(), color: text_color, background_color: None, underline: None, strikethrough: None };
+                    let shaped = window.text_system().shape_line(label.into(), base_font_size, &[run], None);
+                    let label_position = point(
+                        box_bounds.origin.x + (box_bounds.size.width - shaped.width).max(Pixels::ZERO) / 2.0,
+                        box_bounds.origin.y + (box_bounds.size.height - line_height) / 2.0,
+                    );
+                    shaped.paint(label_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+                },
+                Some(terminal::EmbeddedMediaStatus::Loading) | None => {
+                    window.paint_quad(fill(box_bounds, gpui::rgba(0x2a2a3aff)));
+                    let label_text = if image.alt.is_empty() { format!("⟳ {}", image.dest_url) } else { format!("⟳ {}", image.alt) };
+                    let run = TextRun {
+                        len: label_text.len(),
+                        font: prose_font.clone(),
+                        color: gpui::rgba(0xa6adc8ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(label_text.into(), base_font_size, &[run], None);
+                    let label_position = point(
+                        box_bounds.origin.x + (box_bounds.size.width - shaped.width).max(Pixels::ZERO) / 2.0,
+                        box_bounds.origin.y + (box_bounds.size.height - line_height) / 2.0,
+                    );
+                    shaped.paint(label_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+                },
+                Some(terminal::EmbeddedMediaStatus::ReadyVideo { render_image, is_playing, elapsed, duration, position_fraction }) => {
+                    // Picture band: reuse the exact same letterbox-into-
+                    // box_bounds approach the Image branch above uses, via
+                    // `fit_into_box` — identical shape, just an optional
+                    // frame (a video can be "metadata known, no decoded
+                    // frame yet" distinctly from `Loading`).
+                    let controls_bounds =
+                        Bounds::new(point(box_bounds.origin.x, box_bounds.bottom()), gpui::size(box_bounds.size.width, line_height));
+                    let picture_bounds =
+                        Bounds::new(box_bounds.origin, gpui::size(box_bounds.size.width, box_bounds.size.height));
+                    match render_image {
+                        Some(render_image) => {
+                            let fit = fit_into_box(render_image.size(0), picture_bounds);
+                            window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), 0, false).log_err();
+                        },
+                        None => {
+                            window.paint_quad(fill(picture_bounds, gpui::rgba(0x2a2a3aff)));
+                        },
+                    }
+                    let seek_bar_bounds = paint_embedded_media_controls_row(controls_bounds, *is_playing, *elapsed, *duration, *position_fraction, layout, window, cx);
+                    embedded_controls_bounds.push((image.dest_url.clone(), controls_bounds, seek_bar_bounds));
+                },
+                Some(terminal::EmbeddedMediaStatus::ReadyAudio { is_playing, elapsed, duration, position_fraction }) => {
+                    // No picture to letterbox — the reserved band shows a
+                    // plain placeholder fill plus the file name, matching
+                    // the Loading/Failed image branches' own visual
+                    // convention, with the controls row directly below.
+                    window.paint_quad(fill(box_bounds, gpui::rgba(0x2a2a3aff)));
+                    let label_text = if image.alt.is_empty() { format!("♪ {}", image.dest_url) } else { format!("♪ {}", image.alt) };
+                    let run = TextRun {
+                        len: label_text.len(),
+                        font: prose_font.clone(),
+                        color: gpui::rgba(0xa6adc8ff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(label_text.into(), base_font_size, &[run], None);
+                    let label_position = point(
+                        box_bounds.origin.x + (box_bounds.size.width - shaped.width).max(Pixels::ZERO) / 2.0,
+                        box_bounds.origin.y + (box_bounds.size.height - line_height) / 2.0,
+                    );
+                    shaped.paint(label_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+                    let controls_bounds =
+                        Bounds::new(point(box_bounds.origin.x, box_bounds.bottom()), gpui::size(box_bounds.size.width, line_height));
+                    let seek_bar_bounds = paint_embedded_media_controls_row(controls_bounds, *is_playing, *elapsed, *duration, *position_fraction, layout, window, cx);
+                    embedded_controls_bounds.push((image.dest_url.clone(), controls_bounds, seek_bar_bounds));
+                },
+            }
+            continue;
+        }
 
         if line.is_rule {
             let rule_bounds = Bounds::new(
@@ -2432,20 +2739,12 @@ fn paint_rich_content_markdown_widget(
         }
 
         // Headings render larger and bold — level 1 biggest, scaling
-        // down toward level 6, capped so a heading never exceeds twice
-        // the base row height (keeps the reserved footprint's per-row
-        // `line_height` assumption from drifting too far for very large
-        // headings).
-        let heading_scale = match line.heading_level {
-            Some(1) => 1.6,
-            Some(2) => 1.45,
-            Some(3) => 1.3,
-            Some(4) => 1.15,
-            Some(5) => 1.05,
-            Some(_) => 1.0,
-            None => 1.0,
-        };
+        // down toward level 6 (see `markdown_heading_scale`, shared with
+        // `row_heights` above so the row this text is shaped INTO and
+        // the row height the cursor already advanced BY always agree).
+        let heading_scale = markdown_heading_scale(line.heading_level);
         let font_size = base_font_size * heading_scale;
+        let row_height = line_height * heading_scale;
         let text_indent = if line.is_block_quote { cell_width } else { gpui::px(0.0) };
 
         let mut text = String::new();
@@ -2456,7 +2755,7 @@ fn paint_rich_content_markdown_widget(
             if line.heading_level.is_some() {
                 font.weight = gpui::FontWeight::BOLD;
             }
-            let color = if span.is_link { link_color } else { gpui::white() };
+            let color = if span.is_link { link_color } else { text_color };
             let strikethrough =
                 span.strikethrough.then(|| StrikethroughStyle { color: Some(color), thickness: gpui::px(1.0) });
             let underline = span
@@ -2474,7 +2773,7 @@ fn paint_rich_content_markdown_widget(
         }
 
         let shaped = window.text_system().shape_line(text.into(), font_size, &runs, None);
-        shaped.paint(point(at.x + text_indent, at.y), line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        shaped.paint(point(at.x + text_indent, at.y), row_height, gpui::TextAlign::Left, None, window, cx).log_err();
     }
 
     Some(bounds)
@@ -2507,7 +2806,7 @@ fn paint_rich_content_media_widget(
         point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
     let bounds = Bounds::new(position, gpui::size(width, line_height));
 
-    let widget_bg = rich_content_widget_bg();
+    let widget_bg = rich_content_widget_bg(cx);
     let bar_track = gpui::rgba(0x45475aff);
     let bar_fill = gpui::rgba(0x89dcebff);
     let text_color = gpui::white();
@@ -2680,7 +2979,7 @@ fn paint_rich_content_media_widget(
     let full_bar_end_x = total_time_position.x - cell_width;
 
     // Narrow-widget fallback: a yazi preview pane (typically a third or
-    // quarter of the window's width, unlike somcat's usual near-full-
+    // quarter of the window's width, unlike somsrp's usual near-full-
     // width placement) routinely can't fit both "HH:MM:SS" readouts AND
     // a usable bar in between — `full_bar_end_x <= full_bar_start_x`.
     // Confirmed live: play/pause/stop (whose bounds don't depend on this
@@ -2725,9 +3024,279 @@ fn paint_rich_content_media_widget(
     Some((bounds, bar_bounds_out, Some(stop_bounds)))
 }
 
+/// Top-level (non-embedded) audio's own controls-widget paint, now that
+/// its placeholder-grid reservation is the WHOLE terminal (see
+/// `crates/somsrp/src/main.rs`'s `print_placeholder_grid_with_cell_dims`
+/// doc comment) rather than a compact 40x1 footprint. A separate function
+/// from `paint_rich_content_media_widget` — NOT a parameterized reuse of
+/// it — because that function is ALSO used for video's controls row
+/// (called with `origin_line + picture_rows`, a single already-narrow
+/// row directly below the picture, where centering would be wrong: video
+/// wants its controls row exactly as wide as the picture above it, not
+/// centered within the whole terminal). Splitting into two functions
+/// keeps that call site completely untouched and avoids adding a
+/// `center: bool` branch to already-dense layout math.
+///
+/// Reuses the exact same glyph/time/seek-bar layout algorithm as
+/// `paint_rich_content_media_widget` (see that function's own extensive
+/// comments for the reasoning behind each measurement) — the only
+/// difference is that every element positions itself relative to a
+/// CENTERED `position`/`width` (the widget's own compact natural size,
+/// [`AUDIO_WIDGET_COLUMNS`] cells wide) within the full-terminal `bounds`,
+/// instead of `position`/`width` spanning the whole reservation directly.
+/// This is also forward-compatible with the planned (not yet built) audio
+/// cover-art feature: a future cover image would letterbox via `fit_into_
+/// box` within this SAME full-terminal `bounds`, independent of where
+/// this compact controls row centers itself.
+const AUDIO_WIDGET_COLUMNS: u32 = 40;
+
+fn paint_top_level_audio_widget(
+    max_column_seen: Option<u32>,
+    position_fraction: f32,
+    is_playing: bool,
+    elapsed: std::time::Duration,
+    duration: std::time::Duration,
+    origin: Point<Pixels>,
+    origin_line: i32,
+    origin_column: i32,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<(Bounds<Pixels>, Option<Bounds<Pixels>>, Option<Bounds<Pixels>>)> {
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+    let display_line = origin_line + layout.display_offset as i32;
+    let num_lines = layout.dimensions.num_lines() as i32;
+    if display_line < 0 || display_line >= num_lines {
+        return None;
+    }
+
+    let reserved_columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
+    let reserved_width = cell_width * reserved_columns;
+    let reserved_position =
+        point(origin.x + origin_column as f32 * cell_width, origin.y + display_line as f32 * line_height);
+    let bounds = Bounds::new(reserved_position, gpui::size(reserved_width, line_height));
+
+    window.paint_quad(fill(bounds, rich_content_widget_bg(cx)));
+
+    // The compact controls row's own natural width, centered horizontally
+    // within the full reservation — vertically, `bounds`' own height is
+    // already just `line_height` (this widget occupies exactly one row of
+    // the reserved footprint, same as before this change; it does not
+    // itself grow to fill a taller reservation — see this function's own
+    // doc comment on why the reservation being full-terminal doesn't mean
+    // this WIDGET should be).
+    let width = (cell_width * AUDIO_WIDGET_COLUMNS as f32).min(reserved_width);
+    let position = point(bounds.origin.x + (reserved_width - width) / 2.0, bounds.origin.y);
+
+    let bar_track = gpui::rgba(0x45475aff);
+    let bar_fill = gpui::rgba(0x89dcebff);
+    let text_color = gpui::white();
+
+    let mut text_style = layout.base_text_style.clone();
+    text_style.color = text_color;
+    text_style.font_size = line_height.into();
+
+    let resolved_font_id = window.text_system().resolve_font(&text_style.font());
+    let has_nerd_font_glyphs = window.text_system().has_glyph_for_char(resolved_font_id, '\u{f04c}');
+    let (nf_play, nf_pause, nf_stop) = if has_nerd_font_glyphs {
+        ("\u{f04b}", "\u{f04c}", "\u{f04d}")
+    } else {
+        (">", "||", "[]")
+    };
+
+    let shape_and_paint = |text: &str, at: Point<Pixels>, window: &mut Window, cx: &mut App| -> Pixels {
+        let run = TextRun { len: text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        let line = window.text_system().shape_line(
+            text.to_string().into(),
+            text_style.font_size.to_pixels(window.rem_size()),
+            &[run],
+            None,
+        );
+        line.paint(at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        line.width
+    };
+
+    let time_font_size: gpui::Pixels = (line_height - gpui::px(4.0)).max(gpui::px(1.0));
+    let time_text_width = {
+        let probe_text = format_duration(std::time::Duration::ZERO);
+        let probe_run =
+            TextRun { len: probe_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(probe_text.into(), time_font_size, &[probe_run], None).width
+    };
+    let dim_color: gpui::Hsla = gpui::rgba(0x585b70ff).into();
+    let paint_time = |duration: std::time::Duration, at: Point<Pixels>, window: &mut Window, cx: &mut App| {
+        let text = format_duration(duration);
+        let mut first_significant = text.len();
+        for (i, c) in text.char_indices() {
+            if c.is_ascii_digit() && c != '0' {
+                first_significant = i;
+                break;
+            }
+        }
+        let runs = if first_significant == 0 {
+            vec![TextRun { len: text.len(), font: text_style.font(), color: text_color, ..Default::default() }]
+        } else if first_significant >= text.len() {
+            vec![TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() }]
+        } else {
+            vec![
+                TextRun { len: first_significant, font: text_style.font(), color: dim_color, ..Default::default() },
+                TextRun {
+                    len: text.len() - first_significant,
+                    font: text_style.font(),
+                    color: text_color,
+                    ..Default::default()
+                },
+            ]
+        };
+        let line = window.text_system().shape_line(text.into(), time_font_size, &runs, None);
+        let y_offset = (line_height - time_font_size) / 2.0;
+        line.paint(point(at.x, at.y + y_offset), time_font_size, gpui::TextAlign::Left, None, window, cx).log_err();
+    };
+
+    let play_glyph = if is_playing { nf_pause } else { nf_play };
+    let play_glyph_width = {
+        let run = TextRun { len: play_glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(play_glyph.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None).width
+    };
+
+    let stop_glyph_width = {
+        let run = TextRun { len: nf_stop.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(nf_stop.into(), text_style.font_size.to_pixels(window.rem_size()), &[run], None).width
+    };
+    let stop_position = point(position.x + width - cell_width.max(stop_glyph_width), position.y);
+    let stop_bounds = Bounds::new(stop_position, gpui::size(stop_glyph_width.max(cell_width), line_height));
+
+    let current_time_position = point(position.x + play_glyph_width + cell_width * 2.0, position.y);
+    let total_time_position = point(stop_position.x - cell_width * 2.0 - time_text_width, position.y);
+
+    let full_bar_start_x = current_time_position.x + time_text_width + cell_width;
+    let full_bar_end_x = total_time_position.x - cell_width;
+
+    let (bar_start_x, bar_end_x, paint_time_readouts) = if full_bar_end_x > full_bar_start_x {
+        (full_bar_start_x, full_bar_end_x, true)
+    } else {
+        let narrow_start_x = position.x + play_glyph_width + cell_width;
+        let narrow_end_x = stop_position.x - cell_width;
+        (narrow_start_x, narrow_end_x, false)
+    };
+
+    shape_and_paint(play_glyph, position, window, cx);
+    shape_and_paint(nf_stop, stop_position, window, cx);
+    if paint_time_readouts {
+        paint_time(elapsed, current_time_position, window, cx);
+        paint_time(duration, total_time_position, window, cx);
+    }
+
+    let mut bar_bounds_out = None;
+    if bar_end_x > bar_start_x {
+        let bar_bounds = Bounds::new(
+            point(bar_start_x, position.y + line_height * 0.4),
+            gpui::size(bar_end_x - bar_start_x, line_height * 0.2),
+        );
+        window.paint_quad(fill(bar_bounds, bar_track));
+        let fill_width = (bar_end_x - bar_start_x) * position_fraction.clamp(0.0, 1.0);
+        if fill_width > Pixels::ZERO {
+            let fill_bounds = Bounds::new(bar_bounds.origin, gpui::size(fill_width, bar_bounds.size.height));
+            window.paint_quad(fill(fill_bounds, bar_fill));
+        }
+        bar_bounds_out = Some(bar_bounds);
+    }
+
+    Some((bounds, bar_bounds_out, Some(stop_bounds)))
+}
+
 fn format_duration(d: std::time::Duration) -> String {
     let total_seconds = d.as_secs();
     format!("{:02}:{:02}:{:02}", total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60)
+}
+
+/// Paints one compact play/pause + elapsed/seek-bar/total-time row for an
+/// EMBEDDED audio/video player, directly below its `box_bounds` (the
+/// picture/placeholder band `embed_box_bounds` computed). Deliberately a
+/// separate, smaller function rather than a reuse of `paint_rich_content_
+/// media_widget` (the TOP-LEVEL controls row): that function derives its
+/// width/position from `max_column_seen` and a grid-line origin, and has
+/// no independent "close" concept to omit — an embedded player has no
+/// stop icon at all (it lives exactly as long as its host markdown
+/// document/row does, there is nothing separate to click "stop" on), so
+/// parameterizing the top-level function to optionally drop its stop
+/// glyph would be a bigger, riskier refactor of already-working top-level
+/// video/audio than this feature's scope justifies. Reuses the same Nerd
+/// Font glyph/ASCII-fallback convention and `format_duration` helper for
+/// visual consistency with the top-level widget.
+///
+/// Returns the seek bar's own bounds (for future click/drag hit-testing),
+/// or `None` if the row was too narrow to paint one at all.
+fn paint_embedded_media_controls_row(
+    row_bounds: Bounds<Pixels>,
+    is_playing: bool,
+    elapsed: std::time::Duration,
+    duration: std::time::Duration,
+    position_fraction: f32,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Bounds<Pixels>> {
+    let line_height = layout.dimensions.line_height;
+    let cell_width = layout.dimensions.cell_width;
+    window.paint_quad(fill(row_bounds, rich_content_widget_bg(cx)));
+
+    let mut text_style = layout.base_text_style.clone();
+    let text_color = gpui::white();
+    text_style.color = text_color;
+    text_style.font_size = line_height.into();
+
+    let resolved_font_id = window.text_system().resolve_font(&text_style.font());
+    let has_nerd_font_glyphs = window.text_system().has_glyph_for_char(resolved_font_id, '\u{f04c}');
+    let (nf_play, nf_pause) = if has_nerd_font_glyphs { ("\u{f04b}", "\u{f04c}") } else { (">", "||") };
+    let play_glyph = if is_playing { nf_pause } else { nf_play };
+
+    let play_run = TextRun { len: play_glyph.len(), font: text_style.font(), color: text_color, ..Default::default() };
+    let play_line =
+        window.text_system().shape_line(play_glyph.to_string().into(), text_style.font_size.to_pixels(window.rem_size()), &[play_run], None);
+    play_line.paint(row_bounds.origin, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+    let play_glyph_width = play_line.width;
+
+    let time_font_size: gpui::Pixels = (line_height - gpui::px(4.0)).max(gpui::px(1.0));
+    let time_text_width = {
+        let probe_text = format_duration(std::time::Duration::ZERO);
+        let probe_run = TextRun { len: probe_text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        window.text_system().shape_line(probe_text.into(), time_font_size, &[probe_run], None).width
+    };
+    let paint_time = |duration: std::time::Duration, at: Point<Pixels>, window: &mut Window, cx: &mut App| {
+        let text = format_duration(duration);
+        let run = TextRun { len: text.len(), font: text_style.font(), color: text_color, ..Default::default() };
+        let line = window.text_system().shape_line(text.into(), time_font_size, &[run], None);
+        let y_offset = (line_height - time_font_size) / 2.0;
+        line.paint(point(at.x, at.y + y_offset), time_font_size, gpui::TextAlign::Left, None, window, cx).log_err();
+    };
+
+    let current_time_position = point(row_bounds.origin.x + play_glyph_width + cell_width, row_bounds.origin.y);
+    let total_time_position =
+        point(row_bounds.origin.x + row_bounds.size.width - time_text_width, row_bounds.origin.y);
+    let bar_start_x = current_time_position.x + time_text_width + cell_width;
+    let bar_end_x = total_time_position.x - cell_width;
+
+    if bar_end_x > bar_start_x {
+        paint_time(elapsed, current_time_position, window, cx);
+        paint_time(duration, total_time_position, window, cx);
+        let bar_bounds = Bounds::new(
+            point(bar_start_x, row_bounds.origin.y + line_height * 0.4),
+            gpui::size(bar_end_x - bar_start_x, line_height * 0.2),
+        );
+        window.paint_quad(fill(bar_bounds, gpui::rgba(0x45475aff)));
+        let fill_width = bar_bounds.size.width * position_fraction.clamp(0.0, 1.0);
+        if fill_width > Pixels::ZERO {
+            window.paint_quad(fill(Bounds::new(bar_bounds.origin, gpui::size(fill_width, bar_bounds.size.height)), gpui::rgba(0x89dcebff)));
+        }
+        Some(bar_bounds)
+    } else {
+        // Too narrow for a bar at all — the play/pause glyph alone still
+        // painted above, same narrow-widget tolerance the top-level
+        // widget's own fallback documents.
+        None
+    }
 }
 
 fn to_highlighted_range_lines(
@@ -3598,5 +4167,128 @@ mod tests {
         // Negative: lines -7, -6, -5, -4
         assert_eq!(negative_filtered.first().unwrap().point.line, Line(-7));
         assert_eq!(negative_filtered.last().unwrap().point.line, Line(-4));
+    }
+
+    #[test]
+    fn embed_box_bounds_with_default_attrs_matches_the_old_fixed_geometry() {
+        let attrs = crate::markdown_styling::EmbedAttrs::default();
+        let at = point(px(10.0), px(20.0));
+        let full_width = px(200.0);
+        let cell_width = px(8.0);
+        let line_height = px(16.0);
+        let bounds = embed_box_bounds(&attrs, at, full_width, cell_width, line_height);
+        assert_eq!(bounds.origin.x, at.x + cell_width);
+        assert_eq!(bounds.origin.y, at.y);
+        assert_eq!(bounds.size.width, full_width - cell_width * 2.0);
+        assert_eq!(bounds.size.height, line_height * crate::markdown_styling::EMBEDDED_IMAGE_ROWS as f32);
+    }
+
+    #[test]
+    fn embed_box_bounds_width_percent_scales_from_available_width() {
+        let attrs = crate::markdown_styling::EmbedAttrs { width_percent: Some(50), ..Default::default() };
+        let at = point(px(0.0), px(0.0));
+        let full_width = px(200.0);
+        let cell_width = px(8.0);
+        let line_height = px(16.0);
+        let bounds = embed_box_bounds(&attrs, at, full_width, cell_width, line_height);
+        let full_available_width = full_width - cell_width * 2.0;
+        assert_eq!(bounds.size.width, full_available_width * 0.5);
+    }
+
+    #[test]
+    fn embed_box_bounds_height_rows_is_clamped_to_the_reserved_band() {
+        let attrs = crate::markdown_styling::EmbedAttrs {
+            height_rows: Some(crate::markdown_styling::EMBEDDED_IMAGE_ROWS as u32 + 20),
+            ..Default::default()
+        };
+        let bounds = embed_box_bounds(&attrs, point(px(0.0), px(0.0)), px(200.0), px(8.0), px(16.0));
+        assert_eq!(
+            bounds.size.height,
+            px(16.0) * crate::markdown_styling::EMBEDDED_IMAGE_ROWS as f32,
+            "height_rows must never grow the box past EMBEDDED_IMAGE_ROWS"
+        );
+    }
+
+    #[test]
+    fn embed_box_bounds_position_center_and_right_shift_within_available_width() {
+        let full_width = px(200.0);
+        let cell_width = px(8.0);
+        let line_height = px(16.0);
+        let at = point(px(0.0), px(0.0));
+        let full_available_width = full_width - cell_width * 2.0;
+
+        let centered = embed_box_bounds(
+            &crate::markdown_styling::EmbedAttrs {
+                position: crate::markdown_styling::EmbedPosition::Center,
+                width_percent: Some(50),
+                ..Default::default()
+            },
+            at,
+            full_width,
+            cell_width,
+            line_height,
+        );
+        let box_width = full_available_width * 0.5;
+        assert_eq!(centered.origin.x, at.x + cell_width + (full_available_width - box_width) / 2.0);
+
+        let right = embed_box_bounds(
+            &crate::markdown_styling::EmbedAttrs {
+                position: crate::markdown_styling::EmbedPosition::Right,
+                width_percent: Some(50),
+                ..Default::default()
+            },
+            at,
+            full_width,
+            cell_width,
+            line_height,
+        );
+        assert_eq!(right.origin.x, at.x + cell_width + (full_available_width - box_width));
+    }
+
+    #[test]
+    fn embed_box_bounds_vertical_position_middle_and_bottom_shift_within_the_reserved_band() {
+        let full_width = px(200.0);
+        let cell_width = px(8.0);
+        let line_height = px(16.0);
+        let at = point(px(0.0), px(0.0));
+        let reserved_rows = crate::markdown_styling::EMBEDDED_IMAGE_ROWS as u32;
+        let full_reserved_height = line_height * reserved_rows as f32;
+        let height_rows = 2u32;
+        let box_height = line_height * height_rows as f32;
+
+        let top = embed_box_bounds(
+            &crate::markdown_styling::EmbedAttrs { height_rows: Some(height_rows), ..Default::default() },
+            at,
+            full_width,
+            cell_width,
+            line_height,
+        );
+        assert_eq!(top.origin.y, at.y, "default vertical_position (Top) must not shift the box");
+
+        let middle = embed_box_bounds(
+            &crate::markdown_styling::EmbedAttrs {
+                height_rows: Some(height_rows),
+                vertical_position: crate::markdown_styling::EmbedVerticalPosition::Middle,
+                ..Default::default()
+            },
+            at,
+            full_width,
+            cell_width,
+            line_height,
+        );
+        assert_eq!(middle.origin.y, at.y + (full_reserved_height - box_height) / 2.0);
+
+        let bottom = embed_box_bounds(
+            &crate::markdown_styling::EmbedAttrs {
+                height_rows: Some(height_rows),
+                vertical_position: crate::markdown_styling::EmbedVerticalPosition::Bottom,
+                ..Default::default()
+            },
+            at,
+            full_width,
+            cell_width,
+            line_height,
+        );
+        assert_eq!(bottom.origin.y, at.y + (full_reserved_height - box_height));
     }
 }

@@ -71,7 +71,7 @@ struct CacheEntry {
     /// DIRECTLY when no sender is still connected to ask instead —
     /// confirmed live as a real gap: a short/fast transfer (e.g. a
     /// 1-second audio fixture, or a small image/GIF/markdown file) can
-    /// have `somcat` finish streaming and exit before Som even
+    /// have `somsrp` finish streaming and exit before Som even
     /// subscribes, so `subscribe()`'s own watermark-only replay (see its
     /// doc comment) leaves the receiver's buffer permanently empty with
     /// no live sender left to answer an on-demand fetch — `contiguous_
@@ -114,6 +114,21 @@ struct Inner {
     /// backward-compatible with any sender that never sends `Register
     /// RangeResponder` at all).
     range_response_routes: HashMap<CacheKey, SenderRoute>,
+    /// Populated by a live markdown placement's `somsrp` process
+    /// registering itself as the target for `SrvRequest::GrowMarkdownRows`
+    /// — DELIBERATELY a separate table from `range_response_routes`, not
+    /// reusing `RegisterRangeResponder`'s existing registration message
+    /// for this: `route_byte_range_request` checks `range_response_routes`
+    /// FIRST and treats a successful SEND (not a successful ANSWER) as
+    /// "handled," so a markdown grower registered there would silently
+    /// swallow a late-subscriber `RequestByteRange` catch-up (see
+    /// `SrvProgressState::request_whole_range_once_if_needed`) instead of
+    /// letting it fall through to `serve_from_recent_bytes` — confirmed
+    /// live as the root cause of markdown never rendering at all once
+    /// `somsrp` started registering a range responder for the live-
+    /// process model. `route_grow_markdown_rows` only ever looks here,
+    /// never at `range_response_routes`.
+    markdown_grower_routes: HashMap<CacheKey, SenderRoute>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -263,7 +278,7 @@ impl SrvCache {
     /// current watermark if any chunk for this key has already landed —
     /// a subscriber arriving after the fact (a real race, not a
     /// hypothetical one: confirmed live for small, non-keep-alive
-    /// transfers like a single image/GIF, where `somcat` can finish
+    /// transfers like a single image/GIF, where `somsrp` can finish
     /// streaming the ENTIRE file and close its connection before Som's
     /// side ever gets around to sending `SubscribeProgress` for a
     /// placement it only just noticed in the placeholder grid) still
@@ -325,6 +340,26 @@ impl SrvCache {
         }
     }
 
+    /// Pushes `SrvResponse::FetchFailed` to every current subscriber of
+    /// `(session_id, file_id)` — structurally identical to
+    /// [`Self::notify_stop_playback`] (same "not gated on a watermark, a
+    /// dead subscriber is silently skipped" reasoning). Exists because
+    /// the requester of a `SrvRequest::FetchResource` sends it fire-and-
+    /// forget on a one-shot connection it immediately drops (see
+    /// `rich_content_srv_channel::request_fetch_resource`'s own doc
+    /// comment for why it can't block on a reply from inside a paint
+    /// pass) — a reply written back on THAT connection is never read by
+    /// anyone. The requester's real listening connection is its
+    /// `SubscribeProgress` one, which is exactly what this pushes to.
+    pub fn notify_fetch_failed(&self, session_id: u32, file_id: u32, reason: String) {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::FetchFailed { session_id, file_id, reason: reason.clone() });
+            }
+        }
+    }
+
     /// Answers a `SrvRequest::UnsubscribeProgress` by pushing `SrvResponse::
     /// Unsubscribed` to every current subscriber of `(session_id, file_id)`
     /// (in practice exactly one — Som's own `SubscribeProgress` connection
@@ -368,13 +403,22 @@ impl SrvCache {
         inner.range_response_routes.insert((session_id, file_id), send);
     }
 
+    /// Registers `send` as the target for `SrvRequest::GrowMarkdownRows`
+    /// — see `markdown_grower_routes`'s own doc comment for why this is a
+    /// separate table from `register_range_responder_route`, not a reuse
+    /// of it.
+    pub fn register_markdown_grower_route(&self, session_id: u32, file_id: u32, send: SenderRoute) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.markdown_grower_routes.insert((session_id, file_id), send);
+    }
+
     /// Forwards `request` to `(session_id, file_id)`'s registered range-
     /// responder route if one was explicitly registered (see `SrvRequest::
     /// RegisterRangeResponder`'s own doc comment for why that's preferred
     /// — it's on a connection dedicated to range responses, uncontended
     /// by the sequential `PutChunk` stream), falling back to the plain
     /// sender route otherwise (a sender that never registers a dedicated
-    /// responder — images/GIF, or an older `somcat` build — still gets a
+    /// responder — images/GIF, or an older `somsrp` build — still gets a
     /// working, just non-prioritized, byte-range reply). A miss on BOTH
     /// (no route registered at all, or the registered route's underlying
     /// connection has since closed and its `send` call fails) is silently
@@ -428,6 +472,26 @@ impl SrvCache {
         let key = (session_id, file_id);
         if let Some(route) = inner.range_response_routes.get(&key) {
             let _ = route(SrvRequest::EndPlayback { session_id, file_id });
+        }
+    }
+
+    /// Forwards `SrvRequest::GrowMarkdownRows` to `(session_id, file_id)`'s
+    /// registered markdown-grower route (`register_markdown_grower_route`,
+    /// a table DELIBERATELY separate from `range_response_routes` — see
+    /// `markdown_grower_routes`'s own doc comment for why: reusing the
+    /// range-responder table made a late-subscriber `RequestByteRange`
+    /// catch-up silently vanish into a markdown grower that doesn't
+    /// understand it, instead of falling through to `serve_from_recent_
+    /// bytes`). No `sender_routes`/recent-bytes fallback needed — this
+    /// only means anything to `somsrp`'s own live markdown responder
+    /// thread. Silently a no-op on a miss, same tolerance every other
+    /// best-effort message here has — see `SrvRequest::GrowMarkdownRows`'s
+    /// own doc comment.
+    pub fn route_grow_markdown_rows(&self, session_id: u32, file_id: u32, additional_rows: u32) {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        if let Some(route) = inner.markdown_grower_routes.get(&key) {
+            let _ = route(SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows });
         }
     }
 
@@ -506,10 +570,95 @@ mod tests {
     }
 
     #[test]
+    fn route_byte_range_request_still_reaches_the_sender_when_only_a_markdown_grower_is_registered() {
+        // Direct regression test for the real live bug this fixes: a
+        // markdown placement's grower thread registers itself via
+        // `register_markdown_grower_route` (NOT `register_range_responder_
+        // route`) — a late-subscriber `RequestByteRange` catch-up must
+        // still reach the ordinary `PutChunk` sender route (or the
+        // recent-bytes fallback), not silently vanish because a markdown
+        // grower for the same key happens to exist.
+        let cache = SrvCache::new();
+        cache.put_chunk(1, 2, 0, b"hello world", 11, ContentType::Markdown, ContentMetadata::Markdown { base_dir: String::new() });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            cache.register_sender_route(1, 2, Arc::new(move |request| {
+                observed.lock().unwrap().push(request);
+                Ok(())
+            }));
+        }
+        cache.register_markdown_grower_route(1, 2, Arc::new(|_| Ok(())));
+
+        let request = SrvRequest::RequestByteRange { session_id: 1, file_id: 2, offset: 0, len: 11 };
+        cache.route_byte_range_request(1, 2, request);
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1, "the sender route must still receive the request even though a markdown grower is also registered");
+    }
+
+    #[test]
     fn route_byte_range_request_is_a_silent_no_op_with_no_registered_sender() {
         let cache = SrvCache::new();
         // No `register_sender_route` call at all — must not panic or error.
         cache.route_byte_range_request(99, 99, SrvRequest::RequestByteRange { session_id: 99, file_id: 99, offset: 0, len: 10 });
+    }
+
+    #[test]
+    fn route_grow_markdown_rows_forwards_to_the_registered_markdown_grower() {
+        let cache = SrvCache::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let observed = observed.clone();
+            cache.register_markdown_grower_route(
+                1,
+                2,
+                Arc::new(move |request| {
+                    observed.lock().unwrap().push(request);
+                    Ok(())
+                }),
+            );
+        }
+
+        cache.route_grow_markdown_rows(1, 2, 5);
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(matches!(
+            observed[0],
+            SrvRequest::GrowMarkdownRows { session_id: 1, file_id: 2, additional_rows: 5 }
+        ));
+    }
+
+    #[test]
+    fn route_grow_markdown_rows_does_not_leak_into_the_range_responder_table() {
+        // Regression test: registering a RANGE responder (the audio/
+        // video mechanism) must NOT also satisfy GrowMarkdownRows routing
+        // — the two tables are deliberately separate (see `markdown_
+        // grower_routes`'s own doc comment for the real bug this guards
+        // against: a markdown grower registered in the WRONG table
+        // silently swallowed late-subscriber RequestByteRange catch-ups).
+        let cache = SrvCache::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            cache.register_range_responder_route(1, 2, Arc::new(move |request| {
+                observed.lock().unwrap().push(request);
+                Ok(())
+            }));
+        }
+
+        cache.route_grow_markdown_rows(1, 2, 5);
+
+        assert!(observed.lock().unwrap().is_empty(), "a range-responder registration must not receive GrowMarkdownRows");
+    }
+
+    #[test]
+    fn route_grow_markdown_rows_is_a_silent_no_op_with_no_registered_responder() {
+        let cache = SrvCache::new();
+        // No `register_range_responder_route` call at all — must not panic or error.
+        cache.route_grow_markdown_rows(99, 99, 3);
     }
 
     #[test]
@@ -573,6 +722,46 @@ mod tests {
         let cache = SrvCache::new();
         // No `subscribe` call at all — must not panic or error.
         cache.notify_stop_playback(99, 99);
+    }
+
+    #[test]
+    fn notify_fetch_failed_pushes_to_every_subscriber() {
+        let cache = SrvCache::new();
+        let first_observed = Arc::new(Mutex::new(Vec::new()));
+        let second_observed = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let first_observed = first_observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                first_observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        {
+            let second_observed = second_observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                second_observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+
+        cache.notify_fetch_failed(1, 2, "connection refused".to_string());
+
+        for observed in [&first_observed, &second_observed] {
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert!(matches!(
+                &observed[0],
+                SrvResponse::FetchFailed { session_id: 1, file_id: 2, reason } if reason == "connection refused"
+            ));
+        }
+    }
+
+    #[test]
+    fn notify_fetch_failed_is_a_silent_no_op_with_no_subscriber() {
+        let cache = SrvCache::new();
+        // No `subscribe` call at all — must not panic or error.
+        cache.notify_fetch_failed(99, 99, "whatever".to_string());
     }
 
     #[test]

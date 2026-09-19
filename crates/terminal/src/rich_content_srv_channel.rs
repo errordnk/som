@@ -154,6 +154,16 @@ pub struct SrvProgressState {
     /// `RequestByteRange` for this placement — see that method's own doc
     /// comment for the race it closes and why this must only fire once.
     whole_range_requested: AtomicBool,
+    /// Set when a `SrvResponse::FetchFailed` push arrives for this
+    /// `(session_id, file_id)` — only ever populated for a Som-minted
+    /// `FetchResource` subscription (a markdown-embedded image), never
+    /// for an ordinary `somsrp`-originated placement, which has no fetch
+    /// to fail. Distinct from `stop`/`stop_playback_requested`: this is a
+    /// TERMINAL, sticky state (the bytes are never coming), so unlike
+    /// `take_stop_playback_requested`'s consume-once shape this is a
+    /// plain peek — the paint path re-reads it every pass to keep
+    /// painting the broken-image indicator.
+    fetch_failed: Mutex<Option<String>>,
 }
 
 impl SrvProgressState {
@@ -464,7 +474,7 @@ impl SrvProgressState {
     /// arrived (`contiguous_len() > 0`) but the local buffer is actually
     /// empty — the exact gap `somsrv::srv_cache::SrvCache::subscribe`'s
     /// own doc comment describes: a late subscriber (Som noticing a
-    /// placeholder only after `somcat` already finished streaming a
+    /// placeholder only after `somsrp` already finished streaming a
     /// small/fast image, GIF, or markdown file and disconnected) gets a
     /// watermark-only replay with no actual bytes, since this buffer
     /// (unlike the old on-disk `RichContentCache` path) has nothing to
@@ -478,6 +488,38 @@ impl SrvProgressState {
     /// progress) doesn't get spammed with a redundant request on every
     /// poll — one request is enough; the reply arrives as an ordinary
     /// `Progress` push on the existing subscription connection.
+    /// The recorded reason a `SrvRequest::FetchResource` fetch failed for
+    /// good, if any — see the `fetch_failed` field's own doc comment for
+    /// why this is a plain peek rather than a consume-once `take`.
+    pub fn fetch_failure(&self) -> Option<String> {
+        self.fetch_failed.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn record_fetch_failure(&self, reason: String) {
+        *self.fetch_failed.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+    }
+
+    /// True while this subscription is still waiting on bytes: nothing
+    /// has failed AND either no watermark has arrived yet or the
+    /// transfer hasn't reached `total_size`. Used by the paint path to
+    /// decide whether to keep forcing repaints for a markdown-embedded
+    /// image still in flight (see `paint_rich_content_placements`'s
+    /// `any_animating` accumulation) — `SrvProgressState` itself has no
+    /// push/notify mechanism, so without this a still image's arrived
+    /// bytes could sit unnoticed until an unrelated repaint happens.
+    pub fn is_fetch_in_flight(&self) -> bool {
+        if self.fetch_failure().is_some() {
+            return false;
+        }
+        let total = self.total_size();
+        total == 0 || self.contiguous_len() < total
+    }
+
+    #[cfg(test)]
+    pub fn record_fetch_failure_for_test(&self, reason: &str) {
+        self.record_fetch_failure(reason.to_string());
+    }
+
     pub fn request_whole_range_once_if_needed(&self, session_id: u32, file_id: u32) {
         let contiguous_len = self.contiguous_len();
         if contiguous_len == 0 {
@@ -528,7 +570,7 @@ fn to_terminal_metadata(metadata: somsrv::protocol::ContentMetadata) -> ContentM
                 extension,
             }
         },
-        M::Markdown => ContentMetadata::Markdown,
+        M::Markdown { base_dir } => ContentMetadata::Markdown { base_dir },
     }
 }
 
@@ -542,7 +584,7 @@ fn extension_from_metadata(metadata: &somsrv::protocol::ContentMetadata) -> Stri
     use somsrv::protocol::ContentMetadata as M;
     match metadata {
         M::Video { extension, .. } | M::Audio { extension, .. } => extension.clone(),
-        M::Image { .. } | M::Markdown => String::new(),
+        M::Image { .. } | M::Markdown { .. } => String::new(),
     }
 }
 
@@ -635,10 +677,10 @@ fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) 
 /// function's own doc comment for why this can't be inline on the
 /// caller's thread) that a `(session_id, file_id)` playback has
 /// definitively ended: natural EOF, or the widget's own stop icon. The
-/// daemon forwards this straight to whichever `somcat` process registered
+/// daemon forwards this straight to whichever `somsrp` process registered
 /// itself as this key's range responder, which reacts by exiting — see
 /// `SrvRequest::EndPlayback`'s own doc comment for the full reasoning
-/// (`somcat` otherwise has no way to know playback ended and would sit
+/// (`somsrp` otherwise has no way to know playback ended and would sit
 /// forever holding the terminal in the foreground).
 pub fn end_playback(session_id: u32, file_id: u32) {
     std::thread::spawn(move || {
@@ -651,6 +693,30 @@ pub fn end_playback(session_id: u32, file_id: u32) {
 fn try_end_playback(session_id: u32, file_id: u32) -> anyhow::Result<()> {
     let connection = connect_and_handshake()?;
     send(&connection, &SrvRequest::EndPlayback { session_id, file_id })?;
+    Ok(())
+}
+
+/// Sends `SrvRequest::GrowMarkdownRows` on a fresh, one-shot connection —
+/// same shape and same fire-and-forget-on-a-background-thread reasoning
+/// as [`end_playback`]/[`request_byte_range`] (this is called from
+/// inside a paint pass, and the connect+handshake are blocking OS I/O
+/// with no timeout). Tells the live `somsrp` process backing this
+/// markdown placement (registered as its range responder, exactly like
+/// audio/video's own byte-range responder) to print `additional_rows`
+/// more placeholder-grid rows, continuing this SAME placement's row
+/// numbering — see `SrvRequest::GrowMarkdownRows`'s own doc comment for
+/// the full "why does a markdown placement need this at all" reasoning.
+pub fn request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32) {
+    std::thread::spawn(move || {
+        if let Err(err) = try_request_markdown_growth(session_id, file_id, additional_rows) {
+            log::debug!("failed to send somsrv GrowMarkdownRows for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
+}
+
+fn try_request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32) -> anyhow::Result<()> {
+    let connection = connect_and_handshake()?;
+    send(&connection, &SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows })?;
     Ok(())
 }
 
@@ -680,6 +746,63 @@ fn try_unsubscribe(session_id: u32, file_id: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The high bit of `session_id`, reserved for ids Som itself mints for
+/// markdown-embedded media fetches. Every OTHER id in this system is
+/// minted by `somsrp::new_ids()`, which masks to 24 bits (`& 0xFF_FFFF`)
+/// because it must round-trip through a placeholder cell's 24-bit RGB
+/// encoding (`kitty_graphics_placeholder::id_to_rgb`). A Som-minted id
+/// NEVER touches the grid — no placeholder cell is ever printed for it —
+/// so it is not bound by that cap, and setting a bit above 24 makes
+/// collision with any `somsrp`-minted id structurally impossible without
+/// needing any new coordination/authorization mechanism between the two
+/// (trust is already established: see `SrvRequest::FetchResource`'s own
+/// doc comment on reaching `somsrv` implying session ownership).
+pub const SOM_MINTED_SESSION_BIT: u32 = 0x8000_0000;
+
+/// Mints a fresh `(session_id, file_id)` for one markdown-embedded media
+/// fetch. Monotonic per process (not time-derived like `somsrp::new_ids`
+/// — `somsrp` needs time-derivation because independent PROCESSES must
+/// not collide; within ONE Som process a plain counter is both collision-
+/// free and cheaper), tagged with [`SOM_MINTED_SESSION_BIT`].
+pub fn mint_som_ids() -> (u32, u32) {
+    use std::sync::atomic::AtomicU32;
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    (SOM_MINTED_SESSION_BIT | (n & 0x7FFF_FFFF), n.wrapping_mul(2_654_435_761).max(1))
+}
+
+/// Sends `SrvRequest::FetchResource` on a FRESH, one-shot connection to
+/// `somsrv` — same shape and same fire-and-forget-on-a-background-thread
+/// reasoning as [`request_byte_range`] (see its doc comment: this is
+/// called from inside a paint pass, and `PipeConnection::connect` plus
+/// the handshake are blocking OS I/O with no timeout, which would freeze
+/// every repaint if done inline).
+///
+/// ORDERING REQUIREMENT: the caller MUST have already called
+/// [`spawn_progress_listener`] for this same `(session_id, file_id)`
+/// before calling this. `SrvCache::subscribe` does NOT replay chunk
+/// bytes to a late subscriber (only a watermark-bearing `Progress`, see
+/// that method's own doc comment) — the same reason `somsrp` always
+/// prints its placeholder grid BEFORE streaming. A small local PNG can
+/// be fetched and fully streamed into the cache faster than a second
+/// connection's handshake completes, so subscribing afterwards would see
+/// bytes that already went by. The `FetchFailed` reply also only reaches
+/// a SUBSCRIBER (see `SrvCache::notify_fetch_failed`) — this one-shot
+/// connection is closed before it could read anything back.
+pub fn request_fetch_resource(session_id: u32, file_id: u32, target: String, base_dir: Option<String>) {
+    std::thread::spawn(move || {
+        if let Err(err) = try_request_fetch_resource(session_id, file_id, &target, base_dir) {
+            log::debug!("failed to send somsrv FetchResource for {session_id:#x}:{file_id:#x} target {target:?}: {err:#}");
+        }
+    });
+}
+
+fn try_request_fetch_resource(session_id: u32, file_id: u32, target: &str, base_dir: Option<String>) -> anyhow::Result<()> {
+    let connection = connect_and_handshake()?;
+    send(&connection, &SrvRequest::FetchResource { session_id, file_id, target: target.to_string(), base_dir })?;
+    Ok(())
+}
+
 fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Result<()> {
     let connection = connect_and_handshake()?;
     send(&connection, &SrvRequest::SubscribeProgress { session_id, file_id })?;
@@ -694,6 +817,10 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             SrvResponse::Progress { session_id: response_session, file_id: response_file, contiguous_len, tail_available_from, pending_ranges, total_size, content_type, metadata, chunk_offset, chunk_data }
                 if response_session == session_id && response_file == file_id =>
             {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Users\\dnk\\AppData\\Local\\Temp\\som_debug.log").and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, "Progress: {session_id:#x}:{file_id:#x} contiguous_len={contiguous_len} total_size={total_size} chunk_offset={chunk_offset} chunk_len={} content_type={content_type:?}", chunk_data.len())
+                });
                 state.tail_available_from.store(tail_available_from, Ordering::Release);
                 *state.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()) = pending_ranges;
                 state.total_size.store(total_size, Ordering::Release);
@@ -736,6 +863,19 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             {
                 return Ok(());
             },
+            // A fetch we ourselves asked for (`SrvRequest::FetchResource`,
+            // Som-minted id — see `mint_som_ids`) failed for good: no
+            // `Progress` push will EVER arrive for this key, so recording
+            // the reason and returning is the only correct move — looping
+            // back into `read_message()` would park this thread forever.
+            // Mirrors `Unsubscribed`'s own record-and-return shape rather
+            // than `StopPlayback`'s keep-looping one.
+            SrvResponse::FetchFailed { session_id: response_session, file_id: response_file, reason }
+                if response_session == session_id && response_file == file_id =>
+            {
+                state.record_fetch_failure(reason);
+                return Ok(());
+            },
             _ => continue, // unrelated response — ignore, keep waiting
         }
     }
@@ -743,7 +883,7 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
 
 fn connect_and_handshake() -> anyhow::Result<somsrv::pipe::PipeConnection> {
     // Same spawn-if-not-running convention every other `somsrv` client
-    // in this codebase uses (`somcat::srv_channel::SrvChannel::connect`,
+    // in this codebase uses (`somsrp::srv_channel::SrvChannel::connect`,
     // `somsrv::relay`'s own RELAY-side connect) — the daemon binary is
     // expected next to Som's own executable (see `somsrv::daemon::
     // binary_path_next_to_current_exe`'s doc comment for why this one
@@ -763,4 +903,47 @@ fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyh
     let payload = serde_json::to_vec(message)?;
     connection.write_message(&payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_failure_is_none_by_default() {
+        let state = SrvProgressState::default();
+        assert_eq!(state.fetch_failure(), None);
+    }
+
+    #[test]
+    fn fetch_failure_reports_the_recorded_reason() {
+        let state = SrvProgressState::default();
+        state.record_fetch_failure_for_test("connection refused");
+        assert_eq!(state.fetch_failure(), Some("connection refused".to_string()));
+    }
+
+    #[test]
+    fn is_fetch_in_flight_is_false_after_a_failure() {
+        let state = SrvProgressState::default();
+        assert!(state.is_fetch_in_flight(), "nothing has arrived or failed yet — still in flight");
+        state.record_fetch_failure_for_test("boom");
+        assert!(!state.is_fetch_in_flight());
+    }
+
+    #[test]
+    fn is_fetch_in_flight_is_false_once_contiguous_len_reaches_total_size() {
+        let state = SrvProgressState::default();
+        state.seed_whole_file_for_test(b"hello", "png");
+        assert!(!state.is_fetch_in_flight(), "a fully-arrived transfer is no longer in flight");
+    }
+
+    #[test]
+    fn mint_som_ids_always_sets_the_reserved_high_bit_and_never_collides() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let (session_id, file_id) = mint_som_ids();
+            assert_ne!(session_id & SOM_MINTED_SESSION_BIT, 0, "every Som-minted session_id must carry the reserved bit");
+            assert!(seen.insert((session_id, file_id)), "minted ids must never repeat");
+        }
+    }
 }

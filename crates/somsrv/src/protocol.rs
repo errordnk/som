@@ -356,7 +356,7 @@ pub enum HolderOutput {
     ShellExited,
 }
 
-/// `somcat`/other SRP clients -> daemon: the binary side-channel for rich
+/// `somsrp`/other SRP clients -> daemon: the binary side-channel for rich
 /// media content (video/image/audio today, `md://`'s `som-lua` scripts
 /// later) — a SEPARATE connection kind from `RelayInput`/`HolderOutput`
 /// (which stay dedicated to PTY keystrokes/ANSI bytes), even though both
@@ -422,7 +422,7 @@ pub enum SrvRequest {
     /// gone, nothing to do" tolerance the old `kill <pid>`-based approach
     /// had for a PID that had already exited on its own.
     KillSession { client_id: Option<String>, pane_id: String },
-    /// Sent by Som (never by `somcat`) right after `Handshake`, on a
+    /// Sent by Som (never by `somsrp`) right after `Handshake`, on a
     /// SECOND long-lived `Srv`-kind connection separate from whichever
     /// one (if any) is sending `PutChunk`s for this same
     /// `(session_id, file_id)` — subscribes this connection to
@@ -431,7 +431,7 @@ pub enum SrvRequest {
     /// `RichContentCache::apply_chunk` already has today) without racing
     /// a raw on-disk file-size poll against out-of-order chunk arrival.
     SubscribeProgress { session_id: u32, file_id: u32 },
-    /// Sent by Som (never by `somcat`) on the SAME connection as
+    /// Sent by Som (never by `somsrp`) on the SAME connection as
     /// `SubscribeProgress` above, when this placement's in-memory state
     /// (`crate::terminal::rich_content_srv_channel::SrvProgressState` and
     /// friends) has just been evicted because its placeholder cells are
@@ -451,7 +451,7 @@ pub enum SrvRequest {
     /// eviction fires, so there is nothing lost by no longer listening
     /// for further `Progress` pushes on this key.
     UnsubscribeProgress { session_id: u32, file_id: u32 },
-    /// Sent by Som (never by `somcat`) on the SAME connection as
+    /// Sent by Som (never by `somsrp`) on the SAME connection as
     /// `SubscribeProgress` above, whenever it needs bytes further into a
     /// file than the sequential `PutChunk` stream has reached yet (e.g.
     /// seeking forward in audio/video playback past what's currently
@@ -461,7 +461,7 @@ pub enum SrvRequest {
     /// `(session_id, file_id)` in its sender-routing table (populated by
     /// the first `PutChunk` seen for that key) and forwards this same
     /// message, verbatim, down THAT connection — the client that's
-    /// actually holding the file (`somcat` or equivalent) answers by
+    /// actually holding the file (`somsrp` or equivalent) answers by
     /// sending ordinary `PutChunk`s covering `[offset, offset+len)` back
     /// on its own connection, same as it would for any other part of the
     /// file; there is no separate "range response" message shape needed,
@@ -471,7 +471,7 @@ pub enum SrvRequest {
     /// — see this plan's own doc comment for why that's an accepted gap,
     /// not a new failure mode.
     RequestByteRange { session_id: u32, file_id: u32, offset: u64, len: u64 },
-    /// Sent by `somcat` (never by Som) on a SECOND connection, separate
+    /// Sent by `somsrp` (never by Som) on a SECOND connection, separate
     /// from whichever one is sending the sequential `PutChunk` stream for
     /// this `(session_id, file_id)` — registers THIS connection as the
     /// one `RequestByteRange` gets forwarded to, instead of the
@@ -494,7 +494,23 @@ pub enum SrvRequest {
     /// request` prefers this one when present (see `SrvCache`'s own doc
     /// comment).
     RegisterRangeResponder { session_id: u32, file_id: u32 },
-    /// Sent by Som (never by `somcat`) on the SAME connection as
+    /// Sent by `somsrp` on a fresh, one-shot connection when starting a
+    /// live markdown placement's grower thread — registers THAT
+    /// connection as the target for `SrvRequest::GrowMarkdownRows`
+    /// forwarding. DELIBERATELY NOT `RegisterRangeResponder`, even though
+    /// both are "somsrp says where to send me things for this id" —
+    /// reusing that registration made `SrvCache::route_byte_range_request`
+    /// treat a successful SEND to the markdown grower (which doesn't
+    /// understand `RequestByteRange` at all) as "handled," silently
+    /// swallowing a late-subscriber catch-up request that should have
+    /// fallen through to `SrvCache::serve_from_recent_bytes` instead —
+    /// confirmed live as the root cause of a markdown placement never
+    /// rendering at all once its `somsrp` process started registering a
+    /// range responder for the live-process model. Routed via its own
+    /// dedicated `SrvCache::markdown_grower_routes` table, entirely
+    /// separate from `range_response_routes`.
+    RegisterMarkdownGrower { session_id: u32, file_id: u32 },
+    /// Sent by Som (never by `somsrp`) on the SAME connection as
     /// `SubscribeProgress`/`RequestByteRange`, telling whichever client
     /// registered itself as `(session_id, file_id)`'s range responder
     /// (`RegisterRangeResponder`) that playback has definitively ended —
@@ -503,7 +519,7 @@ pub enum SrvRequest {
     /// daemon exactly like `RequestByteRange` (`SrvCache::route_byte_
     /// range_request`'s same `range_response_routes` lookup, see that
     /// method's own doc comment) straight to the registered responder
-    /// connection — `somcat`'s reader loop treats this as its cue to stop
+    /// connection — `somsrp`'s reader loop treats this as its cue to stop
     /// answering `RequestByteRange` and exit, letting the shell that
     /// launched it print its next prompt. This is the reverse direction
     /// of the existing `StopPlayback` variant below (that one is sent BY
@@ -513,11 +529,35 @@ pub enum SrvRequest {
     /// into one ambiguous message. Silently undeliverable (no-op) if the
     /// responder connection has already closed — same tolerance every
     /// other best-effort message in this protocol already has (e.g. the
-    /// Ctrl+C case: `somcat` is already gone by the time this would
+    /// Ctrl+C case: `somsrp` is already gone by the time this would
     /// arrive, so there's nothing left to tell — the daemon separately
     /// notices that disconnect on its own and pushes `StopPlayback` to
     /// subscribers, see `handle_srv_request`'s own doc comment).
     EndPlayback { session_id: u32, file_id: u32 },
+    /// Sent by Som on a fresh, one-shot connection whenever a live
+    /// markdown placement's real laid-out row count (`layout_markdown`,
+    /// which alone knows the real word-wrap width) exceeds however many
+    /// placeholder-grid rows `somsrp` has printed so far. Routed by the
+    /// daemon exactly like `EndPlayback` (`SrvCache::route_grow_markdown_
+    /// rows`'s same `range_response_routes` lookup — `somsrp` registers
+    /// via the EXISTING `RegisterRangeResponder`, no separate
+    /// registration message needed for this) straight to the registered
+    /// responder connection. Unlike `RequestByteRange`/`EndPlayback`,
+    /// receiving this does NOT end `somsrp`'s reader loop — a live
+    /// markdown placement can grow many times over its lifetime as more
+    /// of the document streams in and gets laid out, each growth simply
+    /// printing `additional_rows` more placeholder cells (continuing the
+    /// SAME placement's row numbering, never restarting from row 0) and
+    /// looping back to keep listening. Exists specifically because
+    /// `somsrp` (a plain CLI with no GPUI/font-shaping dependency) cannot
+    /// predict the real wrapped row count up front the way it can for
+    /// audio/video's own fixed pixel-derived footprint — see
+    /// `markdown_line_count`'s removal (this variant is what replaced
+    /// it) for the full "why a lightweight prediction wasn't good enough"
+    /// reasoning. Silently undeliverable (no-op) if the responder
+    /// connection has already closed, same tolerance every other best-
+    /// effort message in this protocol already has.
+    GrowMarkdownRows { session_id: u32, file_id: u32, additional_rows: u32 },
     /// Runs `script_source` as a fresh, explicitly-sandboxed `mlua::Lua`
     /// VM (see `crate::lua::phase1_stdlib`'s own doc comment — NOT
     /// `mlua::Lua::new()`'s default, which turned out live-confirmed to
@@ -525,7 +565,7 @@ pub enum SrvRequest {
     /// `io` as "safe" in the sense of "doesn't corrupt the VM," not "no
     /// filesystem access") INSIDE `somsrv` itself — the first case where the
     /// daemon originates `PutChunk`s on its own, rather than only relaying
-    /// ones an external client (`somcat`, the yazi driver) already sent.
+    /// ones an external client (`somsrp`, the yazi driver) already sent.
     /// The script's single string return value becomes the markdown
     /// source, chunked and pushed through the exact same `SrvCache::
     /// put_chunk` path (and thus the exact same `SrvResponse::Progress`
@@ -539,7 +579,51 @@ pub enum SrvRequest {
     /// its own fresh `Lua::new()`, run synchronously to completion before
     /// this variant's handler returns.
     RunLuaScript { session_id: u32, file_id: u32, script_source: String },
-    /// Sent by an SRP client (`somcat`, the yazi driver — never by Som
+    /// Resolves `target` (an `http://`/`https://` URL, or a filesystem
+    /// path — relative paths are joined against `base_dir`, absolute
+    /// paths used as-is) and streams its bytes into Som through the SAME
+    /// `SrvCache::put_chunk` path/`SrvResponse::Progress` push machinery
+    /// `PutChunk`/`RunLuaScript` already use — a second case (alongside
+    /// `RunLuaScript`) where `somsrv` itself originates `PutChunk`s
+    /// rather than only relaying ones an external client already sent.
+    /// `(session_id, file_id)` plays its usual role: the placeholder-grid
+    /// id a client printed on the PTY BEFORE sending this request. Built
+    /// for a future markdown-embedded-media feature (an `![alt](target)`
+    /// link inside a markdown document Som is displaying) — `target` is
+    /// whatever raw string that link pointed at, `base_dir` is the
+    /// sending client's own working directory at the time (`somsrp`'s
+    /// `std::env::current_dir()`), needed to resolve a *relative*
+    /// `target` the same way a shell would; ignored for an absolute path
+    /// or a `http(s)://` URL. No markdown parsing exists yet to actually
+    /// send this in practice — this variant exists so the transport is
+    /// ready ahead of that feature landing.
+    ///
+    /// Deliberately NO path sandboxing beyond whatever the OS's own file
+    /// permissions already enforce for the user `somsrv` runs as: reaching
+    /// `somsrv` at all already implies the caller is the authenticated
+    /// owner of this session (same trust boundary as having an
+    /// interactive shell on this host), so a local/absolute `target`
+    /// resolves exactly as if that same user ran `cat` on it themselves
+    /// — no canonicalize-and-verify-prefix jail is built on top of that.
+    ///
+    /// On failure (DNS/connect/TLS/non-2xx for a URL; not-found/
+    /// permission-denied/unreadable for a local path; an unrecognized
+    /// `Content-Type`/extension), replies with `SrvResponse::FetchFailed`
+    /// — broadcast to every current `SubscribeProgress` subscriber of
+    /// this `(session_id, file_id)` (see `SrvCache::notify_fetch_failed`,
+    /// mirroring how `StopPlayback` already broadcasts via `notify_stop_
+    /// playback`), AND written back directly on this same connection.
+    /// The broadcast is the one that actually matters: the sender of
+    /// `FetchResource` is expected to be a fire-and-forget one-shot
+    /// connection it closes immediately (see `rich_content_srv_channel::
+    /// request_fetch_resource`'s own doc comment), so a reply on that
+    /// SAME connection would go unread — unlike `RunLuaScript`'s failure
+    /// path (logged server-side only, caller never told), a fetch
+    /// failure needs a real signal back to whoever is actually listening
+    /// (the requester's own `SubscribeProgress` connection) so a markdown
+    /// widget can show "failed to load" instead of hanging forever.
+    FetchResource { session_id: u32, file_id: u32, target: String, base_dir: Option<String> },
+    /// Sent by an SRP client (`somsrp`, the yazi driver — never by Som
     /// itself) on a fresh, one-shot connection, exactly mirroring
     /// `RequestByteRange`'s own connection shape — the mechanism a
     /// PREVIEW-style client uses to tell Som "stop decoding/playing
@@ -564,7 +648,7 @@ pub enum SrvRequest {
     StopPlayback { session_id: u32, file_id: u32 },
 }
 
-/// daemon -> `somcat`/other SRP clients, answering a `SrvRequest`.
+/// daemon -> `somsrp`/other SRP clients, answering a `SrvRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SrvResponse {
     /// Always the FIRST message, replying to `SrvRequest::Handshake`.
@@ -604,7 +688,7 @@ pub enum SrvResponse {
         /// Added after a live-confirmed bug: an MKV whose Cues (seek
         /// index) sit near the end took ~20 minutes to start playing on
         /// a 16GB file, because the existing speculative tail-fetch
-        /// (`somcat`'s `stream_file_from_disk`) wrote the tail bytes to
+        /// (`somsrp`'s `stream_file_from_disk`) wrote the tail bytes to
         /// disk successfully, but `GrowingFileStream::read` had no way
         /// to know they were there — it only trusted `contiguous_len`,
         /// which doesn't move until the SEQUENTIAL send reaches that
@@ -659,6 +743,17 @@ pub enum SrvResponse {
     /// side's own subscription loop treats this as its cue to return
     /// immediately, same as if its own `stop` flag had fired.
     Unsubscribed { session_id: u32, file_id: u32 },
+    /// Pushed to every `SubscribeProgress` subscriber of `(session_id,
+    /// file_id)` whose `SrvRequest::FetchResource` fetch/read did not
+    /// succeed (see that variant's own doc comment for the full list of
+    /// failure causes and why this is broadcast rather than only replied
+    /// to the requesting connection). `reason` is a human-readable
+    /// message (from the underlying `ureq`/`std::io::Error`, or
+    /// "unrecognized content type"/similar) suitable for direct display,
+    /// not a machine-parseable error code — there is exactly one caller
+    /// of this today (a markdown widget showing "failed to load"), which
+    /// has no need to branch on failure kind.
+    FetchFailed { session_id: u32, file_id: u32, reason: String },
 }
 
 /// Mirrors `crates/terminal/src/rich_content_transport::ContentType`
@@ -729,7 +824,20 @@ pub enum ContentMetadata {
         /// field's own doc comment.
         extension: String,
     },
-    Markdown,
+    Markdown {
+        /// The source `.md` file's own directory (`somsrp`'s own
+        /// `std::env::current_dir()` at the moment it streamed this
+        /// file) — the only way Som can later resolve a RELATIVE
+        /// `![alt](./img.png)` link inside this document back to a real
+        /// path, now that no on-disk file/`Path` reaches the receiving
+        /// side at all (`SrvCache`'s own doc comment: chunks are never
+        /// persisted). Threaded back out as `SrvRequest::FetchResource::
+        /// base_dir` when Som later fetches an embedded link. Empty
+        /// string means unknown — the same "empty means unknown"
+        /// convention `Video`/`Audio`'s own `extension` fields already
+        /// use for an identical "receiver has no path anymore" problem.
+        base_dir: String,
+    },
 }
 
 /// One entry in a `SrvResponse::Sessions` answer — just enough for a

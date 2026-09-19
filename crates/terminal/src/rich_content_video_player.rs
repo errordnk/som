@@ -41,7 +41,7 @@
 //! written at that exact moment is unreliable: confirmed live as
 //! decoding silently stalling partway through a real, several-minutes
 //! long movie clip once chunk sizes got realistic (64KB, matching
-//! `somcat`'s own APC chunk size) rather than the handful of large
+//! `somsrp`'s own APC chunk size) rather than the handful of large
 //! writes an earlier synthetic test used. `GrowingFileStream` instead
 //! implements `Read`/`Seek` directly against the SAME on-disk cache file
 //! `RichContentCache` is still writing into: a read past the currently
@@ -92,9 +92,9 @@ use smallvec::SmallVec;
 /// FFI calls resolve them without requiring a system FFmpeg install.
 ///
 /// Shared between `som.exe` (which needs this for its own embedded-video
-/// playback) and `somcat.exe` (a separate, short-lived process that links
+/// playback) and `somsrp.exe` (a separate, short-lived process that links
 /// `ffmpeg-next`/`ffmpeg-sys-next` directly to probe a video file's real
-/// dimensions before printing its placeholder grid — see `somcat`'s own
+/// dimensions before printing its placeholder grid — see `somsrp`'s own
 /// `video_metadata`) — each is an independent OS process with its own DLL
 /// search path, so both must call this, not just `som.exe`. Idempotent:
 /// safe to call from both, and safe to call even if the other process
@@ -104,12 +104,12 @@ use smallvec::SmallVec;
 ///
 /// Also copies each DLL next to the running process's own `.exe` (not just
 /// `AddDllDirectory`'ing the data-dir copy) — confirmed live that
-/// `somcat.exe` crashes with `STATUS_DLL_NOT_FOUND` before a single line of
+/// `somsrp.exe` crashes with `STATUS_DLL_NOT_FOUND` before a single line of
 /// `main()` runs (no stderr, no extracted directory) when only
 /// `AddDllDirectory` is used: unlike `som.exe` (whose FFmpeg calls are only
 /// reachable through code paths the linker doesn't eagerly resolve, so it
 /// ends up with no static FFmpeg imports in its own PE import table at
-/// all — confirmed via `pefile`), `somcat.exe` calls FFmpeg-backed code
+/// all — confirmed via `pefile`), `somsrp.exe` calls FFmpeg-backed code
 /// (`video_metadata`) directly from `main()`, so the linker keeps real
 /// static imports for `avcodec`/`avformat`/`avutil` in its PE header —
 /// Windows resolves those at process-load time, before `main()` starts,
@@ -809,7 +809,7 @@ fn run_decode_loop(
     finished: Arc<AtomicBool>,
     shared_audio: Arc<SharedAudio>,
     // Overrides FFmpeg's own `best()` heuristic for which audio stream
-    // to decode — `somcat`'s `-a <N>` CLI flag, carried here via
+    // to decode — `somsrp`'s `-a <N>` CLI flag, carried here via
     // `ContentMetadata::Video::audio_stream_index` (see that field's own
     // doc comment). `None` keeps the existing heuristic-based selection
     // unchanged.
@@ -960,7 +960,7 @@ fn run_decode_loop(
     // than aborting the whole player — sound is an enhancement here, not
     // a requirement for video playback to work at all.
     // `audio_stream_index_override` counts audio streams ONLY (0-based
-    // among just the audio tracks, matching how `somcat`'s `-a <N>`
+    // among just the audio tracks, matching how `somsrp`'s `-a <N>`
     // flag — and every other player's own track picker — numbers them
     // for a user, e.g. "the 2nd dub language"), NOT the raw
     // `Stream::index()` (which counts every stream in the container —
@@ -2148,7 +2148,7 @@ impl RichContentVideoPlayer {
     /// `shared.slot` to `None` instead — abandoned because the
     /// placeholder grid's picture cells paint their OWN background color
     /// independent of whatever `current_frame()` returns (see
-    /// `print_placeholder_grid_with_cell_dims` in `somcat`), so `None`
+    /// `print_placeholder_grid_with_cell_dims` in `somsrp`), so `None`
     /// still left a solid-colored rectangle on screen, just not the
     /// terminal's own background — confirmed live as a stark black block
     /// instead of the active theme's real background showing through.
@@ -2197,20 +2197,28 @@ impl RichContentVideoPlayer {
     /// polarity, and [`Self::stop`]'s own doc comment for why the choice
     /// is resolved here rather than baked in once when stop was pressed.
     pub fn current_frame(&self, is_light: bool) -> Option<Arc<RenderImage>> {
-        // A synthetic PTS that can never collide with a real decoded
-        // frame's own (`i64`, so `MIN` is never a legitimate stream
-        // timestamp) — used as `last_rendered`'s cache key for the
-        // stand-in image so switching `theme.json` while stopped (light
-        // vs. dark stand-in are different images, same synthetic PTS)
-        // still invalidates the cache correctly below, the same way a
-        // real new decoded frame's differing PTS would.
-        const STOPPED_PTS: i64 = i64::MIN;
+        // Two synthetic PTS values, one per stand-in polarity — both can
+        // never collide with a real decoded frame's own (`i64`, so
+        // `MIN`/`MIN + 1` are never legitimate stream timestamps). Using
+        // a SINGLE shared synthetic PTS here used to be the bug: the
+        // cache-hit check below compared only `cached_pts == STOPPED_PTS`
+        // without also checking `is_light`, so switching `theme.json`
+        // while stopped kept returning the OLD polarity's cached image
+        // forever (confirmed by reading the code, not assumed — the old
+        // comment here claimed this already worked correctly, but the
+        // check it described was never actually present). Two distinct
+        // keys make a polarity change look exactly like a genuine new
+        // frame arriving, correctly invalidating the cache the same way
+        // a real new PTS would.
+        const STOPPED_PTS_DARK: i64 = i64::MIN;
+        const STOPPED_PTS_LIGHT: i64 = i64::MIN + 1;
 
         if self.stopped.load(Ordering::Acquire) {
             let rgba = stopped_placeholder_frame(is_light)?;
+            let stopped_pts = if is_light { STOPPED_PTS_LIGHT } else { STOPPED_PTS_DARK };
             let mut cache = self.last_rendered.lock().unwrap_or_else(|p| p.into_inner());
             if let Some((cached_pts, cached_image)) = cache.as_ref() {
-                if *cached_pts == STOPPED_PTS {
+                if *cached_pts == stopped_pts {
                     return Some(cached_image.clone());
                 }
             }
@@ -2220,7 +2228,7 @@ impl RichContentVideoPlayer {
             }
             let frame = Frame::new(bgra);
             let image = Arc::new(RenderImage::new(SmallVec::from_vec(vec![frame])));
-            if let Some((_, old_image)) = cache.replace((STOPPED_PTS, image.clone())) {
+            if let Some((_, old_image)) = cache.replace((stopped_pts, image.clone())) {
                 self.pending_image_drops.lock().unwrap_or_else(|p| p.into_inner()).push(old_image);
             }
             return Some(image);
@@ -2394,6 +2402,36 @@ mod tests {
     fn decode_thread_populates_a_frame_for_avi() {
         let Some(player) = open_test_player("sample_1920x1080.avi") else { return };
         assert!(wait_for_decode(&player), "decode thread never produced a frame for the avi fixture");
+    }
+
+    #[test]
+    fn current_frame_updates_the_stopped_stand_in_when_the_theme_polarity_changes() {
+        // Regression test for a real bug found while auditing theme-switch
+        // handling across every rich-content type this session: the
+        // `last_rendered` cache for the stopped-state stand-in image used
+        // a SINGLE synthetic PTS for both light and dark variants, so
+        // once cached, switching `theme.json` while a video sat stopped
+        // never actually swapped the stand-in image — `current_frame`
+        // kept returning whatever polarity was cached first, regardless
+        // of the `is_light` argument on later calls. Doesn't need a real
+        // decoded frame at all — `stopped` is set directly (this is a
+        // pure cache-key test, not a decode test).
+        let Some(player) = open_test_player("sample_1920x1080.mkv") else { return };
+        player.stopped.store(true, Ordering::Release);
+
+        let dark_frame = player.current_frame(false).expect("dark stand-in must render");
+        let light_frame = player.current_frame(true).expect("light stand-in must render");
+        assert!(
+            !Arc::ptr_eq(&dark_frame, &light_frame),
+            "switching is_light must produce a DIFFERENT cached image, not reuse the other polarity's"
+        );
+
+        // Switching back must also work — not just a one-way invalidation.
+        let dark_frame_again = player.current_frame(false).expect("dark stand-in must render again");
+        assert!(
+            Arc::ptr_eq(&dark_frame_again, &dark_frame),
+            "re-requesting an already-cached polarity must reuse that SAME cached image, not re-render"
+        );
     }
 
     #[test]

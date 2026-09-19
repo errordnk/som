@@ -35,7 +35,7 @@ images/audio/video — see `SRP_PROTOCOL.md`), not HTTP.
 Confirmed by direct code reading (2026-09-02), not assumption:
 
 - `somsrv`'s `SrvRequest::PutChunk` is, TODAY, only ever sent by an
-  external client (`somcat`, the yazi driver) that already has bytes to
+  external client (`somsrp`, the yazi driver) that already has bytes to
   push — `handle_srv_request` in `crates/somsrv/src/server.rs` (loop
   starting ~line 305) only ever *reads* `PutChunk` off the wire and
   writes it to `SrvCache`; nothing in `somsrv` itself originates
@@ -135,7 +135,7 @@ and PROVEN live before growing the API surface:
    content type in this project has gone through (see `SRP_PROTOCOL.md`/
    `SRP_INTEGRATION_GUIDE.md`'s own verification sections).
 
-### Status (2026-09-02): text-only round trip landed — `somcat file.md`
+### Status (2026-09-02): text-only round trip landed — `somsrp file.md`
 works end to end
 
 Landed and live-tested:
@@ -153,7 +153,7 @@ Landed and live-tested:
   refresh_or_create`, returns `Vec<(session_id, file_id, rendered_
   text)>` — the same shape `rich_content_audio_placements`/
   `rich_content_video_placements` already have.
-- **`somcat` now sends `.md` files** (`stream_file`'s markdown branch,
+- **`somsrp` now sends `.md` files** (`stream_file`'s markdown branch,
   reusing the same whole-file-read-then-`stream_bytes` path
   images/GIF already use — markdown files are small) — `print_markdown_
   placeholder_grid` sizes the footprint from the terminal's own width
@@ -171,7 +171,7 @@ Landed and live-tested:
   actually styled differently from plain text yet — `rendered_text` is
   painted as-is.
 - **Documents taller than the terminal scroll correctly** (fixed the
-  same day, caught live testing a real 354-line file): `somcat`'s
+  same day, caught live testing a real 354-line file): `somsrp`'s
   placeholder grid reserves the file's FULL line count, not clamped to
   the current viewport — so a long document's placeholder cells
   routinely sit outside what's currently on-screen by the time a paint
@@ -219,8 +219,8 @@ trip above. Concretely, this needs:
   note above, which this need reinforces).
 - Each linked media file becomes its OWN `(session_id, file_id)`
   placement, streamed through the exact same `PutChunk`/placeholder-
-  grid machinery a standalone `somcat image.png` already uses — the
-  question is WHO triggers that second transfer: `somcat` itself
+  grid machinery a standalone `somsrp image.png` already uses — the
+  question is WHO triggers that second transfer: `somsrp` itself
   (reading the markdown file, discovering links, spawning additional
   transfers for each one) is the natural fit, given it already owns
   file-reading and transfer logic for every other content type; the

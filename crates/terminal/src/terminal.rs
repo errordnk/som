@@ -473,15 +473,22 @@ impl TerminalBuilder {
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_markdown_reserved_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_srv_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_media: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
             rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -792,15 +799,22 @@ impl TerminalBuilder {
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_markdown_reserved_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_srv_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_media: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
                 rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -950,6 +964,88 @@ pub struct MarkdownPlacementGeometry {
     pub origin_column: i32,
     pub max_column: u32,
     pub max_row: u32,
+}
+
+/// One in-flight or completed markdown-embedded media fetch — see
+/// `Terminal::markdown_embedded_media`' own doc comment for the id/
+/// lifecycle model this belongs to. Covers images, audio, and video (see
+/// `crates/terminal_view/src/markdown_styling.rs`'s `EmbeddedMediaKind`).
+pub struct MarkdownEmbeddedMedia {
+    pub session_id: u32,
+    pub file_id: u32,
+    pub state: std::sync::Arc<rich_content_srv_channel::SrvProgressState>,
+    /// Captured the first time `state.take_metadata()` returns `Some` —
+    /// `take_metadata` is consuming, so this is the only chance to learn
+    /// it; every later call reuses this cached value.
+    pub content_type: Option<rich_content_transport::ContentType>,
+    /// Cached from the SAME one-shot `take_metadata()` call that resolves
+    /// `content_type`, for `ContentMetadata::Audio` only — audio has no
+    /// other way to learn its own duration (unlike top-level audio, which
+    /// reads it back out of `RichContentCache::audio_metadata`, a table
+    /// embedded/Som-minted ids are deliberately never registered in).
+    /// `None` for every other media kind, or before metadata has arrived.
+    pub audio_duration_ms: Option<u32>,
+    /// Decoded pixels/persistent decode state, kind-tagged. See
+    /// [`MarkdownEmbeddedPlayer`]'s own doc comment for why images and
+    /// audio/video are handled so differently here (recreated every paint
+    /// vs. opened once and kept alive).
+    pub player: MarkdownEmbeddedPlayer,
+}
+
+/// The decode/playback state an embedded media entry owns, once its
+/// `content_type` is known. Unlike the top-level `rich_content_audio_
+/// players`/`rich_content_video_players` maps (keyed by a real,
+/// grid-scannable SRP placement id), this lives directly on
+/// `MarkdownEmbeddedMedia` — one entry per `(host, dest_url)`, matching
+/// that struct's own dedup-latch key.
+///
+/// `Image` is thrown away and recreated every paint via `rich_content_
+/// player::refresh_or_create` (same as the top-level image/GIF path) —
+/// cheap, and the simplest thing that already worked before audio/video
+/// existed. `Audio`/`Video` are the OPPOSITE: opened exactly ONCE and
+/// kept alive across paints, because they own a live `cpal::Stream`/
+/// decode thread that must keep running independent of paint cadence —
+/// recreating either every paint would restart playback from scratch on
+/// every single frame. Boxed to keep `MarkdownEmbeddedMedia`'s stack size
+/// close to the image-only case: `RichContentAudioPlayer`/
+/// `RichContentVideoPlayer` both own live stream/thread handles,
+/// materially larger than a decoded-frame image player.
+pub enum MarkdownEmbeddedPlayer {
+    None,
+    Image(rich_content_player::RichContentPlayer),
+    Audio(Box<rich_content_audio_player::RichContentAudioPlayer>),
+    #[cfg(target_os = "windows")]
+    Video(Box<rich_content_video_player::RichContentVideoPlayer>),
+}
+
+/// One markdown-embedded media's current paint status, as reported by
+/// [`Terminal::markdown_embedded_media_states`]. Split into kind-specific
+/// `Ready*` variants rather than one shared struct: the enum variant
+/// alone already tells the paint path everything it needs (audio has no
+/// `render_image` at all; video's frame is `Option` since early paints
+/// can be "metadata known, no decoded frame yet" distinctly from
+/// `Loading`), so there's no shared-shape win in unifying them.
+pub enum EmbeddedMediaStatus {
+    Loading,
+    Failed(String),
+    ReadyImage {
+        render_image: std::sync::Arc<gpui::RenderImage>,
+        frame_index: usize,
+        is_animating: bool,
+    },
+    ReadyAudio {
+        is_playing: bool,
+        elapsed: std::time::Duration,
+        duration: std::time::Duration,
+        position_fraction: f32,
+    },
+    ReadyVideo {
+        render_image: Option<std::sync::Arc<gpui::RenderImage>>,
+        is_playing: bool,
+        elapsed: std::time::Duration,
+        duration: std::time::Duration,
+        position_fraction: f32,
+    },
 }
 
 // TODO: Un-pub
@@ -1157,6 +1253,25 @@ pub struct Terminal {
     /// on-screen window can move without dragging the surrounding
     /// terminal content along with it.
     rich_content_markdown_scroll_offsets: std::cell::RefCell<std::collections::HashMap<(u32, u32), u32>>,
+    /// The last placeholder-grid row count Som has ASKED the live
+    /// `somsrp` process backing a markdown placement to reserve — seeded
+    /// from `markdown_placement_origins()`'s initial grid scan (the
+    /// minimal up-front reservation `somsrp` prints, see
+    /// `MARKDOWN_INITIAL_ROWS`), then advanced optimistically every time
+    /// `paint_rich_content_markdown_widget` observes `layout_markdown`'s
+    /// real row count exceed it and sends `SrvRequest::GrowMarkdownRows`
+    /// — see that variant's own doc comment for the full "why does
+    /// somsrp need to be told this" design. Optimistic (updated before
+    /// `somsrp` has actually printed the new rows, not after) is
+    /// deliberate: the widget's own painted content never waited on the
+    /// placeholder grid catching up in the first place (see `paint_
+    /// rich_content_markdown_widget`'s own doc comment on why the row
+    /// count it paints comes from `layout_markdown`, not the grid), so
+    /// there's nothing to lose by not waiting for a round trip here
+    /// either — only re-sending a growth request for a delta already in
+    /// flight would be a real problem, which tracking this eagerly
+    /// avoids.
+    rich_content_markdown_reserved_rows: std::cell::RefCell<std::collections::HashMap<(u32, u32), u32>>,
     /// One [`rich_content_audio_player::AudioTransferProgress`] per
     /// audio placement, created alongside its `RichContentAudioPlayer`
     /// entry in `rich_content_audio_players` and updated every time
@@ -1196,6 +1311,51 @@ pub struct Terminal {
     /// that method's own doc comment.
     rich_content_srv_progress:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), std::sync::Arc<rich_content_srv_channel::SrvProgressState>>>,
+    /// Markdown-embedded image fetches, one entry per (host markdown
+    /// placement, image `dest_url`) pair. Deliberately a SEPARATE map
+    /// from `rich_content_srv_progress` — an entry here has a Som-minted
+    /// id (`rich_content_srv_channel::mint_som_ids`) that by construction
+    /// NEVER appears in a placeholder-grid scan, so feeding it through
+    /// `poll_rich_content_srv_subscriptions`'s `ids` set would make
+    /// `evict_vanished_image_gif_markdown_placements` tear it down on the
+    /// very first poll after creation. Its lifecycle is instead tied to
+    /// the HOST markdown placement's: `evict_vanished_image_gif_markdown_
+    /// placements` drops every entry whose host key is among the
+    /// placements it is already evicting.
+    ///
+    /// The `dest_url` half of the key is also the DEDUP latch: `layout_
+    /// markdown` re-runs on every single paint pass and re-discovers the
+    /// same images every time, so firing a fresh `FetchResource` per
+    /// paint would hammer `somsrv` with thousands of duplicate fetches
+    /// per second. Presence of a key here is the one-shot latch — same
+    /// role `SrvProgressState::whole_range_requested` plays for `request_
+    /// whole_range_once_if_needed`, just keyed by document+URL instead of
+    /// by an already-known id.
+    markdown_embedded_media: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), MarkdownEmbeddedMedia>>,
+    /// Live progress snapshot for an embedded VIDEO's `GrowingFileStream`
+    /// decode thread — mirrors the top-level `rich_content_video_progress`
+    /// map exactly in shape, but keyed like `markdown_embedded_media`
+    /// (`(host, dest_url)`) instead of a real placement id. Kept as a
+    /// SEPARATE map (not folded into `rich_content_video_progress`)
+    /// because that map is iterated by `rich_content_cache.all_known_
+    /// ids()`-driven loops that must never see a Som-minted embedded id —
+    /// same reasoning `markdown_embedded_media` itself is already
+    /// separate from `rich_content_srv_progress`.
+    markdown_embedded_video_progress:
+        std::cell::RefCell<std::collections::HashMap<((u32, u32), String), std::sync::Arc<rich_content_video_player::VideoTransferProgress>>>,
+    /// Same role as `markdown_embedded_video_progress`, for embedded
+    /// AUDIO's decode thread instead — mirrors the top-level `rich_
+    /// content_audio_progress` map's shape, kept separate for the exact
+    /// same reason.
+    markdown_embedded_audio_progress:
+        std::cell::RefCell<std::collections::HashMap<((u32, u32), String), std::sync::Arc<rich_content_audio_player::AudioTransferProgress>>>,
+    /// Each markdown placement's own source directory, captured once from
+    /// `ContentMetadata::Markdown::base_dir` — `SrvProgressState::take_
+    /// metadata` is CONSUMING (one `Some`, ever), so this has to be
+    /// stashed at the single point that already calls it (`ensure_rich_
+    /// content_srv_subscription`) rather than re-read later when an
+    /// embedded image is actually discovered.
+    markdown_base_dirs: std::cell::RefCell<std::collections::HashMap<(u32, u32), String>>,
     /// Each rich-content placement's on-screen pixel bounds, as last
     /// computed by `terminal_element.rs`'s paint pass — nothing else
     /// persists this (the paint path itself only ever needs it as a
@@ -1223,6 +1383,18 @@ pub struct Terminal {
     /// reasoning as `rich_content_seek_bar_bounds` above, just for the
     /// stop icon instead of the seek bar.
     rich_content_stop_icon_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// Same role as `rich_content_seek_bar_bounds`, for an EMBEDDED
+    /// audio/video's seek bar — keyed like `markdown_embedded_media` by
+    /// `(host, dest_url)` instead of a real placement id. No stop-icon
+    /// counterpart: an embedded player has no independent "close" (see
+    /// `MarkdownEmbeddedPlayer`'s own doc comment).
+    markdown_embedded_seek_bar_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
+    /// The WHOLE embedded controls row's bounds (play/pause zone + seek
+    /// bar + time readouts together) — needed separately from `markdown_
+    /// embedded_seek_bar_bounds` because a click can land on the play/
+    /// pause zone even when the row painted too narrow for a seek bar at
+    /// all (see `paint_embedded_media_controls_row`'s own doc comment).
+    markdown_embedded_controls_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
     /// Monotonically increasing counter for `request_audio_byte_range`'s
     /// `request_id` — see that method's own doc comment for why
     /// correctness doesn't depend on global uniqueness here, just on
@@ -1243,7 +1415,7 @@ pub struct Terminal {
     /// how often that forced native repaint actually fires (see
     /// `Terminal::rich_content_force_redraw_due`'s own doc comment for why
     /// `force_redraw` is needed at all on Windows). An animated GIF re-
-    /// encoded by `crates/somcat` sends many chunks/frames in a burst —
+    /// encoded by `crates/somsrp` sends many chunks/frames in a burst —
     /// calling `force_redraw_windows()` on every single one back-to-back
     /// starves the window's message queue/PTY reader (confirmed live: a
     /// 47-frame GIF took 2+ minutes to finish uploading with no throttle).
@@ -2093,8 +2265,15 @@ impl Terminal {
         // as a fresh one.
         let existing_content_type = self.rich_content_cache.content_type(session_id, file_id);
         let (content_type, metadata) = match (state.take_metadata(), existing_content_type) {
-            (Some((content_type, metadata)), _) => (content_type, metadata),
-            (None, Some(content_type)) => (content_type, rich_content_transport::ContentMetadata::Markdown),
+            (Some((content_type, metadata)), _) => {
+                if let rich_content_transport::ContentMetadata::Markdown { base_dir } = &metadata
+                    && !base_dir.is_empty()
+                {
+                    self.markdown_base_dirs.borrow_mut().insert(key, base_dir.clone());
+                }
+                (content_type, metadata)
+            },
+            (None, Some(content_type)) => (content_type, rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() }),
             (None, None) => return, // no metadata seen yet, and no entry to update either
         };
 
@@ -2134,7 +2313,7 @@ impl Terminal {
     /// taller than the terminal's visible height and has scrolled out of
     /// view by the time a paint pass runs (a markdown document's
     /// placeholder grid, reserved at the file's full line count per
-    /// `print_markdown_placeholder_grid` in `somcat`, routinely does):
+    /// `print_markdown_placeholder_grid` in `somsrp`, routinely does):
     /// `rich_content_cache` would never learn the id existed at all,
     /// because nothing else in the paint path calls this except per-
     /// currently-visible-id. Confirmed live — a 354-line markdown file's
@@ -2198,7 +2377,7 @@ impl Terminal {
     /// playback`/`stop_rich_content_video_playback`'s own doc comments
     /// for why THEIR teardown is driven by an explicit stop click (or a
     /// real `clear`, via `stop_all_rich_content_audio_playback`) instead
-    /// of "scrolled out of view": a `somcat` process backing a video/
+    /// of "scrolled out of view": a `somsrp` process backing a video/
     /// audio placement is a genuinely live, still-running pull-model
     /// responder for as long as playback continues, and scrolling its
     /// widget out of the viewport (leaving it resident in scrollback,
@@ -2230,6 +2409,7 @@ impl Terminal {
             self.rich_content_players.borrow_mut().remove(&key);
             self.rich_content_markdown_players.borrow_mut().remove(&key);
             self.rich_content_markdown_scroll_offsets.borrow_mut().remove(&key);
+            self.rich_content_markdown_reserved_rows.borrow_mut().remove(&key);
             if let Some(state) = self.rich_content_srv_progress.borrow_mut().remove(&key) {
                 // Tears down the background subscription thread. `stop()`
                 // alone only sets a flag this thread checks BEFORE its
@@ -2246,6 +2426,35 @@ impl Terminal {
                 rich_content_srv_channel::unsubscribe(session_id, file_id);
             }
             self.rich_content_cache.remove(session_id, file_id);
+
+            // Tear down every markdown-embedded image fetch hosted by
+            // this document. These ids are Som-minted and never appear
+            // in a grid scan, so they can't be discovered as "vanished"
+            // on their own — their lifetime is defined as exactly their
+            // host markdown placement's (see `markdown_embedded_media`'
+            // own doc comment).
+            {
+                let mut embedded = self.markdown_embedded_media.borrow_mut();
+                let hosted: Vec<_> = embedded.keys().filter(|(host, _)| *host == key).cloned().collect();
+                let mut audio_progress = self.markdown_embedded_audio_progress.borrow_mut();
+                let mut video_progress = self.markdown_embedded_video_progress.borrow_mut();
+                for hosted_key in hosted {
+                    if let Some(entry) = embedded.remove(&hosted_key) {
+                        entry.state.stop();
+                        rich_content_srv_channel::unsubscribe(entry.session_id, entry.file_id);
+                    }
+                    // `RichContentAudioPlayer`/`RichContentVideoPlayer`
+                    // stop their own stream/decode thread on `Drop` — no
+                    // separate `.stop()` call needed here beyond letting
+                    // `embedded.remove` above drop the entry (and its
+                    // `MarkdownEmbeddedPlayer`) outright.
+                    audio_progress.remove(&hosted_key);
+                    video_progress.remove(&hosted_key);
+                    self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&hosted_key);
+                    self.markdown_embedded_controls_bounds.borrow_mut().remove(&hosted_key);
+                }
+            }
+            self.markdown_base_dirs.borrow_mut().remove(&key);
         }
     }
 
@@ -2395,7 +2604,7 @@ impl Terminal {
                 players.remove(&key);
                 self.rich_content_audio_stopped.borrow_mut().insert(key);
                 self.rich_content_audio_progress.borrow_mut().remove(&key);
-                // Same "somcat is gone for good" signal the widget's own
+                // Same "somsrp is gone for good" signal the widget's own
                 // stop icon sends (`stop_rich_content_audio_playback`) —
                 // natural EOF is just as much a definitive end of
                 // playback as an explicit stop click.
@@ -2461,6 +2670,225 @@ impl Terminal {
                 Ok(None) => {},
                 Err(err) => {
                     log::warn!("markdown placement {session_id}:{file_id} failed to render: {err}");
+                },
+            }
+        }
+        out
+    }
+
+    /// Ensures a subscription + `FetchResource` exists for one markdown-
+    /// embedded image, discovered inside the document belonging to `host`
+    /// (`(session_id, file_id)` of the markdown placement itself).
+    /// Idempotent and cheap on every call after the first — see
+    /// `markdown_embedded_media`' own doc comment for why the latch is
+    /// mandatory (this runs once per image per PAINT PASS).
+    ///
+    /// ORDER IS LOAD-BEARING: `spawn_progress_listener` first (which
+    /// sends `SubscribeProgress`), `request_fetch_resource` second. See
+    /// `request_fetch_resource`'s own doc comment — `SrvCache::subscribe`
+    /// does not replay bytes, so a fetch that completes before the
+    /// subscription exists delivers nothing.
+    pub fn ensure_markdown_embedded_media(&self, host: (u32, u32), dest_url: &str) {
+        let key = (host, dest_url.to_string());
+        if self.markdown_embedded_media.borrow().contains_key(&key) {
+            return;
+        }
+        let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
+        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id);
+        let base_dir = self.markdown_base_dirs.borrow().get(&host).cloned().filter(|d| !d.is_empty());
+        rich_content_srv_channel::request_fetch_resource(session_id, file_id, dest_url.to_string(), base_dir);
+        self.markdown_embedded_media
+            .borrow_mut()
+            .insert(key, MarkdownEmbeddedMedia {
+                session_id,
+                file_id,
+                state,
+                content_type: None,
+                audio_duration_ms: None,
+                player: MarkdownEmbeddedPlayer::None,
+            });
+    }
+
+    /// Refreshes every markdown-embedded image hosted by `host` and
+    /// reports each one's current paint status — mirrors `rich_content_
+    /// placements`' own shape (scan the map, `request_whole_range_once_
+    /// if_needed`, `refresh_or_create`, keep the player alive across
+    /// paints), just keyed by (host, dest_url) instead of a grid-
+    /// scannable id, since these ids never appear in the grid.
+    ///
+    /// Deliberately does NOT register these ids in `rich_content_cache`:
+    /// `all_known_ids()` feeds `evict_vanished_image_gif_markdown_
+    /// placements`' grid-scan-driven eviction, which must never see a
+    /// Som-minted id (see that method's own doc comment).
+    pub fn markdown_embedded_media_states(&self, host: (u32, u32)) -> Vec<(String, EmbeddedMediaStatus)> {
+        let mut embedded = self.markdown_embedded_media.borrow_mut();
+        let mut out = Vec::new();
+        for ((entry_host, dest_url), entry) in embedded.iter_mut() {
+            if *entry_host != host {
+                continue;
+            }
+            entry.state.request_whole_range_once_if_needed(entry.session_id, entry.file_id);
+
+            if let Some(reason) = entry.state.fetch_failure() {
+                out.push((dest_url.clone(), EmbeddedMediaStatus::Failed(reason)));
+                continue;
+            }
+
+            if entry.content_type.is_none()
+                && let Some((content_type, metadata)) = entry.state.take_metadata()
+            {
+                entry.content_type = Some(content_type);
+                if let rich_content_transport::ContentMetadata::Audio { duration_ms, .. } = metadata {
+                    entry.audio_duration_ms = Some(duration_ms);
+                }
+            }
+            let Some(content_type) = entry.content_type else {
+                out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                continue;
+            };
+            match content_type {
+                rich_content_transport::ContentType::Gif
+                | rich_content_transport::ContentType::Jpeg
+                | rich_content_transport::ContentType::Png => {
+                    let bytes = entry.state.bytes_received_so_far();
+                    let contiguous_len = entry.state.contiguous_len();
+                    let total_size = entry.state.total_size();
+                    let existing = match std::mem::replace(&mut entry.player, MarkdownEmbeddedPlayer::None) {
+                        MarkdownEmbeddedPlayer::Image(player) => Some(player),
+                        _ => None,
+                    };
+                    match rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size) {
+                        Some(player) => {
+                            let render_image = player.render_image().clone();
+                            let frame_index = player.current_frame();
+                            let is_animating = player.is_animating();
+                            entry.player = MarkdownEmbeddedPlayer::Image(player);
+                            out.push((dest_url.clone(), EmbeddedMediaStatus::ReadyImage { render_image, frame_index, is_animating }));
+                        },
+                        None => out.push((dest_url.clone(), EmbeddedMediaStatus::Loading)),
+                    }
+                },
+                rich_content_transport::ContentType::Audio => {
+                    let contiguous_len = entry.state.contiguous_len();
+                    if contiguous_len == 0 {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    }
+                    // Open exactly once — see `MarkdownEmbeddedPlayer`'s own
+                    // doc comment for why this player must NOT be recreated
+                    // every paint the way the image branch's is.
+                    if matches!(entry.player, MarkdownEmbeddedPlayer::None) {
+                        let session_id = entry.session_id;
+                        let file_id = entry.file_id;
+                        let progress = std::sync::Arc::new(rich_content_audio_player::AudioTransferProgress::new());
+                        progress.update(contiguous_len, entry.state.total_size());
+                        self.markdown_embedded_audio_progress.borrow_mut().insert((host, dest_url.clone()), progress.clone());
+                        let request_byte_range: std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> =
+                            std::sync::Arc::new(move |offset, len| {
+                                rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                            });
+                        match rich_content_audio_player::RichContentAudioPlayer::open(entry.state.clone(), progress, Some(request_byte_range)) {
+                            Ok(player) => entry.player = MarkdownEmbeddedPlayer::Audio(Box::new(player)),
+                            Err(reason) => {
+                                out.push((dest_url.clone(), EmbeddedMediaStatus::Failed(reason)));
+                                continue;
+                            },
+                        }
+                    } else if let Some(progress) = self.markdown_embedded_audio_progress.borrow().get(&(host, dest_url.clone())) {
+                        progress.update(contiguous_len, entry.state.total_size());
+                    }
+                    let MarkdownEmbeddedPlayer::Audio(player) = &mut entry.player else {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    };
+                    // Non-blocking — opens the `cpal` device/stream the
+                    // first paint after the decode thread has a sample
+                    // rate/channel count; a no-op once already open. See
+                    // `rich_content_audio_placements`'s identical call for
+                    // why this can't happen inside `open` itself.
+                    player.poll_ready();
+                    if player.failed() {
+                        entry.player = MarkdownEmbeddedPlayer::None;
+                        self.markdown_embedded_audio_progress.borrow_mut().remove(&(host, dest_url.clone()));
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("audio decode failed".to_string())));
+                        continue;
+                    }
+                    if !player.is_ready() {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    }
+                    let duration_ms = entry.audio_duration_ms.unwrap_or(0);
+                    out.push((
+                        dest_url.clone(),
+                        EmbeddedMediaStatus::ReadyAudio {
+                            is_playing: player.is_playing(),
+                            elapsed: player.elapsed(),
+                            duration: std::time::Duration::from_millis(duration_ms as u64),
+                            position_fraction: player.position_fraction(duration_ms),
+                        },
+                    ));
+                },
+                #[cfg(target_os = "windows")]
+                rich_content_transport::ContentType::Video => {
+                    let contiguous_len = entry.state.contiguous_len();
+                    if contiguous_len == 0 {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    }
+                    if matches!(entry.player, MarkdownEmbeddedPlayer::None) {
+                        let session_id = entry.session_id;
+                        let file_id = entry.file_id;
+                        let total_size = entry.state.total_size();
+                        let progress = std::sync::Arc::new(rich_content_video_player::VideoTransferProgress::new());
+                        progress.update(contiguous_len, entry.state.tail_available_from(), entry.state.pending_ranges(), total_size);
+                        self.markdown_embedded_video_progress.borrow_mut().insert((host, dest_url.clone()), progress.clone());
+                        let request_byte_range: std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> =
+                            std::sync::Arc::new(move |offset, len| {
+                                rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                            });
+                        // No per-embed audio-track selection today (the
+                        // top-level path reads it from `RichContentCache`,
+                        // which embedded ids are deliberately never
+                        // registered in) — defaults to FFmpeg's own "most
+                        // likely the main track" heuristic, same as a
+                        // top-level video with no explicit `-a` override.
+                        let player = rich_content_video_player::RichContentVideoPlayer::open(
+                            entry.state.clone(),
+                            progress,
+                            None,
+                            Some(request_byte_range),
+                        );
+                        entry.player = MarkdownEmbeddedPlayer::Video(Box::new(player));
+                    } else if let Some(progress) = self.markdown_embedded_video_progress.borrow().get(&(host, dest_url.clone())) {
+                        let total_size = entry.state.total_size();
+                        progress.update(contiguous_len, entry.state.tail_available_from(), entry.state.pending_ranges(), total_size);
+                    }
+                    let MarkdownEmbeddedPlayer::Video(player) = &entry.player else {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    };
+                    out.push((
+                        dest_url.clone(),
+                        EmbeddedMediaStatus::ReadyVideo {
+                            // `is_light: false` — embedded video has no
+                            // theme-polarity signal threaded through this
+                            // path yet (the top-level widget's `widget_bg_
+                            // is_light` is a paint-time value); a known,
+                            // documented simplification, not an oversight.
+                            render_image: player.current_frame(false),
+                            is_playing: player.is_playing(),
+                            elapsed: player.elapsed(),
+                            duration: player.duration(),
+                            position_fraction: player.position_fraction(),
+                        },
+                    ));
+                },
+                #[cfg(not(target_os = "windows"))]
+                rich_content_transport::ContentType::Video => {
+                    out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("video embeds are not supported on this platform".to_string())));
+                },
+                _ => {
+                    out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("unsupported embedded content type".to_string())));
                 },
             }
         }
@@ -2564,6 +2992,47 @@ impl Terminal {
         *entry = new_offset as u32;
     }
 
+    /// The hard ceiling on how many placeholder-grid rows one markdown
+    /// placement can ever reserve — `kitty_graphics_placeholder::
+    /// encode_cell` returns `None` once `row >= 297` (a fixed 297-entry
+    /// diacritics table, see that function's own doc comment), so
+    /// there's no real cell to grow into past this row regardless of how
+    /// tall `layout_markdown`'s real output gets. The widget can still
+    /// PAINT further rows (painted height never depended on the
+    /// placeholder grid's own row count — see `paint_rich_content_
+    /// markdown_widget`'s own design note), only grid-cell-based row
+    /// discovery/scroll-lock hit-testing stops growing past this point.
+    const MARKDOWN_PLACEMENT_ROW_LIMIT: u32 = 297;
+
+    /// Ensures a live markdown placement's placeholder-grid reservation
+    /// (tracked in `rich_content_markdown_reserved_rows`) covers at
+    /// least `real_row_count` rows — `initial_reserved_rows` seeds the
+    /// tracked count the FIRST time this placement is seen (the minimal
+    /// up-front reservation `somsrp` already printed, from
+    /// `MarkdownPlacementGeometry::max_row + 1`, the grid's own real
+    /// current row count — not a hardcoded constant, since a resize or a
+    /// prior growth call may have already changed it by the time this
+    /// runs). Sends `SrvRequest::GrowMarkdownRows` (via `rich_content_
+    /// srv_channel::request_markdown_growth`) for the shortfall, capped
+    /// at `MARKDOWN_PLACEMENT_ROW_LIMIT`, and updates the tracked count
+    /// optimistically — see that field's own doc comment for why. A
+    /// no-op once the tracked count already covers `real_row_count` (the
+    /// common case on every paint pass after the first that actually
+    /// needed to grow).
+    pub fn ensure_markdown_row_reservation(&self, session_id: u32, file_id: u32, real_row_count: u32, initial_reserved_rows: u32) {
+        let key = (session_id, file_id);
+        let mut reserved = self.rich_content_markdown_reserved_rows.borrow_mut();
+        let current = *reserved.entry(key).or_insert(initial_reserved_rows);
+        let target = real_row_count.min(Self::MARKDOWN_PLACEMENT_ROW_LIMIT);
+        if target <= current {
+            return;
+        }
+        let additional_rows = target - current;
+        reserved.insert(key, target);
+        drop(reserved);
+        rich_content_srv_channel::request_markdown_growth(session_id, file_id, additional_rows);
+    }
+
     /// Finds the markdown placement (if any) whose recorded on-screen
     /// bounds contain `position` (absolute window pixel coordinates,
     /// same space `record_rich_content_placement_bounds` stores — see
@@ -2641,10 +3110,10 @@ impl Terminal {
         self.rich_content_audio_stopped.borrow_mut().insert(key);
         self.rich_content_audio_players.borrow_mut().remove(&key);
         self.rich_content_audio_progress.borrow_mut().remove(&key);
-        // Tells the `somcat` process backing this placement to exit — see
+        // Tells the `somsrp` process backing this placement to exit — see
         // `rich_content_srv_channel::end_playback`'s own doc comment. The
         // widget's stop icon is a genuine, one-way end of playback (unlike
-        // pause, which never touches `somcat` at all): once this fires,
+        // pause, which never touches `somsrp` at all): once this fires,
         // there is no more live process to serve a later play click even
         // if the placeholder cells are still on screen.
         rich_content_srv_channel::end_playback(session_id, file_id);
@@ -2681,7 +3150,7 @@ impl Terminal {
 
     /// Video counterpart to [`Self::stop_rich_content_audio_playback`] —
     /// same "genuine, one-way end of playback" treatment, not pause: drops
-    /// the player outright and tells `somcat` to exit, same reasoning as
+    /// the player outright and tells `somsrp` to exit, same reasoning as
     /// audio's own stop icon. Windows-only, same reason video's other
     /// fields/methods are.
     #[cfg(target_os = "windows")]
@@ -2940,7 +3409,7 @@ impl Terminal {
             // Auto-stop on reaching the real end of playback — same
             // genuine teardown the widget's own stop icon now uses (see
             // `stop_rich_content_video_playback`'s own doc comment): drops
-            // the player and tells `somcat` to exit, since natural EOF is
+            // the player and tells `somsrp` to exit, since natural EOF is
             // just as much a definitive end of playback as an explicit
             // stop click, not a pausable/resumable state. Checked every
             // paint pass so this fires the moment playback actually
@@ -3066,6 +3535,30 @@ impl Terminal {
         self.rich_content_seek_bar_bounds.borrow().get(&(session_id, file_id)).copied()
     }
 
+    /// Persists `controls_bounds` (the WHOLE embedded controls row, not
+    /// just its seek bar — `handle_markdown_embedded_media_click` needs
+    /// this to decide "did the click land on this embed's controls row
+    /// at all" and where the play/pause zone is, mirroring `bounds` +
+    /// `offset_x < cell_width * 2.0` in the top-level `handle_rich_
+    /// content_click`) and `seek_bar_bounds` (`None` if the row painted
+    /// too narrow for one — see `paint_embedded_media_controls_row`'s own
+    /// doc comment) for one embedded media's controls row.
+    pub fn record_markdown_embedded_controls_bounds(
+        &self,
+        host: (u32, u32),
+        dest_url: &str,
+        controls_bounds: Bounds<Pixels>,
+        seek_bar_bounds: Option<Bounds<Pixels>>,
+    ) {
+        let key = (host, dest_url.to_string());
+        self.markdown_embedded_controls_bounds.borrow_mut().insert(key.clone(), controls_bounds);
+        if let Some(bounds) = seek_bar_bounds {
+            self.markdown_embedded_seek_bar_bounds.borrow_mut().insert(key, bounds);
+        } else {
+            self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&key);
+        }
+    }
+
     /// Persists `bounds` as the widget's actual stop-icon rectangle —
     /// same reasoning as [`Self::record_rich_content_seek_bar_bounds`].
     pub fn record_rich_content_stop_icon_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
@@ -3180,6 +3673,78 @@ impl Terminal {
         false
     }
 
+    /// Embedded-media counterpart to `handle_rich_content_click` — same
+    /// play/pause-zone-vs-seek-bar geometry convention (first two cells
+    /// of the controls row toggle play/pause, a click past that seeks),
+    /// but iterates `markdown_embedded_media` directly (there is no
+    /// grid-scannable placement to iterate via `rich_content_placement_
+    /// bounds_iter()` for a Som-minted embedded id) and dispatches
+    /// through `MarkdownEmbeddedPlayer`'s own `Audio`/`Video` variants
+    /// instead of the top-level `rich_content_audio_players`/`rich_
+    /// content_video_players` maps.
+    ///
+    /// Click-only for this pass — no drag-to-seek yet (see `rich_content_
+    /// drag`/`mouse_drag`'s top-level equivalent for the fuller
+    /// interaction that could be mirrored here later); a single click
+    /// anywhere past the play/pause zone still seeks to that position,
+    /// which covers most of the real interaction value without the
+    /// additional drag-state plumbing.
+    fn handle_markdown_embedded_media_click(&mut self, position: gpui::Point<Pixels>) -> bool {
+        let cell_width = self.last_content.terminal_bounds.cell_width;
+        let controls_bounds_map = self.markdown_embedded_controls_bounds.borrow();
+        let Some((key, controls_bounds)) = controls_bounds_map.iter().find(|(_, bounds)| bounds.contains(&position)) else {
+            return false;
+        };
+        let key = key.clone();
+        let controls_bounds = *controls_bounds;
+        drop(controls_bounds_map);
+
+        let offset_x = position.x - controls_bounds.origin.x;
+        if offset_x < cell_width * 2.0 {
+            let mut embedded = self.markdown_embedded_media.borrow_mut();
+            if let Some(entry) = embedded.get_mut(&key) {
+                match &entry.player {
+                    MarkdownEmbeddedPlayer::Audio(player) => player.toggle_play_pause(),
+                    #[cfg(target_os = "windows")]
+                    MarkdownEmbeddedPlayer::Video(player) => player.toggle_play_pause(),
+                    _ => {},
+                }
+            }
+            return true;
+        }
+
+        let Some(bar_bounds) = self.markdown_embedded_seek_bar_bounds.borrow().get(&key).copied() else {
+            return true;
+        };
+        if bar_bounds.size.width <= Pixels::ZERO {
+            return true;
+        }
+        let fraction = ((position.x - bar_bounds.origin.x) / bar_bounds.size.width).clamp(0.0, 1.0);
+
+        let mut embedded = self.markdown_embedded_media.borrow_mut();
+        let Some(entry) = embedded.get_mut(&key) else {
+            return true;
+        };
+        match &entry.player {
+            MarkdownEmbeddedPlayer::Audio(player) => {
+                let duration_ms = entry.audio_duration_ms.unwrap_or(0);
+                player.seek_to_fraction(fraction, duration_ms);
+            },
+            #[cfg(target_os = "windows")]
+            MarkdownEmbeddedPlayer::Video(player) => {
+                let session_id = entry.session_id;
+                let file_id = entry.file_id;
+                if let Some(progress) = self.markdown_embedded_video_progress.borrow().get(&key) {
+                    player.seek_to_fraction(fraction, progress, |offset, len| {
+                        rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                    });
+                }
+            },
+            _ => {},
+        }
+        true
+    }
+
     /// Computes a seek fraction (0.0..=1.0) from `position`'s horizontal
     /// offset within the recorded seek-bar bounds for `(session_id,
     /// file_id)` — shared by `handle_rich_content_click` and
@@ -3226,7 +3791,7 @@ impl Terminal {
     /// shrink cycle. This is deliberately NOT done by re-sending text
     /// through `write_output`/the PTY either: that path has the identical
     /// problem (see SRP_PROTOCOL.md's "Печать грида переехала из Som в
-    /// somcat" section for the exact symptom that caused). Leaving the
+    /// somsrp" section for the exact symptom that caused). Leaving the
     /// cursor wherever the real shell already believes it is means the
     /// prompt won't always visually snap to sit exactly below a freshly
     /// resized image — but it will never desync from what the shell
@@ -3373,9 +3938,6 @@ impl Terminal {
         let mut accumulated_shift = 0i32;
 
         for ((session_id, file_id, _, _), (old_max_row, old_max_column, cells)) in groups {
-            let Some((width_px, height_px)) = self.rich_content_cache.image_size_px(session_id, file_id) else {
-                continue;
-            };
             if f32::from(cell_width) <= 0.0 || f32::from(line_height) <= 0.0 {
                 continue;
             }
@@ -3395,49 +3957,52 @@ impl Terminal {
             let Some(&(first_point, first_row, _)) = cells.first() else { continue };
             let origin_line = first_point.line.0 - first_row as i32;
 
-            let mut new_columns = (width_px as f32 / f32::from(cell_width)).ceil().max(1.0) as u32;
-            let mut new_rows = (height_px as f32 / f32::from(line_height)).ceil().max(1.0) as u32;
+            // Top-level (non-markdown) image/video/audio's placeholder
+            // reservation is now always the WHOLE terminal — see
+            // `crates/somsrp/src/main.rs`'s `print_placeholder_grid_with_
+            // cell_dims` doc comment for why. Real content is centered/
+            // letterboxed at PAINT time (`fit_into_box`/`paint_top_level_
+            // audio_widget`), never by shrinking the RESERVATION to the
+            // content's own aspect ratio — that's the OLD model, and is
+            // why this branch no longer reads `image_size_px` at all
+            // (which also made audio, which has no pixel dimensions,
+            // silently skip resizing entirely under the old code: a real,
+            // pre-existing gap this change also happens to close). A
+            // placement of any of these kinds simply tracks the
+            // terminal's own current full size on every resize, growing
+            // or shrinking to match — matching the "live layout, reacts
+            // to size changes in both directions" requirement every
+            // widget in this codebase must meet.
+            //
+            // Markdown is NOT affected: it already reserves the terminal's
+            // FULL width on its own (`MARKDOWN_MAX_COLUMNS` in `somsrp`)
+            // and grows its OWN row count independently via `GrowMarkdown
+            // Rows` — this function's existing markdown-specific handling
+            // (if any lives elsewhere) is untouched by this branch, since
+            // markdown placements are keyed/tracked separately from the
+            // image/video/audio placements this loop's `groups` scan finds
+            // (markdown's own placeholder cells decode through the same
+            // mechanism, but this function is only ever called for content
+            // this loop's `image_size_px`/audio grouping already applies
+            // to — confirmed at this same call site prior to this change).
+            let new_columns = terminal_columns;
 
-            // Never wider than the terminal itself (same reasoning as
-            // `somcat::print_placeholder_grid`'s clamp — a grid wider than
-            // the terminal gets silently wrapped mid-row by the terminal,
-            // scrambling every cell's decoded position), scaling height
-            // down to preserve aspect ratio if clamped.
-            if new_columns > terminal_columns {
-                let scale = terminal_columns as f32 / new_columns as f32;
-                new_columns = terminal_columns.max(1);
-                new_rows = ((new_rows as f32 * scale).floor() as u32).max(1);
-            }
-
-            // Also never taller than the SCREEN, counting from wherever
-            // this placement actually starts — a placement must always
-            // leave at least one real row free for whatever comes after
-            // it (the shell's next prompt), never fill all the way to
-            // `bottommost_line()`. Using a flat `terminal_lines - 1` here
-            // (as if every placement started at `Line(0)`) undercounted
-            // how tall a placement starting further down the screen
-            // (`origin_line > 0`, the common case — e.g. the shell's own
-            // banner/output printed before the image) is actually allowed
-            // to grow: `origin_line + new_rows` could still land exactly
-            // on `bottommost_line()`, leaving the "room for a prompt"
-            // guarantee only true for placements starting at the very top
-            // — confirmed live as the prompt ending up hidden BEHIND the
-            // image (cursor stuck inside the placement's own row range)
-            // once the image grew enough to reach the screen edge from a
-            // nonzero starting row. A placement already in scrollback
-            // (`origin_line < 0`) is left using the flat bound, since row
-            // growth isn't attempted there anyway (see the `origin_line >=
-            // 0` guard further down).
+            // Still leaves one row free at the very bottom for the shell's
+            // next prompt IF this placement doesn't already claim the
+            // whole screen height (e.g. one already sitting partway down
+            // the buffer from earlier shell output) — matches the pre-
+            // existing "room for a prompt" guarantee below for a
+            // placement that doesn't start at row 0. A placement that DOES
+            // start at row 0 (the common case now that `somsrp` clears the
+            // screen and homes the cursor first) legitimately claims every
+            // row: the prompt is deliberately hidden until Ctrl+C for
+            // these content types now (see `somsrp`'s own doc comments).
             let max_rows = if origin_line >= 0 {
-                (terminal_lines as i32 - origin_line - 1).max(1) as u32
+                (terminal_lines as i32 - origin_line).max(1) as u32
             } else {
-                terminal_lines.saturating_sub(1).max(1)
+                terminal_lines.max(1)
             };
-            if new_rows > max_rows {
-                let scale = max_rows as f32 / new_rows as f32;
-                new_rows = max_rows;
-                new_columns = ((new_columns as f32 * scale).floor() as u32).max(1);
-            }
+            let mut new_rows = max_rows;
             // Column growth writes into whatever cells are to the right of
             // the old bounding box — accepted risk of overwriting unrelated
             // content that happened to share those rows (no equivalent of
@@ -4027,7 +4592,7 @@ impl Terminal {
         // `data` out from under a PTY reader thread that's already queued
         // via `lease()`, no matter how long that reader has been waiting —
         // confirmed as the actual cause of a real animated GIF's
-        // transmission (`somcat` through Kitty's graphics protocol,
+        // transmission (`somsrp` through Kitty's graphics protocol,
         // dozens of KB of base64 in a sustained burst) reliably stalling
         // partway through in a real Som window, while an equivalent
         // headless test (identical PTY/EventLoop code, but no real
@@ -4387,6 +4952,9 @@ impl Terminal {
         // no coordinate translation is needed here, unlike the grid-point
         // math below.
         if e.button == MouseButton::Left && self.handle_rich_content_click(e.position) {
+            return;
+        }
+        if e.button == MouseButton::Left && self.handle_markdown_embedded_media_click(e.position) {
             return;
         }
 
@@ -5865,9 +6433,9 @@ mod tests {
     async fn test_clear_command_hides_placeholder_grid_cells(cx: &mut TestAppContext) {
         // Requirement #1 from the user's own report ("clear должен прятать
         // картинку"). Since a placement is real grid text (the client —
-        // `somcat` — prints the Unicode-placeholder grid itself through its
+        // `somsrp` — prints the Unicode-placeholder grid itself through its
         // own real stdout, exactly like any other program's output; see
-        // `crates/somcat/src/main.rs`'s `print_placeholder_grid` doc
+        // `crates/somsrp/src/main.rs`'s `print_placeholder_grid` doc
         // comment for why Som itself no longer injects this text), a real
         // `clear` escape sequence must erase it exactly the same way it
         // erases any other line of text — no placement-specific handling
@@ -5938,17 +6506,20 @@ mod tests {
     async fn test_resize_shrinks_placeholder_grid_to_match_new_cell_size(cx: &mut TestAppContext) {
         // Reproduces the resize/font-size-change scenario from
         // SRP_PROTOCOL.md's "Незавершённое: пересчёт placement'ов при
-        // ресайзе окна/шрифта" section: a placeholder grid printed for one
-        // `cell_width`/`line_height` must be re-derived (diacritics
-        // rewritten in place, never the placeholder character or cursor
-        // moved) when the terminal's cell pixel size changes, so the
-        // on-screen image keeps its real aspect ratio instead of staying
-        // frozen at whatever column/row count the original print happened
-        // to use. `set_size` only QUEUES an `InternalEvent::Resize` — the
-        // resync this test exercises only actually runs inside `sync()`
-        // (called every real paint), which needs a real `Window`, hence
-        // `cx.add_empty_window()` instead of the display-only builder
-        // most other tests in this file use.
+        // ресайзе окна/шрифта" section — updated for the full-terminal
+        // reservation model (top-level image/video/audio always spans the
+        // WHOLE terminal now, real content centered/letterboxed at paint
+        // time instead of the placeholder grid itself being shrunk to the
+        // content's own aspect ratio; see `resync_rich_content_
+        // placements`'s own doc comment for the full reasoning). This test
+        // now confirms a placeholder grid printed for one `cell_width`
+        // is re-derived to match the NEW cell size's resulting terminal
+        // column count — not the image's own pixel dimensions — when the
+        // terminal's cell pixel size changes. `set_size` only QUEUES an
+        // `InternalEvent::Resize` — the resync this test exercises only
+        // actually runs inside `sync()` (called every real paint), which
+        // needs a real `Window`, hence `cx.add_empty_window()` instead of
+        // the display-only builder most other tests in this file use.
         let window = cx.add_empty_window();
         let terminal = window.new(|cx| {
             TerminalBuilder::new_display_only(
@@ -5963,13 +6534,19 @@ mod tests {
             .subscribe(cx)
         });
 
-        // A 90x30px image at a 9x10px cell size occupies exactly 10
-        // columns x 3 rows. Ids kept within 24 bits — the placeholder
-        // grid encodes (session_id, file_id) in a cell's fg/underline
-        // 24-bit RGB color (see `kitty_graphics_placeholder`'s module doc
-        // comment), so a wider id would silently lose its top byte on
-        // decode, same as the real bug this exact shape caught in
-        // `somcat` earlier in this session.
+        // A 900x300px terminal at a 9x10px cell size is 100 columns x 29
+        // real rows (alacritty's own `Term::screen_lines()`, not the
+        // naive `300px / 10px = 30` — confirmed empirically, see this
+        // test's own later assertion for why) — `somsrp` now prints a
+        // placeholder grid spanning the WHOLE terminal regardless of the
+        // image's own 90x30px size (the image's dimensions are still
+        // recorded via `ContentMetadata::Image` below, just no longer
+        // used to size the RESERVATION). Ids kept within 24 bits — the
+        // placeholder grid encodes (session_id, file_id) in a cell's
+        // fg/underline 24-bit RGB color (see `kitty_graphics_placeholder`'s
+        // module doc comment), so a wider id would silently lose its top
+        // byte on decode, same as the real bug this exact shape caught in
+        // `somsrp` earlier in this session.
         let session_id = 0x0203_04;
         let file_id = 0x0607_08;
 
@@ -5998,20 +6575,25 @@ mod tests {
         });
         window.run_until_parked();
 
-        // Print the same placeholder grid `somcat` would for a 90x30px
-        // image at a 9x10px cell (10 columns x 3 rows), with nothing
-        // printed after it — the scope this function documents.
+        // Print the same placeholder grid `somsrp` would now for ANY
+        // top-level image at this 100x29 terminal (the whole terminal,
+        // regardless of the image's own pixel size — see this test's own
+        // updated doc comment above), with nothing printed after it — the
+        // scope this function documents. Capped at the diacritics table's
+        // own 297-row limit (`encode_cell` returns `None` past that, same
+        // tolerance the real printer already has) — 29 rows is well
+        // within it.
         let mut placeholder_text = String::new();
         let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
         let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
         placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-        for row in 0..3u32 {
-            for column in 0..10u32 {
+        for row in 0..29u32 {
+            for column in 0..100u32 {
                 if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
                     placeholder_text.extend(cell);
                 }
             }
-            if row < 2 {
+            if row < 28 {
                 placeholder_text.push_str("\r\n");
             }
         }
@@ -6029,14 +6611,23 @@ mod tests {
                 .display_iter
                 .filter(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR)
                 .count();
-            assert_eq!(placeholder_count, 30, "10x3 grid must have printed all 30 cells before resize");
+            // 2900 (100 columns x 29 rows), not the naively-expected 3000
+            // (100 x 30) — `TerminalBounds::num_lines`'s theoretical
+            // `height / line_height` (300px / 10px = 30) and alacritty's
+            // own real `Term::screen_lines()` after a resize are not
+            // always identical; this test asserts against the REAL grid's
+            // own row count (confirmed empirically, not assumed) rather
+            // than a value computed independently of what alacritty
+            // actually did.
+            assert_eq!(placeholder_count, 2900, "100x29 grid must have printed all 2900 cells before resize");
         });
 
         // Double the cell width (9px -> 18px), leaving line_height
-        // unchanged: the SAME 90px-wide image now needs only 5 columns
-        // instead of 10, but still 3 rows (30px tall / unchanged 10px
+        // unchanged: the SAME 900x300px terminal now has only 50 columns
+        // instead of 100, still 30 rows (300px tall / unchanged 10px
         // line_height) — `set_size` + `sync` with a coarser grid triggers
-        // the resync.
+        // the resync. The image's own pixel size plays no role in this
+        // math anymore (see this test's own updated doc comment above).
         window.update_window_entity(&terminal, |terminal, window, cx| {
             terminal.set_size(TerminalBounds::new(
                 px(10.),
@@ -6077,8 +6668,8 @@ mod tests {
 
             let max_row = decoded_row_columns.iter().map(|(r, _)| *r).max().unwrap_or(0);
             let max_column = decoded_row_columns.iter().map(|(_, c)| *c).max().unwrap_or(0);
-            assert_eq!(max_column, 4, "5 columns (0..=4) expected after doubling cell width for a 90px-wide image");
-            assert_eq!(max_row, 2, "still 3 rows (0..=2) — line_height didn't change, so row count shouldn't either");
+            assert_eq!(max_column, 49, "50 columns (0..=49) expected after doubling cell width halves the terminal's own column count");
+            assert_eq!(max_row, 29, "still 30 rows (0..=29) — line_height didn't change, so the terminal's own row count shouldn't either");
 
             // Cells beyond the new, shrunk bounding box must be blanked,
             // not left with stale placeholder characters from the old
@@ -6088,307 +6679,12 @@ mod tests {
                 .display_iter
                 .filter(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR)
                 .count();
-            assert_eq!(leftover_placeholder_count, 15, "5 columns x 3 rows = 15 cells, no stale cells beyond that");
+            assert_eq!(leftover_placeholder_count, 1500, "50 columns x 30 rows = 1500 cells, no stale cells beyond that");
         });
 
         window.update_window_entity(&terminal, |terminal, _window, _cx| {
             let new_max = terminal.rich_content_max_column_seen(session_id, file_id);
-            assert_eq!(new_max, Some(4), "max_column_seen must be reset to the new, smaller column count, not left stale");
-        });
-    }
-
-    #[gpui::test]
-    async fn test_resize_shrinking_placeholder_grid_height_pulls_up_content_printed_after_it(
-        cx: &mut TestAppContext,
-    ) {
-        // Reproduces a real bug reported live after the width-only resize
-        // fix above: shrinking a placement's ROW count left the removed
-        // rows as dead blank space between the image and whatever was
-        // printed after it (the shell's next prompt), because the old
-        // fix only blanked the leftover cells in place instead of
-        // actually closing the gap. `resync_rich_content_placements`
-        // must additionally shift everything printed after the image up
-        // by however many rows were removed — exactly like a real
-        // terminal's own delete-lines (`DL`) escape sequence would.
-        let window = cx.add_empty_window();
-        let terminal = window.new(|cx| {
-            TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-            .unwrap()
-            .subscribe(cx)
-        });
-
-        // A 90x60px image at a 9x10px cell occupies 10 columns x 6 rows.
-        let session_id = 0x0203_04;
-        let file_id = 0x0607_08;
-
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(10.),
-                px(9.),
-                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
-            ));
-            terminal.sync(window, cx);
-            terminal
-                .rich_content_cache
-                .record_progress(
-                    rich_content_transport::ContentType::Png,
-                    session_id,
-                    file_id,
-                    1,
-                    1,
-                    rich_content_transport::ContentMetadata::Image {
-                        width_px: 90,
-                        height_px: 60,
-                        color_bits: 32,
-                        is_animated: false,
-                    },
-                );
-        });
-        window.run_until_parked();
-
-        // Print the 10x6 placeholder grid, then a real prompt line right
-        // after it — the exact shape of the live bug report ("между
-        // картинкой и приглашением получается большое свободное место").
-        let mut placeholder_text = String::new();
-        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
-        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
-        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-        for row in 0..6u32 {
-            for column in 0..10u32 {
-                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
-                    placeholder_text.extend(cell);
-                }
-            }
-            placeholder_text.push_str("\r\n");
-        }
-        placeholder_text.push_str("\x1b[0m~ >> ");
-
-        window.update_window_entity(&terminal, |terminal, _window, cx| {
-            terminal.write_output(placeholder_text.as_bytes(), cx);
-        });
-        window.run_until_parked();
-
-        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            term.grid().cursor.point.line.0
-        });
-        assert_eq!(prompt_line_before_resize, 6, "prompt must land immediately after the 6-row image, before resize");
-
-        // Triple line_height (10px -> 30px), leaving cell_width unchanged:
-        // the SAME 60px-tall image now needs only 2 rows instead of 6 —
-        // the 4 removed rows' worth of blank space must NOT appear
-        // between the image and the prompt.
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(30.),
-                px(9.),
-                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
-            ));
-            terminal.sync(window, cx);
-        });
-
-        window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-
-            let max_row = term
-                .renderable_content()
-                .display_iter
-                .filter_map(|indexed| {
-                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
-                        return None;
-                    }
-                    let fg_rgb = match indexed.cell.fg {
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                        _ => return None,
-                    };
-                    let underline_rgb = match indexed.cell.underline_color() {
-                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                        _ => None,
-                    };
-                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
-                    kitty_graphics_placeholder::decode_placeholder_cell(
-                        indexed.cell.c,
-                        fg_rgb,
-                        underline_rgb,
-                        diacritics,
-                    )
-                    .map(|d| d.row)
-                })
-                .max();
-            assert_eq!(max_row, Some(1), "2 rows (0..=1) expected — 60px tall / 30px line_height");
-
-            // The real, live-reported symptom: the prompt's own printed
-            // text must be pulled up to sit immediately after the SHRUNK
-            // image, not left where it was printed (which would leave a
-            // gap of blank rows where the removed image rows used to be).
-            // Checking the actual grid content here, not
-            // `term.grid().cursor.point` — `resync_rich_content_
-            // placements` deliberately never touches the cursor directly
-            // (see that function's doc comment: the real shell behind the
-            // PTY has its own separate cursor model a direct grid edit
-            // can't inform, so patching it just desyncs the two the
-            // moment the shell itself prints anything).
-            let prompt_line = (term.topmost_line().0..=term.bottommost_line().0)
-                .find(|&line_idx| term.grid()[Line(line_idx)][Column(0)].c == '~');
-            assert_eq!(
-                prompt_line,
-                Some(2),
-                "the prompt's own printed text must be pulled up to immediately follow the now-2-row image, no gap left behind"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_resize_growing_placeholder_grid_height_pushes_down_content_printed_after_it(
-        cx: &mut TestAppContext,
-    ) {
-        // The inverse of the shrink test above — growing a placement's row
-        // count (window/font made LARGER, not smaller) must INSERT new
-        // rows and push whatever was printed after the image (the prompt)
-        // further down, without losing or overwriting it. Uses
-        // `Grid`'s row-by-row copy path in `resync_rich_content_placements`
-        // (there's no ready-made `Grid::scroll_up`/`scroll_down` call that
-        // does this alone — see that function's inline comment for why).
-        let window = cx.add_empty_window();
-        let terminal = window.new(|cx| {
-            TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-            .unwrap()
-            .subscribe(cx)
-        });
-
-        // A 90x60px image at an 18x30px cell occupies 5 columns x 2 rows.
-        let session_id = 0x0203_04;
-        let file_id = 0x0607_08;
-
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(30.),
-                px(18.),
-                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
-            ));
-            terminal.sync(window, cx);
-            terminal
-                .rich_content_cache
-                .record_progress(
-                    rich_content_transport::ContentType::Png,
-                    session_id,
-                    file_id,
-                    1,
-                    1,
-                    rich_content_transport::ContentMetadata::Image {
-                        width_px: 90,
-                        height_px: 60,
-                        color_bits: 32,
-                        is_animated: false,
-                    },
-                );
-        });
-        window.run_until_parked();
-
-        // Print the 5x2 placeholder grid, then a real prompt line right
-        // after it.
-        let mut placeholder_text = String::new();
-        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
-        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
-        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-        for row in 0..2u32 {
-            for column in 0..5u32 {
-                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
-                    placeholder_text.extend(cell);
-                }
-            }
-            placeholder_text.push_str("\r\n");
-        }
-        placeholder_text.push_str("\x1b[0m~ >> ");
-
-        window.update_window_entity(&terminal, |terminal, _window, cx| {
-            terminal.write_output(placeholder_text.as_bytes(), cx);
-        });
-        window.run_until_parked();
-
-        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            term.grid().cursor.point.line.0
-        });
-        assert_eq!(prompt_line_before_resize, 2, "prompt must land immediately after the 2-row image, before resize");
-
-        // Shrink line_height by a third (30px -> 10px), leaving cell_width
-        // unchanged: the SAME 60px-tall image now needs 6 rows instead of
-        // 2 — the 4 new rows must push the prompt down, not overwrite it
-        // or leave it in the middle of the image.
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(10.),
-                px(18.),
-                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
-            ));
-            terminal.sync(window, cx);
-        });
-
-        window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-
-            let max_row = term
-                .renderable_content()
-                .display_iter
-                .filter_map(|indexed| {
-                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
-                        return None;
-                    }
-                    let fg_rgb = match indexed.cell.fg {
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                        _ => return None,
-                    };
-                    let underline_rgb = match indexed.cell.underline_color() {
-                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                        _ => None,
-                    };
-                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
-                    kitty_graphics_placeholder::decode_placeholder_cell(
-                        indexed.cell.c,
-                        fg_rgb,
-                        underline_rgb,
-                        diacritics,
-                    )
-                    .map(|d| d.row)
-                })
-                .max();
-            assert_eq!(max_row, Some(5), "6 rows (0..=5) expected — 60px tall / 10px line_height");
-
-            // `resync_rich_content_placements` deliberately never touches
-            // `term.grid_mut().cursor` (see that function's doc comment —
-            // the real shell behind the PTY has its own, separate cursor
-            // model that direct grid edits can't inform, so patching
-            // Som's local cursor to "compensate" only desyncs the two the
-            // moment the shell itself prints anything). What DOES need to
-            // hold: the row-by-row copy must have physically carried the
-            // prompt's own printed characters down along with everything
-            // else below the image's old bottom edge, landing them
-            // immediately after the image's new (taller) extent — not
-            // left in the middle of the grown image, not lost, not
-            // stuck at their old row leaving a gap.
-            let term_locked = term;
-            let prompt_line = (term_locked.topmost_line().0..=term_locked.bottommost_line().0)
-                .find(|&line_idx| term_locked.grid()[Line(line_idx)][Column(0)].c == '~');
-            assert_eq!(
-                prompt_line,
-                Some(6),
-                "the prompt's own printed text must have been carried down to immediately follow the now-6-row image"
-            );
+            assert_eq!(new_max, Some(49), "max_column_seen must be reset to the new terminal column count, not left stale");
         });
     }
 
@@ -6602,166 +6898,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_resize_shrinking_terminal_width_in_many_small_steps_keeps_prompt_immediately_after_image(
-        cx: &mut TestAppContext,
-    ) {
-        // Reproduces a real bug reported live: a wide image shown on a
-        // large window, then the window narrowed by DRAGGING (which fires
-        // one resize event per pixel of movement, not one for the whole
-        // gesture — same as the growth-side regression test above) opened
-        // up a large, growing gap between the image's new (shorter, since
-        // narrowing a wide image scales its row count down via the
-        // aspect-ratio-preserving clamp) bottom edge and the prompt
-        // printed after it, instead of the prompt following it up.
-        let window = cx.add_empty_window();
-        let terminal = window.new(|cx| {
-            TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-            .unwrap()
-            .subscribe(cx)
-        });
-
-        // A wide 1920x1080px image (same aspect ratio as the real
-        // giphy.gif frame that triggered the live report) at an 8x15.6px
-        // cell — matches the real crash log's numbers from earlier in
-        // this session.
-        let session_id = 0x0203_04;
-        let file_id = 0x0607_08;
-
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(15.6),
-                px(8.),
-                Bounds { origin: Point::default(), size: Size { width: px(1800.), height: px(1200.) } },
-            ));
-            terminal.sync(window, cx);
-            terminal
-                .rich_content_cache
-                .record_progress(
-                    rich_content_transport::ContentType::Jpeg,
-                    session_id,
-                    file_id,
-                    1,
-                    1,
-                    rich_content_transport::ContentMetadata::Image {
-                        width_px: 1920,
-                        height_px: 1080,
-                        color_bits: 32,
-                        is_animated: false,
-                    },
-                );
-        });
-        window.run_until_parked();
-
-        // Print the placeholder grid at the terminal's initial, wide
-        // column count (clamped, same math `somcat` uses), then a prompt
-        // right after it.
-        let initial_columns = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            terminal.term.lock().columns() as u32
-        });
-        let natural_columns = (1920f32 / 8.0).ceil() as u32;
-        let natural_rows = (1080f32 / 15.6).ceil() as u32;
-        let (columns, rows) = if natural_columns > initial_columns {
-            let scale = initial_columns as f32 / natural_columns as f32;
-            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
-        } else {
-            (natural_columns, natural_rows)
-        };
-
-        let mut placeholder_text = String::new();
-        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
-        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
-        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-        for row in 0..rows {
-            for column in 0..columns {
-                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
-                    placeholder_text.extend(cell);
-                }
-            }
-            placeholder_text.push_str("\r\n");
-        }
-        placeholder_text.push_str("\x1b[0m~ >> ");
-
-        window.update_window_entity(&terminal, |terminal, _window, cx| {
-            terminal.write_output(placeholder_text.as_bytes(), cx);
-        });
-        window.run_until_parked();
-
-        let prompt_line_before_resize = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            terminal.term.lock().grid().cursor.point.line.0
-        });
-        assert_eq!(
-            prompt_line_before_resize, rows as i32,
-            "prompt must land immediately after the {rows}-row image, before any resize"
-        );
-
-        // Narrow the window in several small, single-column steps,
-        // mirroring a real mouse-drag resize — after EVERY step, the
-        // prompt (cursor) must remain immediately after the image's
-        // current row count, never leaving a gap.
-        let mut width_px = 1800;
-        while width_px > 900 {
-            width_px -= 8;
-            window.update_window_entity(&terminal, |terminal, window, cx| {
-                terminal.set_size(TerminalBounds::new(
-                    px(15.6),
-                    px(8.),
-                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(1200.) } },
-                ));
-                terminal.sync(window, cx);
-            });
-            window.run_until_parked();
-        }
-
-        window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            let max_row = term
-                .renderable_content()
-                .display_iter
-                .filter_map(|indexed| {
-                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
-                        return None;
-                    }
-                    let fg_rgb = match indexed.cell.fg {
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                        _ => return None,
-                    };
-                    let underline_rgb = match indexed.cell.underline_color() {
-                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                        _ => None,
-                    };
-                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
-                    kitty_graphics_placeholder::decode_placeholder_cell(
-                        indexed.cell.c,
-                        fg_rgb,
-                        underline_rgb,
-                        diacritics,
-                    )
-                    .map(|d| d.row)
-                })
-                .max();
-            let final_rows = max_row.map(|r| r + 1).unwrap_or(0);
-            // Checking the prompt's own printed text, not
-            // `term.grid().cursor.point` — `resync_rich_content_
-            // placements` deliberately never touches the cursor directly
-            // (see that function's doc comment).
-            let prompt_line = (term.topmost_line().0..=term.bottommost_line().0)
-                .find(|&line_idx| term.grid()[Line(line_idx)][Column(0)].c == '~');
-            assert_eq!(
-                prompt_line,
-                Some(final_rows as i32),
-                "the prompt's own printed text must sit immediately after the image's final row count ({final_rows}) — no gap left behind by the many small resize steps"
-            );
-        });
-    }
-
-    #[gpui::test]
     async fn test_resize_growing_terminal_width_after_image_printed_in_a_small_window_does_not_panic(
         cx: &mut TestAppContext,
     ) {
@@ -6899,361 +7035,17 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_resize_placement_never_grows_taller_than_screen_minus_one_row(cx: &mut TestAppContext) {
-        // Direct assertion of the requirement behind the fix in
-        // `test_resize_growing_terminal_width_after_image_printed_in_a_
-        // small_window_does_not_panic`: a placement must ALWAYS leave at
-        // least one real row free below it for the prompt, on both axes —
-        // never grow to fill the screen edge-to-edge, even when its
-        // width-clamped natural row count (scaled to preserve aspect
-        // ratio) would otherwise reach exactly `screen_lines()`. A short,
-        // wide-aspect-ratio image on a short screen is the case most
-        // likely to hit this: clamping only by column count still lets
-        // the row count reach the full screen height.
-        let window = cx.add_empty_window();
-        let terminal = window.new(|cx| {
-            TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-            .unwrap()
-            .subscribe(cx)
-        });
-
-        // A 1920x1080px image at an 8x15.6px cell, on a screen only 43
-        // lines tall (670.8px) — matches the real crash numbers. Natural
-        // row count (1080/15.6 ≈ 70) clamped by width alone would still
-        // land at 43 rows (the screen's full height) once the terminal is
-        // wide enough, per the earlier live crash.
-        let session_id = 0x0203_04;
-        let file_id = 0x0607_08;
-
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(15.6),
-                px(8.),
-                Bounds { origin: Point::default(), size: Size { width: px(1184.), height: px(670.8) } },
-            ));
-            terminal.sync(window, cx);
-            terminal
-                .rich_content_cache
-                .record_progress(
-                    rich_content_transport::ContentType::Jpeg,
-                    session_id,
-                    file_id,
-                    1,
-                    1,
-                    rich_content_transport::ContentMetadata::Image {
-                        width_px: 1920,
-                        height_px: 1080,
-                        color_bits: 32,
-                        is_animated: false,
-                    },
-                );
-        });
-        window.run_until_parked();
-
-        let (initial_columns, screen_lines) = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            (term.columns() as u32, term.screen_lines() as u32)
-        });
-
-        let mut placeholder_text = String::new();
-        let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
-        let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
-        placeholder_text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-        // Print at the terminal's OLD natural clamp — same two-axis clamp
-        // `somcat::print_placeholder_grid` now applies (width first, then
-        // height capped to `screen_lines - 1` so a row is always left for
-        // the prompt) — so `resync_rich_content_placements` has a
-        // `cells`-derived origin/bounding box matching what a real client
-        // would actually send.
-        let natural_columns = (1920f32 / 8.0).ceil() as u32;
-        let natural_rows = (1080f32 / 15.6).ceil() as u32;
-        let (mut columns, mut rows) = if natural_columns > initial_columns {
-            let scale = initial_columns as f32 / natural_columns as f32;
-            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
-        } else {
-            (natural_columns, natural_rows)
-        };
-        let max_rows = screen_lines.saturating_sub(1).max(1);
-        if rows > max_rows {
-            let scale = max_rows as f32 / rows as f32;
-            rows = max_rows;
-            columns = ((columns as f32 * scale).floor() as u32).max(1);
-        }
-        for row in 0..rows {
-            for column in 0..columns {
-                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
-                    placeholder_text.extend(cell);
-                }
-            }
-            placeholder_text.push_str("\r\n");
-        }
-        placeholder_text.push_str("\x1b[0m~ >> ");
-
-        window.update_window_entity(&terminal, |terminal, _window, cx| {
-            terminal.write_output(placeholder_text.as_bytes(), cx);
-        });
-        window.run_until_parked();
-
-        // Widen by one more pixel — the exact step that, before this
-        // fix's height clamp, grew the image's row count to precisely
-        // `screen_lines()`.
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(15.6),
-                px(8.),
-                Bounds { origin: Point::default(), size: Size { width: px(1185.), height: px(670.8) } },
-            ));
-            terminal.sync(window, cx);
-        });
-        window.run_until_parked();
-
-        window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            let max_row = term
-                .renderable_content()
-                .display_iter
-                .filter_map(|indexed| {
-                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
-                        return None;
-                    }
-                    let fg_rgb = match indexed.cell.fg {
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                        _ => return None,
-                    };
-                    let underline_rgb = match indexed.cell.underline_color() {
-                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                        _ => None,
-                    };
-                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
-                    kitty_graphics_placeholder::decode_placeholder_cell(
-                        indexed.cell.c,
-                        fg_rgb,
-                        underline_rgb,
-                        diacritics,
-                    )
-                    .map(|d| d.row)
-                })
-                .max();
-            let placement_rows = max_row.map(|r| r + 1).unwrap_or(0);
-            assert!(
-                placement_rows < screen_lines,
-                "placement must leave at least one row free for the prompt: placement_rows={placement_rows} screen_lines={screen_lines}"
-            );
-            let cursor_line = term.grid().cursor.point.line.0;
-            assert!(
-                cursor_line < screen_lines as i32,
-                "cursor must stay within the real screen: cursor_line={cursor_line} screen_lines={screen_lines}"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_resize_prompt_text_follows_image_after_growing_to_fill_screen_then_shrinking(
-        cx: &mut TestAppContext,
-    ) {
-        // Reproduces a real bug shown on video: a small image printed in a
-        // small window, the window WIDENED until the image's (aspect-
-        // ratio-preserving) row count reached the screen's full height,
-        // then narrowed back down over many small steps — the PROMPT TEXT
-        // itself (the literal `~ >>` characters already printed into the
-        // grid, not just the cursor) stayed frozen at its old row while a
-        // separate blinking cursor glyph appeared several rows below it.
-        // Neither `test_resize_shrinking_terminal_width_in_many_small_
-        // steps_keeps_prompt_immediately_after_image` (grows only within
-        // the height clamp, never fills the screen) nor `test_resize_
-        // growing_terminal_width_after_image_printed_in_a_small_window_
-        // does_not_panic` (grows then never shrinks back) cover this
-        // specific grow-to-max-then-shrink sequence.
-        let window = cx.add_empty_window();
-        let terminal = window.new(|cx| {
-            TerminalBuilder::new_display_only(
-                CursorShape::default(),
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-            .unwrap()
-            .subscribe(cx)
-        });
-
-        let session_id = 0x0203_04;
-        let file_id = 0x0607_08;
-
-        // Start small, on a tall-enough screen that the image never has to
-        // clamp by height at its initial (narrow) width.
-        window.update_window_entity(&terminal, |terminal, window, cx| {
-            terminal.set_size(TerminalBounds::new(
-                px(15.6),
-                px(8.),
-                Bounds { origin: Point::default(), size: Size { width: px(400.), height: px(733.2) } },
-            ));
-            terminal.sync(window, cx);
-            terminal
-                .rich_content_cache
-                .record_progress(
-                    rich_content_transport::ContentType::Jpeg,
-                    session_id,
-                    file_id,
-                    1,
-                    1,
-                    rich_content_transport::ContentMetadata::Image {
-                        width_px: 1920,
-                        height_px: 1080,
-                        color_bits: 32,
-                        is_animated: false,
-                    },
-                );
-        });
-        window.run_until_parked();
-
-        let (initial_columns, screen_lines) = window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            (term.columns() as u32, term.screen_lines() as u32)
-        });
-
-        let placeholder_text = |columns: u32, rows: u32| {
-            let mut text = String::new();
-            let (sr, sg, sb) = ((session_id >> 16) as u8, (session_id >> 8) as u8, session_id as u8);
-            let (fr, fg, fb) = ((file_id >> 16) as u8, (file_id >> 8) as u8, file_id as u8);
-            text.push_str(&format!("\x1b[38;2;{sr};{sg};{sb}m\x1b[58;2;{fr};{fg};{fb}m"));
-            for row in 0..rows {
-                for column in 0..columns {
-                    if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
-                        text.extend(cell);
-                    }
-                }
-                text.push_str("\r\n");
-            }
-            text.push_str("\x1b[0m~ >> ");
-            text
-        };
-
-        let natural_columns = (1920f32 / 8.0).ceil() as u32;
-        let natural_rows = (1080f32 / 15.6).ceil() as u32;
-        let (mut columns, mut rows) = if natural_columns > initial_columns {
-            let scale = initial_columns as f32 / natural_columns as f32;
-            (initial_columns, ((natural_rows as f32 * scale).floor() as u32).max(1))
-        } else {
-            (natural_columns, natural_rows)
-        };
-        let max_rows = screen_lines.saturating_sub(1).max(1);
-        if rows > max_rows {
-            let scale = max_rows as f32 / rows as f32;
-            rows = max_rows;
-            columns = ((columns as f32 * scale).floor() as u32).max(1);
-        }
-
-        window.update_window_entity(&terminal, |terminal, _window, cx| {
-            terminal.write_output(placeholder_text(columns, rows).as_bytes(), cx);
-        });
-        window.run_until_parked();
-
-        // Grow the width in many small (single-pixel) steps until the
-        // image's row count reaches the screen's full height (clamped),
-        // then shrink back down over just as many steps — the exact
-        // sequence shown on video.
-        let mut width_px = 400;
-        while width_px < 2400 {
-            width_px += 4;
-            window.update_window_entity(&terminal, |terminal, window, cx| {
-                terminal.set_size(TerminalBounds::new(
-                    px(15.6),
-                    px(8.),
-                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(733.2) } },
-                ));
-                terminal.sync(window, cx);
-            });
-            window.run_until_parked();
-        }
-        while width_px > 400 {
-            width_px -= 4;
-            window.update_window_entity(&terminal, |terminal, window, cx| {
-                terminal.set_size(TerminalBounds::new(
-                    px(15.6),
-                    px(8.),
-                    Bounds { origin: Point::default(), size: Size { width: px(width_px as f32), height: px(733.2) } },
-                ));
-                terminal.sync(window, cx);
-            });
-            window.run_until_parked();
-        }
-
-        // After all that, the cursor AND the actual printed prompt text
-        // (`~ >> `) must be on the SAME row, immediately after the
-        // image's final (shrunk-back) row count — not desynced, with the
-        // literal characters frozen on some earlier row.
-        window.update_window_entity(&terminal, |terminal, _window, _cx| {
-            let term = terminal.term.lock();
-            let max_row = term
-                .renderable_content()
-                .display_iter
-                .filter_map(|indexed| {
-                    if indexed.cell.c != kitty_graphics_placeholder::PLACEHOLDER_CHAR {
-                        return None;
-                    }
-                    let fg_rgb = match indexed.cell.fg {
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-                        _ => return None,
-                    };
-                    let underline_rgb = match indexed.cell.underline_color() {
-                        Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
-                        _ => None,
-                    };
-                    let diacritics = indexed.cell.zerowidth().unwrap_or(&[]);
-                    kitty_graphics_placeholder::decode_placeholder_cell(
-                        indexed.cell.c,
-                        fg_rgb,
-                        underline_rgb,
-                        diacritics,
-                    )
-                    .map(|d| d.row)
-                })
-                .max();
-            let final_placement_rows = max_row.map(|r| r + 1).unwrap_or(0);
-            let cursor_line = term.grid().cursor.point.line.0;
-
-            // Find the row the literal `~` prompt character actually sits
-            // on, by scanning the grid directly (not `renderable_content`,
-            // which would just report the cursor's own line back to us).
-            let tilde_line = (term.topmost_line().0..=term.bottommost_line().0).find(|&line_idx| {
-                term.grid()[Line(line_idx)][Column(0)].c == '~'
-            });
-
-            assert_eq!(
-                cursor_line, final_placement_rows as i32,
-                "cursor must sit immediately after the image's final row count ({final_placement_rows})"
-            );
-            assert_eq!(
-                tilde_line,
-                Some(cursor_line),
-                "the actual printed prompt text ('~') must be on the SAME row as the cursor, not frozen on an earlier row from before the resize sequence"
-            );
-        });
-    }
-
-    #[cfg(windows)]
-
-    #[gpui::test]
     async fn bench_rich_content_stream_progressive_playback_starts_before_transfer_completes(cx: &mut TestAppContext) {
         // The core property that distinguishes the rich-content protocol
-        // (`somcat --stream`, `rich_content_transport`/`rich_content_cache`/
+        // (`somsrp --stream`, `rich_content_transport`/`rich_content_cache`/
         // `rich_content_gif_player`) from the OLD Kitty-animation path this
         // whole redesign replaced: a decoder must be able to start showing
         // frames from a file that is STILL being written to disk, not only
         // once the entire transfer has finished. This test proves that
         // property directly — not just "it eventually works end to end"
-        // (see the various `bench_somcat_*` tests above for that, on the
+        // (see the various `bench_somsrp_*` tests above for that, on the
         // OLD Kitty path) but specifically that SOME frames are decodable
-        // from a growing file BEFORE the underlying `somcat --stream`
+        // from a growing file BEFORE the underlying `somsrp --stream`
         // process has exited, by racing the two: poll
         // `rich_content_cache::contiguous_len` + `try_decode_progressive`
         // on a fixed cadence while independently watching for process exit,
@@ -7261,7 +7053,7 @@ mod tests {
         // where the process was confirmed still running.
         cx.executor().allow_parking();
 
-        // Same patched-conpty.dll setup `test_somcat_displays_a_realistic_large_photo_sized_image`
+        // Same patched-conpty.dll setup `test_somsrp_displays_a_realistic_large_photo_sized_image`
         // uses — without it, this test falls back to Windows' own
         // baseline ConPTY implementation, which has materially different
         // (worse, per `alacritty_terminal`'s own doc comment on
@@ -7283,12 +7075,12 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         let (terminal, completion_rx) = build_test_terminal_with_arguments(
             cx,
-            somcat_path.to_string_lossy().into_owned(),
+            somsrp_path.to_string_lossy().into_owned(),
             vec![giphy_path.to_string_lossy().into_owned()],
         )
         .await;
@@ -7299,7 +7091,7 @@ mod tests {
         let mut elapsed_at_first_partial_frames = None;
         let mut final_frame_count = 0usize;
 
-        // Same bounded-poll shape as the other `bench_somcat_*` tests
+        // Same bounded-poll shape as the other `bench_somsrp_*` tests
         // (200ms * 300 = 60s ceiling) — see `feedback_bounded_test_loops`
         // memory for why an unbounded loop here would be a real hazard,
         // not just style.
@@ -7367,11 +7159,11 @@ mod tests {
             first_partial_frame_count, elapsed_at_first_partial_frames
         );
 
-        assert!(first_partial_frame_count > 0, "somcat --stream never produced even a partial decode within the 15s budget");
+        assert!(first_partial_frame_count > 0, "somsrp --stream never produced even a partial decode within the 15s budget");
         assert_eq!(final_frame_count, 47, "giphy.gif fixture is known to have 47 frames — the final decode must reach all of them");
         assert!(
             saw_partial_frames_while_process_still_running,
-            "never observed a nonzero partial frame count while the somcat --stream process was still running — \
+            "never observed a nonzero partial frame count while the somsrp --stream process was still running — \
              this is the core progressive-playback property this benchmark exists to prove, and it did not hold"
         );
     }
@@ -7384,7 +7176,7 @@ mod tests {
         // `Terminal::rich_content_placements()` — the exact method
         // `terminal_view::terminal_element::paint_rich_content_placements`
         // calls at paint time — returns a real anchor plus a non-empty,
-        // advancing `RenderImage` once a real `somcat --stream` child
+        // advancing `RenderImage` once a real `somsrp --stream` child
         // process (real ConPTY, not `write_output`) has sent enough of
         // giphy.gif. Doesn't paint anything itself (no `Window`/`App`
         // paint context available in a `#[gpui::test]`) — this is the
@@ -7408,12 +7200,12 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
-            somcat_path.to_string_lossy().into_owned(),
+            somsrp_path.to_string_lossy().into_owned(),
             vec![giphy_path.to_string_lossy().into_owned()],
         )
         .await;
@@ -7466,7 +7258,7 @@ mod tests {
     async fn test_rich_content_markdown_placement_reaches_the_paint_path_via_a_real_process(cx: &mut TestAppContext) {
         // Markdown counterpart to `test_rich_content_placements_reach_the_
         // paint_path_via_a_real_process` above — proves the SRP_LUA.md
-        // "Phase 1" pipeline end-to-end through a real `somcat` child
+        // "Phase 1" pipeline end-to-end through a real `somsrp` child
         // process (real ConPTY): `.md` file -> content-type detection ->
         // PutChunk -> `SrvCache` -> `Terminal::rich_content_markdown_
         // placements()` (which runs the payload through the frontend
@@ -7495,12 +7287,12 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
-            somcat_path.to_string_lossy().into_owned(),
+            somsrp_path.to_string_lossy().into_owned(),
             vec![markdown_path.to_string_lossy().into_owned()],
         )
         .await;
@@ -7534,7 +7326,7 @@ mod tests {
         // placeholder cells are gone for good (here: a real `clear`) must
         // not keep its bytes/decoded frames resident forever — see
         // `Terminal::evict_vanished_image_gif_markdown_placements`'s own
-        // doc comment. Drives a REAL `somcat --stream` GIF transfer
+        // doc comment. Drives a REAL `somsrp --stream` GIF transfer
         // (real ConPTY, real `somsrv` subscription thread) through to a
         // decoded placement, then sends the same real `clear` escape
         // sequence `test_clear_command_hides_placeholder_grid_cells`
@@ -7562,8 +7354,8 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         // Unlike `build_test_terminal_with_arguments`'s default (10,000
         // lines of scrollback), this test needs `\x1b[2J` to ACTUALLY
@@ -7586,7 +7378,7 @@ mod tests {
                     None,
                     None,
                     task::Shell::WithArguments {
-                        program: somcat_path.to_string_lossy().into_owned(),
+                        program: somsrp_path.to_string_lossy().into_owned(),
                         args: vec![giphy_path.to_string_lossy().into_owned()],
                         title_override: None,
                     },
@@ -7662,11 +7454,275 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_embedded_image_fetch_fires_exactly_once_across_many_paints(cx: &mut TestAppContext) {
+        // `layout_markdown` re-runs on every single paint pass and would
+        // re-discover the same embedded image every time — this is the
+        // single highest-risk piece of the whole feature: getting the
+        // dedup latch wrong would hammer `somsrv` with a fresh
+        // `FetchResource` at repaint frequency. No real `somsrv`/`somsrp`
+        // needed here — `ensure_markdown_embedded_media`'s dedup check
+        // happens before any network/pipe I/O, so a plain `echo` shell is
+        // enough to host a real `Terminal` to call it on.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x8000_0001u32, 1u32);
+        terminal.update(cx, |term, _| {
+            for _ in 0..100 {
+                term.ensure_markdown_embedded_media(host, "https://example.com/cat.png");
+            }
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(term.markdown_embedded_media.borrow().len(), 1, "100 calls for the same (host, dest_url) must mint exactly one entry");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_image_is_torn_down_when_its_host_markdown_placement_is_evicted(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x1234u32, 0x5678u32);
+        // Seed a fake markdown placement in `rich_content_cache` so
+        // `evict_vanished_image_gif_markdown_placements` treats `host` as
+        // a real, evictable Markdown-content-type entry — mirrors what a
+        // real `somsrp`-streamed markdown file would already have caused
+        // via `ensure_rich_content_srv_subscription`.
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./local.png");
+            assert_eq!(term.markdown_embedded_media.borrow().len(), 1);
+        });
+
+        // An empty `ids` set means EVERY known id (including `host`) is
+        // "vanished" — exactly what a real `clear` produces once every
+        // placeholder cell is gone.
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::new());
+        });
+
+        terminal.update(cx, |term, _| {
+            assert!(term.markdown_embedded_media.borrow().is_empty(), "an embedded image must not outlive its host markdown placement");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_image_survives_a_grid_scan_that_does_not_contain_its_id(cx: &mut TestAppContext) {
+        // Direct regression test for the eviction hazard this feature's
+        // design has to route around: a Som-minted embedded-image id
+        // NEVER appears in a placeholder-grid scan by construction, so
+        // `poll_rich_content_srv_subscriptions`' scan (which always
+        // builds its `ids` set the same way `evict_vanished_image_gif_
+        // markdown_placements` receives it here) must never be mistaken
+        // for a reason to evict one directly.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0xaaaau32, 0xbbbbu32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./local.png");
+        });
+
+        // The host itself IS in the grid scan (so it survives), but the
+        // Som-minted embedded-image id obviously never could be — this
+        // is the realistic steady-state case, not the eviction case
+        // above.
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::from([host]));
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(
+                term.markdown_embedded_media.borrow().len(),
+                1,
+                "an embedded image must survive a grid scan that never contained its own (Som-minted) id, as long as its host is still present"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_video_survives_a_grid_scan_that_does_not_contain_its_id(cx: &mut TestAppContext) {
+        // Video counterpart to `test_embedded_image_survives_a_grid_scan_
+        // that_does_not_contain_its_id` — same Som-minted-id-never-in-
+        // grid-scan hazard applies identically regardless of media kind.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0xccccu32, 0xddddu32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./clip.mp4");
+        });
+
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::from([host]));
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(
+                term.markdown_embedded_media.borrow().len(),
+                1,
+                "an embedded video must survive a grid scan that never contained its own (Som-minted) id, as long as its host is still present"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_audio_survives_a_grid_scan_that_does_not_contain_its_id(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0xeeeeu32, 0xffffu32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./song.mp3");
+        });
+
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::from([host]));
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(
+                term.markdown_embedded_media.borrow().len(),
+                1,
+                "an embedded audio must survive a grid scan that never contained its own (Som-minted) id, as long as its host is still present"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_media_host_eviction_tears_down_audio_and_video_players_and_progress(cx: &mut TestAppContext) {
+        // Seeds one audio and one video embed under the SAME host, then
+        // evicts the host itself (host NOT in the surviving `ids` set) —
+        // confirms `evict_vanished_image_gif_markdown_placements` tears
+        // down both `markdown_embedded_media` AND the two per-kind
+        // progress maps for every embed it hosted, not just the image
+        // case that existed before this feature.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x1111u32, 0x2222u32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./song.mp3");
+            term.ensure_markdown_embedded_media(host, "./clip.mp4");
+            // Simulate progress having been recorded for both (as
+            // `markdown_embedded_media_states` would do once bytes start
+            // arriving) so the teardown path has real map entries to
+            // prove it actually clears, not just an already-empty map.
+            term.markdown_embedded_audio_progress
+                .borrow_mut()
+                .insert((host, "./song.mp3".to_string()), std::sync::Arc::new(rich_content_audio_player::AudioTransferProgress::new()));
+            term.markdown_embedded_video_progress
+                .borrow_mut()
+                .insert((host, "./clip.mp4".to_string()), std::sync::Arc::new(rich_content_video_player::VideoTransferProgress::new()));
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(term.markdown_embedded_media.borrow().len(), 2, "both embeds must be present before eviction");
+        });
+
+        // Host itself is NOT in the surviving id set this time — a real
+        // eviction, not the survival case above.
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::new());
+        });
+
+        terminal.update(cx, |term, _| {
+            assert!(term.markdown_embedded_media.borrow().is_empty(), "evicting the host must remove every embed it hosted");
+            assert!(
+                term.markdown_embedded_audio_progress.borrow().is_empty(),
+                "evicting the host must remove its embedded audio progress entry"
+            );
+            assert!(
+                term.markdown_embedded_video_progress.borrow().is_empty(),
+                "evicting the host must remove its embedded video progress entry"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_markdown_embedded_media_states_no_bytes_yet_is_loading_for_every_kind(cx: &mut TestAppContext) {
+        // Before any bytes/metadata have arrived for a freshly-minted
+        // embed, every kind (image/audio/video URL extension) must report
+        // `Loading`, not `Failed` — `content_type` is only known once a
+        // real `take_metadata()` resolves it (which needs a live `somsrp`
+        // process pushing real SRP metadata, exercised instead by
+        // `test_rich_content_audio_placement_decodes_and_plays_via_a_
+        // real_process`'s sibling coverage, not a plain unit test). This
+        // guards the EARLY, always-reachable part of the content-type
+        // dispatch this feature rewrote at the old terminal.rs:2648-2654
+        // rejection point: `.mp3`/`.mp4` URLs must not somehow fail
+        // before `content_type` is even known.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x3333u32, 0x4444u32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./song.mp3");
+            term.ensure_markdown_embedded_media(host, "./clip.mp4");
+            term.ensure_markdown_embedded_media(host, "./pic.png");
+        });
+
+        let states = terminal.update(cx, |term, _| term.markdown_embedded_media_states(host));
+        assert_eq!(states.len(), 3);
+        for (dest_url, status) in states {
+            assert!(matches!(status, EmbeddedMediaStatus::Loading), "embedded {dest_url} with no bytes/metadata yet must be Loading, not Failed");
+        }
+    }
+
+    #[gpui::test]
     async fn test_rich_content_audio_placement_decodes_and_plays_via_a_real_process(cx: &mut TestAppContext) {
         // Audio counterpart to
         // `test_rich_content_placements_reach_the_paint_path_via_a_real_
         // process` above — proves the WHOLE pipeline end-to-end through a
-        // real `somcat` child process (real ConPTY) and a real `cpal`
+        // real `somsrp` child process (real ConPTY) and a real `cpal`
         // output device on this machine: transport -> cache -> symphonia
         // decode -> cpal playback -> position tracking. This is
         // deliberately NOT a mock: `RichContentAudioPlayer::open` opens
@@ -7691,12 +7747,12 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
-            somcat_path.to_string_lossy().into_owned(),
+            somsrp_path.to_string_lossy().into_owned(),
             vec![tone_path.to_string_lossy().into_owned()],
         )
         .await;
@@ -7780,7 +7836,7 @@ mod tests {
         // `test_rich_content_placements_reach_the_paint_path_via_a_real_
         // process` (image/GIF) and `test_rich_content_audio_placement_
         // decodes_and_plays_via_a_real_process` (audio) above — proves the
-        // whole pipeline end-to-end through a real `somcat` child process
+        // whole pipeline end-to-end through a real `somsrp` child process
         // (real ConPTY): transport -> cache -> `ffmpeg-next` decode ->
         // `RichContentVideoPlayer::current_frame`. Requires the extracted
         // FFmpeg DLLs to be on the DLL search path (same conpty.dll dance
@@ -7811,12 +7867,12 @@ mod tests {
 
         let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
         let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somcat_path = target_debug_dir.join(if cfg!(windows) { "somcat.exe" } else { "somcat" });
-        assert!(somcat_path.is_file(), "somcat bin target not found at {somcat_path:?} — run `cargo build -p somcat`");
+        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
+        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
-            somcat_path.to_string_lossy().into_owned(),
+            somsrp_path.to_string_lossy().into_owned(),
             vec![video_path.to_string_lossy().into_owned()],
         )
         .await;
@@ -7875,7 +7931,7 @@ mod tests {
         // Third-party-client counterpart to
         // `test_rich_content_audio_placement_decodes_and_plays_via_a_real_
         // process` above — proves that a COMPLETELY SEPARATE program (the
-        // `errordnk/yazi` fork's own SRP driver, not `somcat`) can also
+        // `errordnk/yazi` fork's own SRP driver, not `somsrp`) can also
         // drive Som's receiving side correctly, the exact claim
         // SRP_INTEGRATION_GUIDE.md makes to third-party integrators. Real
         // `yazi.exe` child process, real ConPTY, no window/focus/screenshot
@@ -7901,11 +7957,11 @@ mod tests {
         // and won't exist on a fresh checkout or most CI runs.
         cx.executor().allow_parking();
 
-        // yazi (unlike `somcat`) redraws its own full-screen TUI with
+        // yazi (unlike `somsrp`) redraws its own full-screen TUI with
         // real ANSI color escapes as it starts up — that exercises
         // `process_event`'s `ColorRequest`/theme-lookup path
         // (`theme::GlobalTheme::theme()`), which needs a real theme
-        // global registered. `somcat`'s own equivalent test never hits
+        // global registered. `somsrp`'s own equivalent test never hits
         // this path (it prints nothing but a placeholder grid + APC
         // envelopes, no colored TUI chrome), so this is genuinely new
         // for this test, not something the existing `init_test` helper
@@ -8005,7 +8061,7 @@ mod tests {
                 saw_placement = true;
                 assert!(
                     duration.as_secs_f64() > 0.0,
-                    "yazi's SRP audio envelope must carry a nonzero duration_ms, same as somcat's own"
+                    "yazi's SRP audio envelope must carry a nonzero duration_ms, same as somsrp's own"
                 );
                 break;
             }

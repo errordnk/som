@@ -749,8 +749,8 @@ set(OPTIONS "${OPTIONS} ${OPTIONS_CROSS}")
 
 # Som-specific trim: Som's own video player (crates/terminal/src/
 # rich_content_video_player.rs) only ever demuxes mp4/mov (`mov`
-# demuxer), mkv/webm (`matroska`), and avi (`avi`) — see `somcat`'s own
-# content-type detection (`crates/somcat/src/main.rs`, `mp4|mkv|avi` ->
+# demuxer), mkv/webm (`matroska`), and avi (`avi`) — see `somsrp`'s own
+# content-type detection (`crates/somsrp/src/main.rs`, `mp4|mkv|avi` ->
 # `ContentType::Video`) for the exact container list — and only ever
 # needs to decode the picture codecs `rich_content_transport::VideoCodec`
 # actually models (h264/hevc/vp9/av1/mpeg4; `Unknown` has no decoder of

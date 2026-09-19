@@ -104,7 +104,7 @@ cargo check -p som 2>&1 | tail -20
 
 ## FFmpeg / vcpkg (Windows)
 
-`crates/terminal` and `crates/somcat` link FFmpeg via `ffmpeg-next` /
+`crates/terminal` and `crates/somsrp` link FFmpeg via `ffmpeg-next` /
 `ffmpeg-sys-next`, which on Windows (MSVC) probe a local **vcpkg** tree.
 
 - The tree lives at `C:\home\dnk\vcpkg-root` (permanent — **not** under

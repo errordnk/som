@@ -72,6 +72,229 @@ pub struct LaidOutLine {
     /// `true` for lines inside a block quote — painted with a left-edge
     /// color bar and slight indent, standard blockquote convention.
     pub is_block_quote: bool,
+    /// `Some` on the FIRST of an embedded media's [`EMBEDDED_IMAGE_ROWS`]
+    /// rows; the remaining rows are plain `LaidOutLine::default()`
+    /// spacers (empty `spans`, so the paint loop's existing "nothing to
+    /// shape" skip already handles them, and `wrap_paragraph_line`'s
+    /// `spans.is_empty()` guard already returns them unchanged). See
+    /// this module's own doc comment section on embedded media for why
+    /// this is a whole-row block rather than an inline `StyledSpan`
+    /// variant. Covers images, audio, and video — see [`EmbeddedMedia`]'s
+    /// own doc comment for why one type serves all three kinds.
+    pub embedded_media: Option<EmbeddedMedia>,
+}
+
+/// How many `LaidOutLine` rows one embedded media block reserves. Fixed,
+/// not derived from real pixel dimensions — `somsrv`'s own `http_fetch::
+/// metadata_for` always reports `width_px`/`height_px` as 0 (no probing
+/// capability there, a deliberate, accepted gap), and this pass
+/// deliberately does NOT reflow once real bytes/dimensions land: the
+/// decoded image/video frame is letterboxed INTO this fixed box instead.
+/// `EmbedAttrs::height_rows` can only ever SHRINK the painted box within
+/// this reserved band (see that field's own doc comment) — it never
+/// grows the row reservation past this constant, to avoid every row-count
+/// consumer (`markdown_placement_origins`, `ensure_markdown_row_
+/// reservation`, the wrap wiring) needing to know about a per-embed
+/// variable row count.
+pub const EMBEDDED_IMAGE_ROWS: usize = 10;
+
+/// Which kind of media `![alt](dest_url)` resolves to — decided purely by
+/// `dest_url`'s file extension at parse time (see `media_kind_for_
+/// extension`), matching the same extension table `somsrp`'s (formerly
+/// `somcat`'s) own top-level content-type dispatch and `somsrv::
+/// http_fetch`'s extension table already use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedMediaKind {
+    Image,
+    Audio,
+    Video,
+}
+
+/// Horizontal position of an embedded media block within the markdown
+/// widget's available width — the `left`/`center`/`right` token in an
+/// `{...}` attribute block. Default is `Left`, matching the unconditional
+/// left-anchored placement every embed had before attribute blocks
+/// existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedPosition {
+    Left,
+    Center,
+    Right,
+}
+
+impl Default for EmbedPosition {
+    fn default() -> Self {
+        EmbedPosition::Left
+    }
+}
+
+/// Vertical position of an embedded media block WITHIN its reserved
+/// [`EMBEDDED_IMAGE_ROWS`] row band — the `top`/`middle`/`bottom` token in
+/// an `{...}` attribute block. Only visible when `height_rows` shrinks the
+/// box below the full reserved band (same relationship `EmbedPosition`
+/// has to `width_percent`: a box that already fills its axis has nowhere
+/// to shift within it). Default is `Top`, matching the unconditional
+/// top-anchored placement every embed had before attribute blocks
+/// existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedVerticalPosition {
+    Top,
+    Middle,
+    Bottom,
+}
+
+impl Default for EmbedVerticalPosition {
+    fn default() -> Self {
+        EmbedVerticalPosition::Top
+    }
+}
+
+/// Parsed contents of an optional `{param1 param2 ...}` block written
+/// immediately after `![alt](dest_url)` — see `parse_embed_attrs`'s own
+/// doc comment for the token grammar. `EmbedAttrs::default()` is exactly
+/// "no `{}` block was present," so every existing `![alt](url)` embed
+/// with no attribute block behaves identically to before this type
+/// existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct EmbedAttrs {
+    /// `left`/`center`/`right` token. Default: `Left`.
+    pub position: EmbedPosition,
+    /// `top`/`middle`/`bottom` token. Default: `Top`.
+    pub vertical_position: EmbedVerticalPosition,
+    /// `NN%` token — width as a percentage of the widget's available
+    /// width. `None` ("as is") reproduces today's fixed full-width-minus-
+    /// insets box exactly.
+    pub width_percent: Option<u32>,
+    /// Bare `NN` token — height in TERMINAL ROWS, not pixels or percent.
+    /// Clamped to `1..=EMBEDDED_IMAGE_ROWS` at paint time: this can only
+    /// ever shrink the painted box within the fixed row reservation,
+    /// never grow it past `EMBEDDED_IMAGE_ROWS` — `layout_markdown`
+    /// always reserves exactly `EMBEDDED_IMAGE_ROWS` rows regardless of
+    /// this value (see that constant's own doc comment for why). `None`
+    /// ("as is") uses the full `EMBEDDED_IMAGE_ROWS` band.
+    pub height_rows: Option<u32>,
+    /// `float` token, as literally written — see [`EmbedAttrs::float_side`]
+    /// for whether it actually takes effect. Prefer `float_side()` over
+    /// reading this field directly for anything paint-related.
+    pub float: bool,
+}
+
+impl EmbedAttrs {
+    /// Which side of the block the text wraps on, or `None` if `float`
+    /// doesn't take effect for this combination of attrs.
+    ///
+    /// Confirmed user rule: "float работает если позиция не center" —
+    /// `float` takes effect whenever `position` isn't `Center`, whether
+    /// `left`/`right` was written explicitly or `position` is just at its
+    /// default (`Left`). Concretely:
+    /// - `{right float}` → block sits right, text wraps to its LEFT →
+    ///   `Some(EmbedPosition::Right)`.
+    /// - `{left float}` or `{float}` alone (both resolve to `position ==
+    ///   Left`) → block sits left, text wraps to its RIGHT →
+    ///   `Some(EmbedPosition::Left)`.
+    /// - `{center float}` (or `center` from any source) → `None` — a
+    ///   centered block has no side to wrap around.
+    pub fn float_side(&self) -> Option<EmbedPosition> {
+        if !self.float {
+            return None;
+        }
+        match self.position {
+            EmbedPosition::Left | EmbedPosition::Right => Some(self.position),
+            EmbedPosition::Center => None,
+        }
+    }
+}
+
+/// One `![alt](dest_url)` discovered in the document, reserved as a
+/// whole-row block rather than an inline span — see `EMBEDDED_IMAGE_
+/// ROWS`'s own doc comment. Covers images, audio, and video uniformly:
+/// which kind it is lives in `kind`, and `attrs` (parsed from an optional
+/// `{...}` block immediately following `(dest_url)`) applies the same
+/// position/width/height/float controls to all three kinds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedMedia {
+    pub kind: EmbeddedMediaKind,
+    /// The raw markdown link destination, verbatim — passed straight
+    /// through as `SrvRequest::FetchResource::target`; this module does
+    /// NOT classify URL-vs-path, `somsrv::http_fetch::fetch_and_stream`
+    /// already does that classification server-side.
+    pub dest_url: String,
+    /// The image's alt text (the `Text`/similar events between the
+    /// image's Start/End) — used for the loading/broken placeholder
+    /// label. No longer rendered as plain prose (see this module's own
+    /// doc comment on why `![alt](url)` used to silently degrade into
+    /// bare unstyled text).
+    pub alt: String,
+    /// The `title` attribute, if any — carried for a future tooltip; not
+    /// painted in this pass.
+    pub title: String,
+    /// Parsed from an optional `{...}` block immediately following
+    /// `(dest_url)` in the source — see `EmbedAttrs`'s own doc comment.
+    pub attrs: EmbedAttrs,
+}
+
+/// Classifies a media embed's kind purely by `dest_url`'s file extension.
+/// Mirrors the extension table `somsrp`'s (formerly `somcat`'s) own
+/// top-level content-type dispatch and `somsrv::http_fetch`'s extension
+/// table already use — this module can't depend on either crate, so the
+/// table is duplicated here rather than shared.
+///
+/// An unrecognized extension defaults to [`EmbeddedMediaKind::Image`],
+/// matching every `![alt](url)` embed's behavior before audio/video
+/// support existed — a strict superset, not a regression, for any
+/// existing document.
+fn media_kind_for_extension(dest_url: &str) -> EmbeddedMediaKind {
+    let ext = dest_url.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "mp3" | "flac" => EmbeddedMediaKind::Audio,
+        "mp4" | "mkv" | "avi" => EmbeddedMediaKind::Video,
+        _ => EmbeddedMediaKind::Image,
+    }
+}
+
+/// Parses the body of an `{...}` attribute block (the text between the
+/// braces, not including them) into [`EmbedAttrs`]. Token order does not
+/// matter — each whitespace-separated token is classified independently
+/// by its own shape:
+///
+/// - `left` / `center` / `right` literal → [`EmbedAttrs::position`].
+/// - `top` / `middle` / `bottom` literal → [`EmbedAttrs::vertical_position`].
+/// - `float` literal → [`EmbedAttrs::float`] (see [`EmbedAttrs::float_side`]
+///   for when this actually takes visual effect — anything but `center`).
+/// - `NN%` (parses as `u32` after stripping a trailing `%`) →
+///   [`EmbedAttrs::width_percent`].
+/// - Bare `NN` (parses as `u32`) → [`EmbedAttrs::height_rows`].
+/// - Anything else is silently ignored — no spec'd error path for
+///   unrecognized tokens, and ignoring keeps this forward-compatible with
+///   future token kinds without a hard parse error on older documents.
+///
+/// Deliberately no regex (project convention) — plain `match`/
+/// `str::strip_suffix`/`str::parse`.
+fn parse_embed_attrs(body: &str) -> EmbedAttrs {
+    let mut attrs = EmbedAttrs::default();
+    for token in body.split_whitespace() {
+        match token {
+            "left" => attrs.position = EmbedPosition::Left,
+            "center" => attrs.position = EmbedPosition::Center,
+            "right" => attrs.position = EmbedPosition::Right,
+            "top" => attrs.vertical_position = EmbedVerticalPosition::Top,
+            "middle" => attrs.vertical_position = EmbedVerticalPosition::Middle,
+            "bottom" => attrs.vertical_position = EmbedVerticalPosition::Bottom,
+            "float" => attrs.float = true,
+            _ => {
+                if let Some(pct) = token.strip_suffix('%') {
+                    if let Ok(n) = pct.parse::<u32>() {
+                        attrs.width_percent = Some(n);
+                        continue;
+                    }
+                }
+                if let Ok(n) = token.parse::<u32>() {
+                    attrs.height_rows = Some(n);
+                }
+            },
+        }
+    }
+    attrs
 }
 
 pub fn font_weight_for(emphasis: SpanEmphasis) -> gpui::FontWeight {
@@ -148,6 +371,21 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
     let mut in_code_block = false;
     let mut in_block_quote_depth: u32 = 0;
     let mut pending_item_prefix = false;
+    // Set while walking events between an image's Start/End — the alt
+    // text (an ordinary `Text` event in pulldown-cmark's stream) is
+    // accumulated here instead of becoming a `StyledSpan`, which is what
+    // stops it from silently rendering as bare prose (see this module's
+    // own doc comment).
+    let mut pending_image: Option<EmbeddedMedia> = None;
+    let mut image_alt = String::new();
+    // `Some(row_index)` for exactly the window between `MarkdownTagEnd::
+    // Image` firing and this module either consuming or giving up on a
+    // following `{...}` attrs block — `row_index` points at the just-
+    // pushed row in `lines` that carries the `Some(media)`, so a
+    // recognized attrs block can be written back onto it. See the
+    // `MarkdownEvent::Text` arm below for why this can't just check
+    // `pending_image` (already `None` by the time `{params}` arrives).
+    let mut awaiting_attrs_for: Option<usize> = None;
 
     let finish_line = |lines: &mut Vec<LaidOutLine>, current: &mut LaidOutLine, heading_level: Option<u8>, in_code_block: bool, in_block_quote: bool| {
         current.heading_level = heading_level;
@@ -208,6 +446,16 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
                 MarkdownTag::Paragraph => {
                     insert_block_separator(&mut lines, &list_stack, in_block_quote_depth);
                 },
+                MarkdownTag::Image { dest_url, title, .. } => {
+                    pending_image = Some(EmbeddedMedia {
+                        kind: media_kind_for_extension(dest_url),
+                        dest_url: dest_url.to_string(),
+                        alt: String::new(),
+                        title: title.to_string(),
+                        attrs: EmbedAttrs::default(),
+                    });
+                    image_alt.clear();
+                },
                 _ => {},
             },
             MarkdownEvent::End(tag_end) => match tag_end {
@@ -249,11 +497,78 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
                 MarkdownTagEnd::Strong => inline.bold_depth = inline.bold_depth.saturating_sub(1),
                 MarkdownTagEnd::Strikethrough => inline.strikethrough_depth = inline.strikethrough_depth.saturating_sub(1),
                 MarkdownTagEnd::Link => inline.link_depth = inline.link_depth.saturating_sub(1),
+                MarkdownTagEnd::Image => {
+                    if let Some(mut image) = pending_image.take() {
+                        image.alt = std::mem::take(&mut image_alt);
+                        // An image inside a paragraph splits it: flush
+                        // whatever prose was in progress as its own row
+                        // first, so the image block always starts at a
+                        // row boundary (the same "block-level element
+                        // starts its own line" rule the `CodeBlock` start
+                        // arm already applies).
+                        if !current.spans.is_empty() {
+                            finish_line(&mut lines, &mut current, heading_level, in_code_block, in_block_quote_depth > 0);
+                        }
+                        lines.push(LaidOutLine { embedded_media: Some(image), ..Default::default() });
+                        let row_index = lines.len() - 1;
+                        for _ in 1..EMBEDDED_IMAGE_ROWS {
+                            lines.push(LaidOutLine::default());
+                        }
+                        awaiting_attrs_for = Some(row_index);
+                    }
+                },
                 _ => {},
             },
             MarkdownEvent::Text | MarkdownEvent::Code | MarkdownEvent::InlineHtml => {
-                let is_code = matches!(event, MarkdownEvent::Code) || in_code_block;
                 let text = event_text(event, source, &_range);
+                // `{params}` written directly after `](dest_url)` is NOT
+                // consumed by the image tag itself — pulldown-cmark has
+                // no concept of an inline attribute list, so it arrives
+                // here as an ordinary `Text` event immediately following
+                // `MarkdownTagEnd::Image`, by which point `pending_image`
+                // is already `None`. Must be intercepted here, before it
+                // falls through to becoming a visible prose span below.
+                if let Some(row_index) = awaiting_attrs_for.take() {
+                    if let Some(rest) = text.strip_prefix('{') {
+                        if let Some(close) = rest.find('}') {
+                            let attrs_body = &rest[..close];
+                            if let Some(LaidOutLine { embedded_media: Some(media), .. }) = lines.get_mut(row_index) {
+                                media.attrs = parse_embed_attrs(attrs_body);
+                            }
+                            let remainder = &rest[close + 1..];
+                            if !remainder.is_empty() {
+                                // Text after the closing brace in the same
+                                // event is ordinary prose — falls through
+                                // to the ordinary span-building path below
+                                // with the attrs prefix already stripped.
+                                current.spans.push(StyledSpan {
+                                    text: remainder.to_string(),
+                                    emphasis: inline.emphasis(),
+                                    strikethrough: inline.strikethrough_depth > 0,
+                                    monospace: false,
+                                    is_link: inline.link_depth > 0,
+                                });
+                            }
+                            continue;
+                        }
+                        // No closing `}` anywhere in this Text event:
+                        // degrade to "no attrs block recognized" and let
+                        // the literal text (including the leading `{`)
+                        // render as ordinary prose below, unchanged.
+                        // Silently eating it instead would risk consuming
+                        // arbitrary amounts of real following prose with
+                        // no visible trace of an unclosed brace — showing
+                        // the raw `{center` text is the more debuggable
+                        // failure for a document author to notice and fix.
+                    }
+                    // else: text doesn't start with `{` at all — not an
+                    // attrs block, falls through unchanged below.
+                }
+                if pending_image.is_some() {
+                    image_alt.push_str(&text);
+                    continue;
+                }
+                let is_code = matches!(event, MarkdownEvent::Code) || in_code_block;
                 if text.is_empty() {
                     continue;
                 }
@@ -300,7 +615,9 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
                 });
             },
             MarkdownEvent::SubstitutedText(text) => {
-                if !text.is_empty() {
+                if pending_image.is_some() {
+                    image_alt.push_str(text);
+                } else if !text.is_empty() {
                     current.spans.push(StyledSpan {
                         text: text.clone(),
                         emphasis: inline.emphasis(),
@@ -311,13 +628,17 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
                 }
             },
             MarkdownEvent::SoftBreak => {
-                current.spans.push(StyledSpan {
-                    text: " ".to_string(),
-                    emphasis: inline.emphasis(),
-                    strikethrough: false,
-                    monospace: false,
-                    is_link: false,
-                });
+                if pending_image.is_some() {
+                    image_alt.push(' ');
+                } else {
+                    current.spans.push(StyledSpan {
+                        text: " ".to_string(),
+                        emphasis: inline.emphasis(),
+                        strikethrough: false,
+                        monospace: false,
+                        is_link: false,
+                    });
+                }
             },
             MarkdownEvent::HardBreak => {
                 if !current.spans.is_empty() {
@@ -384,7 +705,7 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
 /// codebase (see this module's own doc comment for the "keep it simple"
 /// call this follows).
 fn wrap_paragraph_line(line: LaidOutLine, wrapper: &mut gpui::LineWrapperHandle, available_width: gpui::Pixels) -> Vec<LaidOutLine> {
-    if line.is_rule || line.is_code_block || line.spans.is_empty() {
+    if line.is_rule || line.is_code_block || line.embedded_media.is_some() || line.spans.is_empty() {
         return vec![line];
     }
 
@@ -446,6 +767,7 @@ fn wrap_paragraph_line(line: LaidOutLine, wrapper: &mut gpui::LineWrapperHandle,
             is_rule: false,
             is_code_block: false,
             is_block_quote: line.is_block_quote,
+            embedded_media: None,
         });
         cut_start = cut_end;
     }
@@ -643,5 +965,226 @@ mod tests {
     fn blank_line_between_paragraphs_is_preserved() {
         let lines = layout_markdown("first\n\nsecond", None);
         assert!(lines.iter().any(|l| l.spans.is_empty() && !l.is_rule));
+    }
+
+    #[test]
+    fn image_produces_a_block_of_reserved_rows() {
+        let lines = layout_markdown("![alt](img.png)", None);
+        assert_eq!(lines.len(), EMBEDDED_IMAGE_ROWS);
+        let image = lines[0].embedded_media.as_ref().expect("first row must carry the embedded image");
+        assert_eq!(image.dest_url, "img.png");
+        assert_eq!(image.alt, "alt");
+        for spacer in &lines[1..] {
+            assert!(spacer.embedded_media.is_none());
+            assert!(spacer.spans.is_empty());
+        }
+    }
+
+    #[test]
+    fn image_alt_text_no_longer_leaks_into_prose() {
+        // Regression test: `![alt](url)` used to silently render "alt" as
+        // bare, unstyled prose (the Start/End tags were ignored but the
+        // inner Text event still fired) — now it must only ever appear
+        // inside the `EmbeddedMedia`, never as a `StyledSpan`.
+        let lines = layout_markdown("![alt](img.png)", None);
+        assert!(!lines.iter().flat_map(|l| &l.spans).any(|s| s.text.contains("alt")));
+    }
+
+    #[test]
+    fn image_inside_a_paragraph_splits_the_paragraph() {
+        let lines = layout_markdown("before ![a](x.png) after", None);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].text.trim(), "before");
+        let image_row = lines.iter().position(|l| l.embedded_media.is_some()).expect("must contain an image row");
+        assert_eq!(lines[image_row].embedded_media.as_ref().unwrap().dest_url, "x.png");
+        let after_row = &lines[image_row + EMBEDDED_IMAGE_ROWS];
+        assert_eq!(after_row.spans[0].text.trim(), "after");
+    }
+
+    #[test]
+    fn absolute_and_relative_and_url_dest_urls_pass_through_verbatim() {
+        for target in ["./a.png", "/tmp/a.png", "https://x/a.png"] {
+            let lines = layout_markdown(&format!("![a]({target})"), None);
+            assert_eq!(lines[0].embedded_media.as_ref().unwrap().dest_url, target);
+        }
+    }
+
+    #[test]
+    fn reference_style_image_carries_its_resolved_dest_url() {
+        let lines = layout_markdown("![a][ref]\n\n[ref]: img.png", None);
+        let image = lines[0].embedded_media.as_ref().expect("reference-style image must still resolve");
+        assert_eq!(image.dest_url, "img.png");
+    }
+
+    #[test]
+    fn image_row_survives_the_wrap_pass_unchanged() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let long_alt = "a very long alt text that would definitely wrap if it were ever treated as prose";
+        let lines = layout_markdown(&format!("![{long_alt}](img.png)"), Some((&mut wrapper, gpui::px(72.))));
+        let image_rows: Vec<_> = lines.iter().filter(|l| l.embedded_media.is_some()).collect();
+        assert_eq!(image_rows.len(), 1, "an image row must never be split by the wrap pass");
+        assert_eq!(lines.len(), EMBEDDED_IMAGE_ROWS, "wrapping must not change an image's reserved row count");
+    }
+
+    #[test]
+    fn media_kind_by_extension_image_audio_video() {
+        for ext in ["png", "jpg", "jpeg", "gif"] {
+            let lines = layout_markdown(&format!("![a](x.{ext})"), None);
+            assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Image, "extension .{ext} should classify as Image");
+        }
+        for ext in ["mp3", "flac"] {
+            let lines = layout_markdown(&format!("![a](x.{ext})"), None);
+            assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Audio, "extension .{ext} should classify as Audio");
+        }
+        for ext in ["mp4", "mkv", "avi"] {
+            let lines = layout_markdown(&format!("![a](x.{ext})"), None);
+            assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Video, "extension .{ext} should classify as Video");
+        }
+        // Unknown extension defaults to Image — matches every `![alt](url)`
+        // embed's behavior before audio/video support existed.
+        let lines = layout_markdown("![a](x.xyz)", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Image);
+    }
+
+    #[test]
+    fn attrs_block_parses_each_token_kind_individually() {
+        let lines = layout_markdown("![a](x.png){left}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.position, EmbedPosition::Left);
+        let lines = layout_markdown("![a](x.png){center}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.position, EmbedPosition::Center);
+        let lines = layout_markdown("![a](x.png){right}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.position, EmbedPosition::Right);
+        let lines = layout_markdown("![a](x.png){60%}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.width_percent, Some(60));
+        let lines = layout_markdown("![a](x.png){20}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.height_rows, Some(20));
+        let lines = layout_markdown("![a](x.png){float}", None);
+        assert!(lines[0].embedded_media.as_ref().unwrap().attrs.float);
+        let lines = layout_markdown("![a](x.png){top}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.vertical_position, EmbedVerticalPosition::Top);
+        let lines = layout_markdown("![a](x.png){middle}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.vertical_position, EmbedVerticalPosition::Middle);
+        let lines = layout_markdown("![a](x.png){bottom}", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.vertical_position, EmbedVerticalPosition::Bottom);
+    }
+
+    #[test]
+    fn attrs_block_parses_combination_order_independent() {
+        let a = layout_markdown("![a](x.png){center 60%}", None);
+        let b = layout_markdown("![a](x.png){60% center}", None);
+        assert_eq!(a[0].embedded_media.as_ref().unwrap().attrs, b[0].embedded_media.as_ref().unwrap().attrs);
+        let attrs = a[0].embedded_media.as_ref().unwrap().attrs;
+        assert_eq!(attrs.position, EmbedPosition::Center);
+        assert_eq!(attrs.width_percent, Some(60));
+
+        let lines = layout_markdown("![a](b.mp4){float 40% 15}", None);
+        let attrs = lines[0].embedded_media.as_ref().unwrap().attrs;
+        assert!(attrs.float);
+        assert_eq!(attrs.width_percent, Some(40));
+        assert_eq!(attrs.height_rows, Some(15));
+
+        let c = layout_markdown("![a](x.png){middle center 60% 3}", None);
+        let d = layout_markdown("![a](x.png){3 60% center middle}", None);
+        assert_eq!(c[0].embedded_media.as_ref().unwrap().attrs, d[0].embedded_media.as_ref().unwrap().attrs);
+        let attrs = c[0].embedded_media.as_ref().unwrap().attrs;
+        assert_eq!(attrs.vertical_position, EmbedVerticalPosition::Middle);
+        assert_eq!(attrs.position, EmbedPosition::Center);
+    }
+
+    #[test]
+    fn no_attrs_block_yields_default_attrs() {
+        let with_no_attrs = layout_markdown("![a](x.png)", None);
+        let with_default_via_attrs_absent = &with_no_attrs[0];
+        assert_eq!(with_default_via_attrs_absent.embedded_media.as_ref().unwrap().attrs, EmbedAttrs::default());
+    }
+
+    #[test]
+    fn unclosed_attrs_block_degrades_to_literal_prose() {
+        let lines = layout_markdown("![a](x.png){center", None);
+        let media = lines[0].embedded_media.as_ref().unwrap();
+        assert_eq!(media.attrs, EmbedAttrs::default(), "an unclosed brace must not be treated as a recognized attrs block");
+        let literal_row = lines.iter().find(|l| l.spans.iter().any(|s| s.text.contains("{center")));
+        assert!(literal_row.is_some(), "the literal unclosed text must still render as prose, not vanish silently");
+    }
+
+    #[test]
+    fn attrs_text_never_leaks_into_prose_when_resolved() {
+        let lines = layout_markdown("![a](x.png){center 60%}", None);
+        assert!(
+            !lines.iter().flat_map(|l| &l.spans).any(|s| s.text.contains("center") || s.text.contains("60%")),
+            "a recognized attrs block must never leak into a visible prose span"
+        );
+    }
+
+    #[test]
+    fn attrs_block_remainder_after_close_brace_becomes_prose() {
+        let lines = layout_markdown("![a](x.png){center} more text", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.position, EmbedPosition::Center);
+        let remainder_row = lines.iter().find(|l| l.spans.iter().any(|s| s.text.contains("more text")));
+        assert!(remainder_row.is_some(), "text after the closing brace must still render as prose, not be swallowed");
+    }
+
+    #[test]
+    fn unrecognized_attrs_tokens_are_ignored() {
+        let lines = layout_markdown("![a](x.png){center bogus 60%}", None);
+        let attrs = lines[0].embedded_media.as_ref().unwrap().attrs;
+        assert_eq!(attrs.position, EmbedPosition::Center);
+        assert_eq!(attrs.width_percent, Some(60));
+    }
+
+    #[test]
+    fn float_attribute_round_trips_without_visual_effect_yet() {
+        // Stage 1: `float` parses and is stored, but paint does not yet
+        // act on it (real text-reflow is a separate, later pass) — this
+        // test documents that boundary so it isn't mistaken for an
+        // oversight later.
+        let lines = layout_markdown("![a](x.png){float}", None);
+        assert!(lines[0].embedded_media.as_ref().unwrap().attrs.float);
+    }
+
+    #[test]
+    fn float_side_is_none_only_when_position_is_center() {
+        // Confirmed user rule: "float работает если позиция не center" —
+        // float takes effect for Left OR Right (explicit or defaulted),
+        // never for Center.
+        let right_float = layout_markdown("![a](x.png){right float}", None);
+        assert_eq!(
+            right_float[0].embedded_media.as_ref().unwrap().attrs.float_side(),
+            Some(EmbedPosition::Right),
+            "{{right float}}: block sits right, text wraps to its left"
+        );
+
+        let left_float = layout_markdown("![a](x.png){left float}", None);
+        assert_eq!(
+            left_float[0].embedded_media.as_ref().unwrap().attrs.float_side(),
+            Some(EmbedPosition::Left),
+            "{{left float}}: block sits left, text wraps to its right"
+        );
+
+        let bare_float = layout_markdown("![a](x.png){float}", None);
+        assert_eq!(
+            bare_float[0].embedded_media.as_ref().unwrap().attrs.float_side(),
+            Some(EmbedPosition::Left),
+            "{{float}} alone defaults to Left, which is not Center, so it DOES take effect"
+        );
+
+        let center_float = layout_markdown("![a](x.png){center float}", None);
+        assert_eq!(
+            center_float[0].embedded_media.as_ref().unwrap().attrs.float_side(),
+            None,
+            "{{center float}} has no side to wrap around, must not take effect"
+        );
+
+        let no_float = layout_markdown("![a](x.png){left}", None);
+        assert_eq!(no_float[0].embedded_media.as_ref().unwrap().attrs.float_side(), None, "left without float must not take effect");
+    }
+
+    #[test]
+    fn attrs_bearing_media_row_survives_the_wrap_pass_unchanged() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let lines = layout_markdown("![a](img.png){center 60%}", Some((&mut wrapper, gpui::px(72.))));
+        let image_rows: Vec<_> = lines.iter().filter(|l| l.embedded_media.is_some()).collect();
+        assert_eq!(image_rows.len(), 1, "an attrs-bearing media row must never be split by the wrap pass");
+        assert_eq!(image_rows[0].embedded_media.as_ref().unwrap().attrs.position, EmbedPosition::Center);
     }
 }

@@ -3,7 +3,7 @@
 fn main() {
     if cfg!(windows) && cfg!(target_env = "msvc") {
         // Mirrors `crates/zed/build.rs`'s own `/DELAYLOAD` setup for the
-        // same reason: `somcat` also calls FFmpeg-backed code
+        // same reason: `somsrp` also calls FFmpeg-backed code
         // (`video_metadata`) directly, so without delay-loading, the
         // Windows PE loader tries to resolve avcodec/avformat/avutil/
         // swresample/swscale at process-start time — before `main` gets a

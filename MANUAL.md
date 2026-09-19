@@ -253,7 +253,7 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 
 ## Images in the terminal (Som Rich Protocol)
 
-Som implements its own binary protocol for streaming rich content (currently images/GIFs, with audio/markdown/video reserved for later) through the PTY — the `somcat` tool bundled alongside Som is the reference client: `somcat some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
+Som implements its own binary protocol for streaming rich content (currently images/GIFs, with audio/markdown/video reserved for later) through the PTY — the `somsrp` tool bundled alongside Som is the reference client: `somsrp some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
 
 - **Images are represented as real grid text.** Each streamed image becomes a block of Unicode placeholder cells printed into the terminal's own scrollback, so the terminal's normal scroll/clear/history handling positions and hides the image correctly with no special-casing needed — clearing the screen hides the image, and scrolling moves it exactly like any other line of output.
 - **Images keep their aspect ratio.** Som fits the decoded image inside the cell-grid footprint the sender described rather than stretching it to fill it.

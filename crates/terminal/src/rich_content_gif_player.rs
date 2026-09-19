@@ -108,7 +108,7 @@ fn is_truncation_error(err: &image::ImageError) -> bool {
 /// Convenience for callers that just want a frame's display duration as a
 /// `Duration` — `image::Frame::delay()` returns its own `Delay` newtype
 /// (numerator/denominator pair), this converts it the same way
-/// `crates/somcat`'s `decode_gif_frames` already does on the sending
+/// `crates/somsrp`'s `decode_gif_frames` already does on the sending
 /// side, kept consistent so a gap value round-trips the same on both
 /// ends of the pipeline.
 pub fn frame_delay(frame: &image::Frame) -> Duration {

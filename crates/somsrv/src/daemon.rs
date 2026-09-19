@@ -2,10 +2,10 @@
 //! every kind of client that needs one running before it can connect:
 //! `crate::relay` (the RELAY a `tmux: true` PTY profile spawns into,
 //! re-spawning ITSELF in `--daemon` mode via its own `current_exe()`),
-//! `somcat` (the payload sender, which needs a NEARBY prebuilt `somsrv`
+//! `somsrp` (the payload sender, which needs a NEARBY prebuilt `somsrv`
 //! binary rather than its own `current_exe()` — it isn't `somsrv`
 //! itself), and Som's own `rich_content_srv_channel` (the progress
-//! subscriber, same "find a nearby binary" situation as `somcat`).
+//! subscriber, same "find a nearby binary" situation as `somsrp`).
 //!
 //! Kept here (in the library half of this crate, unlike `relay`/`server`/
 //! `srv_cache`, which stay private to the `somsrv` binary — see this
@@ -26,7 +26,7 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// executable — the deploy convention every client that isn't `somsrv`
 /// itself relies on to find it: Som proper (`terminal_view::
 /// terminal_panel`, deploying it next to `som.exe` on a remote host, and
-/// expecting it locally next to its own `som.exe`), `somcat` (lives in
+/// expecting it locally next to its own `som.exe`), `somsrp` (lives in
 /// the same `target/<profile>` directory as `somsrv` in a dev build,
 /// and is expected to be deployed the same way in a packaged build), and
 /// `crates/terminal`'s `rich_content_srv_channel` (runs inside Som's own
@@ -40,7 +40,7 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// places in `target/<profile>/deps/`, one level deeper than the real
 /// `target/<profile>/somsrv(.exe)` bin target sits. Without this
 /// fallback, every headless test exercising this side-channel (real
-/// `somsrv` + real `somcat` child process) would silently fail to find
+/// `somsrv` + real `somsrp` child process) would silently fail to find
 /// a `somsrv` that's very much been built — confirmed the hard way as
 /// `rich_content_placements()`/`rich_content_video_placements()` never
 /// seeing a placement at all, tracing back to `spawn_progress_listener`'s

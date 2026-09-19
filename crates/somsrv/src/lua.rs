@@ -15,7 +15,7 @@ use crate::srv_cache::SrvCache;
 use somsrv::protocol::{ContentMetadata, ContentType};
 
 /// Same chunk size every other `PutChunk` sender in this project uses
-/// (`somcat::CHUNK_SIZE`, the yazi driver's own `CHUNK_SIZE`) — no reason
+/// (`somsrp::CHUNK_SIZE`, the yazi driver's own `CHUNK_SIZE`) — no reason
 /// for the Lua-originated path to pick a different number.
 const CHUNK_SIZE: usize = 65536;
 
@@ -26,18 +26,19 @@ const CHUNK_SIZE: usize = 65536;
 /// `server::handle_srv_request`'s `SrvRequest::PutChunk` arm), just driven
 /// by this function's own loop instead of a stream of wire messages.
 ///
-/// `content_type`/`metadata` are always `ContentType::Markdown`/
-/// `ContentMetadata::Markdown` for now — see `ContentMetadata::Markdown`'s
-/// own doc comment for why that variant carries no geometric/format
-/// fields to fill in even if this function wanted to.
+/// `content_type` is always `ContentType::Markdown`. `metadata`'s
+/// `base_dir` is always empty — a Lua script's markdown has no source
+/// file/directory to report (see `ContentMetadata::Markdown::base_dir`'s
+/// own doc comment for the "empty means unknown" convention this uses).
 pub fn run_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, script_source: &str) -> anyhow::Result<()> {
     let markdown = run_script(script_source)?;
     let bytes = markdown.as_bytes();
     let total_size = bytes.len() as u64;
+    let metadata = ContentMetadata::Markdown { base_dir: String::new() };
 
     for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
         let offset = (index * CHUNK_SIZE) as u64;
-        cache.put_chunk(session_id, file_id, offset, chunk, total_size, ContentType::Markdown, ContentMetadata::Markdown);
+        cache.put_chunk(session_id, file_id, offset, chunk, total_size, ContentType::Markdown, metadata.clone());
     }
     // An empty script result still needs ONE put_chunk call (offset 0,
     // zero-length data) so `total_size` reaches somsrv's cache and Som's
@@ -45,7 +46,7 @@ pub fn run_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, script_so
     // yields nothing at all for an empty slice, unlike every other
     // length, so this is the one case the loop above doesn't cover.
     if bytes.is_empty() {
-        cache.put_chunk(session_id, file_id, 0, &[], 0, ContentType::Markdown, ContentMetadata::Markdown);
+        cache.put_chunk(session_id, file_id, 0, &[], 0, ContentType::Markdown, metadata);
     }
     Ok(())
 }

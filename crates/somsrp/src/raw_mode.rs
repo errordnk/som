@@ -61,7 +61,7 @@ pub fn enable() -> RawModeGuard {
             .expect("failed to set raw console input mode");
 
         // The console's active output codepage reinterprets every byte
-        // `somcat` writes before ConPTY forwards it on — this is what
+        // `somsrp` writes before ConPTY forwards it on — this is what
         // `rich_content_transport`'s base91 payload encoding was built to
         // route around entirely (see that module's doc comment), but the
         // Unicode-placeholder grid text (`print_placeholder_grid`) is real
@@ -104,4 +104,4 @@ fn restore(guard: &RawModeGuard) {
 }
 
 #[cfg(not(any(unix, windows)))]
-compile_error!("somcat's raw_mode module only supports Unix and Windows");
+compile_error!("somsrp's raw_mode module only supports Unix and Windows");

@@ -495,15 +495,24 @@ impl TerminalView {
     }
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
-        // Scroll Lock ON redirects the wheel to whichever markdown
-        // widget the cursor is over instead of the terminal's own
-        // scrollback — see [[project_srp_audio_and_md_browser_roadmap]]
-        // memory / SRP_LUA.md for why: a markdown document reserves a
-        // placeholder-grid footprint as tall as the whole file (see
-        // `print_markdown_placeholder_grid` in `somcat`), which can be
-        // far taller than the terminal's visible height, so it needs its
-        // own independent scroll rather than fighting the terminal's.
-        if window.scrolllock().on {
+        // Scroll Lock OFF (the default) redirects the wheel to whichever
+        // markdown widget the cursor is over instead of the terminal's
+        // own scrollback — INVERTED from the old behavior now that a
+        // markdown placement is backed by a live, foreground-holding
+        // `somsrp` process (same live-process model audio/video already
+        // use, see `SrvRequest::GrowMarkdownRows`'s own doc comment for
+        // why markdown moved to this model). With the terminal otherwise
+        // unusable while a markdown placement is live, scrolling the
+        // DOCUMENT is now the primary interaction; Scroll Lock ON
+        // releases the wheel back to the terminal's own scrollback
+        // instead, so the user can still check earlier command history
+        // without closing the markdown viewer (Ctrl+C) first. See
+        // [[project_srp_audio_and_md_browser_roadmap]] memory / SRP_LUA.md
+        // for the original reasoning behind giving markdown its own
+        // independent scroll at all: a document reserves a placeholder-
+        // grid footprint that can be far taller than the terminal's
+        // visible height.
+        if !window.scrolllock().on {
             let terminal = self.terminal.read(cx);
             if let Some((session_id, file_id, line_count)) = terminal.markdown_placement_under(event.position) {
                 let line_height = terminal.last_content().terminal_bounds.line_height;

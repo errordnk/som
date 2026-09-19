@@ -65,14 +65,14 @@ impl SrvChannel {
     pub fn connect() -> Result<Self, String> {
         // `somsrv::daemon::connect_or_spawn` handles the common case
         // (daemon not running yet) by spawning it itself, next to this
-        // `somcat` binary's own executable — same deploy convention
+        // `somsrp` binary's own executable — same deploy convention
         // `terminal_view::terminal_panel::somsrv_binary_path` expects
         // Som proper to find it under. Only a genuinely broken deploy
         // (binary missing entirely) surfaces as an error here.
         let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe().map_err(|err| {
             format!(
                 "{err:#}\n\
-                 (somsrv should be deployed next to somcat's own executable — \
+                 (somsrv should be deployed next to somsrp's own executable — \
                  check `~/.local/bin/somsrv` exists and is executable)"
             )
         })?;
@@ -127,6 +127,35 @@ impl SrvChannel {
     pub fn register_range_responder(&self, session_id: u32, file_id: u32) -> Result<(), String> {
         send(&self.connection, &SrvRequest::RegisterRangeResponder { session_id, file_id })
     }
+
+    /// Registers this connection as the target for `SrvRequest::
+    /// GrowMarkdownRows` forwarding for `(session_id, file_id)` — see
+    /// `somsrv::protocol::SrvRequest::RegisterMarkdownGrower`'s own doc
+    /// comment for why this is a SEPARATE registration from
+    /// `register_range_responder`, not a reuse of it.
+    pub fn register_markdown_grower(&self, session_id: u32, file_id: u32) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::RegisterMarkdownGrower { session_id, file_id })
+    }
+
+    /// Asks `somsrv` to fetch `target` (an `http://`/`https://` URL) itself
+    /// and stream it into the cache as `(session_id, file_id)` — the SAME
+    /// `SrvRequest::FetchResource` mechanism `Terminal`/`rich_content_srv_
+    /// channel.rs`'s `request_fetch_resource` already uses for markdown-
+    /// embedded images, just sent from `somsrp`'s own connection instead
+    /// of Som's. Unlike that Som-side caller, `somsrp` mints `(session_id,
+    /// file_id)` via its own `new_ids()` (no reserved high bit) — this is
+    /// TOP-LEVEL content, meant to be discovered by an ordinary
+    /// placeholder-grid scan like any other `somsrp`-streamed placement,
+    /// not a Som-minted id hidden from grid scans. `base_dir: None`
+    /// always — a URL has no relative-path base to resolve against.
+    /// Fire-and-forget, same one-shot-send shape as every other request
+    /// this type sends: the caller has no need to await a reply, since
+    /// `somsrv`'s own `Progress` pushes (already subscribed to by Som once
+    /// it discovers this placement's id in the grid) are what actually
+    /// carry the fetch's outcome.
+    pub fn request_fetch_resource(&self, session_id: u32, file_id: u32, target: String) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::FetchResource { session_id, file_id, target, base_dir: None })
+    }
 }
 
 impl std::fmt::Debug for Incoming {
@@ -179,7 +208,7 @@ pub fn to_srv_metadata(metadata: terminal::rich_content_transport::ContentMetada
                 extension,
             }
         },
-        M::Markdown => somsrv::protocol::ContentMetadata::Markdown,
+        M::Markdown { base_dir } => somsrv::protocol::ContentMetadata::Markdown { base_dir },
     }
 }
 

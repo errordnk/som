@@ -11,14 +11,14 @@
 //! explicitly via `cargo test --release -p somsrv --test
 //! seek_latency_bench -- --ignored --nocapture`.
 //!
-//! This drives the REAL wire protocol end to end, mirroring `somcat`'s
+//! This drives the REAL wire protocol end to end, mirroring `somsrp`'s
 //! own connection shape EXACTLY (confirmed by reading `server.rs`'s
 //! `handle_srv_request`): `RequestByteRange` is forwarded back down the
 //! SAME connection that sent the first `PutChunk` for a given
 //! `(session_id, file_id)` (`SrvCache::register_sender_route`'s implicit,
 //! first-`PutChunk`-wins registration) — there is no separate
 //! "responder" connection. So one thread here does both roles at once,
-//! just like `somcat::srv_channel::SrvChannel` really does: a writer
+//! just like `somsrp::srv_channel::SrvChannel` really does: a writer
 //! sending sequential `PutChunk`s, and a background reader on the SAME
 //! connection watching for an unsolicited `RequestByteRange` to answer.
 //! A second, independent connection acts as the "receiver" (exactly what
@@ -87,7 +87,7 @@ fn send_request(connection: &PipeConnection, writer: &Mutex<()>, message: &SrvRe
     connection.write_message(&payload).expect("sending message");
 }
 
-/// One connection doing BOTH jobs `somcat` really does on its single
+/// One connection doing BOTH jobs `somsrp` really does on its single
 /// `SrvChannel`: sequentially `PutChunk`s the whole file from a
 /// background thread, while this same function's caller-spawned reader
 /// thread watches the SAME connection for an unsolicited
@@ -108,7 +108,7 @@ fn spawn_sender_and_range_responder(
 
         // Reader thread: answers RequestByteRange messages the daemon
         // forwards back down this connection, interleaved with the
-        // writer thread's own sequential PutChunks — mirrors `somcat`'s
+        // writer thread's own sequential PutChunks — mirrors `somsrp`'s
         // real background query-reader thread design (see project
         // memory on `write_lock` guarding concurrent writes to one
         // PipeConnection).
@@ -155,7 +155,7 @@ fn spawn_sender_and_range_responder(
             }
         });
 
-        // Writer: the ordinary sequential send, same shape as `somcat`'s
+        // Writer: the ordinary sequential send, same shape as `somsrp`'s
         // real `stream_file`.
         let mut file = std::fs::File::open(&path).expect("opening fixture for sending");
         const CHUNK_SIZE: usize = 256 * 1024;

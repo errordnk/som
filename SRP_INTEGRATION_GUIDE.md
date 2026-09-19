@@ -190,7 +190,7 @@ need to parse `Progress` yourself.
    `PutChunk`s, not as an `SrvResponse` variant — a reader on this
    connection needs to be prepared to decode EITHER a `SrvResponse` or a
    raw `SrvRequest` off the wire (Som's own client-side library,
-   `somcat::srv_channel::Incoming`, models this as a two-variant enum
+   `somsrp::srv_channel::Incoming`, models this as a two-variant enum
    and tries `SrvResponse` first, `SrvRequest` second — do the
    equivalent in your own language).
 
@@ -261,7 +261,7 @@ a chance to print/see the grid and subscribe, Som may never learn the
 transfer happened at all (the daemon does replay the current watermark
 to a late subscriber as a best-effort mitigation, but relying on that
 race resolving correctly is strictly worse than just getting the order
-right). This bit Som's own `somcat` client during this exact migration —
+right). This bit Som's own `somsrp` client during this exact migration —
 its image/GIF branch streamed first and printed the grid last, which
 worked fine under the old always-on-PTY transport but broke silently
 under the new one; reordering it (grid first) fixed it.
@@ -356,7 +356,7 @@ receiving end — decoding and playback both happen inside Som itself,
 along with an inline play/pause/seek widget Som paints and handles
 clicks for directly. Your client's only job is to probe the file's
 header for metadata (a cheap format-reader probe, not a full decode —
-see `somcat`'s own `audio_metadata()` for a worked example) and stream
+see `somsrp`'s own `audio_metadata()` for a worked example) and stream
 the raw bytes, then either exit (image/GIF) or keep answering byte-range
 requests (audio/video — see above). No placeholder-grid pixel-size math
 for audio either: audio has no pixel dimensions, so Som's widget uses a
@@ -488,7 +488,7 @@ if rows > max_rows {
 Clamp height to `terminal_rows - 1`, not `terminal_rows` — a placement
 that fills the screen edge-to-edge pushes the next prompt line
 completely out of view until the user scrolls, defeating the point of
-printing the image inline. This mirrors exactly what Som's own `somcat`
+printing the image inline. This mirrors exactly what Som's own `somsrp`
 client and `Terminal::resync_rich_content_placements` (Som's resize
 handler) both do — see `SRP_PROTOCOL.md`'s "Единицы измерения" and
 "Пересчёт placement'ов при ресайзе" sections for the full history of why
@@ -521,7 +521,7 @@ a large file:
 - **Audio (mp3/flac)**: probe with a format-reader library (Rust:
   `symphonia`'s `probe`/`FormatReader`, no full decode) for `sample_rate`/
   `channels`/`bits_per_sample`/`duration_ms`.
-- **Video**: Som's own `somcat` client does NOT probe real video
+- **Video**: Som's own `somsrp` client does NOT probe real video
   dimensions/fps/codec client-side (`ContentMetadata::Video` is sent
   with all-zero/`Unknown` placeholder values) — Som's paint path scales
   whatever it decodes to fit the placeholder grid's footprint regardless,
@@ -533,8 +533,8 @@ a large file:
 ## Windows-specific pitfalls if your client runs there
 
 Two Windows-only issues affect any Rust (or similarly buffered-stdout)
-client, both already solved in Som's own `somcat` reference client
-(`crates/somcat/src/raw_mode.rs`/`main.rs`'s `write_raw_stdout`) — worth
+client, both already solved in Som's own `somsrp` reference client
+(`crates/somsrp/src/raw_mode.rs`/`main.rs`'s `write_raw_stdout`) — worth
 knowing about even if you're implementing in a different language, since
 the underlying causes are platform behavior, not Rust-specific. Both are
 about the PLACEHOLDER GRID text (the only part that goes over the PTY) —
@@ -566,16 +566,16 @@ socket/pipe with no console/codepage involvement at all.
 The reference implementation, `yazi-adapter/src/drivers/srp/` in
 [`errordnk/yazi`](https://github.com/errordnk/yazi), has been migrated
 to the current `somsrv` transport (2026-09-02) and now has full parity
-with `somcat`, not just images/GIF:
+with `somsrp`, not just images/GIF:
 
 - **Transport**: `srp/protocol.rs`, `srp/pipe.rs`, `srp/daemon.rs`, and
   `srp/srv_channel.rs` are a hand-kept, client-only port of `somsrv::
-  protocol`/`somsrv::pipe`/`somsrv::daemon`/`somcat`'s own `srv_
+  protocol`/`somsrv::pipe`/`somsrv::daemon`/`somsrp`'s own `srv_
   channel.rs` — see `protocol.rs`'s own doc comment for why this is a
   port rather than a dependency on the `somsrv` crate (it pulls in
   `alacritty_terminal`/`smol`/`sysinfo`/`zlog`, all Som-internal and
   unwanted in a general-purpose file manager's dependency tree). Unlike
-  `somcat` (which finds `somsrv` next to its own executable, since the
+  `somsrp` (which finds `somsrv` next to its own executable, since the
   two are built and deployed together), this driver has no such
   relationship to `somsrv` at all — it looks for it at the fixed path
   `~/.local/bin/somsrv[.exe]` instead (`daemon.rs`), spawning it
@@ -589,14 +589,14 @@ with `somcat`, not just images/GIF:
   the whole file into memory), with a dedicated byte-range-responder
   connection (`RegisterRangeResponder`) so a seek on Som's side gets
   answered promptly instead of queueing behind a large in-flight
-  sequential transfer — mirrors `somcat::stream_file_from_disk`/`spawn_
+  sequential transfer — mirrors `somsrp::stream_file_from_disk`/`spawn_
   byte_range_responder_from_disk`/`send_range_chunks_from_disk_
   interruptible` field-for-field, including the seek-signal compare-and-
   clear pattern (see `mod.rs`'s own doc comments for the bugs that
   pattern fixes). Does NOT do real ffprobe-style metadata probing — see
   `metadata.rs`'s own doc comment for why (FFmpeg is a large, platform-
   specific dependency this driver deliberately avoids) — so it falls
-  back to a fixed placeholder footprint (same numbers `somcat` itself
+  back to a fixed placeholder footprint (same numbers `somsrp` itself
   falls back to when its own real probe fails); Som decodes the real
   file and learns its true dimensions once playback actually starts
   regardless.

@@ -50,6 +50,7 @@ anyhow.workspace = true
 async-channel.workspace = true
 bincode.workspace = true
 futures.workspace = true
+http.workspace = true
 log.workspace = true
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 paths.workspace = true
@@ -58,6 +59,7 @@ serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 sysinfo.workspace = true
+ureq.workspace = true
 uuid.workspace = true
 zlog.workspace = true
 

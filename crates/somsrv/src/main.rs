@@ -9,6 +9,7 @@
 // so this single implementation covers the Windows-local profile AND every
 // Unix (WSL/SSH) profile.
 mod bounds;
+mod http_fetch;
 mod lua;
 mod redraw;
 mod relay;

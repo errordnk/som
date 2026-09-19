@@ -1,12 +1,12 @@
 [package]
-name = "somcat"
+name = "somsrp"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [[bin]]
-name = "somcat"
+name = "somsrp"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,7 +15,6 @@ terminal.workspace = true
 symphonia.workspace = true
 somsrv.workspace = true
 serde_json.workspace = true
-markdown_line_count.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
@@ -24,7 +23,7 @@ windows.workspace = true
 # embedded FFmpeg `terminal` already links on this platform (see
 # `crates/assets/src/assets.rs`'s own doc comment for why Windows-only
 # today), used directly here rather than through a `terminal`-crate
-# re-export since this is somcat's own probing code, not shared state.
+# re-export since this is somsrp's own probing code, not shared state.
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
 
 [target.'cfg(unix)'.dependencies]

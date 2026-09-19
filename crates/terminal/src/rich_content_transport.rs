@@ -18,7 +18,7 @@
 //! explains a real, hard-won constraint of Windows ConPTY that still
 //! matters for anything this crate DOES still put on the PTY (right now,
 //! that's just the placeholder-grid control handshake — see
-//! `crates/somcat/src/main.rs`'s `print_placeholder_grid_with_cell_dims`,
+//! `crates/somsrp/src/main.rs`'s `print_placeholder_grid_with_cell_dims`,
 //! which sends a session/file id through a placeholder cell's RGB
 //! attributes via ordinary printable-text escape sequences, not through
 //! any encoding this module defines).
@@ -42,7 +42,7 @@
 //!
 //! Confirmed the hard way, not assumed: `Terminal::write_output` (direct
 //! VTE injection, no real ConPTY involved) reconstructed a ~1MB GIF
-//! byte-for-byte; the exact same byte stream sent through a REAL `somcat
+//! byte-for-byte; the exact same byte stream sent through a REAL `somsrp
 //! --stream` child process over a REAL ConPTY pseudo-console consistently
 //! arrived LARGER than it was sent, with each corrupted envelope's
 //! declared `chunk_len` smaller than the actual bytes received (e.g.
@@ -120,7 +120,7 @@ pub enum ContentMetadata {
     /// `somsrv::protocol::SrvRequest::PutChunk`'s `total_size` field).
     ///
     /// Sent explicitly by the client (parsed from the source file's own
-    /// header before streaming — see `crates/somcat`'s `stream_file`)
+    /// header before streaming — see `crates/somsrp`'s `stream_file`)
     /// rather than left for the receiving side to infer from whatever
     /// prefix of the file happens to have decoded so far: a GIF's logical
     /// screen descriptor isn't guaranteed to land inside the FIRST chunk
@@ -184,7 +184,7 @@ pub enum ContentMetadata {
         /// Which of the container's audio streams to decode (0-based, in
         /// FFmpeg demuxer enumeration order) — `None` means "use FFmpeg's
         /// own `best()` heuristic," the only behavior before this field
-        /// existed. Set from `somcat`'s `-a <N>` CLI flag for a
+        /// existed. Set from `somsrp`'s `-a <N>` CLI flag for a
         /// multi-audio-track file (commentary tracks, multiple dub
         /// languages) where the heuristic doesn't pick the track the user
         /// actually wants.
@@ -192,7 +192,7 @@ pub enum ContentMetadata {
         /// Which of the container's subtitle streams to render, if any —
         /// `None` (the default) means no subtitles at all, matching
         /// every other player-widget's own "off unless asked" default.
-        /// Set from `somcat`'s `-s <N>` CLI flag. Unlike `audio_stream_
+        /// Set from `somsrp`'s `-s <N>` CLI flag. Unlike `audio_stream_
         /// index`, there is no "best" heuristic fallback here — subtitles
         /// are opt-in, never picked automatically.
         subtitle_stream_index: Option<u32>,
@@ -212,10 +212,16 @@ pub enum ContentMetadata {
         /// the extension hint more heavily. Empty string means unknown.
         extension: String,
     },
-    /// [`ContentType::Markdown`] carries no geometric/format metadata at
-    /// all — plain text, rendered by whatever overlay eventually consumes
-    /// it, not sized like a raster image or timed like audio/video.
-    Markdown,
+    /// [`ContentType::Markdown`] carries no geometric/format metadata —
+    /// plain text, rendered by whatever overlay eventually consumes it,
+    /// not sized like a raster image or timed like audio/video. It DOES
+    /// carry the source `.md` file's own directory, mirroring
+    /// `somsrv::protocol::ContentMetadata::Markdown::base_dir`
+    /// field-for-field (see that copy's own doc comment for the full
+    /// rationale: resolving a relative `![alt](./img.png)` link inside
+    /// this document requires knowing where the document itself lived,
+    /// now that no on-disk file/`Path` reaches this side at all).
+    Markdown { base_dir: String },
 }
 
 #[cfg(test)]
@@ -242,7 +248,7 @@ mod tests {
             subtitle_stream_index: None,
             extension: "mp4".to_string(),
         };
-        let markdown = ContentMetadata::Markdown;
+        let markdown = ContentMetadata::Markdown { base_dir: String::new() };
 
         assert_ne!(image, audio);
         assert_ne!(audio, video);

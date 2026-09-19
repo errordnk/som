@@ -788,6 +788,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4408,13 +4414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "markdown_line_count"
-version = "0.1.0"
-dependencies = [
- "pulldown-cmark",
-]
-
-[[package]]
 name = "markup5ever"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7313,27 +7312,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "somcat"
-version = "0.1.0"
-dependencies = [
- "ffmpeg-next",
- "image",
- "libc",
- "markdown_line_count",
- "serde_json",
- "somsrv",
- "symphonia",
- "terminal",
- "windows 0.61.3",
-]
-
-[[package]]
 name = "somkey"
 version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui_platform",
  "windows_resources",
+]
+
+[[package]]
+name = "somsrp"
+version = "0.1.0"
+dependencies = [
+ "ffmpeg-next",
+ "image",
+ "libc",
+ "serde_json",
+ "somsrv",
+ "symphonia",
+ "terminal",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -7345,6 +7343,7 @@ dependencies = [
  "async-channel 2.5.0",
  "bincode",
  "futures",
+ "http",
  "libc",
  "log",
  "mlua",
@@ -7355,6 +7354,7 @@ dependencies = [
  "serde_json",
  "smol",
  "sysinfo 0.37.2",
+ "ureq",
  "uuid",
  "windows 0.61.3",
  "zlog",
@@ -8793,6 +8793,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
+name = "ureq"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86fd172ccca569e458f61b6bdd6220965a9ef36e672a6852953b51a0e1583be"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8842,6 +8870,12 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -9295,6 +9329,15 @@ name = "webpki-root-certs"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

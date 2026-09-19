@@ -466,7 +466,7 @@ fn connect_or_spawn_daemon() -> anyhow::Result<PipeConnection> {
     // This RELAY process re-spawns ITSELF (`current_exe()`) in `--daemon`
     // mode if nothing's listening yet — see `somsrv::daemon`'s own doc
     // comment for why the spawn-if-not-running logic itself lives there
-    // rather than here (shared with `somcat`/Som's own client-side code,
+    // rather than here (shared with `somsrp`/Som's own client-side code,
     // neither of which IS the `somsrv` binary, so they pass a
     // discovered/deployed path instead of `current_exe()`).
     let connection = somsrv::daemon::connect_or_spawn(&std::env::current_exe()?)?;

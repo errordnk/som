@@ -3406,26 +3406,22 @@ impl Terminal {
             if just_opened {
                 player.toggle_play_pause();
             }
-            // Auto-stop on reaching the real end of playback — same
-            // genuine teardown the widget's own stop icon now uses (see
-            // `stop_rich_content_video_playback`'s own doc comment): drops
-            // the player and tells `somsrp` to exit, since natural EOF is
-            // just as much a definitive end of playback as an explicit
-            // stop click, not a pausable/resumable state. Checked every
-            // paint pass so this fires the moment playback actually
-            // reaches the end, not only after the user happens to click
-            // play again — `run_decode_loop`'s own EOF handling already
-            // flips `playing` to `false` once `finished` is set. Inlined
-            // (not calling `stop_rich_content_video_playback`) for the
-            // same borrow-conflict reason the `StopPlayback` handling
-            // above is inlined: `players` is already mutably borrowed for
-            // this whole loop.
-            if player.is_finished() && !player.is_playing() {
-                players.remove(&key);
-                self.rich_content_video_progress.borrow_mut().remove(&key);
-                rich_content_srv_channel::end_playback(session_id, file_id);
-                continue;
-            }
+            // Reaching the real end of playback is deliberately NOT a
+            // teardown anymore — the player, its progress entry, and the
+            // underlying `somsrp` process all stay alive exactly as they
+            // are. `run_decode_loop`'s own EOF handling already flips
+            // `playing` to `false` once `finished` is set, so this falls
+            // straight through to the ordinary `out.push` below: the
+            // widget simply settles on PAUSED at the LAST real decoded
+            // frame still sitting in `shared.slot`, seek bar at the end,
+            // exactly as if the user had paused on that frame themselves.
+            // No stop(), no seek-to-0, no dna.png stand-in — confirmed
+            // by the user this is the wanted behavior (an earlier version
+            // of this code tore the placement down and told `somsrp` to
+            // exit here, which is why videos used to visibly restart from
+            // scratch: something re-invoked the same command after
+            // `somsrp` exited, which was never actually a video-player
+            // bug at all).
             // Pushed even with no frame (`current_frame()` returns
             // `None` right after `RichContentVideoPlayer::stop` clears
             // the display) — the control widget (play glyph, 00:00:00,

@@ -481,6 +481,7 @@ impl TerminalBuilder {
             rich_content_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_srv_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_media: std::cell::RefCell::new(std::collections::HashMap::new()),
+            #[cfg(target_os = "windows")]
             markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -810,6 +811,7 @@ impl TerminalBuilder {
                 rich_content_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_srv_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_media: std::cell::RefCell::new(std::collections::HashMap::new()),
+            #[cfg(target_os = "windows")]
             markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1389,6 +1391,7 @@ pub struct Terminal {
     /// ids()`-driven loops that must never see a Som-minted embedded id —
     /// same reasoning `markdown_embedded_media` itself is already
     /// separate from `rich_content_srv_progress`.
+    #[cfg(target_os = "windows")]
     markdown_embedded_video_progress:
         std::cell::RefCell<std::collections::HashMap<((u32, u32), String), std::sync::Arc<rich_content_video_player::VideoTransferProgress>>>,
     /// Same role as `markdown_embedded_video_progress`, for embedded
@@ -2548,6 +2551,7 @@ impl Terminal {
                 let mut embedded = self.markdown_embedded_media.borrow_mut();
                 let hosted: Vec<_> = embedded.keys().filter(|(host, _)| *host == key).cloned().collect();
                 let mut audio_progress = self.markdown_embedded_audio_progress.borrow_mut();
+                #[cfg(target_os = "windows")]
                 let mut video_progress = self.markdown_embedded_video_progress.borrow_mut();
                 for hosted_key in hosted {
                     if let Some(entry) = embedded.remove(&hosted_key) {
@@ -2567,6 +2571,7 @@ impl Terminal {
                     // `embedded.remove` above drop the entry (and its
                     // `MarkdownEmbeddedPlayer`) outright.
                     audio_progress.remove(&hosted_key);
+                    #[cfg(target_os = "windows")]
                     video_progress.remove(&hosted_key);
                     self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&hosted_key);
                     self.markdown_embedded_controls_bounds.borrow_mut().remove(&hosted_key);
@@ -8474,6 +8479,7 @@ mod tests {
             term.markdown_embedded_audio_progress
                 .borrow_mut()
                 .insert((host, "./song.mp3".to_string()), std::sync::Arc::new(rich_content_audio_player::AudioTransferProgress::new()));
+            #[cfg(target_os = "windows")]
             term.markdown_embedded_video_progress
                 .borrow_mut()
                 .insert((host, "./clip.mp4".to_string()), std::sync::Arc::new(rich_content_video_player::VideoTransferProgress::new()));

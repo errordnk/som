@@ -2051,6 +2051,8 @@ fn paint_rich_content_placements(
             let width_columns = available_columns.clamp(40, 120);
             let mut real_row_count: Option<u32> = None;
             let mut embedded_controls_bounds: Vec<(String, Bounds<Pixels>, Option<Bounds<Pixels>>)> = Vec::new();
+            let mut any_nested_loading = false;
+            let sel_range = terminal.read(cx).selection_line_range().map(|(start, end)| (start.0, end.0));
             if let Some(bounds) = paint_rich_content_markdown_widget(
                 &rendered_text,
                 Some(width_columns - 1),
@@ -2063,11 +2065,16 @@ fn paint_rich_content_placements(
                 &mut discovered,
                 &mut embedded_controls_bounds,
                 &mut real_row_count,
+                terminal,
+                (session_id, file_id),
+                &mut any_nested_loading,
+                sel_range,
                 window,
                 cx,
             ) {
                 terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
             }
+            any_markdown_embedded_image_loading |= any_nested_loading;
             if !discovered.is_empty() {
                 terminal.update(cx, |terminal, _cx| {
                     for dest_url in &discovered {
@@ -2365,9 +2372,62 @@ fn paint_rich_content_placements(
         window.paint_quad(fill(box_bounds, rich_content_widget_bg(cx)));
         let fit = fit_into_box(image_size, box_bounds);
         window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), current_frame, false).log_err();
+
+        // The transient "Copied" toast — see `Terminal::copy_rich_
+        // content_image_to_clipboard`'s own doc comment for when this
+        // gets set, and `rich_content_image_copied_toast_active`'s for
+        // why checking it here (not just once at click time) is what
+        // makes it disappear again a second later: this whole function
+        // reruns every paint, so once `COPIED_TOAST_DURATION` elapses
+        // the check below simply stops being true and the toast stops
+        // being painted, no timer callback needed.
+        if terminal.read(cx).rich_content_image_copied_toast_active(session_id, file_id) {
+            any_animating = true;
+            paint_copied_toast(fit, layout, window, cx);
+        }
     }
 
     any_animating
+}
+
+/// Paints a small rounded "Copied" pill anchored to the top-right corner
+/// of `picture_bounds` (the image's own real letterboxed rectangle, NOT
+/// its full reserved footprint — so the toast sits against the actual
+/// picture edge regardless of how much empty letterbox padding surrounds
+/// it), inset by half a cell so it doesn't touch the picture's own edge
+/// pixels. A fixed dark pill with white text regardless of the active
+/// theme (matches the always-dark video/audio controls-row convention
+/// this file already uses elsewhere, e.g. `paint_rich_content_media_
+/// widget`'s glyphs) — it overlays a photo of arbitrary color, where a
+/// theme-derived color could easily blend into the picture itself.
+fn paint_copied_toast(picture_bounds: Bounds<Pixels>, layout: &LayoutState, window: &mut Window, cx: &mut App) {
+    let line_height = layout.dimensions.line_height;
+    let font_size: gpui::Pixels = (line_height * 0.6).max(gpui::px(10.0));
+    let text_color = gpui::white();
+    let run = TextRun { len: "Copied".len(), font: layout.base_text_style.font(), color: text_color, background_color: None, underline: None, strikethrough: None };
+    let shaped = window.text_system().shape_line("Copied".into(), font_size, &[run], None);
+
+    let h_padding = gpui::px(8.0);
+    let v_padding = gpui::px(4.0);
+    let pill_size = gpui::size(shaped.width + h_padding * 2.0, font_size + v_padding * 2.0);
+    let inset = line_height * 0.5;
+    let pill_origin = point(
+        (picture_bounds.right() - pill_size.width - inset).max(picture_bounds.origin.x),
+        (picture_bounds.origin.y + inset).min(picture_bounds.bottom() - pill_size.height),
+    );
+    let pill_bounds = Bounds::new(pill_origin, pill_size);
+
+    let border_width = gpui::px(1.0);
+    window.paint_quad(gpui::PaintQuad {
+        bounds: pill_bounds,
+        corner_radii: gpui::Corners::all(pill_size.height / 2.0),
+        background: gpui::rgba(0x1e1e2eee).into(),
+        border_widths: gpui::Edges::all(border_width),
+        border_color: gpui::rgba(0xffffff55).into(),
+        border_style: gpui::BorderStyle::default(),
+    });
+    let text_position = point(pill_origin.x + h_padding, pill_origin.y + v_padding);
+    shaped.paint(text_position, font_size, gpui::TextAlign::Left, None, window, cx).log_err();
 }
 
 /// Paints one media placement's (audio OR video) inline control row —
@@ -2488,6 +2548,155 @@ fn markdown_heading_scale(heading_level: Option<u8>) -> f32 {
 /// tracks the terminal's own column count reliably, only height does
 /// not.
 #[allow(clippy::too_many_arguments)]
+/// How many `![alt](nested.md)` levels deep resolution will follow before
+/// giving up — a defense-in-depth backstop independent of cycle
+/// detection (`resolve_nested_markdown_embeds`'s own `visited` set
+/// already catches an actual cycle; this catches a very long NON-cyclic
+/// chain instead, the same "belt and suspenders" reasoning `Terminal::
+/// MARKDOWN_PLACEMENT_ROW_LIMIT` already applies to row growth).
+const MAX_NESTED_MARKDOWN_DEPTH: u32 = 16;
+
+/// Recursively resolves every `![alt](nested.md)` embed reachable from
+/// `host`'s own embedded-media state into a `dest_url -> Vec<LaidOutLine>`
+/// map ready to hand to `layout_markdown_with_nested`. Bottom-up by
+/// construction: an embed can only produce its OWN final `Vec<LaidOutLine>`
+/// (and be added to the returned map) once every markdown embed nested
+/// INSIDE it has itself already resolved — this function recurses into a
+/// `ReadyMarkdown` entry's own nested embeds FIRST, and only calls
+/// `layout_markdown_with_nested` on that entry's text once its own
+/// recursive call returns, so a deeply-nested leaf document is always
+/// laid out before anything that embeds it. An embed whose own nested
+/// embeds aren't fully resolved yet (still `Loading`, or itself has
+/// unresolved children) simply doesn't appear in the returned map for
+/// this paint — `layout_markdown_with_nested` already treats a missing
+/// `nested` entry as "show a loading placeholder," and the NEXT paint
+/// naturally re-attempts with whatever has resolved by then (same
+/// discovery-then-grow pattern the rest of this embed system already
+/// uses, not a new polling mechanism).
+///
+/// `visited` guards against a cycle (`a.md` embeds `b.md` embeds `a.md`)
+/// — a `dest_url` already in the CURRENT resolution chain (not a global
+/// "ever seen" set: the same nested doc legitimately can appear in two
+/// unrelated places in a large document) causes that embed to resolve as
+/// `Err` instead of recursing forever, surfaced by `layout_markdown_
+/// with_nested` as a visible warning span. `depth` is the independent
+/// absolute-depth backstop (`MAX_NESTED_MARKDOWN_DEPTH`) — also `Err`,
+/// not silently dropped, so a pathologically long (but non-cyclic) chain
+/// is just as visible to the document's author as an actual cycle.
+fn resolve_nested_markdown_embeds(
+    terminal: &Entity<Terminal>,
+    cx: &mut App,
+    host: (u32, u32),
+    prose_font: &Font,
+    base_font_size: Pixels,
+    wrap_width: Pixels,
+    visited: &mut std::collections::HashSet<String>,
+    depth: u32,
+    // Set (never cleared) the moment ANY embed at ANY depth below `host`
+    // is still `Loading` — a nested embed's own Loading/Ready transition
+    // is otherwise invisible to the caller: the top-level paint loop's
+    // `any_markdown_embedded_image_loading` flag (which drives whether
+    // another repaint gets scheduled at all — see that flag's own use
+    // site's doc comment) only ever inspected the ROOT document's own
+    // `markdown_embedded_media_states`, never anything discovered two or
+    // more levels deep. Without this, a second-level embed (or, as with
+    // a genuinely circular document, EVERY level past the first) could
+    // finish fetching and never trigger the repaint that would let its
+    // resolved content — or its `Err` cycle warning — ever actually
+    // reach the screen: confirmed live as a nested embed permanently
+    // stuck showing its very first loading-placeholder frame forever,
+    // even though `ensure_markdown_embedded_media` HAD been called for
+    // it and its fetch HAD completed somsrv-side.
+    any_loading: &mut bool,
+) -> std::collections::HashMap<String, Result<std::sync::Arc<Vec<crate::markdown_styling::LaidOutLine>>, String>> {
+    let mut resolved = std::collections::HashMap::new();
+
+    let embedded_here: Vec<(String, terminal::EmbeddedMediaStatus)> =
+        terminal.read(cx).markdown_embedded_media_states(host).into_iter().collect();
+
+    for (dest_url, status) in embedded_here {
+        if matches!(status, terminal::EmbeddedMediaStatus::Loading) {
+            *any_loading = true;
+        }
+        let terminal::EmbeddedMediaStatus::ReadyMarkdown { source, host_id } = status else {
+            continue;
+        };
+        if depth >= MAX_NESTED_MARKDOWN_DEPTH {
+            resolved.insert(dest_url.clone(), Err(format!("nested markdown embed too deep (limit {MAX_NESTED_MARKDOWN_DEPTH}): {dest_url}")));
+            continue;
+        }
+        if visited.contains(&dest_url) {
+            resolved.insert(dest_url.clone(), Err(format!("circular markdown embed: {dest_url}")));
+            continue;
+        }
+        visited.insert(dest_url.clone());
+        // Recurse into THIS embed's own nested embeds FIRST (bottom-up)
+        // — its own `host_id` (its Som-minted id) is the `host` for
+        // whatever it itself embeds, one level down. A fresh line wrapper
+        // per recursion level (the outer one is still borrowed by the
+        // caller's own in-progress `layout_markdown_with_nested` call by
+        // the time this returns) — same font/size, since nested documents
+        // share the parent's wrap width (see this function's own
+        // module-level design note in the plan for why: there's no
+        // independent "box" to letterbox text into the way image/audio/
+        // video have).
+        let mut nested_line_wrapper = cx.text_system().line_wrapper(prose_font.clone(), base_font_size);
+        let child_nested =
+            resolve_nested_markdown_embeds(terminal, cx, host_id, prose_font, base_font_size, wrap_width, visited, depth + 1, any_loading);
+        let laid_out = crate::markdown_styling::layout_markdown_with_nested(
+            &source,
+            Some((&mut nested_line_wrapper, wrap_width)),
+            &child_nested,
+        );
+        // Discovers THIS embed's own markdown-in-markdown children and
+        // registers them under `host_id` (not the caller's `host`) —
+        // the top-level paint loop's own `discovered` vec only ever sees
+        // marker rows that make it into the ROOT document's spliced
+        // `laid_out`, which never happens for a child that hasn't
+        // resolved yet (an unresolved embed contributes a single
+        // marker-less loading row, see `layout_markdown_with_nested`'s
+        // own doc comment — its real content, and thus ITS OWN nested
+        // markers, only exists in `laid_out` computed right here). Without
+        // this, a `dest_url` nested two or more levels deep would only
+        // ever get `ensure_markdown_embedded_media` called against it
+        // with the WRONG host (the document that first became visible at
+        // the top level), which `markdown_embedded_media_states(host_id)`
+        // would then never find — confirmed live as a permanently-stuck
+        // loading row for any embed nested past the first level.
+        //
+        // Scans `child_nested` (what THIS embed's own children already
+        // resolved to), NOT `laid_out` — `laid_out` still contains a
+        // marker row for a `dest_url` `child_nested` resolved to `Err`
+        // (a cycle, or the depth cap), and re-discovering THAT marker
+        // every paint would mint a brand-new Som id and fire a brand-new
+        // `FetchResource` for it on every single paint pass forever, each
+        // one immune to `visited` (which is scoped to ONE paint's
+        // resolution attempt and starts empty again next paint) —
+        // confirmed live as an unbounded, ever-growing chain of `somsrv`
+        // fetches for a genuinely circular embed, instead of the single
+        // stable "⚠ circular markdown embed" warning this is supposed to
+        // produce. `child_nested`'s keys are exactly this document's own
+        // `Markdown`-kind `dest_url`s (both `Ok` and `Err` populate it,
+        // see the loop above) — a `dest_url` already in `child_nested`
+        // never needs re-registering: `Ok` is already resolved, `Err` is
+        // a terminal state this paint should stop retrying.
+        for line in &laid_out {
+            if let Some(image) = &line.embedded_media
+                && image.kind == crate::markdown_styling::EmbeddedMediaKind::Markdown
+                && !child_nested.contains_key(&image.dest_url)
+            {
+                terminal.update(cx, |terminal, _cx| {
+                    terminal.ensure_markdown_embedded_media(host_id, &image.dest_url);
+                });
+            }
+        }
+        visited.remove(&dest_url);
+        resolved.insert(dest_url, Ok(std::sync::Arc::new(laid_out)));
+    }
+
+    resolved
+}
+
 fn paint_rich_content_markdown_widget(
     rendered_text: &str,
     max_column_seen: Option<u32>,
@@ -2514,6 +2723,26 @@ fn paint_rich_content_markdown_widget(
     // reservation`. `None` on an early return (nothing visible this
     // paint) — the caller must not treat that as "0 rows needed."
     real_row_count: &mut Option<u32>,
+    // Needed only to recursively resolve `![alt](nested.md)` embeds
+    // (`resolve_nested_markdown_embeds`) — `host` is THIS document's own
+    // `(session_id, file_id)`, the root of the resolution chain.
+    terminal: &Entity<Terminal>,
+    host: (u32, u32),
+    // Set if ANY nested embed at ANY depth is still `Loading` — see
+    // `resolve_nested_markdown_embeds`'s own `any_loading` parameter doc
+    // comment for why the caller can't just inspect its own top-level
+    // `embedded` map for this.
+    any_nested_loading: &mut bool,
+    // The terminal's current selection, as absolute grid `Line`
+    // (`.0` — plain `i32`, avoiding an `alacritty_terminal` import here)
+    // start/end — `None` if there's no active selection at all. See
+    // `Terminal::selection_line_range`'s own doc comment for why the
+    // ORDINARY grid-cell selection highlight (painted earlier in the
+    // same frame, before rich-content placements) is invisible for a
+    // markdown placement's own rows without this: this function paints
+    // its own opaque `widget_bg` over the placeholder cells underneath,
+    // covering whatever selection tint `layout_grid` already drew there.
+    selection_line_range: Option<(i32, i32)>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Bounds<Pixels>> {
@@ -2555,10 +2784,34 @@ fn paint_rich_content_markdown_widget(
         style: gpui::FontStyle::Normal,
     };
     let wrap_width = (width - cell_width).max(gpui::px(1.0));
+    // Resolved BEFORE the top-level `layout_markdown_with_nested` call —
+    // see `resolve_nested_markdown_embeds`'s own doc comment for why this
+    // is bottom-up by construction (a nested doc's own nested embeds are
+    // resolved first, recursively, before this document's own text is
+    // laid out). `visited` starts empty for the root of the chain.
+    let mut visited = std::collections::HashSet::new();
+    let nested =
+        resolve_nested_markdown_embeds(terminal, cx, host, &prose_font, base_font_size, wrap_width, &mut visited, 0, any_nested_loading);
     let mut line_wrapper = window.text_system().line_wrapper(prose_font.clone(), base_font_size);
-    let laid_out = crate::markdown_styling::layout_markdown(rendered_text, Some((&mut line_wrapper, wrap_width)));
+    let laid_out = crate::markdown_styling::layout_markdown_with_nested(rendered_text, Some((&mut line_wrapper, wrap_width)), &nested);
     let placement_rows = laid_out.len().max(1) as i32;
     *real_row_count = Some(laid_out.len() as u32);
+    // Records this paint's own `laid_out[i].source_range` alongside the
+    // exact `rendered_text` it was computed from, keyed by `host` — see
+    // `Terminal::copy`'s own doc comment for why a mouse selection over
+    // this widget needs to recover the REAL markdown source (`#`, `**`,
+    // `![alt](url)`) instead of copying rendered plain prose. Written on
+    // every paint (matches every other "record during paint, read
+    // during input" rich-content bounds field already in `Terminal`),
+    // and the source text is captured in the SAME call as the ranges
+    // that index into it — reading them from two different paints could
+    // otherwise pair a stale range with fresher text (or vice versa) if
+    // the document changed between calls.
+    terminal.read(cx).record_markdown_source_ranges(
+        host,
+        rendered_text.to_string(),
+        laid_out.iter().map(|line| line.source_range.clone()).collect(),
+    );
 
     // Each row's REAL painted height — a heading renders taller than
     // `line_height` (see `markdown_heading_scale`), so advancing the
@@ -2600,28 +2853,70 @@ fn paint_rich_content_markdown_widget(
     // background would otherwise stop short of the heading's own real
     // bottom edge, and the NEXT placement/prompt would show through the
     // gap).
-    let total_height: gpui::Pixels = visible_row_heights.iter().copied().sum();
-    let bounds = Bounds::new(position, gpui::size(width, total_height));
+    let content_height: gpui::Pixels = visible_row_heights.iter().copied().sum();
+    let bounds = Bounds::new(position, gpui::size(width, content_height));
 
     window.paint_quad(fill(bounds, widget_bg));
 
+    // Grid row `N` (relative to `origin_line`, absolute once added to it)
+    // is FIXED regardless of Scroll Lock's own offset — a `visible_rows`
+    // entry at slice index `i` sits at grid row `first_visible_row + i`,
+    // not `skip + i` (`skip` already folds `scroll_offset_lines` in,
+    // which shifts which TEXT paints over that fixed row, not the row
+    // itself — see `Terminal::markdown_source_text_for_selection`'s own
+    // doc comment on this same distinction for the copy path).
+    let selection_bg = cx.theme().colors().text_accent;
     let mut at_y = position.y;
-    for (line, row_height) in visible_rows.iter().zip(visible_row_heights.iter()) {
+    for (i, (line, row_height)) in visible_rows.iter().zip(visible_row_heights.iter()).enumerate() {
         let at = point(position.x, at_y);
+        let row_top = at_y;
         at_y += *row_height;
 
-        if let Some(image) = &line.embedded_media {
+        if let Some((sel_start, sel_end)) = selection_line_range {
+            let absolute_grid_row = origin_line + first_visible_row + i as i32;
+            if absolute_grid_row >= sel_start && absolute_grid_row <= sel_end {
+                window.paint_quad(fill(Bounds::new(point(position.x, row_top), gpui::size(width, *row_height)), selection_bg.opacity(0.35)));
+            }
+        }
+
+        // Markdown-kind embeds are discovered here too (needed for the
+        // FIRST level of nesting — anything deeper is separately
+        // discovered by `resolve_nested_markdown_embeds` itself, see its
+        // own doc comment for why that recursive discovery is required),
+        // but deliberately fall through to the ordinary text-rendering
+        // path below rather than being handled in the `!= Markdown`
+        // branch beneath this — see that branch's own doc comment on the
+        // early-return bug this replaced.
+        if let Some(image) = &line.embedded_media
+            && image.kind == crate::markdown_styling::EmbeddedMediaKind::Markdown
+        {
+            discovered.push(image.dest_url.clone());
+        }
+
+        if let Some(image) = &line.embedded_media
+            && image.kind != crate::markdown_styling::EmbeddedMediaKind::Markdown
+        {
+            discovered.push(image.dest_url.clone());
             // Box geometry honors the embed's `{...}` attrs (position/
             // width/height) — see `embed_box_bounds`'s own doc comment.
             // With no attrs block (`EmbedAttrs::default()`), this
             // reproduces the old fixed full-width-minus-insets,
             // EMBEDDED_IMAGE_ROWS-tall box exactly.
             let box_bounds = embed_box_bounds(&image.attrs, at, width, cell_width, line_height);
-            discovered.push(image.dest_url.clone());
             match embedded.get(&image.dest_url) {
                 Some(terminal::EmbeddedMediaStatus::ReadyImage { render_image, frame_index, .. }) => {
                     let fit = fit_into_box(render_image.size(*frame_index), box_bounds);
                     window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), *frame_index, false).log_err();
+                    // Click-anywhere-on-the-picture-to-copy zone + its
+                    // "Copied" toast — see `Terminal::copy_markdown_
+                    // embedded_image_to_clipboard`'s own doc comment for
+                    // why this is the SAME feature as top-level images,
+                    // not a separate reimplementation.
+                    terminal.read(cx).record_markdown_embedded_image_bounds(host, &image.dest_url, fit);
+                    if terminal.read(cx).markdown_embedded_image_copied_toast_active(host, &image.dest_url) {
+                        *any_nested_loading = true;
+                        paint_copied_toast(fit, layout, window, cx);
+                    }
                 },
                 Some(terminal::EmbeddedMediaStatus::Failed(reason)) => {
                     window.paint_quad(fill(box_bounds, gpui::rgba(0x3a2a2aff)));
@@ -2716,6 +3011,13 @@ fn paint_rich_content_markdown_widget(
                     let seek_bar_bounds = paint_embedded_media_controls_row(controls_bounds, *is_playing, *elapsed, *duration, *position_fraction, layout, window, cx);
                     embedded_controls_bounds.push((image.dest_url.clone(), controls_bounds, seek_bar_bounds));
                 },
+                // Unreachable in practice — `image.kind == Markdown` is
+                // handled entirely by the early-return branch above,
+                // before this match ever runs, and no OTHER kind ever
+                // produces a `ReadyMarkdown` status. Required only
+                // because `EmbeddedMediaStatus` is one enum shared across
+                // all kinds, so this match must stay exhaustive.
+                Some(terminal::EmbeddedMediaStatus::ReadyMarkdown { .. }) => {},
             }
             continue;
         }

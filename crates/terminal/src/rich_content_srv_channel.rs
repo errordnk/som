@@ -817,10 +817,6 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             SrvResponse::Progress { session_id: response_session, file_id: response_file, contiguous_len, tail_available_from, pending_ranges, total_size, content_type, metadata, chunk_offset, chunk_data }
                 if response_session == session_id && response_file == file_id =>
             {
-                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Users\\dnk\\AppData\\Local\\Temp\\som_debug.log").and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "Progress: {session_id:#x}:{file_id:#x} contiguous_len={contiguous_len} total_size={total_size} chunk_offset={chunk_offset} chunk_len={} content_type={content_type:?}", chunk_data.len())
-                });
                 state.tail_available_from.store(tail_available_from, Ordering::Release);
                 *state.pending_ranges.lock().unwrap_or_else(|p| p.into_inner()) = pending_ranges;
                 state.total_size.store(total_size, Ordering::Release);

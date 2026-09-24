@@ -650,7 +650,7 @@ fn write_placeholder_grid_rows_from(session_id: u32, file_id: u32, columns: u32,
 }
 
 /// Clears the real terminal and homes the cursor to (row 0, column 0)
-/// before printing a top-level (non-markdown) placeholder grid — `CSI 2J`
+/// before printing a top-level placeholder grid — `CSI 2J`
 /// (clear entire screen) + `CSI H` (cursor home), both standard ANSI,
 /// already relied upon elsewhere in this codebase's terminal handling.
 /// Needed now that a top-level placement's placeholder grid always spans
@@ -659,9 +659,14 @@ fn write_placeholder_grid_rows_from(session_id: u32, file_id: u32, columns: u32,
 /// its `(row=0, column=0)` placeholder cell actually sits in the real
 /// terminal grid — homing the cursor first guarantees that's the
 /// terminal's own real top-left corner, with no change needed to that
-/// origin-detection logic on Som's side. Markdown does NOT call this —
-/// markdown's own placement stays left/top-anchored wherever the cursor
-/// was at invocation time, unaffected by this change.
+/// origin-detection logic on Som's side. Markdown calls this too (see
+/// `stream_file_impl`'s markdown branch) — a top-level markdown
+/// placement is still top-left-anchored like every other top-level
+/// widget, even though (unlike image/video/audio) its own real painted
+/// height is exactly the document's own content height, not stretched
+/// to fill the whole terminal (a short document leaves the rest of the
+/// screen showing the terminal's own plain background, not a padded
+/// widget box).
 fn clear_screen_and_home_cursor() {
     print!("\x1b[2J\x1b[H");
     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -1377,6 +1382,12 @@ fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream
         // player for at all). Prints only `MARKDOWN_INITIAL_ROWS` up
         // front now — see that constant's own doc comment for why the
         // old predicted-row-count reservation was removed.
+        //
+        // `clear_screen_and_home_cursor()` first, matching every other
+        // top-level widget — a markdown document reads like any other
+        // full-terminal placement (image/video/audio), not a small
+        // inline block wherever the cursor happened to be.
+        clear_screen_and_home_cursor();
         let (columns, initial_rows) = print_markdown_placeholder_grid(session_id, file_id)?;
 
         stream_bytes(&channel, &bytes, content_type, metadata, ids)?;
@@ -1412,6 +1423,32 @@ fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drop(handle);
+        // A long document's placeholder grid can easily grow taller than
+        // the terminal's own visible height (unlike image/video/audio,
+        // whose reservation is always exactly the terminal's current
+        // size) — by the time this point is reached, rows that scrolled
+        // past the top of the visible screen while `write_placeholder_
+        // grid_rows`/`spawn_markdown_grower` were still printing are
+        // ALREADY sitting in the terminal's scrollback history, not just
+        // off the bottom of the current view. Plain `clear_screen_and_
+        // home_cursor()` (`CSI 2J` + `CSI H`) only clears the CURRENT
+        // screen, matching every other top-level widget's own start-of-
+        // stream call — but those never leave anything in scrollback to
+        // begin with, since their reservation never exceeds one
+        // screenful. Markdown needs the scrollback purged too (`CSI 3J`,
+        // `ClearMode::Saved` in the terminal's own emulator), or the
+        // user is left looking at a screen that LOOKS blank/unresponsive
+        // (Ctrl+C/Escape/q already worked, the shell's prompt already
+        // reprinted, but it's buried below dozens of leftover diacritics-
+        // encoded placeholder rows) — confirmed live as needing roughly
+        // 20 Enter presses to physically push the real prompt back into
+        // view, when the actual expectation (matching image/audio) is
+        // that the terminal looks exactly as it did before the widget
+        // ever ran.
+        print!("\x1b[2J\x1b[3J\x1b[H");
+        if let Err(err) = std::io::Write::flush(&mut std::io::stdout()) {
+            eprintln!("somsrp: failed to flush the exit-time screen/scrollback clear: {err}");
+        }
         return Ok(());
     }
 

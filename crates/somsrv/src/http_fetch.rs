@@ -57,7 +57,14 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
 
     let mut body = response.into_body();
     let reader = body.as_reader();
-    stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type)
+    // A URL has no local directory to resolve a nested relative embed
+    // against — same "empty means unknown" convention `metadata_for`
+    // already uses for every other genuinely-unknowable field. A nested
+    // `.md` embed inside a document fetched over HTTP would need an
+    // absolute URL (or one resolved against the PARENT URL, not a
+    // filesystem path) to work at all; that's a real, separate gap this
+    // change doesn't attempt to close.
+    stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new())
 }
 
 fn fetch_local(cache: &SrvCache, session_id: u32, file_id: u32, target: &str, base_dir: Option<&str>) -> anyhow::Result<()> {
@@ -77,7 +84,39 @@ fn fetch_local(cache: &SrvCache, session_id: u32, file_id: u32, target: &str, ba
     let file = std::fs::File::open(&resolved).map_err(|err| anyhow::anyhow!("opening {}: {err}", resolved.display()))?;
     let total_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
-    stream_reader_into_cache(cache, session_id, file_id, file, total_size, content_type)
+    // A fetched markdown document's OWN directory — needed so a markdown
+    // embed nested INSIDE this one (`![alt](further.md)`, resolved via a
+    // SECOND, recursive `FetchResource`) can resolve ITS OWN relative
+    // path correctly. Without this, nested-markdown-in-markdown (see
+    // `metadata_for`'s old doc comment, which explicitly called this out
+    // of scope before this feature existed) silently resolved every
+    // second-level-and-deeper relative embed against nothing, since
+    // `metadata_for` always reported an empty `base_dir` — confirmed
+    // live as a second-level nested embed never resolving at all.
+    // `canonicalize()` (not just `.parent()` on the possibly-relative
+    // `resolved`) so the resulting path stands on its own regardless of
+    // `somsrv`'s own cwd, the same reasoning `somsrp`'s own top-level
+    // markdown streaming already uses for this exact field.
+    let real_base_dir = match resolved.canonicalize() {
+        Ok(canonical) => canonical.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        Err(err) => {
+            // Only matters for `ContentType::Markdown` (every other kind
+            // ignores `base_dir` entirely) — logged rather than silently
+            // defaulting to `""`, since an empty `base_dir` is otherwise
+            // indistinguishable from "this document genuinely has no
+            // nested embeds to resolve". `File::open` above already
+            // succeeded, so this is a narrow race (the file/an ancestor
+            // directory was removed, or became unreadable, between that
+            // open and this canonicalize), not the common case — worth a
+            // warning, not a hard failure of the fetch itself.
+            if content_type == ContentType::Markdown {
+                log::warn!("canonicalize failed for {} after it was already opened: {err} — nested relative embeds in this document will not resolve", resolved.display());
+            }
+            String::new()
+        },
+    };
+
+    stream_reader_into_cache(cache, session_id, file_id, file, total_size, content_type, real_base_dir)
 }
 
 /// Reads `reader` to completion in `CHUNK_SIZE` pieces, pushing each
@@ -91,8 +130,9 @@ fn stream_reader_into_cache(
     mut reader: impl Read,
     total_size: u64,
     content_type: ContentType,
+    base_dir: String,
 ) -> anyhow::Result<()> {
-    let metadata = metadata_for(content_type);
+    let metadata = metadata_for(content_type, base_dir);
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut offset = 0u64;
     loop {
@@ -114,13 +154,16 @@ fn stream_reader_into_cache(
 }
 
 /// `ContentMetadata`'s already-existing "unknown" convention (zero-valued
-/// numeric fields) for every content type except `Markdown` (which has
-/// none) — `somsrv` has no FFmpeg/image-decoding dependency to probe real
-/// pixel dimensions/duration/codec from fetched bytes, and won't gain one
-/// for this. An accepted, explicit gap for this pass (see this module's
-/// own doc comment) — a future markdown-embedded-media feature decides
-/// whether real probing belongs here or client-side.
-fn metadata_for(content_type: ContentType) -> ContentMetadata {
+/// numeric fields) for every content type except `Markdown` — `somsrv`
+/// has no FFmpeg/image-decoding dependency to probe real pixel
+/// dimensions/duration/codec from fetched bytes, and won't gain one for
+/// this. An accepted, explicit gap for this pass (see this module's own
+/// doc comment) — a future markdown-embedded-media feature decides
+/// whether real probing belongs here or client-side. `base_dir` is real
+/// (not a placeholder) for a fetched markdown document specifically —
+/// see `fetch_local`'s own doc comment for why: it's what lets a markdown
+/// embed NESTED inside this one resolve its own relative path correctly.
+fn metadata_for(content_type: ContentType, base_dir: String) -> ContentMetadata {
     match content_type {
         ContentType::Gif | ContentType::Jpeg | ContentType::Png => {
             ContentMetadata::Image { width_px: 0, height_px: 0, color_bits: 0, is_animated: false }
@@ -136,10 +179,7 @@ fn metadata_for(content_type: ContentType) -> ContentMetadata {
             subtitle_stream_index: None,
             extension: String::new(),
         },
-        // A fetched markdown document's own base_dir is genuinely
-        // unknown to `somsrv` (nested markdown-in-markdown is out of
-        // scope) — empty per the "empty means unknown" convention.
-        ContentType::Markdown => ContentMetadata::Markdown { base_dir: String::new() },
+        ContentType::Markdown => ContentMetadata::Markdown { base_dir },
     }
 }
 

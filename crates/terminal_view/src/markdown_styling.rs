@@ -82,6 +82,25 @@ pub struct LaidOutLine {
     /// variant. Covers images, audio, and video — see [`EmbeddedMedia`]'s
     /// own doc comment for why one type serves all three kinds.
     pub embedded_media: Option<EmbeddedMedia>,
+    /// The byte range in the ORIGINAL markdown source text this line's
+    /// content was drawn from — the union of every source event's own
+    /// range that contributed a span to this line (see the main parsing
+    /// loop's `source_range_for_line` helper). `None` for a line with no
+    /// real source position of its own: a blank block-separator row
+    /// (`insert_block_separator`), a spacer row under embedded media
+    /// (only the FIRST such row carries a range, matching `embedded_
+    /// media`'s own "first row only" convention), or any row produced by
+    /// `wrap_paragraph_line` splitting a longer source line into several
+    /// on-screen ones (word-wrap doesn't track which literal
+    /// sub-substring of the source maps to which wrapped visual row, so
+    /// a wrapped row inherits its ORIGINAL pre-wrap line's full range
+    /// instead — see that function's own doc comment for why this is a
+    /// deliberate simplification, not an oversight). Exists so mouse
+    /// selection over a rendered markdown widget can copy the REAL
+    /// source text (`# heading`, `**bold**`, `![alt](url)`, etc.)
+    /// instead of the rendered plain prose — see `Terminal::copy`'s own
+    /// doc comment for how this gets used.
+    pub source_range: Option<std::ops::Range<usize>>,
 }
 
 /// How many `LaidOutLine` rows one embedded media block reserves. Fixed,
@@ -108,6 +127,15 @@ pub enum EmbeddedMediaKind {
     Image,
     Audio,
     Video,
+    /// `![alt](nested.md)` — inlines ANOTHER markdown document's real
+    /// rendered content directly into this one, not a hyperlink jump.
+    /// Deliberately does NOT go through the fixed `EMBEDDED_IMAGE_ROWS`
+    /// band every other kind uses (see that constant's own doc comment):
+    /// a nested document's real row count depends entirely on its own
+    /// content and can't be known until it's been fetched and laid out
+    /// itself — see `layout_markdown`'s `nested` parameter for how the
+    /// already-resolved lines get spliced in once available.
+    Markdown,
 }
 
 /// Horizontal position of an embedded media block within the markdown
@@ -248,6 +276,7 @@ fn media_kind_for_extension(dest_url: &str) -> EmbeddedMediaKind {
     match ext.as_str() {
         "mp3" | "flac" => EmbeddedMediaKind::Audio,
         "mp4" | "mkv" | "avi" => EmbeddedMediaKind::Video,
+        "md" => EmbeddedMediaKind::Markdown,
         _ => EmbeddedMediaKind::Image,
     }
 }
@@ -360,6 +389,25 @@ impl InlineState {
 /// that function's own doc comment for why only paragraph/list/quote text
 /// gets this treatment (headings/code blocks/rules do not).
 pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle, gpui::Pixels)>) -> Vec<LaidOutLine> {
+    layout_markdown_with_nested(source, wrap, &std::collections::HashMap::new())
+}
+
+/// Same as [`layout_markdown`], but additionally accepts `nested` —
+/// already-resolved nested markdown documents (see `EmbeddedMediaKind::
+/// Markdown`'s own doc comment), keyed by `dest_url`, exactly matching
+/// `embedded`'s existing keying convention at this function's paint-path
+/// call site. `layout_markdown` itself is a thin wrapper passing an empty
+/// map here — this function is the one real callers with resolved nested
+/// content (the paint path, and the resolver that produces `nested` maps
+/// for EMBEDDED documents recursively) should call directly; kept as a
+/// separate function rather than adding a parameter to `layout_markdown`
+/// itself so the ~50 existing unit tests calling `layout_markdown(source,
+/// None)` don't all need updating for a case that doesn't concern them.
+pub fn layout_markdown_with_nested(
+    source: &str,
+    wrap: Option<(&mut gpui::LineWrapperHandle, gpui::Pixels)>,
+    nested: &std::collections::HashMap<String, Result<std::sync::Arc<Vec<LaidOutLine>>, String>>,
+) -> Vec<LaidOutLine> {
     let parsed = parse_markdown_with_options(source, false, false, false);
     let mut lines: Vec<LaidOutLine> = Vec::new();
     let mut current = LaidOutLine::default();
@@ -409,6 +457,20 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
     };
 
     for (_range, event) in parsed.events.iter() {
+        // Extends `current`'s own source range to cover this event too —
+        // union, not overwrite, since a line accumulates several events
+        // (e.g. `**bold** text` is a Strong Start/Text/End followed by a
+        // plain Text, all contributing to the SAME line). Done
+        // unconditionally, before the match below decides what KIND of
+        // event this is, so structural events (list markers, emphasis
+        // start/end) that don't themselves reach the `Text` arm still
+        // widen the range to their own real source position — e.g.
+        // `**` markers are covered here even though only the text
+        // BETWEEN them reaches `MarkdownEvent::Text`.
+        current.source_range = Some(match current.source_range.take() {
+            Some(existing) => existing.start.min(_range.start)..existing.end.max(_range.end),
+            None => _range.clone(),
+        });
         match event {
             MarkdownEvent::Start(tag) => match tag {
                 MarkdownTag::Heading { level, .. } => {
@@ -509,12 +571,83 @@ pub fn layout_markdown(source: &str, wrap: Option<(&mut gpui::LineWrapperHandle,
                         if !current.spans.is_empty() {
                             finish_line(&mut lines, &mut current, heading_level, in_code_block, in_block_quote_depth > 0);
                         }
-                        lines.push(LaidOutLine { embedded_media: Some(image), ..Default::default() });
-                        let row_index = lines.len() - 1;
-                        for _ in 1..EMBEDDED_IMAGE_ROWS {
-                            lines.push(LaidOutLine::default());
+                        if image.kind == EmbeddedMediaKind::Markdown {
+                            // Deliberately NOT the fixed EMBEDDED_IMAGE_ROWS
+                            // band every other kind uses — see
+                            // `EmbeddedMediaKind::Markdown`'s own doc
+                            // comment for why a nested document's real
+                            // row count can't be guessed up front.
+                            let row_index = lines.len();
+                            match nested.get(&image.dest_url) {
+                                Some(Ok(resolved)) => {
+                                    // Splice the ALREADY-LAID-OUT nested
+                                    // lines in verbatim — they were wrapped
+                                    // at their own resolution time (see
+                                    // `layout_markdown_with_nested`'s own
+                                    // doc comment on wrap width), not
+                                    // re-wrapped here. The first spliced
+                                    // line still carries `embedded_media`
+                                    // (for `wrap_paragraph_line`'s existing
+                                    // skip guard and for attrs-parsing
+                                    // below to have a row to write into),
+                                    // the rest are the resolved content
+                                    // as-is.
+                                    let mut resolved_lines = (**resolved).clone();
+                                    if let Some(first) = resolved_lines.first_mut() {
+                                        first.embedded_media = Some(image);
+                                    } else {
+                                        // An empty nested document (e.g.
+                                        // a blank file) still needs ONE
+                                        // row to carry the embed marker
+                                        // for attrs-parsing/discovery.
+                                        resolved_lines.push(LaidOutLine { embedded_media: Some(image), ..Default::default() });
+                                    }
+                                    lines.extend(resolved_lines);
+                                },
+                                Some(Err(reason)) => {
+                                    // Circular embed (or any other
+                                    // resolution failure the recursive
+                                    // resolver detected) — rendered as an
+                                    // ordinary visible warning span rather
+                                    // than a letterboxed error box (that
+                                    // treatment belongs to the OTHER
+                                    // kinds' `Failed` status, which flows
+                                    // through `Terminal`'s `embedded` map
+                                    // instead — nested-markdown failures
+                                    // are detected entirely client-side
+                                    // during resolution, before there's
+                                    // ever a `Terminal`-side status to
+                                    // report one through).
+                                    let label = format!("⚠ {reason}");
+                                    lines.push(LaidOutLine {
+                                        embedded_media: Some(image),
+                                        spans: vec![StyledSpan { text: label, emphasis: SpanEmphasis::None, strikethrough: false, monospace: false, is_link: false }],
+                                        ..Default::default()
+                                    });
+                                },
+                                None => {
+                                    // Not resolved yet (fetch/recursive
+                                    // resolution still in flight) — a
+                                    // single loading-placeholder row, not
+                                    // a fixed-size band: the eventual size
+                                    // is unknown, so reserving any guess
+                                    // would be wrong either way.
+                                    lines.push(LaidOutLine { embedded_media: Some(image), ..Default::default() });
+                                },
+                            }
+                            awaiting_attrs_for = Some(row_index);
+                        } else {
+                            lines.push(LaidOutLine {
+                                embedded_media: Some(image),
+                                source_range: Some(_range.clone()),
+                                ..Default::default()
+                            });
+                            let row_index = lines.len() - 1;
+                            for _ in 1..EMBEDDED_IMAGE_ROWS {
+                                lines.push(LaidOutLine::default());
+                            }
+                            awaiting_attrs_for = Some(row_index);
                         }
-                        awaiting_attrs_for = Some(row_index);
                     }
                 },
                 _ => {},
@@ -768,6 +901,11 @@ fn wrap_paragraph_line(line: LaidOutLine, wrapper: &mut gpui::LineWrapperHandle,
             is_code_block: false,
             is_block_quote: line.is_block_quote,
             embedded_media: None,
+            // Every wrapped visual row inherits the FULL pre-wrap
+            // source range — see `LaidOutLine::source_range`'s own doc
+            // comment for why a wrapped row doesn't track which literal
+            // sub-substring it corresponds to.
+            source_range: line.source_range.clone(),
         });
         cut_start = cut_end;
     }
@@ -821,6 +959,56 @@ mod tests {
         let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
         let lines = layout_markdown("short line", Some((&mut wrapper, gpui::px(500.))));
         assert_eq!(lines.len(), 1, "a short paragraph well within the width must not be split");
+    }
+
+    #[test]
+    fn source_range_covers_a_plain_paragraph_verbatim() {
+        let source = "just a plain paragraph";
+        let lines = layout_markdown(source, None);
+        assert_eq!(lines.len(), 1);
+        let range = lines[0].source_range.clone().expect("a real text line must carry a source range");
+        assert_eq!(&source[range], source);
+    }
+
+    #[test]
+    fn source_range_for_a_heading_includes_the_hash_marker() {
+        let source = "# Title here";
+        let lines = layout_markdown(source, None);
+        let range = lines[0].source_range.clone().expect("a heading line must carry a source range");
+        // The range must reach back far enough to include the leading
+        // `#`/space marker, not just the heading TEXT — otherwise
+        // copying a selected heading would silently drop its own level.
+        assert_eq!(&source[range], source, "expected the full `# Title here` tag, marker included");
+    }
+
+    #[test]
+    fn source_range_for_bold_text_includes_the_asterisk_markers() {
+        let source = "plain **bold** plain";
+        let lines = layout_markdown(source, None);
+        assert_eq!(lines.len(), 1);
+        let range = lines[0].source_range.clone().expect("a line with inline emphasis must carry a source range");
+        assert_eq!(&source[range], source, "the whole paragraph's range, including ** markers, must be covered — not just the plain-text portions");
+    }
+
+    #[test]
+    fn source_range_for_an_image_embed_covers_the_full_markdown_tag() {
+        let source = "![alt text](picture.png)";
+        let lines = layout_markdown(source, None);
+        let embed_line = lines.iter().find(|l| l.embedded_media.is_some()).expect("expected an embedded-media line");
+        let range = embed_line.source_range.clone().expect("an image embed line must carry a source range");
+        assert_eq!(&source[range], source, "selecting an embedded image's row must be able to copy back the real ![alt](url) tag");
+    }
+
+    #[test]
+    fn source_range_survives_word_wrap_as_the_full_pre_wrap_line() {
+        let (_cx, mut wrapper) = build_wrapper(gpui::px(16.));
+        let source = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj";
+        let lines = layout_markdown(source, Some((&mut wrapper, gpui::px(72.))));
+        assert!(lines.len() > 1, "expected this to wrap given the narrow width");
+        for line in &lines {
+            let range = line.source_range.clone().expect("every wrapped row must still carry a source range");
+            assert_eq!(&source[range], source, "a wrapped row's range must be the FULL original line, not just its own visible slice");
+        }
     }
 
     #[test]
@@ -1040,10 +1228,81 @@ mod tests {
             let lines = layout_markdown(&format!("![a](x.{ext})"), None);
             assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Video, "extension .{ext} should classify as Video");
         }
+        let lines = layout_markdown("![a](nested.md)", None);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Markdown, ".md should classify as Markdown");
         // Unknown extension defaults to Image — matches every `![alt](url)`
         // embed's behavior before audio/video support existed.
         let lines = layout_markdown("![a](x.xyz)", None);
         assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Image);
+    }
+
+    #[test]
+    fn unresolved_nested_markdown_produces_one_loading_row_not_a_fixed_band() {
+        // No `nested` entry for "child.md" at all — resolution/fetch still
+        // in flight. Must NOT reserve EMBEDDED_IMAGE_ROWS (that band is
+        // meaningless for text of unknown eventual size) — exactly one
+        // loading-placeholder row.
+        let lines = layout_markdown("![a](child.md)", None);
+        assert_eq!(lines.len(), 1, "an unresolved nested markdown embed must reserve exactly one row, not EMBEDDED_IMAGE_ROWS");
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Markdown);
+    }
+
+    #[test]
+    fn resolved_nested_markdown_splices_in_the_exact_real_row_count() {
+        // A resolved nested document with 3 real lines must contribute
+        // EXACTLY 3 lines to the parent — no padding, no truncation.
+        let nested_lines = vec![
+            LaidOutLine { spans: vec![StyledSpan { text: "one".to_string(), emphasis: SpanEmphasis::None, strikethrough: false, monospace: false, is_link: false }], ..Default::default() },
+            LaidOutLine { spans: vec![StyledSpan { text: "two".to_string(), emphasis: SpanEmphasis::None, strikethrough: false, monospace: false, is_link: false }], ..Default::default() },
+            LaidOutLine { spans: vec![StyledSpan { text: "three".to_string(), emphasis: SpanEmphasis::None, strikethrough: false, monospace: false, is_link: false }], ..Default::default() },
+        ];
+        let mut nested = std::collections::HashMap::new();
+        nested.insert("child.md".to_string(), Ok(std::sync::Arc::new(nested_lines)));
+
+        let lines = layout_markdown_with_nested("![a](child.md)", None, &nested);
+        assert_eq!(lines.len(), 3, "resolved nested content must splice in with its exact real row count, no EMBEDDED_IMAGE_ROWS padding");
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().kind, EmbeddedMediaKind::Markdown, "the first spliced row still carries the embed marker");
+        assert_eq!(lines[0].spans[0].text, "one");
+        assert_eq!(lines[1].spans[0].text, "two");
+        assert_eq!(lines[2].spans[0].text, "three");
+    }
+
+    #[test]
+    fn resolved_nested_markdown_before_and_after_surrounding_prose_is_preserved() {
+        let nested_lines = vec![LaidOutLine {
+            spans: vec![StyledSpan { text: "nested content".to_string(), emphasis: SpanEmphasis::None, strikethrough: false, monospace: false, is_link: false }],
+            ..Default::default()
+        }];
+        let mut nested = std::collections::HashMap::new();
+        nested.insert("child.md".to_string(), Ok(std::sync::Arc::new(nested_lines)));
+
+        let lines = layout_markdown_with_nested("before ![a](child.md) after", None, &nested);
+        assert_eq!(lines[0].spans[0].text.trim(), "before");
+        let nested_row = lines.iter().position(|l| l.embedded_media.is_some()).expect("must contain the nested embed row");
+        assert_eq!(lines[nested_row].spans[0].text, "nested content");
+        // Exactly the resolved content's own row count (1 line here) after
+        // the embed marker row — not EMBEDDED_IMAGE_ROWS away, confirming
+        // no fixed-band padding was inserted for this kind.
+        let after_row = &lines[nested_row + 1];
+        assert_eq!(after_row.spans[0].text.trim(), "after");
+    }
+
+    #[test]
+    fn failed_nested_markdown_resolution_renders_a_visible_warning_not_a_silent_gap() {
+        // Regression guard for a real bug caught during implementation:
+        // a circular/too-deep nested embed used to be silently dropped
+        // (no entry in `nested` at all looked identical to "still
+        // loading"). `Err` must render as an ordinary visible span, not
+        // vanish or hang on a loading indicator forever.
+        let mut nested = std::collections::HashMap::new();
+        nested.insert("a.md".to_string(), Err("circular markdown embed: a.md".to_string()));
+
+        let lines = layout_markdown_with_nested("![x](a.md)", None, &nested);
+        assert_eq!(lines.len(), 1, "a failed resolution is exactly one row, same as loading — no fixed-band padding either");
+        assert!(
+            lines[0].spans.iter().any(|s| s.text.contains("circular markdown embed: a.md")),
+            "the failure reason must be visible as ordinary text, not swallowed"
+        );
     }
 
     #[test]

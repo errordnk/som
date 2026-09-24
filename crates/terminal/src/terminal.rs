@@ -484,11 +484,14 @@ impl TerminalBuilder {
             markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_source_ranges: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_image_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
             rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -810,11 +813,14 @@ impl TerminalBuilder {
             markdown_embedded_video_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_source_ranges: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_image_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
                 rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -966,6 +972,21 @@ pub struct MarkdownPlacementGeometry {
     pub max_row: u32,
 }
 
+/// One markdown placement's raw source text plus its most recent paint's
+/// per-row source ranges — see `Terminal::markdown_source_ranges`'s own
+/// doc comment. `row_source_ranges[i]` is row `i`'s range within `source`
+/// (0-indexed from the placement's own `origin_line`, matching the same
+/// convention `MarkdownPlacementGeometry` already uses) — this 1:1
+/// row-index-to-placeholder-grid-row correspondence holds because
+/// `somsrp` prints placeholder rows linearly from row 0 and `Terminal::
+/// ensure_markdown_row_reservation` only ever grows that reservation to
+/// match `laid_out.len()`, never reorders or skips rows.
+#[derive(Clone, Debug)]
+pub struct MarkdownSourceRanges {
+    pub source: String,
+    pub row_source_ranges: Vec<Option<std::ops::Range<usize>>>,
+}
+
 /// One in-flight or completed markdown-embedded media fetch — see
 /// `Terminal::markdown_embedded_media`' own doc comment for the id/
 /// lifecycle model this belongs to. Covers images, audio, and video (see
@@ -985,6 +1006,14 @@ pub struct MarkdownEmbeddedMedia {
     /// embedded/Som-minted ids are deliberately never registered in).
     /// `None` for every other media kind, or before metadata has arrived.
     pub audio_duration_ms: Option<u32>,
+    /// Cached from the SAME one-shot `take_metadata()` call, for
+    /// `ContentMetadata::Markdown` only — this EMBED's own source
+    /// directory, needed so a markdown embed NESTED inside IT can resolve
+    /// its own relative `dest_url` correctly (see `ensure_markdown_
+    /// embedded_media`'s own doc comment for why this can't reuse the
+    /// top-level-only `markdown_base_dirs` map). `None` for every other
+    /// media kind, or before metadata has arrived.
+    pub markdown_base_dir: Option<String>,
     /// Decoded pixels/persistent decode state, kind-tagged. See
     /// [`MarkdownEmbeddedPlayer`]'s own doc comment for why images and
     /// audio/video are handled so differently here (recreated every paint
@@ -1046,6 +1075,25 @@ pub enum EmbeddedMediaStatus {
         duration: std::time::Duration,
         position_fraction: f32,
     },
+    /// A `![alt](nested.md)` embed's raw fetched TEXT (not yet laid out —
+    /// `Terminal` (this crate) cannot depend on `terminal_view`'s
+    /// `markdown_styling::LaidOutLine` type at all, that dependency runs
+    /// the other way around; see this module's own doc comment on why
+    /// image/audio/video are handled the analogous way, keeping decoded
+    /// state OUT of `Terminal` itself). The actual recursive `layout_
+    /// markdown_with_nested` call (and the bottom-up "resolve my own
+    /// nested embeds before I can be considered fully laid out" logic)
+    /// happens entirely in `terminal_view`'s paint path, which already
+    /// has both this text AND `markdown_styling` in scope. `Arc` to avoid
+    /// cloning potentially large document text every paint.
+    ///
+    /// `host_id` is THIS embed's own Som-minted `(session_id, file_id)`
+    /// — needed by the paint path to recursively call `markdown_embedded_
+    /// media_states(host_id)` for whatever markdown embeds are nested
+    /// INSIDE this document, one level down. Every other `Ready*` variant
+    /// doesn't need this because none of them can themselves host further
+    /// embeds.
+    ReadyMarkdown { source: std::sync::Arc<String>, host_id: (u32, u32) },
 }
 
 // TODO: Un-pub
@@ -1364,6 +1412,20 @@ pub struct Terminal {
     /// `Terminal::mouse_down`'s click-interception check so a click can
     /// be tested against a placement's bounds outside of a paint pass.
     rich_content_placement_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// One markdown placement's raw source text plus, for every row of
+    /// its most recent `layout_markdown_with_nested` output, the byte
+    /// range in that text the row's content came from (`None` for a row
+    /// with no source position of its own — see `LaidOutLine::source_
+    /// range`'s own doc comment). Written every paint by `terminal_
+    /// element.rs`'s `record_markdown_source_ranges` call, read by
+    /// `Terminal::copy` to recover the REAL markdown source (`#`,
+    /// `**`, `![alt](url)`) for a mouse selection landing inside this
+    /// widget, instead of copying whatever plain prose is visibly
+    /// painted on screen. Keyed by `host` — the SAME `(session_id,
+    /// file_id)` `markdown_placement_origins()` already uses to find a
+    /// placement's on-screen grid footprint, needed to map a selection's
+    /// `AlacPoint` row back to an index into `row_source_ranges` below.
+    markdown_source_ranges: std::cell::RefCell<std::collections::HashMap<(u32, u32), MarkdownSourceRanges>>,
     /// The audio widget's seek-bar bounds specifically — a strict
     /// sub-rectangle of the corresponding entry in
     /// `rich_content_placement_bounds` (the bar doesn't span the whole
@@ -1383,6 +1445,14 @@ pub struct Terminal {
     /// reasoning as `rich_content_seek_bar_bounds` above, just for the
     /// stop icon instead of the seek bar.
     rich_content_stop_icon_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// The `Instant` a plain image/GIF placement's picture was last
+    /// clicked-to-copy — see `Terminal::copy_rich_content_image_to_
+    /// clipboard`'s own doc comment. Present in this map means "show the
+    /// transient 'Copied' toast for THIS placement"; `terminal_element.
+    /// rs`'s paint path removes the entry once `COPIED_TOAST_DURATION`
+    /// has elapsed since the recorded instant, so a stale entry never
+    /// lingers past its own visible lifetime.
+    rich_content_image_copied_at: std::cell::RefCell<std::collections::HashMap<(u32, u32), std::time::Instant>>,
     /// Same role as `rich_content_seek_bar_bounds`, for an EMBEDDED
     /// audio/video's seek bar — keyed like `markdown_embedded_media` by
     /// `(host, dest_url)` instead of a real placement id. No stop-icon
@@ -1395,6 +1465,16 @@ pub struct Terminal {
     /// pause zone even when the row painted too narrow for a seek bar at
     /// all (see `paint_embedded_media_controls_row`'s own doc comment).
     markdown_embedded_controls_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
+    /// An embedded IMAGE/GIF's own real letterboxed picture bounds —
+    /// separate from `markdown_embedded_controls_bounds` (that one is
+    /// audio/video-only: a plain image has no play/pause/seek geometry
+    /// at all, just a click-anywhere-to-copy zone covering its whole
+    /// picture). Written every paint by `terminal_element.rs`'s embedded-
+    /// image branch, read by `Terminal::handle_markdown_embedded_media_
+    /// click` to decide whether a click landed on this embed's picture —
+    /// same "record during paint, read during input" split every other
+    /// rich-content hit-test rectangle in this file already uses.
+    markdown_embedded_image_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
     /// Monotonically increasing counter for `request_audio_byte_range`'s
     /// `request_id` — see that method's own doc comment for why
     /// correctness doesn't depend on global uniqueness here, just on
@@ -1756,6 +1836,27 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
+    /// The current selection's absolute grid start/end `Line`s, if any —
+    /// used by `terminal_element.rs`'s markdown paint path to know which
+    /// of ITS OWN rows fall under the terminal's own selection highlight
+    /// (the ordinary grid-cell selection paint, done earlier in the same
+    /// paint pass via `layout_grid`, is invisible for a markdown
+    /// placement's rows: they're placeholder diacritics cells, and the
+    /// markdown widget's own `widget_bg` fill paints OVER whatever
+    /// selection-tinted background `layout_grid` already drew under
+    /// them — without this, a real mouse drag over rendered markdown
+    /// text copies correctly (see `markdown_source_text_for_selection`)
+    /// but shows no visible highlight at all, confirmed live). Returns
+    /// just the two `Line` values, not a full `SelectionRange` — the
+    /// caller only needs to test "is grid row N between these two rows",
+    /// exactly the same shape `markdown_source_text_for_selection`
+    /// already uses internally.
+    pub fn selection_line_range(&self) -> Option<(Line, Line)> {
+        let term = self.term.lock();
+        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term))?;
+        Some((selection_range.start.line, selection_range.end.line))
+    }
+
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
@@ -1938,7 +2039,17 @@ impl Terminal {
 
             InternalEvent::Copy(keep_selection) => {
                 trace!("Copying selection: keep_selection={keep_selection:?}");
-                if let Some(txt) = term.selection_to_string() {
+                // A selection lying entirely inside one markdown
+                // placement copies the REAL markdown source (`#`,
+                // `**`, `![alt](url)`) instead of `term.selection_to_
+                // string()`'s plain rendered prose — see `Self::
+                // markdown_source_text_for_selection`'s own doc comment
+                // for how the selection's grid rows map back to source
+                // byte ranges. Falls through to the normal terminal
+                // selection text for every other case (a selection
+                // spanning ordinary shell output, or one that only
+                // PARTLY overlaps a markdown placement).
+                if let Some(txt) = self.markdown_source_text_for_selection(term).or_else(|| term.selection_to_string()) {
                     cx.write_to_clipboard(ClipboardItem::new_string(txt));
                     if !keep_selection.unwrap_or_else(|| {
                         let settings = TerminalSettings::get_global(cx);
@@ -2442,6 +2553,13 @@ impl Terminal {
                     if let Some(entry) = embedded.remove(&hosted_key) {
                         entry.state.stop();
                         rich_content_srv_channel::unsubscribe(entry.session_id, entry.file_id);
+                        // The embed's own "Copied" toast, if it was ever
+                        // clicked while it was an image — keyed by its
+                        // Som-minted id, same map top-level images use
+                        // (see `Terminal::copy_markdown_embedded_image_
+                        // to_clipboard`'s own doc comment for why they
+                        // share one map).
+                        self.rich_content_image_copied_at.borrow_mut().remove(&(entry.session_id, entry.file_id));
                     }
                     // `RichContentAudioPlayer`/`RichContentVideoPlayer`
                     // stop their own stream/decode thread on `Drop` — no
@@ -2452,9 +2570,17 @@ impl Terminal {
                     video_progress.remove(&hosted_key);
                     self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&hosted_key);
                     self.markdown_embedded_controls_bounds.borrow_mut().remove(&hosted_key);
+                    self.markdown_embedded_image_bounds.borrow_mut().remove(&hosted_key);
                 }
             }
             self.markdown_base_dirs.borrow_mut().remove(&key);
+            // This placement's own "Copied" toast (if it was itself a
+            // plain image/GIF that got clicked) and, if it was markdown,
+            // its most recently recorded source-range table — both are
+            // otherwise never revisited once this id stops appearing in
+            // a grid scan, so nothing else would ever prune them.
+            self.rich_content_image_copied_at.borrow_mut().remove(&key);
+            self.markdown_source_ranges.borrow_mut().remove(&key);
         }
     }
 
@@ -2695,7 +2821,24 @@ impl Terminal {
         }
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
         let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id);
-        let base_dir = self.markdown_base_dirs.borrow().get(&host).cloned().filter(|d| !d.is_empty());
+        // `markdown_base_dirs` only ever holds an entry for a TOP-LEVEL
+        // placement's own id (populated from the grid-scanned placement,
+        // see that map's own doc comment) — a `host` that is itself an
+        // EMBEDDED markdown document (this embed is nested two or more
+        // levels deep) never appears there. For that case, the host
+        // embed's own `MarkdownEmbeddedMedia::markdown_base_dir` (filled
+        // in once ITS fetch's metadata arrives, mirroring `audio_
+        // duration_ms`) is the correct source of truth instead — this is
+        // what lets a relative `dest_url` inside a nested document
+        // resolve against ITS OWN directory rather than the root
+        // document's.
+        let base_dir = self.markdown_base_dirs.borrow().get(&host).cloned().filter(|d| !d.is_empty()).or_else(|| {
+            self.markdown_embedded_media
+                .borrow()
+                .values()
+                .find(|entry| (entry.session_id, entry.file_id) == host)
+                .and_then(|entry| entry.markdown_base_dir.clone())
+        });
         rich_content_srv_channel::request_fetch_resource(session_id, file_id, dest_url.to_string(), base_dir);
         self.markdown_embedded_media
             .borrow_mut()
@@ -2705,6 +2848,7 @@ impl Terminal {
                 state,
                 content_type: None,
                 audio_duration_ms: None,
+                markdown_base_dir: None,
                 player: MarkdownEmbeddedPlayer::None,
             });
     }
@@ -2738,8 +2882,14 @@ impl Terminal {
                 && let Some((content_type, metadata)) = entry.state.take_metadata()
             {
                 entry.content_type = Some(content_type);
-                if let rich_content_transport::ContentMetadata::Audio { duration_ms, .. } = metadata {
-                    entry.audio_duration_ms = Some(duration_ms);
+                match metadata {
+                    rich_content_transport::ContentMetadata::Audio { duration_ms, .. } => {
+                        entry.audio_duration_ms = Some(duration_ms);
+                    },
+                    rich_content_transport::ContentMetadata::Markdown { base_dir } if !base_dir.is_empty() => {
+                        entry.markdown_base_dir = Some(base_dir);
+                    },
+                    _ => {},
                 }
             }
             let Some(content_type) = entry.content_type else {
@@ -2887,8 +3037,29 @@ impl Terminal {
                 rich_content_transport::ContentType::Video => {
                     out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("video embeds are not supported on this platform".to_string())));
                 },
-                _ => {
-                    out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("unsupported embedded content type".to_string())));
+                rich_content_transport::ContentType::Markdown => {
+                    // No player/decode state needed at all — just the raw
+                    // text, once the whole file has arrived. Recursive
+                    // layout (this document's own nested embeds, if any)
+                    // happens entirely in `terminal_view`'s paint path,
+                    // which has both this text AND `markdown_styling` in
+                    // scope — see `EmbeddedMediaStatus::ReadyMarkdown`'s
+                    // own doc comment for why `Terminal` can't do that
+                    // part itself.
+                    let contiguous_len = entry.state.contiguous_len();
+                    let total_size = entry.state.total_size();
+                    if total_size == 0 || contiguous_len < total_size {
+                        out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
+                        continue;
+                    }
+                    let bytes = entry.state.bytes_received_so_far();
+                    match String::from_utf8(bytes) {
+                        Ok(source) => out.push((
+                            dest_url.clone(),
+                            EmbeddedMediaStatus::ReadyMarkdown { source: std::sync::Arc::new(source), host_id: (entry.session_id, entry.file_id) },
+                        )),
+                        Err(_) => out.push((dest_url.clone(), EmbeddedMediaStatus::Failed("nested markdown file is not valid UTF-8".to_string()))),
+                    }
                 },
             }
         }
@@ -2971,6 +3142,102 @@ impl Terminal {
         geometry
     }
 
+    /// Recovers the REAL markdown source text for the terminal's current
+    /// selection, if (and only if) every row it spans decodes as a
+    /// placeholder cell belonging to the SAME markdown placement — see
+    /// `MarkdownSourceRanges`'s own doc comment for the row-index
+    /// convention this relies on (grid row `N` relative to that
+    /// placement's own origin is `laid_out[N]`, i.e. `row_source_
+    /// ranges[N]`). `None` for every other case: no selection, an empty
+    /// selection, a selection over ordinary shell output (no placeholder
+    /// cell decodes at all), a selection spanning MULTIPLE placements or
+    /// mixing markdown with plain terminal output (ambiguous — which
+    /// source would a mixed copy even use?), or a placement whose source
+    /// ranges haven't been recorded yet (no markdown paint has happened
+    /// since this placement first appeared). The caller falls through to
+    /// `term.selection_to_string()`'s ordinary plain-text copy in every
+    /// `None` case — this is a strict enhancement, never a way to lose
+    /// the ability to copy ordinary terminal output.
+    ///
+    /// Takes `term` directly (already locked by the caller) rather than
+    /// calling `Self::markdown_placement_origins` (which does its OWN
+    /// `self.term.lock()`) — that would deadlock, since `Copy` is
+    /// processed with `term` already held for the whole `process_
+    /// terminal_event` match.
+    fn markdown_source_text_for_selection(&self, term: &Term<ZedListener>) -> Option<String> {
+        use kitty_graphics_placeholder::decode_placeholder_cell;
+
+        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term))?;
+        let SelectionRange { start, end, .. } = selection_range;
+        if start.line == end.line && start.column == end.column {
+            return None;
+        }
+
+        let grid = term.grid();
+        let decode_row_host = |line: Line| -> Option<((u32, u32), u32)> {
+            let row = &grid[line];
+            row.into_iter().find_map(|cell| {
+                let fg_rgb = match cell.fg {
+                    alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                    _ => return None,
+                };
+                let underline_rgb = match cell.underline_color() {
+                    Some(alacritty_terminal::vte::ansi::Color::Spec(rgb)) => Some((rgb.r, rgb.g, rgb.b)),
+                    Some(_) => return None,
+                    None => None,
+                };
+                let diacritics = cell.zerowidth().unwrap_or(&[]);
+                decode_placeholder_cell(cell.c, fg_rgb, underline_rgb, diacritics)
+                    .map(|placeholder| ((placeholder.image_id, placeholder.placement_id), placeholder.row))
+            })
+        };
+
+        let (host, start_row) = decode_row_host(start.line)?;
+        let mut min_row = start_row;
+        let mut max_row = start_row;
+        for line_num in (start.line.0 + 1)..=end.line.0 {
+            let (line_host, row) = decode_row_host(Line(line_num))?;
+            if line_host != host {
+                // Selection crosses into a DIFFERENT placement (or back
+                // out to plain terminal output) — ambiguous, bail to the
+                // ordinary plain-text copy instead of guessing.
+                return None;
+            }
+            min_row = min_row.min(row);
+            max_row = max_row.max(row);
+        }
+
+        // Grid row `N` is a FIXED placeholder cell printed once (`somsrp`
+        // never reprints or renumbers existing rows — only grows past
+        // the current end), but the TEXT painted over it depends on
+        // Scroll Lock's own widget-local scroll offset (`rich_content_
+        // markdown_scroll_offsets` — see that field's own doc comment
+        // for how it differs from the terminal's `display_offset`):
+        // `paint_rich_content_markdown_widget` maps grid row `N` to
+        // `laid_out[N + scroll_offset]`, not `laid_out[N]` directly. A
+        // selection's rows must be corrected the same way, or dragging
+        // over a SCROLLED document would copy the WRONG rows' source
+        // text — confirmed by inspection, not yet hit live only because
+        // this session's own manual tests never scrolled before
+        // selecting.
+        let scroll_offset = self.rich_content_markdown_scroll_offset(host.0, host.1);
+        let ranges = self.markdown_source_ranges.borrow();
+        let entry = ranges.get(&host)?;
+        let mut span: Option<std::ops::Range<usize>> = None;
+        for row in min_row..=max_row {
+            let laid_out_index = row as usize + scroll_offset as usize;
+            let Some(Some(row_range)) = entry.row_source_ranges.get(laid_out_index) else {
+                continue;
+            };
+            span = Some(match span.take() {
+                Some(existing) => existing.start.min(row_range.start)..existing.end.max(row_range.end),
+                None => row_range.clone(),
+            });
+        }
+        let span = span?;
+        entry.source.get(span).map(|s| s.to_string())
+    }
+
     /// Current widget-local scroll offset (in text lines) for a markdown
     /// placement — `0` if it's never been scrolled. See
     /// `rich_content_markdown_scroll_offsets`'s own doc comment for how
@@ -3049,12 +3316,24 @@ impl Terminal {
             if !bounds.contains(&position) {
                 continue;
             }
-            let line_count = self
-                .rich_content_markdown_players
-                .borrow()
-                .get(&(session_id, file_id))
-                .map(|player| player.rendered().lines().count() as u32)
-                .unwrap_or(0);
+            // `rich_content_markdown_reserved_rows` (kept current by
+            // `ensure_markdown_row_reservation`, driven by the paint
+            // path's own `real_row_count` = `laid_out.len()`) — NOT
+            // `player.rendered().lines().count()`, which counts raw
+            // `\n`-separated lines in the SOURCE markdown text, ignoring
+            // both word-wrap (a single long paragraph wraps into several
+            // on-screen rows) and any embedded/nested content spliced in
+            // (an embedded image/audio/video reserves several rows of
+            // its own, and a resolved `![alt](nested.md)` embed
+            // contributes however many real rows ITS OWN content laid
+            // out to). Using the source-line count as the scroll clamp
+            // made the widget's true bottom — including any content past
+            // whatever the FIRST screenful showed — permanently
+            // unreachable by Scroll Lock, confirmed live as a resolved
+            // nested-markdown cycle's own "⚠ circular markdown embed"
+            // warning existing in `laid_out` (confirmed via direct
+            // instrumentation) but never being scrollable into view.
+            let line_count = self.rich_content_markdown_reserved_rows.borrow().get(&(session_id, file_id)).copied().unwrap_or(0);
             return Some((session_id, file_id, line_count));
         }
         None
@@ -3516,6 +3795,19 @@ impl Terminal {
         self.rich_content_placement_bounds.borrow().get(&(session_id, file_id)).copied()
     }
 
+    /// Persists `source` and `row_source_ranges` for markdown placement
+    /// `host` — see [`Self::markdown_source_ranges`]'s own doc comment.
+    /// Called once per paint from `terminal_element.rs`'s `paint_rich_
+    /// content_markdown_widget`, for every markdown document (top-level
+    /// AND, via `resolve_nested_markdown_embeds`'s own recursive
+    /// resolution, every fully-resolved nested embed too — each gets its
+    /// own entry keyed by ITS OWN `host_id`, mirroring how `markdown_
+    /// embedded_media` is already keyed per-embed rather than only for
+    /// the root).
+    pub fn record_markdown_source_ranges(&self, host: (u32, u32), source: String, row_source_ranges: Vec<Option<std::ops::Range<usize>>>) {
+        self.markdown_source_ranges.borrow_mut().insert(host, MarkdownSourceRanges { source, row_source_ranges });
+    }
+
     /// Persists `bounds` as the audio widget's actual seek-bar
     /// rectangle — see [`Self::rich_content_seek_bar_bounds`]'s own doc
     /// comment for why this is tracked separately from the widget's
@@ -3553,6 +3845,15 @@ impl Terminal {
         } else {
             self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&key);
         }
+    }
+
+    /// Persists `bounds` as an embedded image/GIF's own real letterboxed
+    /// picture rectangle — see `markdown_embedded_image_bounds`'s own
+    /// doc comment for why this is separate from the controls-row bounds
+    /// above (a plain image has a click-anywhere-to-copy zone, no play/
+    /// pause/seek geometry).
+    pub fn record_markdown_embedded_image_bounds(&self, host: (u32, u32), dest_url: &str, bounds: Bounds<Pixels>) {
+        self.markdown_embedded_image_bounds.borrow_mut().insert((host, dest_url.to_string()), bounds);
     }
 
     /// Persists `bounds` as the widget's actual stop-icon rectangle —
@@ -3600,7 +3901,7 @@ impl Terminal {
     /// fraction's denominator under-shot every click: clicking the
     /// visual middle of the bar seeked to roughly a third of the way
     /// through, confirmed live.
-    fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>) -> bool {
+    fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) -> bool {
         log::trace!("handle_rich_content_click: position={position:?}");
         let cell_width = self.last_content.terminal_bounds.cell_width;
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
@@ -3611,6 +3912,22 @@ impl Terminal {
             let is_video = false;
             log::trace!("placement {session_id:#x}:{file_id:#x} is_audio={is_audio} is_video={is_video} bounds={bounds:?} contains_click={}", bounds.contains(&position));
             if !is_audio && !is_video {
+                // Not audio/video — a plain image or GIF click copies the
+                // decoded picture to the clipboard instead (there's no
+                // play/pause/seek geometry to test against for these, so
+                // any click anywhere inside `bounds` counts). Ordinary
+                // shell output painted OUTSIDE this placement's `bounds`
+                // still falls through to the `false` return below and
+                // gets normal PTY-forwarding/selection behavior.
+                if bounds.contains(&position)
+                    && matches!(
+                        self.rich_content_cache.content_type(session_id, file_id),
+                        Some(rich_content_transport::ContentType::Png | rich_content_transport::ContentType::Jpeg | rich_content_transport::ContentType::Gif)
+                    )
+                {
+                    self.copy_rich_content_image_to_clipboard(session_id, file_id, cx);
+                    return true;
+                }
                 continue;
             }
             if !bounds.contains(&position) {
@@ -3669,6 +3986,127 @@ impl Terminal {
         false
     }
 
+    /// How long the transient "Copied" toast stays visible over a plain
+    /// image/GIF placement's picture after a click copies it — see
+    /// `rich_content_image_copied_at`'s own doc comment. One second,
+    /// matching the "small balloon for a second" behavior this feature
+    /// was explicitly asked for, not a value derived from anything else.
+    pub const COPIED_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Encodes a top-level placement `(session_id, file_id)`'s CURRENTLY
+    /// RECEIVED raw bytes as a `gpui::Image` and copies it to the
+    /// clipboard — thin wrapper around `Self::copy_image_bytes_to_
+    /// clipboard` that looks up `content_type`/the `SrvProgressState`
+    /// from THIS placement's own top-level storage
+    /// (`rich_content_cache`/`rich_content_srv_progress`). See that
+    /// method's own doc comment for the actual encode-and-copy logic,
+    /// shared verbatim with `copy_markdown_embedded_image_to_clipboard`
+    /// so this feature automatically covers an embedded image inside a
+    /// markdown document too, not just a top-level one — the explicit
+    /// design intent behind splitting this out at all.
+    fn copy_rich_content_image_to_clipboard(&self, session_id: u32, file_id: u32, cx: &mut Context<Self>) {
+        let Some(content_type) = self.rich_content_cache.content_type(session_id, file_id) else {
+            return;
+        };
+        let Some(state) = self.rich_content_srv_progress.borrow().get(&(session_id, file_id)).cloned() else {
+            return;
+        };
+        self.copy_image_bytes_to_clipboard(content_type, &state, (session_id, file_id), cx);
+    }
+
+    /// Embedded counterpart to `copy_rich_content_image_to_clipboard` —
+    /// same encode-and-copy logic, sourced from a markdown-embedded
+    /// image's own `MarkdownEmbeddedMedia` entry (`content_type`/`state`
+    /// are already right there on the struct, no separate top-level
+    /// lookup needed) instead of a top-level placement's storage. Toast
+    /// state is still keyed by the embed's own Som-minted `(session_id,
+    /// file_id)` — the SAME `rich_content_image_copied_at` map top-level
+    /// images use, since a Som-minted id is by construction never equal
+    /// to a real top-level id, so there's no risk of collision.
+    fn copy_markdown_embedded_image_to_clipboard(&self, host: (u32, u32), dest_url: &str, cx: &mut Context<Self>) {
+        let embedded = self.markdown_embedded_media.borrow();
+        let Some(entry) = embedded.get(&(host, dest_url.to_string())) else {
+            return;
+        };
+        let Some(content_type) = entry.content_type else {
+            return;
+        };
+        let state = entry.state.clone();
+        let ids = (entry.session_id, entry.file_id);
+        drop(embedded);
+        self.copy_image_bytes_to_clipboard(content_type, &state, ids, cx);
+    }
+
+    /// Shared implementation: encodes `state`'s CURRENTLY RECEIVED raw
+    /// bytes (`SrvProgressState::bytes_received_so_far()` — the same
+    /// already-encoded PNG/JPEG/GIF bytes `rich_content_player` decodes
+    /// for painting, not re-encoded pixels) as a `gpui::Image` and writes
+    /// it to the system clipboard, then records `Instant::now()` under
+    /// `toast_key` in `rich_content_image_copied_at` so the next paint
+    /// shows the "Copied" toast for that id. A no-op (does nothing,
+    /// records nothing) if `content_type` isn't a recognized image
+    /// format or no bytes have arrived yet — both callers already
+    /// checked `content_type` before reaching here, so in practice this
+    /// only guards against a placement whose transfer hasn't started,
+    /// not a genuinely wrong content type.
+    fn copy_image_bytes_to_clipboard(
+        &self,
+        content_type: rich_content_transport::ContentType,
+        state: &rich_content_srv_channel::SrvProgressState,
+        toast_key: (u32, u32),
+        cx: &mut Context<Self>,
+    ) {
+        let format = match content_type {
+            rich_content_transport::ContentType::Png => gpui::ImageFormat::Png,
+            rich_content_transport::ContentType::Jpeg => gpui::ImageFormat::Jpeg,
+            rich_content_transport::ContentType::Gif => gpui::ImageFormat::Gif,
+            _ => return,
+        };
+        let bytes = state.bytes_received_so_far();
+        if bytes.is_empty() {
+            return;
+        }
+        let image = gpui::Image::from_bytes(format, bytes);
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        self.rich_content_image_copied_at.borrow_mut().insert(toast_key, std::time::Instant::now());
+        cx.notify();
+    }
+
+    /// `true` if placement `(session_id, file_id)`'s "Copied" toast
+    /// should still be showing — `terminal_element.rs`'s paint path
+    /// calls this every frame while ANY toast is active (driven by the
+    /// same `any_animating`-style repaint-on-demand mechanism every
+    /// other timed rich-content visual already uses) and stops asking
+    /// for another repaint once every toast has aged out. Prunes an
+    /// expired entry the moment it's observed rather than leaving it in
+    /// `rich_content_image_copied_at` forever — this is the only reader,
+    /// so there's no other place that would ever notice and clean it up.
+    pub fn rich_content_image_copied_toast_active(&self, session_id: u32, file_id: u32) -> bool {
+        let mut copied = self.rich_content_image_copied_at.borrow_mut();
+        let Some(&at) = copied.get(&(session_id, file_id)) else {
+            return false;
+        };
+        if at.elapsed() >= Self::COPIED_TOAST_DURATION {
+            copied.remove(&(session_id, file_id));
+            return false;
+        }
+        true
+    }
+
+    /// Embedded-image counterpart to `rich_content_image_copied_toast_
+    /// active` — resolves `(host, dest_url)` to the embed's own Som-
+    /// minted `(session_id, file_id)` (the same id `copy_markdown_
+    /// embedded_image_to_clipboard` recorded the toast under) and checks
+    /// the SAME `rich_content_image_copied_at` map. `false` if the embed
+    /// itself no longer exists (evicted, or never resolved to an image
+    /// at all) — there is then nothing to look a toast up FOR.
+    pub fn markdown_embedded_image_copied_toast_active(&self, host: (u32, u32), dest_url: &str) -> bool {
+        let Some(ids) = self.markdown_embedded_media.borrow().get(&(host, dest_url.to_string())).map(|entry| (entry.session_id, entry.file_id)) else {
+            return false;
+        };
+        self.rich_content_image_copied_toast_active(ids.0, ids.1)
+    }
+
     /// Embedded-media counterpart to `handle_rich_content_click` — same
     /// play/pause-zone-vs-seek-bar geometry convention (first two cells
     /// of the controls row toggle play/pause, a click past that seeks),
@@ -3685,7 +4123,26 @@ impl Terminal {
     /// anywhere past the play/pause zone still seeks to that position,
     /// which covers most of the real interaction value without the
     /// additional drag-state plumbing.
-    fn handle_markdown_embedded_media_click(&mut self, position: gpui::Point<Pixels>) -> bool {
+    fn handle_markdown_embedded_media_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        // Plain embedded image/GIF — click-anywhere-on-the-picture-to-
+        // copy, checked BEFORE the audio/video controls-bounds lookup
+        // below (an image has no controls row to compete with, so order
+        // between the two doesn't matter in practice, but checking the
+        // simpler case first keeps this readable). Mirrors `handle_rich_
+        // content_click`'s own top-level image branch — see `Terminal::
+        // copy_markdown_embedded_image_to_clipboard`'s own doc comment
+        // for why this shares its actual encode-and-copy logic with that
+        // one instead of duplicating it.
+        {
+            let image_bounds_map = self.markdown_embedded_image_bounds.borrow();
+            if let Some((key, _)) = image_bounds_map.iter().find(|(_, bounds)| bounds.contains(&position)) {
+                let (host, dest_url) = key.clone();
+                drop(image_bounds_map);
+                self.copy_markdown_embedded_image_to_clipboard(host, &dest_url, cx);
+                return true;
+            }
+        }
+
         let cell_width = self.last_content.terminal_bounds.cell_width;
         let controls_bounds_map = self.markdown_embedded_controls_bounds.borrow();
         let Some((key, controls_bounds)) = controls_bounds_map.iter().find(|(_, bounds)| bounds.contains(&position)) else {
@@ -4929,7 +5386,7 @@ impl Terminal {
         Some(scroll_lines.clamp(-3, 3))
     }
 
-    pub fn mouse_down(&mut self, e: &MouseDownEvent, _cx: &mut Context<Self>) {
+    pub fn mouse_down(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
         log::trace!(
             "mouse_down: button={:?} position={:?} window_bounds={:?}",
             e.button,
@@ -4947,10 +5404,10 @@ impl Terminal {
         // `terminal_element.rs`'s paint pass using the same `origin`), so
         // no coordinate translation is needed here, unlike the grid-point
         // math below.
-        if e.button == MouseButton::Left && self.handle_rich_content_click(e.position) {
+        if e.button == MouseButton::Left && self.handle_rich_content_click(e.position, cx) {
             return;
         }
-        if e.button == MouseButton::Left && self.handle_markdown_embedded_media_click(e.position) {
+        if e.button == MouseButton::Left && self.handle_markdown_embedded_media_click(e.position, cx) {
             return;
         }
 
@@ -7614,6 +8071,376 @@ mod tests {
                 1,
                 "an embedded audio must survive a grid scan that never contained its own (Som-minted) id, as long as its host is still present"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_embedded_markdown_survives_a_grid_scan_that_does_not_contain_its_id(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x1111_1111u32, 0x2222_2222u32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./nested.md");
+        });
+
+        terminal.update(cx, |term, _| {
+            term.evict_vanished_image_gif_markdown_placements(&std::collections::HashSet::from([host]));
+        });
+
+        terminal.update(cx, |term, _| {
+            assert_eq!(
+                term.markdown_embedded_media.borrow().len(),
+                1,
+                "an embedded markdown document must survive a grid scan that never contained its own (Som-minted) id, as long as its host is still present"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_markdown_embedded_media_states_resolves_ready_markdown_once_bytes_arrive(cx: &mut TestAppContext) {
+        // Regression guard for the dispatch this feature adds at the
+        // `ContentType::Markdown` arm: before this feature, ANY non-
+        // image/audio/video content type (including Markdown) fell
+        // through to `Failed("unsupported embedded content type")`. Once
+        // the whole nested file's bytes have arrived, the status must be
+        // `ReadyMarkdown` carrying the real text and this embed's own
+        // minted `host_id` — not `Loading` forever, not `Failed`.
+        cx.executor().allow_parking();
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["hello"]).await;
+
+        let host = (0x3333_3333u32, 0x4444_4444u32);
+        terminal.update(cx, |term, _| {
+            term.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            term.ensure_markdown_embedded_media(host, "./nested.md");
+        });
+
+        // Directly seed the embed's own SrvProgressState with a whole
+        // "file" of text and its resolved content_type — mirrors how a
+        // real FetchResource for a `.md` target would eventually look
+        // once fully received, without standing up a real somsrv
+        // connection (same reasoning `seed_whole_file_for_test` already
+        // documents for the video/audio player unit tests).
+        let nested_text = "# nested\n\nhello from the nested document";
+        terminal.update(cx, |term, _| {
+            let mut embedded = term.markdown_embedded_media.borrow_mut();
+            let entry = embedded.get_mut(&(host, "./nested.md".to_string())).expect("ensure_markdown_embedded_media must have inserted an entry");
+            entry.state.seed_whole_file_for_test(nested_text.as_bytes(), "md");
+            entry.content_type = Some(rich_content_transport::ContentType::Markdown);
+        });
+
+        let states = terminal.update(cx, |term, _| term.markdown_embedded_media_states(host));
+        assert_eq!(states.len(), 1);
+        let (dest_url, status) = &states[0];
+        assert_eq!(dest_url, "./nested.md");
+        match status {
+            EmbeddedMediaStatus::ReadyMarkdown { source, host_id } => {
+                assert_eq!(source.as_str(), nested_text, "the resolved text must be exactly the seeded nested document");
+                assert_ne!(*host_id, host, "host_id must be this EMBED's own minted id, not the same as its parent host");
+                assert_ne!(*host_id, (0, 0), "host_id must be a real minted id, not left zeroed");
+            },
+            EmbeddedMediaStatus::Loading => panic!("expected ReadyMarkdown once the whole file has arrived, got Loading"),
+            EmbeddedMediaStatus::Failed(reason) => panic!("expected ReadyMarkdown once the whole file has arrived, got Failed({reason})"),
+            _ => panic!("expected ReadyMarkdown once the whole file has arrived, got a different Ready* variant"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_copy_over_a_markdown_placement_returns_the_real_source_not_rendered_prose(cx: &mut TestAppContext) {
+        // A selection spanning grid rows 0..=1 of a markdown placement
+        // must copy the ORIGINAL markdown source for those two rows
+        // (`# Heading` and `**bold** prose`, tags included) rather than
+        // whatever alacritty's own `selection_to_string()` would read
+        // back from the placeholder-encoded grid cells (diacritics —
+        // meaningless as text). Writes the exact placeholder grid text a
+        // real `somsrp` client would print (mirrors `test_clear_command_
+        // hides_placeholder_grid_cells`'s own no-real-PTY-process
+        // pattern), seeds `markdown_source_ranges` the way `terminal_
+        // element.rs`'s real paint pass would via `record_markdown_
+        // source_ranges`, then builds a `Selection` covering both rows
+        // exactly like a real mouse drag would. `InternalEvent::Copy` is
+        // only drained inside `sync()`, which needs a real `Window` —
+        // same reasoning `test_resize_shrinks_placeholder_grid_to_match_
+        // new_cell_size` already documents for using `cx.add_empty_
+        // window()` instead of the display-only builder most other
+        // tests in this file use. `init_test` itself is Unix-only (most
+        // tests don't need settings/theme globals) — `copy`'s clipboard
+        // write does (`TerminalSettings::get_global` for `keep_
+        // selection_on_copy`), so this registers them inline instead,
+        // matching `test_yazi_...`'s own identical Windows-safe pattern.
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+
+        let session_id = 0x010203u32;
+        let file_id = 0x040506u32;
+        let mut placeholder_text = String::new();
+        placeholder_text.push_str("\x1b[38;2;1;2;3m\x1b[58;2;4;5;6m");
+        for row in 0..2u32 {
+            for column in 0..4u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    placeholder_text.extend(cell);
+                }
+            }
+            if row == 0 {
+                placeholder_text.push_str("\r\n");
+            }
+        }
+        placeholder_text.push_str("\x1b[0m\r\n");
+        window.update_window_entity(&terminal, |terminal, _window, cx| terminal.write_output(placeholder_text.as_bytes(), cx));
+
+        let source = "# Heading\n\n**bold** prose";
+        // Row 0 is `# Heading` (byte range 0..9), row 1 is `**bold**
+        // prose` (byte range 11..25) — matches how `markdown_styling`'s
+        // own `finish_line` would have laid this out (a blank block-
+        // separator row between them gets `None`, but this test only
+        // needs rows 0 and 1, which are the ones under selection).
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            terminal.record_markdown_source_ranges((session_id, file_id), source.to_string(), vec![Some(0..9), Some(11..25)]);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let start = AlacPoint::new(Line(0), Column(0));
+            let end = AlacPoint::new(Line(1), Column(3));
+            terminal.set_selection(Some((make_selection(&(start..=end)), end)));
+        });
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.copy(None);
+            terminal.sync(window, cx);
+        });
+
+        let clipboard_text = window.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clipboard_text.as_deref(),
+            Some("# Heading\n\n**bold** prose"),
+            "expected the real markdown source (both rows' ranges unioned, tags included) instead of rendered/placeholder text"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_copy_outside_any_markdown_placement_falls_back_to_plain_selection_text(cx: &mut TestAppContext) {
+        // Guards the fallback path: ordinary shell output has no
+        // placeholder cells to decode at all, so `markdown_source_text_
+        // for_selection` must return `None` and `copy` must fall through
+        // to `term.selection_to_string()` exactly as it did before this
+        // feature existed — this is a strict enhancement, not a
+        // replacement, for the common case.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+        window.update_window_entity(&terminal, |terminal, _window, cx| terminal.write_output(b"hello", cx));
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let start = AlacPoint::new(Line(0), Column(0));
+            let end = AlacPoint::new(Line(0), Column(4));
+            terminal.set_selection(Some((make_selection(&(start..=end)), end)));
+        });
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.copy(None);
+            terminal.sync(window, cx);
+        });
+
+        let clipboard_text = window.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(clipboard_text.as_deref(), Some("hello"), "plain terminal output must still copy as ordinary rendered text");
+    }
+
+    #[gpui::test]
+    async fn test_clicking_an_image_placement_copies_its_raw_bytes_to_the_clipboard(cx: &mut TestAppContext) {
+        // A click on a plain PNG/GIF/JPEG placement (not audio/video, no
+        // play/pause/seek geometry to test against) must copy the
+        // ALREADY-ENCODED bytes `somsrv` sent — not re-encoded decoded
+        // pixels — as a `gpui::Image` to the clipboard, and record the
+        // "Copied" toast's start time. Seeds `rich_content_srv_progress`
+        // and `rich_content_cache` directly (mirrors this file's other
+        // rich-content tests' own no-real-somsrv-connection pattern)
+        // rather than going through `handle_rich_content_click`'s own
+        // bounds hit-test (that's `terminal_element.rs`'s paint-time
+        // concern) — this test exercises `copy_rich_content_image_to_
+        // clipboard` directly, the same unit `handle_rich_content_click`
+        // calls once it decides a click landed on an image.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+
+        let session_id = 0xaaaau32;
+        let file_id = 0xbbbbu32;
+        // A minimal valid 1x1 PNG — real bytes a decoder could actually
+        // open, not an arbitrary placeholder buffer, so this test's own
+        // "encoded bytes, unmodified" claim is meaningful.
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
+            0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            terminal.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Png,
+                session_id,
+                file_id,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Image { width_px: 1, height_px: 1, color_bits: 32, is_animated: false },
+            );
+            let state = std::sync::Arc::new(rich_content_srv_channel::SrvProgressState::default());
+            state.seed_whole_file_for_test(png_bytes, "png");
+            terminal.rich_content_srv_progress.borrow_mut().insert((session_id, file_id), state);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            assert!(!terminal.rich_content_image_copied_toast_active(session_id, file_id), "toast must not be active before any click");
+            terminal.copy_rich_content_image_to_clipboard(session_id, file_id, cx);
+        });
+
+        let clipboard_item = window.read_from_clipboard().expect("expected something to have been written to the clipboard");
+        let image = clipboard_item
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+            .expect("expected an image entry on the clipboard");
+        assert_eq!(image.format, gpui::ImageFormat::Png, "content_type Png must map to ImageFormat::Png");
+        assert_eq!(image.bytes, png_bytes, "the clipboard must hold the exact already-encoded bytes, not re-encoded pixels");
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            assert!(terminal.rich_content_image_copied_toast_active(session_id, file_id), "toast must be active immediately after the click");
+
+            // Backdate the recorded instant past `COPIED_TOAST_DURATION`
+            // instead of a real `sleep` — exercises the exact same
+            // `Instant::elapsed()` comparison `rich_content_image_
+            // copied_toast_active` does at real paint time, without
+            // making this test itself take a full second to run.
+            let backdated = std::time::Instant::now() - Terminal::COPIED_TOAST_DURATION - std::time::Duration::from_millis(1);
+            terminal.rich_content_image_copied_at.borrow_mut().insert((session_id, file_id), backdated);
+            assert!(
+                !terminal.rich_content_image_copied_toast_active(session_id, file_id),
+                "toast must stop being active once COPIED_TOAST_DURATION has elapsed"
+            );
+            assert!(
+                !terminal.rich_content_image_copied_at.borrow().contains_key(&(session_id, file_id)),
+                "an expired toast entry must be pruned the moment it's observed, not left lingering"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_clicking_an_embedded_markdown_image_copies_its_raw_bytes_to_the_clipboard(cx: &mut TestAppContext) {
+        // Embedded counterpart to `test_clicking_an_image_placement_
+        // copies_its_raw_bytes_to_the_clipboard` — proves the SAME
+        // feature (click a picture, copy its raw encoded bytes, show a
+        // "Copied" toast) also works for an image embedded inside a
+        // markdown document via `![alt](pic.png)`, not just a top-level
+        // `somsrp image.png` placement. Exercises `copy_markdown_
+        // embedded_image_to_clipboard` and `markdown_embedded_image_
+        // copied_toast_active` directly — the same units `terminal_
+        // element.rs`'s embedded-image paint branch and `handle_
+        // markdown_embedded_media_click` call, respectively.
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+
+        let host = (0xccccu32, 0xddddu32);
+        let dest_url = "./picture.png";
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63,
+            0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            terminal.rich_content_cache.record_progress(
+                rich_content_transport::ContentType::Markdown,
+                host.0,
+                host.1,
+                0,
+                0,
+                rich_content_transport::ContentMetadata::Markdown { base_dir: String::new() },
+            );
+            terminal.ensure_markdown_embedded_media(host, dest_url);
+            let mut embedded = terminal.markdown_embedded_media.borrow_mut();
+            let entry = embedded.get_mut(&(host, dest_url.to_string())).expect("ensure_markdown_embedded_media must have inserted an entry");
+            entry.state.seed_whole_file_for_test(png_bytes, "png");
+            entry.content_type = Some(rich_content_transport::ContentType::Png);
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            assert!(!terminal.markdown_embedded_image_copied_toast_active(host, dest_url), "toast must not be active before any click");
+        });
+
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            terminal.copy_markdown_embedded_image_to_clipboard(host, dest_url, cx);
+        });
+
+        let clipboard_item = window.read_from_clipboard().expect("expected something to have been written to the clipboard");
+        let image = clipboard_item
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+            .expect("expected an image entry on the clipboard");
+        assert_eq!(image.format, gpui::ImageFormat::Png);
+        assert_eq!(image.bytes, png_bytes, "the clipboard must hold the exact already-encoded bytes, not re-encoded pixels");
+
+        window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            assert!(terminal.markdown_embedded_image_copied_toast_active(host, dest_url), "toast must be active immediately after the click");
         });
     }
 

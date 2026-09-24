@@ -5480,7 +5480,7 @@ impl Terminal {
                 }
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 MouseButton::Middle => {
-                    if let Some(item) = _cx.read_from_primary() {
+                    if let Some(item) = cx.read_from_primary() {
                         let text = item.text().unwrap_or_default();
                         self.paste(&text);
                     }

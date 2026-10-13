@@ -196,6 +196,15 @@ fn main() {
         START_MINIMIZED.store(true, Ordering::Relaxed);
     }
 
+    if let Some(name) = args.admin_profile.clone() {
+        workspace::som_admin::set_admin_profile(name);
+    }
+    if let Some(dir) = args.admin_config_dir.clone() {
+        if let Err(rejected) = paths::set_config_dir_override(dir) {
+            eprintln!("--admin-config-dir ignored: config dir already initialized (wanted {rejected:?})");
+        }
+    }
+
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
     unsafe {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
@@ -441,6 +450,7 @@ fn main() {
                     lua: t.lua,
                     os: workspace::RemoteOs::parse(&t.os),
                     default: t.default,
+                    admin: t.admin,
                 }
             })
             .collect();
@@ -751,6 +761,20 @@ struct Args {
     /// Start Som minimized to the taskbar
     #[arg(long)]
     minimized: bool,
+
+    /// Internal: this process is an admin-launched window for the named
+    /// tab profile (see `workspace::som_admin`). Opens exactly that one
+    /// tab instead of restoring the saved session, and never writes
+    /// `db.json`. Passed automatically when a profile with `"admin":
+    /// true` is opened from a non-elevated Som.
+    #[arg(long, value_name = "PROFILE", hide = true)]
+    admin_profile: Option<String>,
+    /// The invoking user's config directory, passed alongside
+    /// `--admin-profile` on macOS/Linux, where the elevated process runs
+    /// with root's `HOME` and would otherwise look for `settings.json` in
+    /// root's own (empty) config dir.
+    #[arg(long, value_name = "DIR", hide = true)]
+    admin_config_dir: Option<std::path::PathBuf>,
 }
 
 fn parse_url_arg(arg: &str, _cx: &App) -> String {

@@ -37,6 +37,13 @@
       "icon": "",
       "shell": "$SHELL",
       "home": "~"
+    },
+    {
+      "name": "admin",
+      "icon": "",
+      "shell": "powershell.exe",
+      "home": "~",
+      "admin": true
     }
   ],
   "keys": {

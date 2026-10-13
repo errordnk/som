@@ -60,6 +60,19 @@ impl TerminalPanel {
         let tab_name = action.tab_name.clone().or(default_tab_name);
 
         let profile = tab_name.as_deref().and_then(|name| workspace::TabProfiles::find_by_name(name, cx));
+        // An `admin` profile can't be a child of this process's PTY — it
+        // opens as its own elevated Som window instead (see `elevate`).
+        // Only meaningful for LOCAL shells: elevating Som does nothing for
+        // what an ssh/wsl session is allowed to do remotely.
+        if let Some(profile) = profile.as_ref()
+            && profile.admin
+            && classify_remote(&project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or("")).0)
+                == RemoteKind::Local
+            && crate::elevate::needs_elevated_window(true)
+        {
+            Self::open_admin_window(workspace, &profile.name.clone(), cx);
+            return;
+        }
         let (profile_shell, tab_icon) = tab_name.as_deref()
             .map(|name| TabProfiles::profile_by_name(name, cx))
             .unwrap_or((None, None));
@@ -222,6 +235,40 @@ impl TerminalPanel {
     /// doc comment) — opens no tab at all rather than silently falling back
     /// to the default profile, which would be confusing (pressing "9" and
     /// getting profile 1 with no indication why).
+    /// Launches the elevated Som window for an `admin` profile. A declined
+    /// UAC prompt is the user's own choice, so it's only logged; a real
+    /// launch failure is surfaced as a toast.
+    fn open_admin_window(workspace: &mut Workspace, profile_name: &str, cx: &mut Context<Workspace>) {
+        use crate::elevate::{ElevatedLaunch, launch_elevated_window};
+        use workspace::notifications::{
+            NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
+        };
+        let err = match launch_elevated_window(profile_name) {
+            Ok(ElevatedLaunch::Started) => return,
+            Ok(ElevatedLaunch::Cancelled) => {
+                log::info!("UAC prompt declined for admin profile {profile_name:?}");
+                return;
+            }
+            Err(err) => err,
+        };
+        log::error!("failed to open admin window for profile {profile_name:?}: {err:#}");
+        let msg = format!("Som: could not open {profile_name:?} as administrator: {err:#}");
+        let id = NotificationId::Named(format!("som-admin-window-{profile_name}").into());
+        workspace.show_scoped_notification(id, NotificationScope::Global, NotificationSeverity::Error, cx, move |cx| {
+            let msg2 = msg.clone();
+            let msg3 = msg.clone();
+            cx.new(|cx| {
+                MessageNotification::new(msg2, cx)
+                    .severity(NotificationSeverity::Error)
+                    .primary_message("Copy")
+                    .primary_on_click(move |_window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(msg3.clone()));
+                    })
+                    .show_suppress_button(false)
+            })
+        });
+    }
+
     fn show_missing_profile_error(workspace: &mut Workspace, idx: usize, cx: &mut Context<Workspace>) {
         use workspace::notifications::{
             NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
@@ -558,6 +605,23 @@ impl TerminalPanel {
         cx: &mut App,
     ) -> Task<()> {
         let window_handle = window.window_handle();
+        // Admin window (see `workspace::som_admin`): open exactly the one
+        // requested profile instead of restoring `db.json`'s session.
+        if let Some(name) = workspace::som_admin::admin_profile() {
+            let action = workspace::NewTerminal {
+                tab_name: Some(name.to_owned()),
+                ..Default::default()
+            };
+            return cx.spawn(async move |cx| {
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            Self::new_terminal(workspace, &action, window, cx)
+                        })
+                    })
+                    .log_err();
+            });
+        }
         // Drives the titlebar's drag-zone spinner (see `workspace::
         // SomRestoreActivity`'s doc comment) — `begin` here, `end` right
         // before this whole task resolves, so the spinner covers this
@@ -1177,7 +1241,7 @@ fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
 /// stdin/stdout tunnel bytes to/from wherever the shell actually runs), so
 /// wrapping the local `ssh`/`wsl` invocation would be wrapping the wrong
 /// end entirely.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteKind {
     Local,
     Ssh,

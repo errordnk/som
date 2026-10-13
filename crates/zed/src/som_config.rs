@@ -201,6 +201,14 @@ pub struct TabProfile {
     /// settings.json as invalid if more than one does. If none do,
     /// `tabs[0]` remains the default (see `TabProfiles::default_index`).
     pub default: bool,
+    /// Windows only: open this profile in a NEW Som window running with
+    /// administrator rights (a UAC prompt appears), instead of as a tab in
+    /// the current window. An elevated process can't be a child of this
+    /// non-elevated window's ConPTY, so it has to be its own window; that
+    /// window has just this one tab and doesn't touch `db.json`. If Som is
+    /// already running elevated this has no effect — the tab simply opens
+    /// in place. Ignored on macOS/Linux.
+    pub admin: bool,
 }
 
 impl SomConfig {

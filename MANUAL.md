@@ -120,6 +120,7 @@ An ordered array of tab profiles. The bare `NewTab` action (`Ctrl+Shift+=`/`Cmd+
 | `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. |
 | `home` | string | none | Working directory; `~` is expanded. Must resolve to an existing directory or is ignored. |
 | `tmux` | bool | `false` | Opt-in to the `somsrv` backend for this profile — keeps the session alive across Som restarts. See [somsrv](#somsrv-keeping-remote-sessions-alive). |
+| `admin` | bool | `false` | Local shells only (ignored for `ssh`/`wsl` profiles): open this profile in a new Som window running as administrator/root — UAC on Windows, an admin-password dialog via `osascript` on macOS, `pkexec` (polkit) on Linux. Declining the prompt opens nothing. The elevated window holds just this one tab, reads your normal `settings.json`, and does not save or restore the session. |
 | `default` | bool | `false` | Marks this profile as the one the `+` button/bare `NewTab` action opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
 
 ### `keys`

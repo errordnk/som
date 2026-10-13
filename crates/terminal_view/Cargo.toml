@@ -28,6 +28,7 @@ itertools.workspace = true
 log.workspace = true
 markdown.workspace = true
 menu.workspace = true
+paths.workspace = true
 project.workspace = true
 pulldown-cmark.workspace = true
 regex.workspace = true
@@ -50,6 +51,9 @@ zed_actions.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

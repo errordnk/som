@@ -120,6 +120,15 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
     })
 }
 
+/// Pins `config_dir()` to `dir`, independent of `HOME`/XDG. Used by the
+/// admin window (a root-owned Som process with its own `HOME`, so that
+/// state/logs/cache land under root's home instead of the invoking user's)
+/// to still read the invoking user's `settings.json`. Must be called before
+/// the first `config_dir()` call; returns the rejected path otherwise.
+pub fn set_config_dir_override(dir: PathBuf) -> Result<(), PathBuf> {
+    CONFIG_DIR.set(dir)
+}
+
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {

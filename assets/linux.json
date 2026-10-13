@@ -33,6 +33,13 @@
       "icon": "",
       "shell": "$SHELL",
       "home": "~"
+    },
+    {
+      "name": "root",
+      "icon": "",
+      "shell": "$SHELL",
+      "home": "~",
+      "admin": true
     }
   ],
   "keys": {

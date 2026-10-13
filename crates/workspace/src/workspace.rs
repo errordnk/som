@@ -10,6 +10,7 @@ pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
 pub mod serialized_state;
+pub mod som_admin;
 pub mod som_db;
 pub mod searchable;
 pub mod security_modal;
@@ -456,6 +457,9 @@ pub struct TabProfile {
     /// See `som_config::TabProfile::default` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub default: bool,
+    /// See `som_config::TabProfile::admin` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub admin: bool,
 }
 
 /// The three remote platforms Som ships a pre-built `somsrv` for (see
@@ -5914,6 +5918,12 @@ impl Workspace {
     /// Called from the same trigger points `som_persist_tab_state` is (tab
     /// focus, split creation/removal, tab close/switch).
     fn som_persist_db_json(&mut self, cx: &mut Context<Self>) {
+        // An admin-launched child window (see `som_admin`) holds a single
+        // ad-hoc tab, not the user's saved session — writing it out would
+        // replace the main window's real tab layout with that one tab.
+        if som_admin::is_admin_session() {
+            return;
+        }
         let Some(main_pane) = self.panes.first().cloned() else {
             return;
         };
@@ -6252,6 +6262,11 @@ impl Workspace {
     /// user's last windowed size with a maximized-sized rect the moment
     /// they maximize).
     fn save_window_bounds(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+        // An admin window shares `db.json` with the main window and must
+        // not overwrite its remembered geometry (see `som_admin`).
+        if som_admin::is_admin_session() {
+            return Task::ready(());
+        }
         let gpui::WindowBounds::Windowed(bounds) = window.inner_window_bounds() else {
             return Task::ready(());
         };

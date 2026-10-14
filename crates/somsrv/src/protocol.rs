@@ -572,7 +572,18 @@ pub enum SrvRequest {
     /// `target` is what is being played (a path or URL); `somsrv` uses it
     /// to tell whether a station lookup is about to deliver the track's
     /// real tags and cover (`NowPlayingInfo::cover_lookup_pending`).
-    AnnounceTrack { session_id: u32, file_id: u32, title: Option<String>, index: u32, len: u32, target: String },
+    ///
+    /// `tags` are the tags read from a local audio file, if it has any:
+    /// `somsrv` shows them and looks the cover up by artist and album.
+    AnnounceTrack {
+        session_id: u32,
+        file_id: u32,
+        title: Option<String>,
+        index: u32,
+        len: u32,
+        target: String,
+        tags: Option<TrackTags>,
+    },
     /// Sent by Som on a fresh, one-shot connection when the user presses
     /// previous (`delta: -1`) or next (`delta: 1`) on a playlist
     /// placement. Routed like `EndPlayback` to the key's registered
@@ -788,6 +799,15 @@ pub enum SrvResponse {
     /// `title` is the entry's name from the playlist (`#EXTINF`), e.g. the
     /// station - what stays on screen between a stream's songs.
     Playlist { session_id: u32, file_id: u32, index: u32, len: u32, title: Option<String> },
+}
+
+/// Tags read from a local audio file (title / artist / album / year).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackTags {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub year: Option<u32>,
 }
 
 /// What an internet-radio stream is playing right now, as learned by

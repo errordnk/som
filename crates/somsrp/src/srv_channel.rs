@@ -179,8 +179,9 @@ impl SrvChannel {
         index: u32,
         len: u32,
         target: String,
+        tags: Option<somsrv::protocol::TrackTags>,
     ) -> Result<(), String> {
-        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target })
+        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags })
     }
 }
 

@@ -442,6 +442,8 @@ mod tests {
         assert_eq!(chan("http://stream.radioparadise.com/rock-192?x=1"), Some(2));
         assert_eq!(chan("https://stream.radioparadise.com/beyond-flac"), Some(4));
         assert_eq!(chan("https://stream.radioparadise.com/flac"), Some(0));
+        assert_eq!(chan("https://stream.radioparadise.com/flacm"), Some(0));
+        assert_eq!(chan("https://stream.radioparadise.com/world-etc-flacm"), Some(3));
         assert_eq!(station_for_url("https://example.com/world-etc-flac"), None);
         assert_eq!(station_for_url("not a url"), None);
     }

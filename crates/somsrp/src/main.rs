@@ -187,6 +187,62 @@ fn static_image_metadata(bytes: &[u8]) -> Result<(u32, u32, bool), String> {
 /// at all (see `SRP_PROTOCOL.md`'s progressive-audio section). `0` if
 /// the format reader couldn't determine it, same "unknown" convention
 /// the rest of this protocol's metadata fields use.
+/// Reads the title / artist / album / year tags of a local audio file
+/// (ID3, Vorbis comments, ...), or `None` if there are none to speak of.
+/// A missing title falls back to the file's name.
+fn read_audio_tags(path: &str) -> Option<somsrv::protocol::TrackTags> {
+    use symphonia::core::meta::{MetadataRevision, StandardTagKey};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut probed =
+        symphonia::default::get_probe().format(&hint, mss, &Default::default(), &Default::default()).ok()?;
+
+    let mut tags = somsrv::protocol::TrackTags::default();
+    let mut album_artist = String::new();
+    let mut absorb = |revision: &MetadataRevision| {
+        for tag in revision.tags() {
+            let value = tag.value.to_string();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match tag.std_key {
+                Some(StandardTagKey::TrackTitle) if tags.title.is_empty() => tags.title = value.to_string(),
+                Some(StandardTagKey::Artist) if tags.artist.is_empty() => tags.artist = value.to_string(),
+                Some(StandardTagKey::AlbumArtist) if album_artist.is_empty() => album_artist = value.to_string(),
+                Some(StandardTagKey::Album) if tags.album.is_empty() => tags.album = value.to_string(),
+                Some(StandardTagKey::Date | StandardTagKey::OriginalDate | StandardTagKey::ReleaseDate)
+                    if tags.year.is_none() =>
+                {
+                    tags.year = value.get(..4).and_then(|year| year.parse().ok());
+                },
+                _ => {},
+            }
+        }
+    };
+    if let Some(metadata) = probed.metadata.get()
+        && let Some(revision) = metadata.current()
+    {
+        absorb(revision);
+    }
+    absorb(probed.format.metadata().current()?);
+
+    if tags.artist.is_empty() {
+        tags.artist = album_artist;
+    }
+    if tags.title.is_empty() {
+        tags.title = std::path::Path::new(path).file_stem()?.to_string_lossy().into_owned();
+    }
+    Some(tags)
+}
+
 fn audio_metadata(path: &str) -> Result<(u32, u8, u8, u32), String> {
     use symphonia::core::codecs::CODEC_TYPE_NULL;
     use symphonia::core::io::MediaSourceStream;
@@ -772,7 +828,7 @@ struct PlaylistEntry {
 /// Announces `position` for `ids` to Som (via `somsrv`). Failure only
 /// costs the previous/next controls and title, so it is reported, not
 /// fatal.
-fn announce_track(ids: SrpIds, position: &PlaylistPosition) {
+fn announce_track(ids: SrpIds, position: &PlaylistPosition, tags: Option<somsrv::protocol::TrackTags>) {
     let (session_id, file_id) = ids;
     let result = srv_channel::SrvChannel::connect().and_then(|channel| {
         channel.announce_track(
@@ -782,6 +838,7 @@ fn announce_track(ids: SrpIds, position: &PlaylistPosition) {
             position.index as u32,
             position.len as u32,
             position.target.clone(),
+            tags,
         )
     });
     if let Err(err) = result {
@@ -1389,7 +1446,7 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
     }
 
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    announce_track(ids, playlist);
+    announce_track(ids, playlist, None);
     channel.request_fetch_resource(session_id, file_id, url.to_string())?;
     {
         let channel = channel.clone();
@@ -1573,7 +1630,7 @@ fn stream_file_impl(
         clear_screen_and_home_cursor();
         print_audio_placeholder_grid(session_id, file_id)?;
         if let Some(position) = playlist {
-            announce_track(ids, position);
+            announce_track(ids, position, read_audio_tags(path));
         }
 
         // Streams off disk in bounded chunks rather than reading the
@@ -1932,6 +1989,27 @@ mod tests {
         let absolute = if cfg!(windows) { "C:\\music\\a.mp3" } else { "/music/a.mp3" };
         let entries = parse_m3u(&format!("{absolute}\n"), Some(std::path::Path::new("/elsewhere")));
         assert_eq!(entries, vec![PlaylistEntry { target: absolute.to_string(), title: None }]);
+    }
+
+    #[test]
+    fn tags_are_read_from_the_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tagged-tone.flac");
+        let tags = read_audio_tags(path.to_str().unwrap()).expect("the fixture has tags");
+
+        assert_eq!(tags.title, "Test Title");
+        assert_eq!(tags.artist, "Test Artist");
+        assert_eq!(tags.album, "Test Album");
+        assert_eq!(tags.year, Some(2011));
+    }
+
+    #[test]
+    fn a_file_without_tags_is_titled_by_its_name() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac");
+        let tags = read_audio_tags(path.to_str().unwrap()).expect("a decodable file");
+
+        assert_eq!(tags.title, "tone");
+        assert!(tags.album.is_empty());
+        assert_eq!(tags.year, None);
     }
 
     #[test]

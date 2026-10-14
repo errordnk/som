@@ -3485,17 +3485,20 @@ impl Terminal {
         // when the audio does. Otherwise (no length, no player yet) the
         // station's own clock is the best there is.
         let (info, duration, elapsed, track_ended) = match (now, clock) {
-            (Some((reported, age)), Some((playhead, decoded, rate))) if reported.duration_ms > 0 => {
+            (Some((reported, age)), Some((playhead, decoded, rate))) => {
                 let generation = state.now_playing_generation();
                 let mut timelines = self.audio_timelines.borrow_mut();
                 let timeline = timelines.entry(key).or_default();
                 timeline.observe(generation, &reported, age, decoded, rate);
                 match timeline.current(playhead, rate) {
-                    Some((heard, remaining)) => {
+                    Some((heard, Some(remaining))) => {
                         let duration = std::time::Duration::from_millis(heard.duration_ms as u64);
                         let remaining = remaining.min(duration);
                         (Some(heard), duration, duration - remaining, false)
                     },
+                    // No length known (a station's in-stream title, a
+                    // local file): the player's own clock is used.
+                    Some((heard, None)) => (Some(heard), std::time::Duration::ZERO, std::time::Duration::ZERO, false),
                     // Past every track reported so far: the next one is
                     // not known yet - nothing of the finished one stays.
                     None => (None, std::time::Duration::ZERO, std::time::Duration::ZERO, true),

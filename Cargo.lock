@@ -7259,7 +7259,7 @@ dependencies = [
 
 [[package]]
 name = "som"
-version = "0.8.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -7322,7 +7322,7 @@ dependencies = [
 
 [[package]]
 name = "somsrp"
-version = "0.8.0"
+version = "0.7.0"
 dependencies = [
  "ffmpeg-next",
  "image",
@@ -7336,7 +7336,7 @@ dependencies = [
 
 [[package]]
 name = "somsrv"
-version = "0.8.0"
+version = "0.7.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

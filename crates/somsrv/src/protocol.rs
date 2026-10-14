@@ -566,6 +566,9 @@ pub enum SrvRequest {
     /// key's subscribers, so Som can show previous/next controls for a
     /// list of more than one entry.
     ///
+    /// `len == 0` means the track is not part of a playlist at all (a lone
+    /// file or URL): it only carries a title, no previous/next controls.
+    ///
     /// `target` is what is being played (a path or URL); `somsrv` uses it
     /// to tell whether a station lookup is about to deliver the track's
     /// real tags and cover (`NowPlayingInfo::cover_lookup_pending`).

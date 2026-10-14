@@ -1324,7 +1324,7 @@ fn single_audio_entry(target: &str) -> Option<PlaylistEntry> {
 /// `print_placeholder_grid_with_cell_dims`'s own doc comment), so there's
 /// nothing about the grid's size that would need to differ once the real
 /// type is known anyway.
-fn stream_url(url: &str, playlist: Option<&PlaylistPosition>) -> Result<(), String> {
+fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1379,9 +1379,7 @@ fn stream_url(url: &str, playlist: Option<&PlaylistPosition>) -> Result<(), Stri
     }
 
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    if let Some(position) = playlist {
-        announce_track(ids, position);
-    }
+    announce_track(ids, playlist);
     channel.request_fetch_resource(session_id, file_id, url.to_string())?;
     {
         let channel = channel.clone();
@@ -1494,13 +1492,11 @@ fn run_playlist(entries: Vec<PlaylistEntry>) -> Result<(), String> {
         }
         PLAYLIST_STEP.store(0, std::sync::atomic::Ordering::Release);
         let entry = &entries[index];
-        // Som shows previous/next only when there is more than one entry.
-        let position =
-            Some(PlaylistPosition { index, len, title: entry.title.clone(), target: entry.target.clone() });
+        let position = PlaylistPosition { index, len, title: entry.title.clone(), target: entry.target.clone() };
         let result = if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
-            stream_url(&entry.target, position.as_ref())
+            stream_url(&entry.target, &position)
         } else {
-            stream_file_impl(&entry.target, None, None, position.as_ref())
+            stream_file_impl(&entry.target, None, None, Some(&position))
         };
         let step = PLAYLIST_STEP.swap(0, std::sync::atomic::Ordering::AcqRel);
         match result {

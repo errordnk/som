@@ -295,6 +295,140 @@ pub fn announce_file_tags(cache: SrvCache, session_id: u32, file_id: u32, tags: 
 }
 
 // ---------------------------------------------------------------------
+// Any station: the title in the stream itself (ICY)
+// ---------------------------------------------------------------------
+
+/// `("Artist", "Title")` from the `Artist - Title` convention radio uses
+/// for a stream title; with no ` - ` the whole text is the title.
+pub fn split_stream_title(raw: &str) -> (String, String) {
+    match raw.split_once(" - ") {
+        Some((artist, title)) => (artist.trim().to_string(), title.trim().to_string()),
+        None => (String::new(), raw.trim().to_string()),
+    }
+}
+
+fn stream_info(
+    session_id: u32,
+    file_id: u32,
+    artist: &str,
+    title: &str,
+    album: &str,
+    cover_url: Option<String>,
+    pending: bool,
+) -> NowPlayingInfo {
+    NowPlayingInfo {
+        session_id,
+        file_id,
+        artist: artist.to_string(),
+        title: title.to_string(),
+        album: album.to_string(),
+        year: None,
+        duration_ms: 0,
+        remaining_ms: 0,
+        cover_url,
+        cover_lookup_pending: pending,
+    }
+}
+
+/// The finished answer for a streamed track: its artist and title and,
+/// when a catalogue knows the track, the album and cover.
+fn resolve_stream_info(http: &dyn HttpGet, session_id: u32, file_id: u32, artist: &str, title: &str) -> NowPlayingInfo {
+    match find_track_cover(http, artist, title) {
+        Some((album, cover)) => stream_info(session_id, file_id, artist, title, &album, Some(cover), false),
+        None => stream_info(session_id, file_id, artist, title, "", None, false),
+    }
+}
+
+/// The newest stream title announced per placement, so a slow lookup of an
+/// older title never overwrites the answer for a newer one.
+static LATEST_STREAM_TITLE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), String>>> =
+    std::sync::OnceLock::new();
+
+/// Shows a station's new stream title at once and fills the album and
+/// cover in when the lookup answers.
+pub fn announce_stream_title(cache: &SrvCache, session_id: u32, file_id: u32, raw: &str) {
+    let latest = LATEST_STREAM_TITLE.get_or_init(Default::default);
+    latest.lock().unwrap_or_else(|p| p.into_inner()).insert((session_id, file_id), raw.to_string());
+
+    let (artist, title) = split_stream_title(raw);
+    log::info!("stream title for {session_id:08x}/{file_id:08x}: {artist:?} - {title:?}");
+    cache.set_now_playing(stream_info(session_id, file_id, &artist, &title, "", None, !artist.is_empty()));
+    if artist.is_empty() {
+        return;
+    }
+    let cache = cache.clone();
+    let raw = raw.to_string();
+    std::thread::spawn(move || {
+        let info = resolve_stream_info(&UreqHttp::new(), session_id, file_id, &artist, &title);
+        let still_current = LATEST_STREAM_TITLE
+            .get()
+            .and_then(|latest| latest.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).cloned())
+            .is_some_and(|newest| newest == raw);
+        if still_current {
+            cache.set_now_playing(info);
+        }
+    });
+}
+
+/// Looks a track up by artist and title - Deezer first, iTunes second -
+/// returning `(album, cover)`. A stream title carries no album, so the
+/// catalogue's own track entry supplies it.
+fn find_track_cover(http: &dyn HttpGet, artist: &str, title: &str) -> Option<(String, String)> {
+    if artist.trim().is_empty() || title.trim().is_empty() {
+        return None;
+    }
+    deezer_track(http, artist, title).or_else(|| itunes_track(http, artist, title))
+}
+
+fn deezer_track(http: &dyn HttpGet, artist: &str, title: &str) -> Option<(String, String)> {
+    let query = format!("artist:\"{}\" track:\"{}\"", artist.replace('"', ""), title.replace('"', ""));
+    let url = format!("https://api.deezer.com/search?q={}&limit=5", encode_component(&query));
+    let body = http.get_text(&url).ok()?;
+    deezer_track_from_search(&body, artist, title)
+}
+
+fn deezer_track_from_search(body: &str, artist: &str, title: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    for hit in value.get("data")?.as_array()? {
+        let hit_title = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let hit_artist = hit.get("artist").and_then(|a| a.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+        if !names_match(hit_title, title) || !names_match(hit_artist, artist) {
+            continue;
+        }
+        let album = hit.get("album")?;
+        let cover = album.get("cover_xl").and_then(|v| v.as_str())?;
+        let album_title = album.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        return Some((album_title, cover.replace("1000x1000", &format!("{COVER_PIXELS}x{COVER_PIXELS}"))));
+    }
+    None
+}
+
+fn itunes_track(http: &dyn HttpGet, artist: &str, title: &str) -> Option<(String, String)> {
+    let term = format!("{artist} {title}");
+    let url = format!(
+        "https://itunes.apple.com/search?term={}&media=music&entity=song&limit=5",
+        encode_component(&term)
+    );
+    let body = http.get_text(&url).ok()?;
+    itunes_track_from_search(&body, artist, title)
+}
+
+fn itunes_track_from_search(body: &str, artist: &str, title: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    for hit in value.get("results")?.as_array()? {
+        let hit_title = hit.get("trackName").and_then(|v| v.as_str()).unwrap_or("");
+        let hit_artist = hit.get("artistName").and_then(|v| v.as_str()).unwrap_or("");
+        if !names_match(hit_title, title) || !names_match(hit_artist, artist) {
+            continue;
+        }
+        let small = hit.get("artworkUrl100").and_then(|v| v.as_str())?;
+        let album = hit.get("collectionName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        return Some((album, small.replace("100x100bb", &format!("{COVER_PIXELS}x{COVER_PIXELS}bb"))));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------
 // Cover lookup
 // ---------------------------------------------------------------------
 
@@ -721,6 +855,65 @@ mod tests {
         assert_eq!(done.cover_url, None);
         assert!(!done.cover_lookup_pending);
         assert!(http.asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_titles_split_into_artist_and_title() {
+        assert_eq!(split_stream_title("Daft Punk - Get Lucky"), ("Daft Punk".to_string(), "Get Lucky".to_string()));
+        assert_eq!(
+            split_stream_title("Jay-Z - 99 Problems - Remix"),
+            ("Jay-Z".to_string(), "99 Problems - Remix".to_string())
+        );
+        assert_eq!(split_stream_title("Station jingle"), (String::new(), "Station jingle".to_string()));
+    }
+
+    #[test]
+    fn a_streamed_track_gets_its_album_and_cover_from_deezer() {
+        let mut http = Canned::new();
+        http.answers.insert(
+            "api.deezer.com/search?",
+            r#"{"data":[{"title":"Get Lucky","artist":{"name":"Daft Punk"},"album":{"title":"Random Access Memories","cover_xl":"https://cdn.example/c/1000x1000-000000-80-0-0.jpg"}}]}"#
+                .to_string(),
+        );
+
+        let info = resolve_stream_info(&http, 1, 2, "Daft Punk", "Get Lucky");
+
+        assert_eq!(info.album, "Random Access Memories");
+        assert_eq!(info.cover_url.as_deref(), Some("https://cdn.example/c/600x600-000000-80-0-0.jpg"));
+        assert!(!info.cover_lookup_pending);
+    }
+
+    #[test]
+    fn itunes_answers_when_deezer_does_not_know_the_track() {
+        let mut http = Canned::new();
+        http.answers.insert("api.deezer.com/search?", r#"{"data":[]}"#.to_string());
+        http.answers.insert(
+            "itunes.apple.com",
+            r#"{"results":[{"trackName":"Get Lucky","artistName":"Daft Punk","collectionName":"RAM","artworkUrl100":"https://x/100x100bb.jpg"}]}"#
+                .to_string(),
+        );
+
+        let info = resolve_stream_info(&http, 1, 2, "Daft Punk", "Get Lucky");
+
+        assert_eq!(info.album, "RAM");
+        assert_eq!(info.cover_url.as_deref(), Some("https://x/600x600bb.jpg"));
+    }
+
+    #[test]
+    fn an_unknown_track_keeps_its_title_without_a_cover() {
+        let http = Canned::new();
+
+        let info = resolve_stream_info(&http, 1, 2, "Nobody", "Nothing");
+
+        assert_eq!((info.artist.as_str(), info.title.as_str()), ("Nobody", "Nothing"));
+        assert_eq!(info.cover_url, None);
+        assert!(!info.cover_lookup_pending, "the answer is final - the stand-in may show");
+    }
+
+    #[test]
+    fn a_different_track_by_the_same_artist_is_not_accepted() {
+        let body = r#"{"data":[{"title":"Another One","artist":{"name":"Daft Punk"},"album":{"title":"X","cover_xl":"https://c/1000x1000-1.jpg"}}]}"#;
+        assert_eq!(deezer_track_from_search(body, "Daft Punk", "Get Lucky"), None);
     }
 
     #[test]

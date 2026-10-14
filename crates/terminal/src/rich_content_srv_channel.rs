@@ -164,9 +164,31 @@ pub struct SrvProgressState {
     /// plain peek — the paint path re-reads it every pass to keep
     /// painting the broken-image indicator.
     fetch_failed: Mutex<Option<String>>,
+    /// Latest `SrvResponse::NowPlaying` for this key - what an internet-
+    /// radio stream is playing (see `NowPlayingInfo`). Paired with the
+    /// instant it arrived, so `remaining_ms` can be counted down locally
+    /// between two pushes.
+    now_playing: Mutex<Option<(somsrv::protocol::NowPlayingInfo, std::time::Instant)>>,
+    /// `(index, len)` from the latest `SrvResponse::Playlist` - this
+    /// key's track is entry `index` of a playlist of `len`.
+    playlist: Mutex<Option<(u32, u32)>>,
 }
 
 impl SrvProgressState {
+    /// The latest "now playing" push and how long ago it arrived.
+    pub fn now_playing(&self) -> Option<(somsrv::protocol::NowPlayingInfo, std::time::Duration)> {
+        self.now_playing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(info, at)| (info.clone(), at.elapsed()))
+    }
+
+    /// `(index, len)` of this key's playlist entry, if it is part of one.
+    pub fn playlist(&self) -> Option<(u32, u32)> {
+        *self.playlist.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn contiguous_len(&self) -> u64 {
         self.contiguous_len.load(Ordering::Acquire)
     }
@@ -671,6 +693,20 @@ fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) 
     Ok(())
 }
 
+/// Sends `SrvRequest::PlaylistStep` on a fresh, one-shot connection —
+/// the previous (`delta` -1) / next (+1) buttons of a playlist placement.
+/// Fire-and-forget on a background thread, for the same reason
+/// [`request_byte_range`] is.
+pub fn playlist_step(session_id: u32, file_id: u32, delta: i32) {
+    std::thread::spawn(move || {
+        let result = connect_and_handshake()
+            .and_then(|connection| send(&connection, &SrvRequest::PlaylistStep { session_id, file_id, delta }));
+        if let Err(err) = result {
+            log::debug!("failed to send somsrv PlaylistStep for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
+}
+
 /// Sends `SrvRequest::EndPlayback` on a fresh, one-shot connection —
 /// Som's own signal (mirroring [`request_byte_range`]'s exact shape and
 /// same fire-and-forget-on-a-background-thread reasoning, see that
@@ -846,6 +882,14 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
                 if response_session == session_id && response_file == file_id =>
             {
                 state.stop_playback_requested.store(true, Ordering::Release);
+            },
+            SrvResponse::NowPlaying(info) if info.session_id == session_id && info.file_id == file_id => {
+                *state.now_playing.lock().unwrap_or_else(|p| p.into_inner()) = Some((info, std::time::Instant::now()));
+            },
+            SrvResponse::Playlist { session_id: response_session, file_id: response_file, index, len }
+                if response_session == session_id && response_file == file_id =>
+            {
+                *state.playlist.lock().unwrap_or_else(|p| p.into_inner()) = Some((index, len));
             },
             // The daemon's direct reply to our own `UnsubscribeProgress`
             // (see that variant's own doc comment) — this connection is

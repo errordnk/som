@@ -156,6 +156,32 @@ impl SrvChannel {
     pub fn request_fetch_resource(&self, session_id: u32, file_id: u32, target: String) -> Result<(), String> {
         send(&self.connection, &SrvRequest::FetchResource { session_id, file_id, target, base_dir: None })
     }
+
+    /// Tells `somsrv` (which relays it to Som) to stop playing
+    /// `(session_id, file_id)` and, for a `FetchResource`-sourced track,
+    /// to stop downloading it. Used when a playlist moves on to its next
+    /// track: printing a new placeholder grid replaces the old cells, but
+    /// the old player would keep sounding with no widget left to reach
+    /// it. Best sent on a fresh one-shot connection - a connection busy
+    /// serving a long `FetchResource` cannot read further requests.
+    pub fn stop_playback(&self, session_id: u32, file_id: u32) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::StopPlayback { session_id, file_id })
+    }
+
+    /// Tells `somsrv` which playlist entry `(session_id, file_id)` is, so
+    /// Som can show previous/next controls and the entry's title. See
+    /// `SrvRequest::AnnounceTrack`.
+    pub fn announce_track(
+        &self,
+        session_id: u32,
+        file_id: u32,
+        title: Option<String>,
+        index: u32,
+        len: u32,
+        target: String,
+    ) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target })
+    }
 }
 
 impl std::fmt::Debug for Incoming {

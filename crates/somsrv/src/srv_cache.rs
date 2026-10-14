@@ -146,7 +146,7 @@ struct Inner {
     /// replayed to a subscriber that arrives later.
     now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
     /// `(index, len)` of the playlist entry a key is (`set_playlist`).
-    playlists: HashMap<CacheKey, (u32, u32)>,
+    playlists: HashMap<CacheKey, (u32, u32, Option<String>)>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -338,8 +338,8 @@ impl SrvCache {
         if let Some(info) = inner.now_playing.get(&key) {
             let _ = send(SrvResponse::NowPlaying(info.clone()));
         }
-        if let Some(&(index, len)) = inner.playlists.get(&key) {
-            let _ = send(SrvResponse::Playlist { session_id, file_id, index, len });
+        if let Some((index, len, title)) = inner.playlists.get(&key).cloned() {
+            let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title });
         }
         inner.subscribers.entry(key).or_default().push(send);
     }
@@ -358,9 +358,9 @@ impl SrvCache {
     ) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
-        inner.playlists.insert(key, (index, len));
-        let mut pushes = vec![SrvResponse::Playlist { session_id, file_id, index, len }];
         let title = title.filter(|t| !t.trim().is_empty());
+        inner.playlists.insert(key, (index, len, title.clone()));
+        let mut pushes = vec![SrvResponse::Playlist { session_id, file_id, index, len, title: title.clone() }];
         if title.is_none() && lookup_pending && !inner.now_playing.contains_key(&key) {
             // No title to show, but a lookup is coming: say so, so the
             // consumer holds back its stand-in picture.
@@ -1227,5 +1227,26 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.last().unwrap().title, "T");
         assert!(!seen.last().unwrap().cover_lookup_pending);
+    }
+
+    #[test]
+    fn playlist_push_carries_the_entry_title_and_is_replayed() {
+        let cache = SrvCache::new();
+        cache.set_playlist(1, 2, Some("Radio Paradise - Main Mix".to_string()), 0, 2, true);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        cache.subscribe(1, 2, Arc::new(move |response| {
+            if let SrvResponse::Playlist { index, len, title, .. } = response {
+                sink.lock().unwrap().push((index, len, title));
+            }
+            Ok(())
+        }));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, 2, Some("Radio Paradise - Main Mix".to_string()))],
+            "a late subscriber must learn the station's name too"
+        );
     }
 }

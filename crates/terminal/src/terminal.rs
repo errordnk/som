@@ -3468,6 +3468,7 @@ impl Terminal {
         if now.is_none() && playlist.is_none() {
             return None;
         }
+        let station_title = state.station_title();
         let clock = self
             .rich_content_audio_players
             .borrow()
@@ -3554,7 +3555,13 @@ impl Terminal {
 
         Some(rich_content_audio_widget::AudioNowPlaying {
             artist: info.as_ref().map(|i| i.artist.clone()).unwrap_or_default(),
-            title: info.as_ref().map(|i| i.title.clone()).unwrap_or_default(),
+            // Between songs (a voice insert, the gap before the next
+            // report) the station's name stays, as at the start and after
+            // a station switch.
+            title: match &info {
+                Some(info) => info.title.clone(),
+                None => station_title.unwrap_or_default(),
+            },
             album: info.as_ref().map(|i| i.album.clone()).unwrap_or_default(),
             year: info.as_ref().and_then(|i| i.year),
             duration,

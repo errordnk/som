@@ -77,8 +77,11 @@ pub enum Station {
 /// Recognizes a station from a stream URL, or `None` for any other.
 pub fn station_for_url(url: &str) -> Option<Station> {
     let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/')?;
-    if !host.eq_ignore_ascii_case("stream.radioparadise.com") {
+    let (authority, path) = rest.split_once('/')?;
+    // Only a server whose NAME says Radio Paradise gets its API and the
+    // full widget; every other station is played as a plain stream.
+    let host = authority.rsplit('@').next().unwrap_or(authority).split(':').next().unwrap_or("");
+    if !host.to_ascii_lowercase().contains("radioparadise") {
         return None;
     }
     let path = path.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
@@ -490,6 +493,9 @@ mod tests {
         assert_eq!(chan("https://stream.radioparadise.com/flacm"), Some(0));
         assert_eq!(chan("https://stream.radioparadise.com/world-etc-flacm"), Some(3));
         assert_eq!(station_for_url("https://example.com/world-etc-flac"), None);
+        assert_eq!(station_for_url("https://ice1.somafm.com/groovesalad-128-mp3"), None);
+        assert_eq!(chan("https://audio.radioparadise.stream/mellow-flac"), Some(1));
+        assert_eq!(chan("http://RadioParadise.com:8000/flac"), Some(0));
         assert_eq!(station_for_url("not a url"), None);
     }
 

@@ -282,6 +282,7 @@ fn best_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<ffmpe
         .or_else(|| ictx.streams().best(ffmpeg_next::media::Type::Video))
 }
 
+#[cfg(windows)]
 fn video_metadata(
     path: &str,
     audio_stream_index: Option<u32>,

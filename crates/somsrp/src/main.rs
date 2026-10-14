@@ -232,7 +232,11 @@ fn read_audio_tags(path: &str) -> Option<somsrv::protocol::TrackTags> {
     {
         absorb(revision);
     }
-    absorb(probed.format.metadata().current()?);
+    // Either place may be empty: ID3 in an MP3 is surfaced by the probe
+    // itself, Vorbis comments by the format reader.
+    if let Some(revision) = probed.format.metadata().current() {
+        absorb(revision);
+    }
 
     if tags.artist.is_empty() {
         tags.artist = album_artist;
@@ -1995,6 +1999,17 @@ mod tests {
     fn tags_are_read_from_the_file() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tagged-tone.flac");
         let tags = read_audio_tags(path.to_str().unwrap()).expect("the fixture has tags");
+
+        assert_eq!(tags.title, "Test Title");
+        assert_eq!(tags.artist, "Test Artist");
+        assert_eq!(tags.album, "Test Album");
+        assert_eq!(tags.year, Some(2011));
+    }
+
+    #[test]
+    fn id3_tags_are_read_from_an_mp3() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tagged-tone.mp3");
+        let tags = read_audio_tags(path.to_str().unwrap()).expect("the fixture has ID3 tags");
 
         assert_eq!(tags.title, "Test Title");
         assert_eq!(tags.artist, "Test Artist");

@@ -698,6 +698,22 @@ impl RichContentAudioPlayer {
         total_frames > 0 && self.position_frames.load(Ordering::Acquire) >= total_frames
     }
 
+    /// Where playback is, in frames from the start of the stream.
+    pub fn playhead_frames(&self) -> u64 {
+        self.position_frames.load(Ordering::Acquire)
+    }
+
+    /// Output sample rate (`0` until the format is known).
+    pub fn sample_rate(&self) -> u32 {
+        self.shared.sample_rate.load(Ordering::Acquire)
+    }
+
+    /// Frames decoded so far, counted from the start of the stream
+    /// (including any head already trimmed from a live buffer).
+    pub fn decoded_frames_total(&self) -> u64 {
+        self.decoded_frames()
+    }
+
     /// Frames decoded so far, counted from the start of the stream
     /// (including any head already trimmed from a live buffer).
     fn decoded_frames(&self) -> u64 {

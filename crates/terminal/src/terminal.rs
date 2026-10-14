@@ -474,8 +474,8 @@ impl TerminalBuilder {
             audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_cover_drops: std::cell::RefCell::new(Vec::new()),
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
-            audio_prev_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -809,8 +809,8 @@ impl TerminalBuilder {
                 audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_cover_drops: std::cell::RefCell::new(Vec::new()),
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
-                audio_prev_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1288,18 +1288,16 @@ pub struct Terminal {
     /// frame (cover, previous, next, progress bar).
     audio_widget_bounds:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioWidgetBounds>>,
+    /// Each live stream's tracks pinned to its audio timeline - see
+    /// `rich_content_audio_widget::TrackTimeline`.
+    audio_timelines:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::TrackTimeline>>,
     /// Audio placements whose source has ended for good (`somsrv` pushed
     /// `StopPlayback`: a playlist moved on, the sender exited). Never
     /// reopened - unlike `rich_content_audio_stopped`, which a screen
     /// clear resets, so a track replaced by the next one would otherwise
     /// come back to life and play its leftover buffer over the new one.
     rich_content_audio_dead: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
-    /// The cover of a placement's PREVIOUS track, kept on screen until
-    /// the next one is decoded - a new track's cover takes a moment, and
-    /// blank space (or the stand-in) between two real covers looks worse
-    /// than the old one lingering.
-    audio_prev_covers:
-        std::cell::RefCell<std::collections::HashMap<(u32, u32), std::sync::Arc<gpui::RenderImage>>>,
     /// `(session_id, file_id)` pairs the user has explicitly clicked
     /// "stop" on — unlike video's `stop` (which keeps its player alive
     /// and merely shows a stand-in image), audio's stop tears the
@@ -3470,9 +3468,52 @@ impl Terminal {
         if now.is_none() && playlist.is_none() {
             return None;
         }
-        let (info, age) = match now {
-            Some((info, age)) => (Some(info), age),
-            None => (None, std::time::Duration::ZERO),
+        let clock = self
+            .rich_content_audio_players
+            .borrow()
+            .get(&key)
+            .filter(|player| player.is_ready() && player.sample_rate() > 0)
+            .map(|player| {
+                (player.playhead_frames() as f64, player.decoded_frames_total() as f64, player.sample_rate() as f64)
+            });
+
+        // What is shown is what is being HEARD. With a station report that
+        // carries a track length and a running player, the report is
+        // pinned to the audio timeline and the track the playhead is in
+        // is the one shown - tags, cover and time left then change exactly
+        // when the audio does. Otherwise (no length, no player yet) the
+        // station's own clock is the best there is.
+        let (info, duration, elapsed, track_ended) = match (now, clock) {
+            (Some((reported, age)), Some((playhead, decoded, rate))) if reported.duration_ms > 0 => {
+                let generation = state.now_playing_generation();
+                let mut timelines = self.audio_timelines.borrow_mut();
+                let timeline = timelines.entry(key).or_default();
+                timeline.observe(generation, &reported, age, decoded, rate);
+                match timeline.current(playhead, rate) {
+                    Some((heard, remaining)) => {
+                        let duration = std::time::Duration::from_millis(heard.duration_ms as u64);
+                        let remaining = remaining.min(duration);
+                        (Some(heard), duration, duration - remaining, false)
+                    },
+                    // Past every track reported so far: the next one is
+                    // not known yet - nothing of the finished one stays.
+                    None => (None, std::time::Duration::ZERO, std::time::Duration::ZERO, true),
+                }
+            },
+            (Some((reported, age)), _) => {
+                let (duration, elapsed) = rich_content_audio_widget::track_times(
+                    reported.duration_ms,
+                    reported.remaining_ms,
+                    age,
+                );
+                let ended = duration > std::time::Duration::ZERO && elapsed >= duration;
+                if ended {
+                    (None, std::time::Duration::ZERO, std::time::Duration::ZERO, true)
+                } else {
+                    (Some(reported), duration, elapsed, false)
+                }
+            },
+            (None, _) => (None, std::time::Duration::ZERO, std::time::Duration::ZERO, false),
         };
 
         let mut covers = self.audio_covers.borrow_mut();
@@ -3484,10 +3525,7 @@ impl Terminal {
         };
         if stale && let Some(old) = covers.remove(&key) {
             if let Some(image) = old.finish() {
-                let mut prev_covers = self.audio_prev_covers.borrow_mut();
-                if let Some(older) = prev_covers.insert(key, image) {
-                    self.audio_cover_drops.borrow_mut().push(older);
-                }
+                self.audio_cover_drops.borrow_mut().push(image);
             }
         }
         if let Some(url) = &wanted
@@ -3505,33 +3543,15 @@ impl Terminal {
         };
         drop(covers);
 
-        // A decoded cover replaces the one being kept from the previous
-        // track (queued for release); until then that one stays shown.
-        let mut prev_covers = self.audio_prev_covers.borrow_mut();
-        let shown_cover = match cover {
-            Some(image) => {
-                if let Some(old) = prev_covers.remove(&key)
-                    && !std::sync::Arc::ptr_eq(&old, &image)
-                {
-                    self.audio_cover_drops.borrow_mut().push(old);
-                }
-                Some(image)
-            },
-            None => prev_covers.get(&key).cloned(),
-        };
-        drop(prev_covers);
+        let shown_cover = cover;
 
         // The stand-in is the very last resort: only when no cover was
         // found anywhere - never while one is loading, never while a
         // station lookup that may still deliver one is under way.
         let lookup_pending = info.as_ref().is_some_and(|i| i.cover_lookup_pending);
-        let show_placeholder = shown_cover.is_none() && !cover_loading && !lookup_pending;
-        let ready = !lookup_pending && !cover_loading && (shown_cover.is_some() || show_placeholder);
+        let show_placeholder = shown_cover.is_none() && !cover_loading && !lookup_pending && !track_ended;
+        let ready = !lookup_pending && !cover_loading && !track_ended && (shown_cover.is_some() || show_placeholder);
 
-        let (duration, elapsed) = info
-            .as_ref()
-            .map(|info| rich_content_audio_widget::track_times(info.duration_ms, info.remaining_ms, age))
-            .unwrap_or((std::time::Duration::ZERO, std::time::Duration::ZERO));
         Some(rich_content_audio_widget::AudioNowPlaying {
             artist: info.as_ref().map(|i| i.artist.clone()).unwrap_or_default(),
             title: info.as_ref().map(|i| i.title.clone()).unwrap_or_default(),
@@ -3555,10 +3575,8 @@ impl Terminal {
         {
             self.audio_cover_drops.borrow_mut().push(image);
         }
-        if let Some(image) = self.audio_prev_covers.borrow_mut().remove(&key) {
-            self.audio_cover_drops.borrow_mut().push(image);
-        }
         self.audio_widget_bounds.borrow_mut().remove(&key);
+        self.audio_timelines.borrow_mut().remove(&key);
     }
 
     /// Covers no longer shown, for the paint path to release with

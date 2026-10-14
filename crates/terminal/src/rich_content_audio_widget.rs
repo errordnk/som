@@ -76,6 +76,97 @@ pub fn track_times(duration_ms: u32, remaining_ms: u32, age: Duration) -> (Durat
 /// empty space.
 const COVER_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Places the tracks of a live stream on the stream's own frame timeline,
+/// so the widget shows what is being HEARD, not what the station's clock
+/// says is on air right now.
+///
+/// What a station reports (`NowPlayingInfo`) is true at the live edge; the
+/// speakers play audio that was decoded some seconds ago (network burst,
+/// decoder and device buffers). Each report is therefore pinned to the
+/// frame count decoded when it arrived: the track ends `remaining` seconds
+/// of audio after that point. Whatever track the playhead is inside is
+/// the one shown - tags, cover and time left switch exactly when its
+/// audio does, however far behind the live edge playback is, and a pause
+/// freezes everything with the playhead.
+#[derive(Default)]
+pub struct TrackTimeline {
+    spans: Vec<TrackSpan>,
+    last_generation: u64,
+}
+
+struct TrackSpan {
+    info: somsrv::protocol::NowPlayingInfo,
+    /// Frame (counted from the start of the stream) where the track ends.
+    end_frame: f64,
+}
+
+/// How early (seconds) a track may be shown before its computed start.
+const START_TOLERANCE_SECS: f64 = 1.0;
+
+impl TrackSpan {
+    /// Frame where the track starts: its end minus its own length.
+    fn start_frame(&self, rate: f64) -> f64 {
+        self.end_frame - self.info.duration_ms as f64 / 1000.0 * rate
+    }
+}
+
+fn same_track(a: &somsrv::protocol::NowPlayingInfo, b: &somsrv::protocol::NowPlayingInfo) -> bool {
+    a.artist == b.artist && a.title == b.title && a.album == b.album && a.duration_ms == b.duration_ms
+}
+
+impl TrackTimeline {
+    /// Feeds one station report (identified by `generation`, `age` old),
+    /// pinned to `decoded_frames` - the frames decoded right now - at
+    /// `rate` frames per second. Repeats of an already seen report are
+    /// ignored; a report of a known track corrects that track's end.
+    pub fn observe(
+        &mut self,
+        generation: u64,
+        info: &somsrv::protocol::NowPlayingInfo,
+        age: Duration,
+        decoded_frames: f64,
+        rate: f64,
+    ) {
+        if generation == self.last_generation || info.duration_ms == 0 || rate <= 0.0 {
+            return;
+        }
+        self.last_generation = generation;
+        let decoded_at_arrival = (decoded_frames - age.as_secs_f64() * rate).max(0.0);
+        let end_frame = decoded_at_arrival + info.remaining_ms as f64 / 1000.0 * rate;
+        match self.spans.iter_mut().find(|span| same_track(&span.info, info)) {
+            Some(span) => {
+                span.info = info.clone();
+                span.end_frame = end_frame;
+            },
+            None => self.spans.push(TrackSpan { info: info.clone(), end_frame }),
+        }
+    }
+
+    /// The track the playhead is inside, with how much of it is left, or
+    /// `None` when playback is between tracks: past every track known so
+    /// far (the next one has not been reported yet) or in a gap before a
+    /// reported one starts - a station's voice inserts and jingles sit
+    /// between songs and belong to no track, so nothing is shown for them
+    /// rather than the next song ahead of time. Tracks already left behind
+    /// are forgotten.
+    pub fn current(&mut self, playhead: f64, rate: f64) -> Option<(somsrv::protocol::NowPlayingInfo, Duration)> {
+        if rate <= 0.0 {
+            return None;
+        }
+        self.spans.retain(|span| span.end_frame > playhead);
+        // A track counts from its start, give or take the second a
+        // station's whole-second clock can be off by.
+        let tolerance = START_TOLERANCE_SECS * rate;
+        let span = self
+            .spans
+            .iter()
+            .filter(|span| playhead >= span.start_frame(rate) - tolerance)
+            .min_by(|a, b| a.end_frame.total_cmp(&b.end_frame))?;
+        let remaining = Duration::from_secs_f64(((span.end_frame - playhead) / rate).max(0.0));
+        Some((span.info.clone(), remaining))
+    }
+}
+
 /// One placement's cover-art fetch and its decoded image.
 pub struct AudioCover {
     started: std::time::Instant,
@@ -180,6 +271,122 @@ pub fn placeholder_image(is_light: bool) -> Option<Arc<RenderImage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(title: &str, duration_ms: u32, remaining_ms: u32) -> somsrv::protocol::NowPlayingInfo {
+        somsrv::protocol::NowPlayingInfo {
+            session_id: 1,
+            file_id: 2,
+            artist: "A".into(),
+            title: title.into(),
+            album: "B".into(),
+            year: None,
+            duration_ms,
+            remaining_ms,
+            cover_url: None,
+            cover_lookup_pending: false,
+        }
+    }
+
+    #[test]
+    fn the_end_of_a_track_is_pinned_to_the_audio_decoded_when_it_was_reported() {
+        let mut timeline = TrackTimeline::default();
+        // 100 frames/s; 3000 frames (30 s) already decoded, track has 20 s left.
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+
+        // The speakers are 10 s behind the live edge (playhead at frame 2000):
+        // 30 s of this track remain for the listener, not 20.
+        let (shown, remaining) = timeline.current(2000.0, 100.0).unwrap();
+        assert_eq!(shown.title, "one");
+        assert_eq!(remaining, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_next_track_appears_only_when_the_playhead_reaches_it() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+        // The live edge has moved on: a new track was reported 20 s later.
+        timeline.observe(2, &info("two", 180_000, 170_000), Duration::ZERO, 5000.0, 100.0);
+
+        // Playhead still inside "one" (ends at frame 5000): shows "one".
+        assert_eq!(timeline.current(4000.0, 100.0).unwrap().0.title, "one");
+        // Past it: now "two".
+        assert_eq!(timeline.current(5100.0, 100.0).unwrap().0.title, "two");
+    }
+
+    #[test]
+    fn a_voice_insert_between_songs_shows_nothing() {
+        let mut timeline = TrackTimeline::default();
+        // 100 frames/s. "one" ends at frame 5000.
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+        // "two" (180 s) is reported while the insert still plays: it ends
+        // at 5000 + 54 s insert + 180 s = frame 28400, so it starts at 10400.
+        timeline.observe(2, &info("two", 180_000, 254_000), Duration::ZERO, 3000.0, 100.0);
+
+        assert_eq!(timeline.current(4000.0, 100.0).unwrap().0.title, "one");
+        // Inside the insert: neither track.
+        assert!(timeline.current(7000.0, 100.0).is_none());
+        // The song starts.
+        assert_eq!(timeline.current(10400.0, 100.0).unwrap().0.title, "two");
+    }
+
+    #[test]
+    fn a_crossfade_still_hands_over_at_the_end_of_the_first_track() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+        // "two" starts 3 s before "one" ends (crossfade): ends at 5000+17000.
+        timeline.observe(2, &info("two", 200_000, 190_000), Duration::ZERO, 3000.0, 100.0);
+
+        assert_eq!(timeline.current(4800.0, 100.0).unwrap().0.title, "one");
+        assert_eq!(timeline.current(5001.0, 100.0).unwrap().0.title, "two");
+    }
+
+    #[test]
+    fn past_every_known_track_nothing_is_shown() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 200_000, 1_000), Duration::ZERO, 1000.0, 100.0);
+
+        assert!(timeline.current(1200.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn a_repeated_report_does_not_move_the_track() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+        // Same generation again, much later: ignored.
+        timeline.observe(1, &info("one", 200_000, 5_000), Duration::ZERO, 9000.0, 100.0);
+
+        let (_, remaining) = timeline.current(3000.0, 100.0).unwrap();
+        assert_eq!(remaining, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_fresh_report_of_the_same_track_corrects_its_end() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
+        // Five seconds later the station says 14 s are left (clock drift).
+        timeline.observe(2, &info("one", 200_000, 14_000), Duration::ZERO, 3500.0, 100.0);
+
+        let (_, remaining) = timeline.current(3500.0, 100.0).unwrap();
+        assert_eq!(remaining, Duration::from_secs(14));
+    }
+
+    #[test]
+    fn the_age_of_a_report_is_taken_off_the_decoded_count() {
+        let mut timeline = TrackTimeline::default();
+        // Reported 2 s ago: at that moment 2800 frames had been decoded.
+        timeline.observe(1, &info("one", 200_000, 20_000), Duration::from_secs(2), 3000.0, 100.0);
+
+        let (_, remaining) = timeline.current(2800.0, 100.0).unwrap();
+        assert_eq!(remaining, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_report_without_a_duration_builds_no_timeline() {
+        let mut timeline = TrackTimeline::default();
+        timeline.observe(1, &info("one", 0, 0), Duration::ZERO, 3000.0, 100.0);
+
+        assert!(timeline.current(0.0, 100.0).is_none());
+    }
 
     #[test]
     fn elapsed_is_duration_minus_what_remains() {

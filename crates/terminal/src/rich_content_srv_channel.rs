@@ -169,6 +169,9 @@ pub struct SrvProgressState {
     /// instant it arrived, so `remaining_ms` can be counted down locally
     /// between two pushes.
     now_playing: Mutex<Option<(somsrv::protocol::NowPlayingInfo, std::time::Instant)>>,
+    /// Bumped on every `NowPlaying` push - lets a consumer tell a fresh
+    /// answer from the one it already used.
+    now_playing_generation: AtomicU64,
     /// `(index, len)` from the latest `SrvResponse::Playlist` - this
     /// key's track is entry `index` of a playlist of `len`.
     playlist: Mutex<Option<(u32, u32)>>,
@@ -182,6 +185,11 @@ impl SrvProgressState {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|(info, at)| (info.clone(), at.elapsed()))
+    }
+
+    /// How many `NowPlaying` pushes have arrived so far.
+    pub fn now_playing_generation(&self) -> u64 {
+        self.now_playing_generation.load(Ordering::Acquire)
     }
 
     /// `(index, len)` of this key's playlist entry, if it is part of one.
@@ -885,6 +893,7 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             },
             SrvResponse::NowPlaying(info) if info.session_id == session_id && info.file_id == file_id => {
                 *state.now_playing.lock().unwrap_or_else(|p| p.into_inner()) = Some((info, std::time::Instant::now()));
+                state.now_playing_generation.fetch_add(1, Ordering::AcqRel);
             },
             SrvResponse::Playlist { session_id: response_session, file_id: response_file, index, len }
                 if response_session == session_id && response_file == file_id =>

@@ -7349,6 +7349,7 @@ dependencies = [
  "mlua",
  "nix 0.29.0",
  "paths",
+ "percent-encoding",
  "rust-embed",
  "serde",
  "serde_json",

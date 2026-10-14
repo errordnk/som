@@ -256,6 +256,22 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 
 Som implements its own binary protocol for streaming rich content (currently images/GIFs, with audio/markdown/video reserved for later) through the PTY — the `somsrp` tool bundled alongside Som is the reference client: `somsrp some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
 
+### Audio, internet radio and playlists
+
+`somsrp` plays audio files (`.mp3`, `.flac`, `.ogg`), internet-radio streams by URL and `.m3u` playlists of files and URLs:
+
+```
+somsrp track.flac
+somsrp https://stream.radioparadise.com/world-etc-flac
+somsrp list.m3u
+```
+
+A playing track gets a "now playing" widget: an artist / album / year line, the cover, the track title and a progress bar with the time left. A line that doesn't fit scrolls sideways; clicking the cover pauses and resumes.
+
+- **Playlists.** A list of more than one entry adds previous/next buttons on both sides of the bar (keys `p` / `n` work too) and plays in a circle. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
+- **Radio.** For Radio Paradise streams the tags, the time left in the track and the cover come from the station's own API. Other streams show the title from the playlist and the elapsed time.
+- **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in.
+
 - **Images are represented as real grid text.** Each streamed image becomes a block of Unicode placeholder cells printed into the terminal's own scrollback, so the terminal's normal scroll/clear/history handling positions and hides the image correctly with no special-casing needed — clearing the screen hides the image, and scrolling moves it exactly like any other line of output.
 - **Images keep their aspect ratio.** Som fits the decoded image inside the cell-grid footprint the sender described rather than stretching it to fill it.
 - **Images survive SSH reconnects on `tmux: true` tabs.** Reattaching to a `somsrv` session that had images on screen redraws them along with the rest of the scrollback, without a manual refresh.

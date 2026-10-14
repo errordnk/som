@@ -3650,7 +3650,9 @@ fn paint_now_playing_audio_widget(
     let info_text = info_parts.join("   ");
     let title_text = np.title.clone();
 
-    let has_playlist = np.playlist.is_some_and(|(_, len)| len > 1);
+    // Previous/next are always there for a playlist entry, even a lone
+    // one (they then start it over).
+    let has_playlist = np.playlist.is_some();
     let (elapsed, duration) = if np.duration > std::time::Duration::ZERO {
         (np.elapsed, np.duration)
     } else {

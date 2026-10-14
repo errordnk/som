@@ -781,7 +781,10 @@ pub enum SrvResponse {
     /// Pushed to subscribers when the key's track is entry `index`
     /// (0-based) of a playlist of `len` entries - see
     /// `SrvRequest::AnnounceTrack`. Also replayed to a late subscriber.
-    Playlist { session_id: u32, file_id: u32, index: u32, len: u32 },
+    ///
+    /// `title` is the entry's name from the playlist (`#EXTINF`), e.g. the
+    /// station - what stays on screen between a stream's songs.
+    Playlist { session_id: u32, file_id: u32, index: u32, len: u32, title: Option<String> },
 }
 
 /// What an internet-radio stream is playing right now, as learned by

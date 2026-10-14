@@ -14,6 +14,8 @@ use crate::srv_cache::SrvCache;
 use somsrv::protocol::{ContentMetadata, ContentType};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Same chunk size every other `PutChunk` sender in this project uses
 /// (`somsrp::CHUNK_SIZE`, `crate::lua`'s own `CHUNK_SIZE`) — no reason
@@ -34,6 +36,7 @@ const CHUNK_SIZE: usize = 65536;
 /// reply, unlike `crate::lua::run_and_stream`'s failure path (logged
 /// server-side only).
 pub fn fetch_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, target: &str, base_dir: Option<&str>) -> anyhow::Result<()> {
+    cache.begin_fetch(session_id, file_id);
     if target.starts_with("http://") || target.starts_with("https://") {
         fetch_network(cache, session_id, file_id, target)
     } else {
@@ -55,6 +58,14 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // An internet-radio stream: ask the station's own API what is playing
+    // for as long as this fetch runs.
+    let station = if content_type == ContentType::Audio { crate::now_playing::station_for_url(url) } else { None };
+    let fetch_done = Arc::new(AtomicBool::new(false));
+    if let Some(station) = station {
+        crate::now_playing::spawn_poller(cache.clone(), session_id, file_id, station, fetch_done.clone());
+    }
+
     let mut body = response.into_body();
     let reader = body.as_reader();
     // A URL has no local directory to resolve a nested relative embed
@@ -64,7 +75,9 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
     // absolute URL (or one resolved against the PARENT URL, not a
     // filesystem path) to work at all; that's a real, separate gap this
     // change doesn't attempt to close.
-    stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new())
+    let result = stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new());
+    fetch_done.store(true, Ordering::Release);
+    result
 }
 
 fn fetch_local(cache: &SrvCache, session_id: u32, file_id: u32, target: &str, base_dir: Option<&str>) -> anyhow::Result<()> {
@@ -136,12 +149,26 @@ fn stream_reader_into_cache(
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut offset = 0u64;
     loop {
+        // An endless source (an internet radio stream) never reaches EOF
+        // on its own — stop as soon as playback ended or nobody is
+        // subscribed anymore, or it would download forever.
+        if cache.is_fetch_cancelled(session_id, file_id) {
+            return Ok(());
+        }
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         cache.put_chunk(session_id, file_id, offset, &buf[..n], total_size, content_type, metadata.clone());
         offset += n as u64;
+    }
+    // A response without a `Content-Length` (chunked transfer) announced
+    // `total_size == 0`; now that the body really ended its size is
+    // known. Tell the cache with one empty chunk, otherwise a consumer
+    // can never tell "ended" from "more is coming" and a finished
+    // download would hang at its last byte.
+    if total_size == 0 && offset > 0 {
+        cache.put_chunk(session_id, file_id, offset, &[], offset, content_type, metadata.clone());
     }
     // An empty body still needs ONE put_chunk call (offset 0, zero-length
     // data) so `total_size` reaches the cache and Som's own `contiguous_
@@ -202,7 +229,7 @@ fn content_type_from_mime(mime: &str, url: &str) -> Option<ContentType> {
     if mime.starts_with("video/") {
         return Some(ContentType::Video);
     }
-    if mime.starts_with("audio/") {
+    if mime.starts_with("audio/") || mime == "application/ogg" {
         return Some(ContentType::Audio);
     }
     if matches!(mime.as_str(), "" | "text/plain" | "application/octet-stream") {
@@ -227,7 +254,7 @@ fn content_type_from_extension(path: &Path) -> Option<ContentType> {
         "gif" => Some(ContentType::Gif),
         "jpg" | "jpeg" => Some(ContentType::Jpeg),
         "png" => Some(ContentType::Png),
-        "mp3" | "flac" => Some(ContentType::Audio),
+        "mp3" | "flac" | "ogg" | "oga" => Some(ContentType::Audio),
         "mp4" | "mkv" | "avi" => Some(ContentType::Video),
         "md" => Some(ContentType::Markdown),
         _ => None,
@@ -305,6 +332,49 @@ mod tests {
         assert_eq!(chunk_data, b"# hello");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_length_stream_reports_its_real_size_once_it_ends() {
+        let cache = SrvCache::new();
+        let observed = subscribe_and_collect(&cache);
+
+        stream_reader_into_cache(&cache, 1, 2, std::io::Cursor::new(vec![7u8; 100_000]), 0, ContentType::Audio, String::new()).unwrap();
+
+        let observed = observed.lock().unwrap();
+        let mut received = 0usize;
+        let mut last_total_size = None;
+        for response in observed.iter() {
+            if let SrvResponse::Progress { chunk_data, total_size, .. } = response {
+                received += chunk_data.len();
+                last_total_size = Some(*total_size);
+            }
+        }
+        assert_eq!(received, 100_000);
+        assert_eq!(last_total_size, Some(100_000), "the final push must carry the real size so EOF is detectable");
+    }
+
+    #[test]
+    fn cancelled_fetch_stops_reading_an_endless_source() {
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(1);
+                Ok(buf.len())
+            }
+        }
+        let cache = SrvCache::new();
+        cache.begin_fetch(1, 2);
+        cache.notify_stop_playback(1, 2);
+
+        // Returns instead of looping forever.
+        stream_reader_into_cache(&cache, 1, 2, Endless, 0, ContentType::Audio, String::new()).unwrap();
+    }
+
+    #[test]
+    fn ogg_audio_is_classified_as_audio() {
+        assert_eq!(content_type_from_mime("application/ogg", "https://stream.example/x"), Some(ContentType::Audio));
+        assert_eq!(content_type_from_mime("audio/ogg", "https://stream.example/x"), Some(ContentType::Audio));
     }
 
     #[test]

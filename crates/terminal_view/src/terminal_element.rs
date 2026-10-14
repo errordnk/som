@@ -1987,6 +1987,9 @@ fn paint_rich_content_placements(
     for image in pending_image_drops {
         cx.drop_image(image, Some(window));
     }
+    for image in terminal.read(cx).take_audio_cover_drops() {
+        cx.drop_image(image, Some(window));
+    }
 
     // Markdown placements are painted from their own full-grid (viewport
     // + scrollback) scan, NOT from `origins` above (which only sees
@@ -2125,6 +2128,38 @@ fn paint_rich_content_placements(
             audio_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id)
         {
             let max_column_seen = max_columns_seen.get(&key).copied();
+            // A placement `somsrv` knows tags/playlist for gets the "now
+            // playing" layout; a bare audio file keeps the controls row.
+            if let Some(now_playing) = terminal.read(cx).audio_now_playing(session_id, file_id) {
+                let placeholder = if now_playing.cover.is_none() && now_playing.show_placeholder {
+                    terminal::rich_content_audio_widget::placeholder_image(widget_bg_is_light)
+                } else {
+                    None
+                };
+                let max_row_seen = max_rows_seen.get(&key).copied();
+                if let Some((bounds, widget_bounds, needs_repaint)) = paint_now_playing_audio_widget(
+                    &now_playing,
+                    placeholder,
+                    *is_playing,
+                    *elapsed,
+                    *duration,
+                    *position_fraction,
+                    max_column_seen,
+                    max_row_seen,
+                    origin,
+                    origin_line,
+                    origin_column,
+                    layout,
+                    window,
+                    cx,
+                ) {
+                    let terminal = terminal.read(cx);
+                    terminal.record_rich_content_placement_bounds(session_id, file_id, bounds);
+                    terminal.record_audio_widget_bounds(session_id, file_id, widget_bounds);
+                    any_animating |= needs_repaint;
+                }
+                continue;
+            }
             if let Some((bounds, bar_bounds, stop_bounds)) = paint_top_level_audio_widget(
                 max_column_seen,
                 *position_fraction,
@@ -3506,6 +3541,254 @@ fn paint_top_level_audio_widget(
     }
 
     Some((bounds, bar_bounds_out, Some(stop_bounds)))
+}
+
+/// Logical width, in physical pixels, a cover is shown at: the cover art
+/// itself is at most this many pixels square, so 1:1 is as sharp as it
+/// gets.
+const NOW_PLAYING_COVER_PHYSICAL_PX: f32 = 600.0;
+
+/// Seconds as `m:ss`, or `h:mm:ss` from one hour up.
+fn format_clock(d: std::time::Duration) -> String {
+    let total = d.as_secs();
+    if total >= 3600 {
+        format!("{}:{:02}:{:02}", total / 3600, (total / 60) % 60, total % 60)
+    } else {
+        format!("{}:{:02}", total / 60, total % 60)
+    }
+}
+
+/// Top-level audio's "now playing" widget, painted instead of the plain
+/// controls row for a placement `somsrv` has tags/playlist info for:
+///
+/// ```text
+///   artist   album   year        <- one line, scrolls if too wide
+///        +---------------+
+///        |     cover     |       <- click: play / pause
+///        +---------------+
+///        track title             <- scrolls if too wide
+///   |<  ===========o------  >|   <- prev/next only for a playlist
+///   0:42               -3:51
+/// ```
+///
+/// The stack is centered in the placement's reserved box. Returns the
+/// painted box, the clickable parts and whether anything on it keeps
+/// changing (so the caller keeps repainting).
+#[allow(clippy::too_many_arguments)]
+fn paint_now_playing_audio_widget(
+    np: &terminal::rich_content_audio_widget::AudioNowPlaying,
+    placeholder: Option<std::sync::Arc<gpui::RenderImage>>,
+    is_playing: bool,
+    player_elapsed: std::time::Duration,
+    player_duration: std::time::Duration,
+    position_fraction: f32,
+    max_column_seen: Option<u32>,
+    max_row_seen: Option<u32>,
+    origin: Point<Pixels>,
+    origin_line: i32,
+    origin_column: i32,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<(Bounds<Pixels>, terminal::rich_content_audio_widget::AudioWidgetBounds, bool)> {
+    use terminal::rich_content_audio_widget::AudioWidgetBounds;
+
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+    let display_line = origin_line + layout.display_offset as i32;
+    let num_lines = layout.dimensions.num_lines() as i32;
+
+    let reserved_columns = max_column_seen.map(|c| c + 1).unwrap_or(1) as f32;
+    let reserved_rows = max_row_seen.map(|r| r + 1).unwrap_or(1) as i32;
+    // The reserved rows may start above the viewport (a full-screen
+    // placeholder grid scrolls its first row up by one with its trailing
+    // newline) or run past its bottom; only the visible part is laid out.
+    let first_visible = display_line.max(0);
+    let last_visible = (display_line + reserved_rows).min(num_lines);
+    if first_visible >= last_visible {
+        return None;
+    }
+    let box_width = cell_width * reserved_columns;
+    let box_height = line_height * (last_visible - first_visible) as f32;
+    let box_origin = point(origin.x + origin_column as f32 * cell_width, origin.y + first_visible as f32 * line_height);
+    let bounds = Bounds::new(box_origin, gpui::size(box_width, box_height));
+    window.paint_quad(fill(bounds, rich_content_widget_bg(cx)));
+
+    let text_color = gpui::white();
+    let dim_color: Hsla = gpui::rgba(0x9399b2ff).into();
+    let track_color = gpui::rgba(0x45475aff);
+    let fill_color = gpui::rgba(0x89dcebff);
+
+    let mut text_style = layout.base_text_style.clone();
+    text_style.color = text_color;
+    text_style.font_size = line_height.into();
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let resolved_font_id = window.text_system().resolve_font(&text_style.font());
+    let has_nerd = window.text_system().has_glyph_for_char(resolved_font_id, '\u{f007}');
+
+    let shape = |text: &str, color: Hsla, window: &mut Window| {
+        let run = TextRun { len: text.len(), font: text_style.font(), color, ..Default::default() };
+        window.text_system().shape_line(text.to_string().into(), font_size, &[run], None)
+    };
+
+    // ---- what to show --------------------------------------------------
+    let (nf_user, nf_disc, nf_year, nf_prev, nf_next, nf_play) = if has_nerd {
+        ("\u{f007}", "\u{f05ee}", "\u{f073}", "\u{f048}", "\u{f051}", "\u{f04b}")
+    } else {
+        ("", "", "", "|<", ">|", ">")
+    };
+    let mut info_parts = Vec::new();
+    if !np.artist.is_empty() {
+        info_parts.push(format!("{nf_user} {}", np.artist));
+    }
+    if !np.album.is_empty() {
+        info_parts.push(format!("{nf_disc} {}", np.album));
+    }
+    if let Some(year) = np.year {
+        info_parts.push(format!("{nf_year} {year}"));
+    }
+    let info_text = info_parts.join("   ");
+    let title_text = np.title.clone();
+
+    let has_playlist = np.playlist.is_some_and(|(_, len)| len > 1);
+    let (elapsed, duration) = if np.duration > std::time::Duration::ZERO {
+        (np.elapsed, np.duration)
+    } else {
+        (player_elapsed, player_duration)
+    };
+    let fraction = if np.duration > std::time::Duration::ZERO {
+        (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+    } else {
+        position_fraction.clamp(0.0, 1.0)
+    };
+    // A bar from the station's own clock is not seekable; one from the
+    // local player (a file with a known length) is.
+    let seekable = np.duration == std::time::Duration::ZERO && player_duration > std::time::Duration::ZERO;
+
+    // ---- geometry ------------------------------------------------------
+    let gap = line_height * 0.5;
+    let rows_height = line_height * 4.0 + gap * 3.0; // info, title, bar, times
+    let side_limit = (box_width - cell_width * 6.0).max(Pixels::ZERO);
+    let height_limit = (box_height - rows_height).max(Pixels::ZERO);
+    let wanted = px(NOW_PLAYING_COVER_PHYSICAL_PX / window.scale_factor());
+    let side = wanted.min(side_limit).min(height_limit);
+    let block_height = rows_height + side;
+    let left = box_origin.x + (box_width - side) / 2.0;
+    let mut y = box_origin.y + ((box_height - block_height) / 2.0).max(Pixels::ZERO);
+
+    let secs = crate::marquee::now_secs();
+    let mut scrolling = false;
+    // One line of text in a box `side` wide: centered when it fits,
+    // otherwise sliding to and fro behind a clip.
+    let mut paint_line = |text: &str, color: Hsla, at_y: Pixels, window: &mut Window, cx: &mut App| {
+        if text.is_empty() {
+            return;
+        }
+        let line = shape(text, color, window);
+        let line_box = Bounds::new(point(left, at_y), gpui::size(side.max(cell_width), line_height));
+        let overflow = line.width - line_box.size.width;
+        let x = if overflow > Pixels::ZERO {
+            scrolling = true;
+            left - px(crate::marquee::offset_at(f32::from(overflow), secs))
+        } else {
+            left + (line_box.size.width - line.width) / 2.0
+        };
+        window.with_content_mask(Some(ContentMask { bounds: line_box }), |window| {
+            line.paint(point(x, at_y), line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        });
+    };
+
+    // 1. artist / album / year
+    paint_line(&info_text, dim_color, y, window, cx);
+    y += line_height + gap;
+
+    // 2. cover
+    let cover_bounds = Bounds::new(point(left, y), gpui::size(side, side));
+    let mut widget_bounds = AudioWidgetBounds::default();
+    if side >= cell_width * 2.0 {
+        let image = np.cover.clone().or(placeholder);
+        if let Some(image) = image {
+            window.paint_image(cover_bounds, gpui::Corners::all(Pixels::ZERO), image, 0, false).log_err();
+        }
+        if !is_playing {
+            // Paused: a play glyph over the cover says what a click does.
+            let glyph = shape(nf_play, text_color, window);
+            let overlay_side = line_height * 2.0;
+            let overlay = Bounds::new(
+                point(left + (side - overlay_side) / 2.0, y + (side - overlay_side) / 2.0),
+                gpui::size(overlay_side, overlay_side),
+            );
+            window.paint_quad(fill(overlay, gpui::rgba(0x000000a0)));
+            glyph
+                .paint(
+                    point(overlay.origin.x + (overlay_side - glyph.width) / 2.0, overlay.origin.y + (overlay_side - line_height) / 2.0),
+                    line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .log_err();
+        }
+        widget_bounds.cover = Some(cover_bounds);
+    }
+    y += side + gap;
+
+    // 3. title
+    paint_line(&title_text, text_color, y, window, cx);
+    y += line_height + gap;
+
+    // 4. [prev] bar [next] - the whole row stays within the cover's width:
+    // with a playlist the two buttons take a slot each at the ends and
+    // the bar only gets what is between them.
+    let slot = if has_playlist { cell_width * 2.0 } else { Pixels::ZERO };
+    // A gap between each button and the bar.
+    let inset = if has_playlist { slot + cell_width } else { Pixels::ZERO };
+    let bar_left = left + inset;
+    let bar_width = (side - inset * 2.0).max(Pixels::ZERO);
+    let bar_bounds = Bounds::new(point(bar_left, y + line_height * 0.4), gpui::size(bar_width, line_height * 0.2));
+    window.paint_quad(fill(bar_bounds, track_color));
+    // Progress and times only once everything else is known.
+    if np.ready && duration > std::time::Duration::ZERO {
+        let filled = Bounds::new(bar_bounds.origin, gpui::size(bar_width * fraction, bar_bounds.size.height));
+        window.paint_quad(fill(filled, fill_color));
+    }
+    if seekable {
+        // A thin bar is hard to hit: the whole row is the target.
+        widget_bounds.bar = Some(Bounds::new(point(bar_left, y), gpui::size(bar_width, line_height)));
+    }
+    if has_playlist {
+        let prev = shape(nf_prev, text_color, window);
+        let next = shape(nf_next, text_color, window);
+        let prev_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));
+        let next_slot = Bounds::new(point(left + side - slot, y), gpui::size(slot, line_height));
+        let prev_at = point(prev_slot.origin.x + (slot - prev.width) / 2.0, y);
+        let next_at = point(next_slot.origin.x + (slot - next.width) / 2.0, y);
+        prev.paint(prev_at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        next.paint(next_at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        widget_bounds.prev = Some(prev_slot);
+        widget_bounds.next = Some(next_slot);
+    }
+    y += line_height + gap;
+
+    // 5. elapsed on the left, what is left on the right
+    let time_font = (line_height - px(4.0)).max(px(1.0));
+    let time_y = y + (line_height - time_font) / 2.0;
+    let mut paint_time = |text: String, right_aligned: bool, window: &mut Window, cx: &mut App| {
+        let run = TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() };
+        let line = window.text_system().shape_line(text.into(), time_font, &[run], None);
+        let x = if right_aligned { left + side - line.width } else { left };
+        line.paint(point(x, time_y), time_font, gpui::TextAlign::Left, None, window, cx).log_err();
+    };
+    if np.ready {
+        paint_time(format_clock(elapsed), false, window, cx);
+        if duration > std::time::Duration::ZERO {
+            paint_time(format_clock(duration.saturating_sub(elapsed)), true, window, cx);
+        }
+    }
+
+    let needs_repaint = scrolling || np.cover_loading || is_playing || !np.ready;
+    Some((bounds, widget_bounds, needs_repaint))
 }
 
 fn format_duration(d: std::time::Duration) -> String {

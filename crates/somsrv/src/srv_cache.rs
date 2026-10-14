@@ -129,6 +129,24 @@ struct Inner {
     /// process model. `route_grow_markdown_rows` only ever looks here,
     /// never at `range_response_routes`.
     markdown_grower_routes: HashMap<CacheKey, SenderRoute>,
+    /// Keys whose bytes come from `somsrv`'s OWN `FetchResource` fetch
+    /// (see `begin_fetch`) — never removed. A client may register a
+    /// range responder for such a key purely to hear `EndPlayback` (a
+    /// playlist runner waiting for a track to finish); it cannot answer
+    /// byte-range requests for bytes it never held, so
+    /// `route_byte_range_request` must skip `range_response_routes` for
+    /// these keys instead of letting the request vanish into it.
+    fetched_keys: std::collections::HashSet<CacheKey>,
+    /// Fetches told to stop (playback ended/stopped, or the last
+    /// subscriber went away) — polled by the fetch loop via
+    /// `is_fetch_cancelled`. Without this an endless radio stream would
+    /// keep downloading forever once nobody is listening.
+    cancelled_fetches: std::collections::HashSet<CacheKey>,
+    /// Latest "now playing" for a radio stream (`set_now_playing`),
+    /// replayed to a subscriber that arrives later.
+    now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
+    /// `(index, len)` of the playlist entry a key is (`set_playlist`).
+    playlists: HashMap<CacheKey, (u32, u32)>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -317,7 +335,96 @@ impl SrvCache {
                 chunk_data: Vec::new(),
             });
         }
+        if let Some(info) = inner.now_playing.get(&key) {
+            let _ = send(SrvResponse::NowPlaying(info.clone()));
+        }
+        if let Some(&(index, len)) = inner.playlists.get(&key) {
+            let _ = send(SrvResponse::Playlist { session_id, file_id, index, len });
+        }
         inner.subscribers.entry(key).or_default().push(send);
+    }
+
+    /// Records which playlist entry `(session_id, file_id)` is and pushes
+    /// it to the key's subscribers. A `title` from the playlist becomes a
+    /// title-only "now playing" unless something richer is already known.
+    pub fn set_playlist(
+        &self,
+        session_id: u32,
+        file_id: u32,
+        title: Option<String>,
+        index: u32,
+        len: u32,
+        lookup_pending: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        inner.playlists.insert(key, (index, len));
+        let mut pushes = vec![SrvResponse::Playlist { session_id, file_id, index, len }];
+        let title = title.filter(|t| !t.trim().is_empty());
+        if title.is_none() && lookup_pending && !inner.now_playing.contains_key(&key) {
+            // No title to show, but a lookup is coming: say so, so the
+            // consumer holds back its stand-in picture.
+            let info = somsrv::protocol::NowPlayingInfo {
+                session_id,
+                file_id,
+                artist: String::new(),
+                title: String::new(),
+                album: String::new(),
+                year: None,
+                duration_ms: 0,
+                remaining_ms: 0,
+                cover_url: None,
+                cover_lookup_pending: true,
+            };
+            inner.now_playing.insert(key, info.clone());
+            pushes.push(SrvResponse::NowPlaying(info));
+        } else if let Some(title) = title
+            && !inner.now_playing.contains_key(&key)
+        {
+            let info = somsrv::protocol::NowPlayingInfo {
+                session_id,
+                file_id,
+                artist: String::new(),
+                title,
+                album: String::new(),
+                year: None,
+                duration_ms: 0,
+                remaining_ms: 0,
+                cover_url: None,
+                cover_lookup_pending: lookup_pending,
+            };
+            inner.now_playing.insert(key, info.clone());
+            pushes.push(SrvResponse::NowPlaying(info));
+        }
+        if let Some(subscribers) = inner.subscribers.get(&key) {
+            for subscriber in subscribers {
+                for push in &pushes {
+                    let _ = subscriber(push.clone());
+                }
+            }
+        }
+    }
+
+    /// Forwards a previous/next request to the key's registered range
+    /// responder (the playlist runner). Silently a no-op without one.
+    pub fn route_playlist_step(&self, session_id: u32, file_id: u32, delta: i32) {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(route) = inner.range_response_routes.get(&(session_id, file_id)) {
+            let _ = route(SrvRequest::PlaylistStep { session_id, file_id, delta });
+        }
+    }
+
+    /// Records `info` as the latest "now playing" of its key and pushes it
+    /// to every current subscriber.
+    pub fn set_now_playing(&self, info: somsrv::protocol::NowPlayingInfo) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (info.session_id, info.file_id);
+        if let Some(subscribers) = inner.subscribers.get(&key) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::NowPlaying(info.clone()));
+            }
+        }
+        inner.now_playing.insert(key, info);
     }
 
     /// Pushes `SrvResponse::StopPlayback` to every current subscriber of
@@ -332,12 +439,30 @@ impl SrvCache {
     /// same tolerance every other best-effort push in this cache already
     /// has.
     pub fn notify_stop_playback(&self, session_id: u32, file_id: u32) {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.cancelled_fetches.insert((session_id, file_id));
         if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
             for subscriber in subscribers {
                 let _ = subscriber(SrvResponse::StopPlayback { session_id, file_id });
             }
         }
+    }
+
+    /// Marks `(session_id, file_id)` as sourced by `somsrv`'s own fetch
+    /// and clears any stale cancellation left over from an earlier use of
+    /// the same key — called once at the start of every `FetchResource`.
+    pub fn begin_fetch(&self, session_id: u32, file_id: u32) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        inner.fetched_keys.insert(key);
+        inner.cancelled_fetches.remove(&key);
+    }
+
+    /// `true` once playback of `(session_id, file_id)` ended/stopped or
+    /// its subscriber unsubscribed — the fetch loop should stop reading.
+    pub fn is_fetch_cancelled(&self, session_id: u32, file_id: u32) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.cancelled_fetches.contains(&(session_id, file_id))
     }
 
     /// Pushes `SrvResponse::FetchFailed` to every current subscriber of
@@ -371,6 +496,7 @@ impl SrvCache {
     pub fn unsubscribe(&self, session_id: u32, file_id: u32) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
+        inner.cancelled_fetches.insert(key);
         if let Some(subscribers) = inner.subscribers.remove(&key) {
             for subscriber in &subscribers {
                 let _ = subscriber(SrvResponse::Unsubscribed { session_id, file_id });
@@ -442,7 +568,8 @@ impl SrvCache {
         // call site's `let _ = ...`, which doesn't need to react to
         // failure) is what lets this fall through to the in-memory
         // window below instead of the request silently vanishing.
-        if let Some(route) = inner.range_response_routes.get(&key)
+        if !inner.fetched_keys.contains(&key)
+            && let Some(route) = inner.range_response_routes.get(&key)
             && route(request.clone()).is_ok()
         {
             return;
@@ -468,8 +595,9 @@ impl SrvCache {
     /// no-op on a miss, same tolerance every other best-effort message
     /// here has — see `SrvRequest::EndPlayback`'s own doc comment.
     pub fn route_end_playback(&self, session_id: u32, file_id: u32) {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
+        inner.cancelled_fetches.insert(key);
         if let Some(route) = inner.range_response_routes.get(&key) {
             let _ = route(SrvRequest::EndPlayback { session_id, file_id });
         }
@@ -1023,5 +1151,81 @@ mod tests {
         // this test's concern, see the companion test.)
         cache.put_chunk(1, 2, 5, b"world", 15, ContentType::Gif, test_metadata());
         assert_eq!(*observed.lock().unwrap(), vec![10, 5], "tail_available_from must advance to the connecting chunk's own start");
+    }
+
+    /// Subscribes to `(1, 2)` and returns the `NowPlaying` infos pushed.
+    fn collect_now_playing(cache: &SrvCache) -> Arc<Mutex<Vec<somsrv::protocol::NowPlayingInfo>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        cache.subscribe(1, 2, Arc::new(move |response| {
+            if let SrvResponse::NowPlaying(info) = response {
+                sink.lock().unwrap().push(info);
+            }
+            Ok(())
+        }));
+        seen
+    }
+
+    #[test]
+    fn announced_title_of_a_station_track_holds_the_stand_in_back() {
+        let cache = SrvCache::new();
+        let seen = collect_now_playing(&cache);
+
+        cache.set_playlist(1, 2, Some("Radio Paradise".to_string()), 0, 2, true);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].title, "Radio Paradise");
+        assert!(seen[0].cover_lookup_pending, "a lookup is coming, so no stand-in yet");
+    }
+
+    #[test]
+    fn announced_file_without_a_lookup_is_final() {
+        let cache = SrvCache::new();
+        let seen = collect_now_playing(&cache);
+
+        cache.set_playlist(1, 2, Some("song".to_string()), 0, 1, false);
+
+        assert!(!seen.lock().unwrap()[0].cover_lookup_pending);
+    }
+
+    #[test]
+    fn untitled_station_track_still_reports_the_pending_lookup() {
+        let cache = SrvCache::new();
+        let seen = collect_now_playing(&cache);
+
+        cache.set_playlist(1, 2, None, 0, 2, true);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].title.is_empty());
+        assert!(seen[0].cover_lookup_pending);
+    }
+
+    #[test]
+    fn a_real_answer_replaces_the_announced_placeholder_info() {
+        let cache = SrvCache::new();
+        cache.set_playlist(1, 2, Some("announced".to_string()), 0, 2, true);
+        let seen = collect_now_playing(&cache);
+        // Late subscriber gets the announced info replayed...
+        assert!(seen.lock().unwrap()[0].cover_lookup_pending);
+
+        cache.set_now_playing(somsrv::protocol::NowPlayingInfo {
+            session_id: 1,
+            file_id: 2,
+            artist: "A".into(),
+            title: "T".into(),
+            album: "B".into(),
+            year: None,
+            duration_ms: 1000,
+            remaining_ms: 500,
+            cover_url: None,
+            cover_lookup_pending: false,
+        });
+
+        // ...and the real answer is final.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.last().unwrap().title, "T");
+        assert!(!seen.last().unwrap().cover_lookup_pending);
     }
 }

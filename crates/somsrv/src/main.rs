@@ -11,6 +11,7 @@
 mod bounds;
 mod http_fetch;
 mod lua;
+mod now_playing;
 mod redraw;
 mod relay;
 mod server;

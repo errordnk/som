@@ -558,6 +558,25 @@ pub enum SrvRequest {
     /// connection has already closed, same tolerance every other best-
     /// effort message in this protocol already has.
     GrowMarkdownRows { session_id: u32, file_id: u32, additional_rows: u32 },
+    /// Sent by a playlist runner (`somsrp` playing an `.m3u`) when it
+    /// starts a track: where that track sits in the list, and its
+    /// display title from the playlist (`#EXTINF`), if it had one.
+    /// `somsrv` stores it and pushes `SrvResponse::Playlist` (and, when
+    /// nothing better is known yet, a title-only `NowPlaying`) to the
+    /// key's subscribers, so Som can show previous/next controls for a
+    /// list of more than one entry.
+    ///
+    /// `target` is what is being played (a path or URL); `somsrv` uses it
+    /// to tell whether a station lookup is about to deliver the track's
+    /// real tags and cover (`NowPlayingInfo::cover_lookup_pending`).
+    AnnounceTrack { session_id: u32, file_id: u32, title: Option<String>, index: u32, len: u32, target: String },
+    /// Sent by Som on a fresh, one-shot connection when the user presses
+    /// previous (`delta: -1`) or next (`delta: 1`) on a playlist
+    /// placement. Routed like `EndPlayback` to the key's registered
+    /// range responder - the playlist runner - which moves to the
+    /// neighbouring entry, wrapping around the list. Silently dropped if
+    /// that runner is gone.
+    PlaylistStep { session_id: u32, file_id: u32, delta: i32 },
     /// Runs `script_source` as a fresh, explicitly-sandboxed `mlua::Lua`
     /// VM (see `crate::lua::phase1_stdlib`'s own doc comment — NOT
     /// `mlua::Lua::new()`'s default, which turned out live-confirmed to
@@ -754,6 +773,41 @@ pub enum SrvResponse {
     /// of this today (a markdown widget showing "failed to load"), which
     /// has no need to branch on failure kind.
     FetchFailed { session_id: u32, file_id: u32, reason: String },
+    /// Pushed to every `SubscribeProgress` subscriber of the key whenever
+    /// `somsrv` learns what an internet-radio stream it is fetching is
+    /// currently playing - see [`NowPlayingInfo`]. The latest one is also
+    /// replayed to a late subscriber.
+    NowPlaying(NowPlayingInfo),
+    /// Pushed to subscribers when the key's track is entry `index`
+    /// (0-based) of a playlist of `len` entries - see
+    /// `SrvRequest::AnnounceTrack`. Also replayed to a late subscriber.
+    Playlist { session_id: u32, file_id: u32, index: u32, len: u32 },
+}
+
+/// What an internet-radio stream is playing right now, as learned by
+/// `somsrv` from the station's own API (a stream itself carries almost
+/// none of this). Sent whole on every update; the consumer interpolates
+/// `remaining_ms` between two updates with its own clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NowPlayingInfo {
+    pub session_id: u32,
+    pub file_id: u32,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub year: Option<u32>,
+    /// Whole length of the current track; `0` when unknown (no
+    /// progress bar can be drawn then).
+    pub duration_ms: u32,
+    /// How much of the current track is left at the moment this was
+    /// produced; meaningful only when `duration_ms > 0`.
+    pub remaining_ms: u32,
+    /// Where the cover art can be fetched (at most ~600 px), if any.
+    pub cover_url: Option<String>,
+    /// `true` while a station lookup that will still deliver the real
+    /// cover (or settle that there is none) is under way - so a consumer
+    /// must not show a stand-in yet. `false` once the answer is final.
+    pub cover_lookup_pending: bool,
 }
 
 /// Mirrors `crates/terminal/src/rich_content_transport::ContentType`

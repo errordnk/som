@@ -544,9 +544,12 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::Handshake(_) => {
                 log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
             }
-            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target } => {
+            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags } => {
                 let lookup_pending = crate::now_playing::station_for_url(&target).is_some();
                 cache.set_playlist(session_id, file_id, title, index, len, lookup_pending);
+                if let Some(tags) = tags {
+                    crate::now_playing::announce_file_tags(cache.clone(), session_id, file_id, tags);
+                }
             }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {
                 cache.route_playlist_step(session_id, file_id, delta);

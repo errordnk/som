@@ -15,7 +15,7 @@
 //! without a network.
 
 use crate::srv_cache::SrvCache;
-use somsrv::protocol::NowPlayingInfo;
+use somsrv::protocol::{NowPlayingInfo, TrackTags};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -247,6 +247,51 @@ fn current_year() -> u32 {
     let mp = (5 * doy + 2) / 153;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (year + i64::from(month <= 2)) as u32
+}
+
+// ---------------------------------------------------------------------
+// Local files
+// ---------------------------------------------------------------------
+
+/// What the widget shows for a local file with `tags`: its own tags, no
+/// station clock (the player's own length and position are used), and a
+/// cover that is `pending` until the lookup answers.
+fn file_info(session_id: u32, file_id: u32, tags: &TrackTags, cover_url: Option<String>, pending: bool) -> NowPlayingInfo {
+    NowPlayingInfo {
+        session_id,
+        file_id,
+        artist: tags.artist.clone(),
+        title: tags.title.clone(),
+        album: tags.album.clone(),
+        year: tags.year,
+        duration_ms: 0,
+        remaining_ms: 0,
+        cover_url,
+        cover_lookup_pending: pending,
+    }
+}
+
+/// The finished answer for a local file: its tags and the cover the
+/// chain ([`find_cover`]) found by artist and album, if any.
+fn resolve_file_info(
+    http: &dyn HttpGet,
+    session_id: u32,
+    file_id: u32,
+    tags: &TrackTags,
+    current_year: u32,
+) -> NowPlayingInfo {
+    let cover = find_cover(http, &tags.artist, &tags.album, tags.year, current_year);
+    file_info(session_id, file_id, tags, cover, false)
+}
+
+/// Shows a local file's `tags` at once and fills its cover in as soon as
+/// the lookup (MusicBrainz / Cover Art Archive, Deezer, iTunes) answers.
+pub fn announce_file_tags(cache: SrvCache, session_id: u32, file_id: u32, tags: TrackTags) {
+    cache.set_now_playing(file_info(session_id, file_id, &tags, None, true));
+    std::thread::spawn(move || {
+        let info = resolve_file_info(&UreqHttp::new(), session_id, file_id, &tags, current_year());
+        cache.set_now_playing(info);
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -647,6 +692,35 @@ mod tests {
         http.answers.insert("musicbrainz.org", r#"{"releases":[]}"#.to_string());
 
         assert_eq!(find_cover(&http, "Band", "Wanted Album", Some(2000), 2026), None);
+    }
+
+    #[test]
+    fn local_file_tags_are_shown_with_the_cover_the_chain_found() {
+        let mut http = Canned::new();
+        http.answers.insert("musicbrainz.org", r#"{"releases":[{"id":"abc","title":"Test Album"}]}"#.to_string());
+        http.existing.push("release/abc/front-500");
+        let tags = TrackTags { title: "Test Title".into(), artist: "Test Artist".into(), album: "Test Album".into(), year: Some(2011) };
+
+        let pending = file_info(1, 2, &tags, None, true);
+        let done = resolve_file_info(&http, 1, 2, &tags, 2026);
+
+        assert!(pending.cover_lookup_pending && pending.cover_url.is_none());
+        assert_eq!((done.artist.as_str(), done.title.as_str(), done.album.as_str()), ("Test Artist", "Test Title", "Test Album"));
+        assert_eq!(done.year, Some(2011));
+        assert_eq!(done.cover_url.as_deref(), Some("https://coverartarchive.org/release/abc/front-500"));
+        assert!(!done.cover_lookup_pending, "the answer is final");
+    }
+
+    #[test]
+    fn local_file_without_an_album_gets_no_cover_and_a_final_answer() {
+        let http = Canned::new();
+        let tags = TrackTags { title: "Song".into(), ..Default::default() };
+
+        let done = resolve_file_info(&http, 1, 2, &tags, 2026);
+
+        assert_eq!(done.cover_url, None);
+        assert!(!done.cover_lookup_pending);
+        assert!(http.asked.lock().unwrap().is_empty());
     }
 
     #[test]

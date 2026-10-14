@@ -3650,9 +3650,9 @@ fn paint_now_playing_audio_widget(
     let info_text = info_parts.join("   ");
     let title_text = np.title.clone();
 
-    // Previous/next are always there for a playlist entry, even a lone
-    // one (they then start it over).
-    let has_playlist = np.playlist.is_some();
+    // Previous/next belong to a playlist track - even to a playlist of one
+    // (which just loops). A lone file or URL is announced with length 0.
+    let has_playlist = np.playlist.is_some_and(|(_, len)| len > 0);
     let (elapsed, duration) = if np.duration > std::time::Duration::ZERO {
         (np.elapsed, np.duration)
     } else {

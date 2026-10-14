@@ -1287,19 +1287,29 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     if is_playlist_path(path) {
         return stream_playlist(path);
     }
-    // A lone URL or audio file is a one-entry playlist: it gets the same
-    // widget and the same previous/next buttons (which then just start it
-    // over) as a list of many.
+    // A lone URL or audio file gets the same widget as a playlist track,
+    // but no previous/next buttons and no looping: it plays once.
     if let Some(entry) = single_audio_entry(path) {
-        return run_playlist(vec![entry]);
+        return run_standalone(entry);
     }
     stream_file_impl(path, audio_stream_index, subtitle_stream_index, None)
 }
 
-/// The one-entry playlist a lone URL or audio file stands for, or `None`
-/// for anything else (images, video, markdown: they keep their own,
-/// non-playlist presentation). A file's name is its title; a URL's comes
-/// from the station.
+/// Plays one URL or audio file that is not part of a playlist. It is
+/// announced with a playlist length of `0` - "not in a playlist" - so Som
+/// shows its title but no previous/next buttons.
+fn run_standalone(entry: PlaylistEntry) -> Result<(), String> {
+    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone() };
+    if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
+        stream_url(&entry.target, &position)
+    } else {
+        stream_file_impl(&entry.target, None, None, Some(&position))
+    }
+}
+
+/// What a lone URL or audio file is played as, or `None` for anything
+/// else (images, video, markdown keep their own presentation). A file's
+/// name is its title; a URL's comes from the station.
 fn single_audio_entry(target: &str) -> Option<PlaylistEntry> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Some(PlaylistEntry { target: target.to_string(), title: None });
@@ -1925,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_url_or_audio_file_is_a_one_entry_playlist() {
+    fn a_lone_url_or_audio_file_is_played_standalone() {
         assert_eq!(
             single_audio_entry("https://stream.radioparadise.com/flacm"),
             Some(PlaylistEntry { target: "https://stream.radioparadise.com/flacm".to_string(), title: None })

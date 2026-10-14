@@ -375,6 +375,7 @@ impl SrvCache {
                 remaining_ms: 0,
                 cover_url: None,
                 cover_lookup_pending: true,
+                next: None,
             };
             inner.now_playing.insert(key, info.clone());
             pushes.push(SrvResponse::NowPlaying(info));
@@ -392,6 +393,7 @@ impl SrvCache {
                 remaining_ms: 0,
                 cover_url: None,
                 cover_lookup_pending: lookup_pending,
+                next: None,
             };
             inner.now_playing.insert(key, info.clone());
             pushes.push(SrvResponse::NowPlaying(info));
@@ -1221,6 +1223,7 @@ mod tests {
             remaining_ms: 500,
             cover_url: None,
             cover_lookup_pending: false,
+            next: None,
         });
 
         // ...and the real answer is final.

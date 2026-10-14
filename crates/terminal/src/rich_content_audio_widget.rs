@@ -313,6 +313,7 @@ mod tests {
             remaining_ms,
             cover_url: None,
             cover_lookup_pending: false,
+            next: None,
         }
     }
 

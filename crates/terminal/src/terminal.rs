@@ -472,6 +472,7 @@ impl TerminalBuilder {
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_next_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_cover_drops: std::cell::RefCell::new(Vec::new()),
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -807,6 +808,7 @@ impl TerminalBuilder {
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_next_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_cover_drops: std::cell::RefCell::new(Vec::new()),
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1281,6 +1283,9 @@ pub struct Terminal {
     /// The cover-art fetch of each top-level audio placement showing a
     /// "now playing" widget - see `rich_content_audio_widget`.
     audio_covers: std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioCover>>,
+    /// The cover of the track a station announced as next, fetched while
+    /// the current one plays so it is ready the moment that track starts.
+    audio_next_covers: std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioCover>>,
     /// Decoded covers no longer shown; the paint path (the only place
     /// with an `App`) releases their GPU copies.
     audio_cover_drops: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>>,
@@ -3484,6 +3489,10 @@ impl Terminal {
         // is the one shown - tags, cover and time left then change exactly
         // when the audio does. Otherwise (no length, no player yet) the
         // station's own clock is the best there is.
+        let announced_cover = now
+            .as_ref()
+            .and_then(|(reported, _)| reported.next.as_ref())
+            .and_then(|next| next.cover_url.clone());
         let (info, duration, elapsed, track_ended) = match (now, clock) {
             (Some((reported, age)), Some((playhead, decoded, rate))) => {
                 let generation = state.now_playing_generation();
@@ -3532,11 +3541,41 @@ impl Terminal {
                 self.audio_cover_drops.borrow_mut().push(image);
             }
         }
+        let mut upcoming = self.audio_next_covers.borrow_mut();
         if let Some(url) = &wanted
             && !covers.contains_key(&key)
         {
-            covers.insert(key, rich_content_audio_widget::AudioCover::start(url));
+            // The picture fetched ahead, if this is that track.
+            let cover = match upcoming.remove(&key) {
+                Some(ahead) if ahead.url() == url => ahead,
+                other => {
+                    if let Some(image) = other.and_then(|ahead| ahead.finish()) {
+                        self.audio_cover_drops.borrow_mut().push(image);
+                    }
+                    rich_content_audio_widget::AudioCover::start(url)
+                },
+            };
+            covers.insert(key, cover);
         }
+        // Fetch the announced next track's picture now, not when it starts.
+        let ahead_stale = match (&announced_cover, upcoming.get(&key)) {
+            (Some(url), Some(ahead)) => ahead.url() != url,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if ahead_stale && let Some(old) = upcoming.remove(&key) {
+            if let Some(image) = old.finish() {
+                self.audio_cover_drops.borrow_mut().push(image);
+            }
+        }
+        if let Some(url) = &announced_cover
+            && wanted.as_ref() != Some(url)
+        {
+            let ahead = upcoming.entry(key).or_insert_with(|| rich_content_audio_widget::AudioCover::start(url));
+            // Advances the download and decode while the current one plays.
+            ahead.image();
+        }
+        drop(upcoming);
         let (cover, cover_loading) = match covers.get_mut(&key) {
             Some(entry) => {
                 let image = entry.image();
@@ -3581,6 +3620,11 @@ impl Terminal {
     /// release.
     fn clear_audio_cover(&self, key: (u32, u32)) {
         if let Some(cover) = self.audio_covers.borrow_mut().remove(&key)
+            && let Some(image) = cover.finish()
+        {
+            self.audio_cover_drops.borrow_mut().push(image);
+        }
+        if let Some(cover) = self.audio_next_covers.borrow_mut().remove(&key)
             && let Some(image) = cover.finish()
         {
             self.audio_cover_drops.borrow_mut().push(image);

@@ -346,6 +346,14 @@ fn video_metadata(
 /// there's no interactive session afterward whose console mode would need
 /// to stay untouched.
 fn query_cell_size_px() -> Option<(u32, u32)> {
+    // Asked once per process: a playlist prints a new grid per track, by
+    // which time the key watcher owns stdin and a second query's reply
+    // would be eaten by it.
+    static CACHE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(query_cell_size_px_uncached)
+}
+
+fn query_cell_size_px_uncached() -> Option<(u32, u32)> {
     print!("\x1b[16t");
     std::io::Write::flush(&mut std::io::stdout()).ok()?;
 
@@ -403,6 +411,12 @@ fn query_cell_size_px() -> Option<(u32, u32)> {
 /// terminal's own reported character grid size sidesteps the unit mismatch
 /// entirely, regardless of what it turns out to be.
 fn query_cell_count() -> Option<(u32, u32)> {
+    // Asked once per process - see `query_cell_size_px`.
+    static CACHE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(query_cell_count_uncached)
+}
+
+fn query_cell_count_uncached() -> Option<(u32, u32)> {
     print!("\x1b[18t");
     std::io::Write::flush(&mut std::io::stdout()).ok()?;
 
@@ -722,6 +736,58 @@ static CTRL_C_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// for the start of — every byte arriving here is a real keypress.
 const ESC: u8 = 0x1b;
 
+/// Set once [`spawn_ctrlc_watcher`] has started its single stdin reader.
+static WATCHER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `true` while playing an `.m3u` playlist - only then does `n` mean
+/// "next track" instead of being an ordinary ignored key.
+static PLAYLIST_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A requested move through the playlist: `1` next, `-1` previous, `0`
+/// none. Set by the key watcher (`n`/`p`) or by Som's previous/next
+/// buttons (`SrvRequest::PlaylistStep`, seen by a track's responder
+/// thread); taken by the playlist loop after each track.
+static PLAYLIST_STEP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn skip_requested() -> bool {
+    PLAYLIST_STEP.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Where a track sits in the playlist being played, and its title from
+/// the playlist.
+struct PlaylistPosition {
+    index: usize,
+    len: usize,
+    title: Option<String>,
+    /// The path or URL being played.
+    target: String,
+}
+
+/// One playable entry of a parsed playlist.
+#[derive(Debug, PartialEq, Eq)]
+struct PlaylistEntry {
+    target: String,
+    title: Option<String>,
+}
+
+/// Announces `position` for `ids` to Som (via `somsrv`). Failure only
+/// costs the previous/next controls and title, so it is reported, not
+/// fatal.
+fn announce_track(ids: SrpIds, position: &PlaylistPosition) {
+    let (session_id, file_id) = ids;
+    let result = srv_channel::SrvChannel::connect().and_then(|channel| {
+        channel.announce_track(
+            session_id,
+            file_id,
+            position.title.clone(),
+            position.index as u32,
+            position.len as u32,
+            position.target.clone(),
+        )
+    });
+    if let Err(err) = result {
+        eprint!("somsrp: could not announce the track: {err}\r\n");
+    }
+}
+
 /// Watches stdin for any of the three keys that end a live full-terminal
 /// widget's wait loop — `Ctrl+C` (`ETX`), `Escape`, or `q`/`Q` — matching
 /// the same exit convention `vim`/`top`/`mc` already use for a full-
@@ -732,6 +798,11 @@ const ESC: u8 = 0x1b;
 /// distinguish which key was pressed, they're fully equivalent once this
 /// flag is set.
 fn spawn_ctrlc_watcher() {
+    // A playlist starts several tracks in one process; two readers on
+    // stdin would split its bytes between them.
+    if WATCHER_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     std::thread::spawn(|| {
         let mut stdin = std::io::stdin();
         let mut byte = [0u8; 1];
@@ -742,6 +813,13 @@ fn spawn_ctrlc_watcher() {
                     if byte[0] == ETX || byte[0] == ESC || byte[0] == b'q' || byte[0] == b'Q' {
                         CTRL_C_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
                         return;
+                    }
+                    if PLAYLIST_MODE.load(std::sync::atomic::Ordering::Acquire) {
+                        match byte[0] {
+                            b'n' | b'N' => PLAYLIST_STEP.store(1, std::sync::atomic::Ordering::Release),
+                            b'p' | b'P' => PLAYLIST_STEP.store(-1, std::sync::atomic::Ordering::Release),
+                            _ => {},
+                        }
                     }
                 },
                 Err(_) => return,
@@ -932,6 +1010,13 @@ fn spawn_byte_range_responder_from_disk(
                 {
                     ended_for_thread.store(true, Ordering::Release);
                     return;
+                },
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::PlaylistStep {
+                    session_id,
+                    file_id,
+                    delta,
+                })) if (session_id, file_id) == ids => {
+                    PLAYLIST_STEP.store(delta.signum(), Ordering::Release);
                 },
                 Ok(_) => continue,
                 Err(_) => return,
@@ -1138,12 +1223,27 @@ fn stream_file_from_disk(
     // `CTRL_C_REQUESTED` (`spawn_ctrlc_watcher`, the user pressing Ctrl+C
     // in this terminal) — see this function's own doc comment for why
     // both must lead here, not just Ctrl+C.
-    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) && !ended.load(std::sync::atomic::Ordering::Acquire) {
+    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+        && !ended.load(std::sync::atomic::Ordering::Acquire)
+        && !skip_requested()
+    {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(handle);
+    stop_playback_best_effort(ids);
     Ok(())
+}
+
+/// Asks Som (via `somsrv`) to stop `ids`' player - a no-op if it already
+/// ended. A failure only means the old player may keep sounding until its
+/// widget disappears, so it is reported, not fatal.
+fn stop_playback_best_effort(ids: SrpIds) {
+    let (session_id, file_id) = ids;
+    let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.stop_playback(session_id, file_id));
+    if let Err(err) = result {
+        eprint!("somsrp: could not stop previous track: {err}\r\n");
+    }
 }
 
 /// Streams `path` to Som over SRP, then prints a placeholder grid
@@ -1184,9 +1284,15 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     // that looks like a recognized extension (or might not have one at
     // all — query strings, extension-less API endpoints).
     if path.starts_with("http://") || path.starts_with("https://") {
-        return stream_url(path);
+        return stream_url(path, None);
     }
-    stream_file_impl(path, audio_stream_index, subtitle_stream_index)
+    if is_playlist_path(path) {
+        return stream_playlist(path);
+    }
+    // A lone audio file is a one-entry list: its name is its title.
+    let title = std::path::Path::new(path).file_stem().map(|stem| stem.to_string_lossy().into_owned());
+    let position = PlaylistPosition { index: 0, len: 1, title, target: path.to_string() };
+    stream_file_impl(path, audio_stream_index, subtitle_stream_index, Some(&position))
 }
 
 /// Streams an `http://`/`https://` URL directly, WITHOUT `somsrp` ever
@@ -1201,49 +1307,207 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 /// `print_placeholder_grid_with_cell_dims`'s own doc comment), so there's
 /// nothing about the grid's size that would need to differ once the real
 /// type is known anyway.
-fn stream_url(url: &str) -> Result<(), String> {
-    let (session_id, file_id) = new_ids();
+fn stream_url(url: &str, playlist: Option<&PlaylistPosition>) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    // One connection for the `FetchResource` request AND to hold the
-    // terminal open afterward — unlike `stream_file`'s branches, there's
-    // no bulk byte stream THIS process sends at all (that's entirely
-    // `somsrv`'s job now), so there's no separate "drop the sender
-    // connection" step needed the way markdown/image's live-process
-    // branches have (see those branches' own doc comments for why THEY
-    // need an explicit early drop — this process was never a `PutChunk`
-    // sender in the first place, so `SrvCache`'s `sender_routes` table
-    // never has an entry for this connection to begin with).
-    let channel = srv_channel::SrvChannel::connect()?;
+    let ids = new_ids();
+    let (session_id, file_id) = ids;
+
+    // The connection that carries the `FetchResource` request. `somsrv`
+    // serves that request inline on this connection's own thread, so for
+    // the whole download nothing else can be asked of it - it is only
+    // read from, to learn that the fetch FAILED (the daemon answers a
+    // failed fetch here too, not just to Som's progress subscription).
+    let channel = Arc::new(srv_channel::SrvChannel::connect()?);
 
     clear_screen_and_home_cursor();
     // Content-type-agnostic footprint: the full terminal, same as every
-    // other top-level (non-markdown) content type now reserves — see
+    // other top-level (non-markdown) content type now reserves - see
     // `print_placeholder_grid_with_cell_dims`'s own doc comment. The
-    // `columns`/`rows` fallback values passed here (used only if `query_
-    // cell_count()` gets no reply at all) are arbitrary since there's no
-    // known aspect ratio to fall back to for a URL of unknown type —
-    // `AUDIO_WIDGET_COLUMNS`/`AUDIO_WIDGET_ROWS` are reused here purely as
-    // an existing "small, sane default" constant, not because this is
-    // audio-specific.
+    // `columns`/`rows` fallback values are only used if `query_cell_
+    // count()` gets no reply at all.
     print_placeholder_grid_with_cell_dims(session_id, file_id, AUDIO_WIDGET_COLUMNS, AUDIO_WIDGET_ROWS)?;
 
-    channel.request_fetch_resource(session_id, file_id, url.to_string())?;
-    drop(channel);
+    // A second connection, registered as the range responder purely to
+    // be told when playback ended: `somsrv` relays Som's `EndPlayback`
+    // only to a registered responder. It never serves byte ranges (the
+    // daemon knows this key is fetch-sourced and does not forward them
+    // here) - the fetched bytes are somsrv's own, not this process's.
+    let ended = Arc::new(AtomicBool::new(false));
+    let responder = Arc::new(srv_channel::SrvChannel::connect()?);
+    responder.register_range_responder(session_id, file_id)?;
+    {
+        let ended = ended.clone();
+        std::thread::spawn(move || loop {
+            match responder.read_incoming() {
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::EndPlayback {
+                    session_id: ended_session,
+                    file_id: ended_file,
+                })) if (ended_session, ended_file) == ids => {
+                    ended.store(true, Ordering::Release);
+                    return;
+                },
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::PlaylistStep {
+                    session_id: step_session,
+                    file_id: step_file,
+                    delta,
+                })) if (step_session, step_file) == ids => {
+                    PLAYLIST_STEP.store(delta.signum(), Ordering::Release);
+                },
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        });
+    }
 
-    // Same live-process model every other top-level content type now
-    // uses (see `print_placeholder_grid_with_cell_dims`'s doc comment for
-    // why the prompt no longer reappears immediately) — `somsrv` itself
-    // determines the real content type and streams bytes on its own; this
-    // process has nothing further to do but hold the terminal open until
-    // the user is done looking.
+    let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    if let Some(position) = playlist {
+        announce_track(ids, position);
+    }
+    channel.request_fetch_resource(session_id, file_id, url.to_string())?;
+    {
+        let channel = channel.clone();
+        let ended = ended.clone();
+        let failure = failure.clone();
+        std::thread::spawn(move || {
+            loop {
+                match channel.read_incoming() {
+                    Ok(srv_channel::Incoming::Response(somsrv::protocol::SrvResponse::FetchFailed { reason, .. })) => {
+                        *failure.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+                        ended.store(true, Ordering::Release);
+                        return;
+                    },
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    // Same live-process model every other top-level content type uses:
+    // hold the terminal until the user is done, the track ended, or a
+    // playlist asked to move on.
     spawn_ctrlc_watcher();
-    while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+    while !CTRL_C_REQUESTED.load(Ordering::Acquire) && !ended.load(Ordering::Acquire) && !skip_requested() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(())
+    stop_playback_best_effort(ids);
+
+    let reason = failure.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    match reason {
+        Some(reason) => Err(format!("fetching {url}: {reason}")),
+        None => Ok(()),
+    }
 }
 
-fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream_index: Option<u32>) -> Result<(), String> {
+/// `.m3u`/`.m3u8` - the extensions `somsrp` treats as a playlist.
+fn is_playlist_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".m3u") || lower.ends_with(".m3u8")
+}
+
+/// Parses an M3U/M3U8 playlist into the entries to play, in order: blank
+/// lines and `#` lines are skipped (a `#EXTINF:<secs>,<title>` line
+/// supplies the title of the entry after it), `http://`/`https://`
+/// entries are kept as they are, anything else is a file path resolved
+/// against `base_dir` (the playlist's own directory) unless it is
+/// absolute. A UTF-8 byte order mark on the first line is ignored.
+fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntry> {
+    let mut entries = Vec::new();
+    let mut pending_title: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(info) = line.strip_prefix("#EXTINF:") {
+            pending_title = info
+                .split_once(',')
+                .map(|(_, title)| title.trim().to_string())
+                .filter(|title| !title.is_empty());
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let is_url = line.starts_with("http://") || line.starts_with("https://");
+        let path = std::path::Path::new(line);
+        let target = match (is_url, path.is_absolute(), base_dir) {
+            (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
+            _ => line.to_string(),
+        };
+        entries.push(PlaylistEntry { target, title: pending_title.take() });
+    }
+    entries
+}
+
+/// Plays an `.m3u` playlist track after track, each as its own top-level
+/// placement (so every track gets the normal audio widget). The list is a
+/// circle: after the last entry it starts over, `n` / Som's next button
+/// goes forward and `p` / its previous button back, both wrapping. A track
+/// ends when Som reports natural end-of-playback; a live stream never
+/// ends by itself, so it plays until stepped away from. `q`/`Esc`/
+/// `Ctrl+C` quits the whole playlist. A one-entry list just plays that
+/// entry once. Entries that fail to start (missing file, unreachable URL,
+/// unsupported type) are skipped; if every entry in a row fails the last
+/// failure is returned.
+fn stream_playlist(path: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading playlist {path}: {e}"))?;
+    if text.contains("#EXT-X-") {
+        return Err("HLS (.m3u8 segment) playlists are not supported - only plain track lists".to_string());
+    }
+    let base_dir = std::path::Path::new(path).parent().filter(|p| !p.as_os_str().is_empty());
+    let entries = parse_m3u(&text, base_dir);
+    if entries.is_empty() {
+        return Err(format!("{path}: playlist has no entries"));
+    }
+
+    PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
+    let len = entries.len();
+    let mut index = 0usize;
+    let mut failures_in_a_row = 0usize;
+    loop {
+        if CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        PLAYLIST_STEP.store(0, std::sync::atomic::Ordering::Release);
+        let entry = &entries[index];
+        // Som shows previous/next only when there is more than one entry.
+        let position =
+            Some(PlaylistPosition { index, len, title: entry.title.clone(), target: entry.target.clone() });
+        let result = if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
+            stream_url(&entry.target, position.as_ref())
+        } else {
+            stream_file_impl(&entry.target, None, None, position.as_ref())
+        };
+        let step = PLAYLIST_STEP.swap(0, std::sync::atomic::Ordering::AcqRel);
+        match result {
+            Ok(()) => failures_in_a_row = 0,
+            Err(err) => {
+                failures_in_a_row += 1;
+                if failures_in_a_row >= len {
+                    return Err(format!("{}: {err}", entry.target));
+                }
+            },
+        }
+        if CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        // Natural end of the only entry: done. Otherwise keep circling.
+        if len == 1 && step == 0 {
+            return Ok(());
+        }
+        index = if step < 0 { (index + len - 1) % len } else { (index + 1) % len };
+    }
+}
+
+fn stream_file_impl(
+    path: &str,
+    audio_stream_index: Option<u32>,
+    subtitle_stream_index: Option<u32>,
+    playlist: Option<&PlaylistPosition>,
+) -> Result<(), String> {
     use terminal::rich_content_transport::{ContentMetadata, ContentType};
 
     let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
@@ -1251,12 +1515,12 @@ fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream
         Some("gif") => ContentType::Gif,
         Some("jpg" | "jpeg") => ContentType::Jpeg,
         Some("png") => ContentType::Png,
-        Some("mp3" | "flac") => ContentType::Audio,
+        Some("mp3" | "flac" | "ogg" | "oga") => ContentType::Audio,
         Some("mp4" | "mkv" | "avi") => ContentType::Video,
         Some("md") => ContentType::Markdown,
         Some(other) => {
             return Err(format!(
-                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac/.mp4/.mkv/.avi/.md are supported so far"
+                "unrecognized extension .{other} — only .gif/.jpg/.jpeg/.png/.mp3/.flac/.ogg/.mp4/.mkv/.avi/.md/.m3u are supported so far"
             ));
         },
         None => return Err("file has no extension, can't infer content type".to_string()),
@@ -1283,6 +1547,9 @@ fn stream_file_impl(path: &str, audio_stream_index: Option<u32>, subtitle_stream
         // content type; audio adopted the same order first.
         clear_screen_and_home_cursor();
         print_audio_placeholder_grid(session_id, file_id)?;
+        if let Some(position) = playlist {
+            announce_track(ids, position);
+        }
 
         // Streams off disk in bounded chunks rather than reading the
         // whole file into memory first — see `stream_file_from_disk`'s
@@ -1609,5 +1876,43 @@ mod tests {
         };
         assert_eq!(width_px, 1920);
         assert_eq!(height_px, 804);
+    }
+
+    #[test]
+    fn m3u_skips_comments_and_blank_lines_and_keeps_urls() {
+        let text = "\u{feff}#EXTM3U\n#EXTINF:-1,Radio Paradise\nhttps://stream.radioparadise.com/world-etc-flac\n\n  http://example.com/a.mp3  \n";
+        let entries = parse_m3u(text, None);
+        assert_eq!(
+            entries,
+            vec![
+                PlaylistEntry {
+                    target: "https://stream.radioparadise.com/world-etc-flac".to_string(),
+                    title: Some("Radio Paradise".to_string()),
+                },
+                PlaylistEntry { target: "http://example.com/a.mp3".to_string(), title: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn m3u_resolves_relative_paths_against_the_playlist_directory() {
+        let base = std::path::Path::new("/music/lists");
+        let entries = parse_m3u("one.mp3\nsub/two.flac\n", Some(base));
+        assert_eq!(entries[0].target, base.join("one.mp3").to_string_lossy());
+        assert_eq!(entries[1].target, base.join("sub/two.flac").to_string_lossy());
+    }
+
+    #[test]
+    fn m3u_leaves_absolute_paths_alone() {
+        let absolute = if cfg!(windows) { "C:\\music\\a.mp3" } else { "/music/a.mp3" };
+        let entries = parse_m3u(&format!("{absolute}\n"), Some(std::path::Path::new("/elsewhere")));
+        assert_eq!(entries, vec![PlaylistEntry { target: absolute.to_string(), title: None }]);
+    }
+
+    #[test]
+    fn playlist_extensions_are_recognized_case_insensitively() {
+        assert!(is_playlist_path("radio.m3u"));
+        assert!(is_playlist_path("RADIO.M3U8"));
+        assert!(!is_playlist_path("radio.mp3"));
     }
 }

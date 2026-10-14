@@ -101,6 +101,15 @@ impl std::io::Read for GrowingSrvStream {
             if total_size > 0 && self.position >= total_size {
                 return Ok(0); // Real EOF.
             }
+            // A source of unknown length (a live radio stream, or a
+            // chunked HTTP body that has not ended yet) only ever delivers
+            // forward, in order - there is nothing to range-request, and
+            // `reset_buffer_for_seek` below would just throw away bytes
+            // already on their way.
+            if total_size == 0 {
+                std::thread::sleep(DECODE_RETRY_INTERVAL);
+                continue;
+            }
             // Stuck: the buffer has nothing for `self.position` right
             // now, whether because it genuinely hasn't arrived yet OR
             // because it arrived before this reader ever subscribed (see
@@ -148,7 +157,9 @@ impl std::io::Seek for GrowingSrvStream {
 
 impl symphonia::core::io::MediaSource for GrowingSrvStream {
     fn is_seekable(&self) -> bool {
-        true
+        // A live stream can't be seeked, and claiming otherwise makes
+        // container readers try to jump to the end to measure duration.
+        self.srv_state.total_size() > 0
     }
 
     fn byte_len(&self) -> Option<u64> {
@@ -210,6 +221,11 @@ const DECODE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// sides need `channels` to interpret `samples` as interleaved frames.
 struct SharedPcm {
     samples: Mutex<Vec<f32>>,
+    /// Absolute frame number of `samples[0]` - nonzero only for a live
+    /// stream, whose already-played head is dropped (see
+    /// [`trim_live_buffer`]) so memory stays bounded however long it
+    /// plays. `position_frames` stays absolute.
+    base_frames: AtomicU64,
     sample_rate: std::sync::atomic::AtomicU32,
     channels: std::sync::atomic::AtomicU32,
     /// Set once the background thread has decoded everything it's ever
@@ -248,6 +264,7 @@ fn run_decode_loop(
     shared: Arc<SharedPcm>,
     progress: Arc<AudioTransferProgress>,
     stop: Arc<AtomicBool>,
+    position_frames: Arc<AtomicU64>,
     request_byte_range: Option<RequestByteRange>,
 ) {
     use symphonia::core::audio::SampleBuffer;
@@ -368,7 +385,61 @@ fn run_decode_loop(
         }
         let buf = sample_buf.as_mut().expect("initialized above");
         buf.copy_interleaved_ref(decoded);
-        shared.samples.lock().unwrap_or_else(|p| p.into_inner()).extend_from_slice(buf.samples());
+        let mut samples = shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+        samples.extend_from_slice(buf.samples());
+        // Unknown total length == live stream: nothing will ever seek
+        // back into it, so keep only a bounded window.
+        if srv_state.total_size() == 0 {
+            let channels = shared.channels.load(Ordering::Acquire) as usize;
+            let rate = shared.sample_rate.load(Ordering::Acquire);
+            trim_live_buffer(&mut samples, &shared.base_frames, &position_frames, channels, rate);
+        }
+    }
+}
+
+/// How much already-played audio of a live stream is kept behind the
+/// playhead.
+const LIVE_KEEP_BEHIND_SECS: u64 = 5;
+/// If a live stream is paused so long that more than this is buffered
+/// ahead of the playhead, the excess is skipped instead of growing
+/// memory without bound.
+const LIVE_MAX_AHEAD_SECS: u64 = 30;
+/// How far behind the live edge (in buffered seconds) the playhead lands
+/// after such a skip.
+const LIVE_RESUME_AHEAD_SECS: u64 = 5;
+
+/// Bounds a live stream's PCM buffer: drops audio older than
+/// [`LIVE_KEEP_BEHIND_SECS`] behind the playhead and, when playback has
+/// fallen more than [`LIVE_MAX_AHEAD_SECS`] behind the stream (paused),
+/// jumps the playhead forward so it is only [`LIVE_RESUME_AHEAD_SECS`]
+/// behind the live edge. Must be called with `samples`' lock held - the
+/// output callback reads and advances `position_frames` under the same
+/// lock, so the two never disagree.
+fn trim_live_buffer(
+    samples: &mut Vec<f32>,
+    base_frames: &AtomicU64,
+    position_frames: &AtomicU64,
+    channels: usize,
+    sample_rate: u32,
+) {
+    if channels == 0 || sample_rate == 0 {
+        return;
+    }
+    let rate = sample_rate as u64;
+    let base = base_frames.load(Ordering::Acquire);
+    let end = base + (samples.len() / channels) as u64;
+    let mut position = position_frames.load(Ordering::Acquire).max(base);
+    if end - position.min(end) > LIVE_MAX_AHEAD_SECS * rate {
+        position = end - LIVE_RESUME_AHEAD_SECS * rate;
+        position_frames.store(position, Ordering::Release);
+    }
+    let keep_from = position.saturating_sub(LIVE_KEEP_BEHIND_SECS * rate);
+    // Drain in whole-second batches so a long-lived stream does not
+    // memmove the whole buffer after every packet.
+    if keep_from >= base + rate {
+        let drop_frames = keep_from - base;
+        samples.drain(..(drop_frames as usize * channels));
+        base_frames.store(keep_from, Ordering::Release);
     }
 }
 
@@ -459,23 +530,28 @@ impl RichContentAudioPlayer {
     ) -> Result<Self, String> {
         let shared = Arc::new(SharedPcm {
             samples: Mutex::new(Vec::new()),
+            base_frames: AtomicU64::new(0),
             sample_rate: std::sync::atomic::AtomicU32::new(0),
             channels: std::sync::atomic::AtomicU32::new(0),
             decode_finished: AtomicBool::new(false),
         });
         let decode_stop = Arc::new(AtomicBool::new(false));
+        let position_frames = Arc::new(AtomicU64::new(0));
 
         {
             let shared = shared.clone();
             let decode_stop = decode_stop.clone();
-            std::thread::spawn(move || run_decode_loop(srv_state, shared, progress, decode_stop, request_byte_range));
+            let position_frames = position_frames.clone();
+            std::thread::spawn(move || {
+                run_decode_loop(srv_state, shared, progress, decode_stop, position_frames, request_byte_range)
+            });
         }
 
         Ok(Self {
             shared,
             _stream: None,
             decode_stop,
-            position_frames: Arc::new(AtomicU64::new(0)),
+            position_frames,
             playing: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -561,8 +637,11 @@ impl RichContentAudioPlayer {
                         return;
                     }
                     let samples = cb_shared.samples.lock().unwrap_or_else(|p| p.into_inner());
-                    let total_frames_available = (samples.len() / channels_usize.max(1)) as u64;
-                    let mut frame = cb_position.load(Ordering::Acquire);
+                    let base = cb_shared.base_frames.load(Ordering::Acquire);
+                    let total_frames_available = base + (samples.len() / channels_usize.max(1)) as u64;
+                    // A live stream's head is trimmed away; never index
+                    // below what is still buffered.
+                    let mut frame = cb_position.load(Ordering::Acquire).max(base);
                     for out_frame in output.chunks_mut(channels_usize) {
                         if frame >= total_frames_available {
                             // Either genuinely at the end (decode
@@ -578,7 +657,7 @@ impl RichContentAudioPlayer {
                             }
                             continue;
                         }
-                        let start = frame as usize * channels_usize;
+                        let start = (frame - base) as usize * channels_usize;
                         for (dst, src) in out_frame.iter_mut().zip(&samples[start..start + channels_usize]) {
                             *dst = *src;
                         }
@@ -613,8 +692,21 @@ impl RichContentAudioPlayer {
         if !self.shared.decode_finished.load(Ordering::Acquire) {
             return false;
         }
-        let total_frames = self.total_frames_for(duration_ms);
+        // Unknown duration (a fetched URL): the decoded length is the
+        // only measure of "the end".
+        let total_frames = if duration_ms == 0 { self.decoded_frames() } else { self.total_frames_for(duration_ms) };
         total_frames > 0 && self.position_frames.load(Ordering::Acquire) >= total_frames
+    }
+
+    /// Frames decoded so far, counted from the start of the stream
+    /// (including any head already trimmed from a live buffer).
+    fn decoded_frames(&self) -> u64 {
+        let channels = self.shared.channels.load(Ordering::Acquire) as usize;
+        if channels == 0 {
+            return 0;
+        }
+        let samples = self.shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+        self.shared.base_frames.load(Ordering::Acquire) + (samples.len() / channels) as u64
     }
 
     pub fn toggle_play_pause(&self) {
@@ -664,6 +756,11 @@ impl RichContentAudioPlayer {
     /// request_audio_byte_range`) produces samples that far; this
     /// method itself never blocks or triggers a query directly.
     pub fn seek_to_fraction(&self, fraction: f32, duration_ms: u32) {
+        // No known duration (live stream / unsized fetch): there is no
+        // timeline to seek along.
+        if duration_ms == 0 {
+            return;
+        }
         let total_frames = self.total_frames_for(duration_ms);
         let target = (total_frames as f64 * fraction.clamp(0.0, 1.0) as f64) as u64;
         self.position_frames.store(target, Ordering::Release);
@@ -737,6 +834,40 @@ mod tests {
     /// The fixture is a 1-second tone — `1000` ms is what a real
     /// `ContentMetadata::Audio::duration_ms` would carry for it.
     const TEST_FIXTURE_DURATION_MS: u32 = 1000;
+
+    #[test]
+    fn live_trim_keeps_a_bounded_window_behind_the_playhead() {
+        let rate = 100u32; // tiny rate keeps the test buffer small
+        let channels = 2usize;
+        let frames = 60 * rate as usize;
+        let mut samples = vec![0.0f32; frames * channels];
+        let base = AtomicU64::new(0);
+        let position = AtomicU64::new(40 * rate as u64);
+
+        trim_live_buffer(&mut samples, &base, &position, channels, rate);
+
+        // Playhead is 20s behind the end (< LIVE_MAX_AHEAD_SECS): untouched.
+        assert_eq!(position.load(Ordering::Acquire), 40 * rate as u64);
+        // Everything older than 5s behind the playhead is gone.
+        assert_eq!(base.load(Ordering::Acquire), 35 * rate as u64);
+        assert_eq!(samples.len(), 25 * rate as usize * channels);
+    }
+
+    #[test]
+    fn live_trim_skips_ahead_when_far_behind_the_live_edge() {
+        let rate = 100u32;
+        let channels = 2usize;
+        let mut samples = vec![0.0f32; 120 * rate as usize * channels];
+        let base = AtomicU64::new(0);
+        let position = AtomicU64::new(0); // paused for the whole 120s
+
+        trim_live_buffer(&mut samples, &base, &position, channels, rate);
+
+        let end = 120 * rate as u64;
+        assert_eq!(position.load(Ordering::Acquire), end - LIVE_RESUME_AHEAD_SECS * rate as u64);
+        let base = base.load(Ordering::Acquire);
+        assert_eq!(base + (samples.len() / channels) as u64, end, "trimming must not lose the live edge");
+    }
 
     #[test]
     fn player_starts_paused_at_zero_position() {

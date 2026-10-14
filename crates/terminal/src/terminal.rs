@@ -5,6 +5,7 @@ pub use alacritty_terminal;
 pub mod kitty_graphics_placeholder;
 mod pty_info;
 pub mod rich_content_audio_player;
+pub mod rich_content_audio_widget;
 pub mod rich_content_cache;
 pub mod rich_content_gif_player;
 pub mod rich_content_lua_frontend;
@@ -470,6 +471,11 @@ impl TerminalBuilder {
             rich_content_cache: rich_content_cache::RichContentCache::new(),
             rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_cover_drops: std::cell::RefCell::new(Vec::new()),
+            audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
+            audio_prev_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -800,6 +806,11 @@ impl TerminalBuilder {
                 rich_content_cache: rich_content_cache::RichContentCache::new(),
                 rich_content_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_cover_drops: std::cell::RefCell::new(Vec::new()),
+                audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+                rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
+                audio_prev_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1267,6 +1278,28 @@ pub struct Terminal {
     /// GIF decoding.
     rich_content_audio_players:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_player::RichContentAudioPlayer>>,
+    /// The cover-art fetch of each top-level audio placement showing a
+    /// "now playing" widget - see `rich_content_audio_widget`.
+    audio_covers: std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioCover>>,
+    /// Decoded covers no longer shown; the paint path (the only place
+    /// with an `App`) releases their GPU copies.
+    audio_cover_drops: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>>,
+    /// Where each audio placement's clickable parts were painted this
+    /// frame (cover, previous, next, progress bar).
+    audio_widget_bounds:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioWidgetBounds>>,
+    /// Audio placements whose source has ended for good (`somsrv` pushed
+    /// `StopPlayback`: a playlist moved on, the sender exited). Never
+    /// reopened - unlike `rich_content_audio_stopped`, which a screen
+    /// clear resets, so a track replaced by the next one would otherwise
+    /// come back to life and play its leftover buffer over the new one.
+    rich_content_audio_dead: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
+    /// The cover of a placement's PREVIOUS track, kept on screen until
+    /// the next one is decoded - a new track's cover takes a moment, and
+    /// blank space (or the stand-in) between two real covers looks worse
+    /// than the old one lingering.
+    audio_prev_covers:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), std::sync::Arc<gpui::RenderImage>>>,
     /// `(session_id, file_id)` pairs the user has explicitly clicked
     /// "stop" on — unlike video's `stop` (which keeps its player alive
     /// and merely shows a stand-in image), audio's stop tears the
@@ -2626,12 +2659,31 @@ impl Terminal {
             // no player was open yet for this id (the request arrived for
             // a placement whose bytes never got far enough to autoplay),
             // removing a key that was never inserted is a correct no-op.
-            if let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key)
-                && srv_state.take_stop_playback_requested()
-            {
-                self.rich_content_audio_stopped.borrow_mut().insert(key);
+            if self.rich_content_audio_dead.borrow().contains(&key) {
+                continue;
+            }
+            let stop_requested = self
+                .rich_content_srv_progress
+                .borrow()
+                .get(&key)
+                .is_some_and(|srv_state| srv_state.take_stop_playback_requested());
+            if stop_requested {
+                // The source of this placement is gone for good: tear it
+                // down completely and never reopen it. A bare "stopped"
+                // mark is not enough - a screen clear (the next track of
+                // a playlist prints one) resets that, and the stale
+                // placement would then autoplay its leftover buffer on
+                // top of the new track.
+                self.rich_content_audio_dead.borrow_mut().insert(key);
                 players.remove(&key);
+                log::debug!("audio placement {session_id:#x}:{file_id:#x} ended for good; {} player(s) left", players.len());
                 self.rich_content_audio_progress.borrow_mut().remove(&key);
+                self.clear_audio_cover(key);
+                if let Some(state) = self.rich_content_srv_progress.borrow_mut().remove(&key) {
+                    state.stop();
+                    rich_content_srv_channel::unsubscribe(session_id, file_id);
+                }
+                continue;
             }
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);
@@ -2740,6 +2792,7 @@ impl Terminal {
                 // natural EOF is just as much a definitive end of
                 // playback as an explicit stop click.
                 rich_content_srv_channel::end_playback(session_id, file_id);
+                self.clear_audio_cover(key);
                 out.push((session_id, file_id, 0.0, false, std::time::Duration::ZERO, std::time::Duration::from_millis(duration_ms as u64)));
                 continue;
             }
@@ -3394,6 +3447,7 @@ impl Terminal {
         self.rich_content_audio_stopped.borrow_mut().insert(key);
         self.rich_content_audio_players.borrow_mut().remove(&key);
         self.rich_content_audio_progress.borrow_mut().remove(&key);
+        self.clear_audio_cover(key);
         // Tells the `somsrp` process backing this placement to exit — see
         // `rich_content_srv_channel::end_playback`'s own doc comment. The
         // widget's stop icon is a genuine, one-way end of playback (unlike
@@ -3401,6 +3455,162 @@ impl Terminal {
         // there is no more live process to serve a later play click even
         // if the placeholder cells are still on screen.
         rich_content_srv_channel::end_playback(session_id, file_id);
+    }
+
+    /// What the "now playing" widget shows for the audio placement
+    /// `(session_id, file_id)` - tags, playlist position and cover - or
+    /// `None` when `somsrv` told us nothing about it (a bare audio file,
+    /// which keeps the plain controls row). Fetches/decodes the cover as
+    /// a side effect and replaces it when the track changes.
+    pub fn audio_now_playing(&self, session_id: u32, file_id: u32) -> Option<rich_content_audio_widget::AudioNowPlaying> {
+        let key = (session_id, file_id);
+        let state = self.rich_content_srv_progress.borrow().get(&key).cloned()?;
+        let now = state.now_playing();
+        let playlist = state.playlist();
+        if now.is_none() && playlist.is_none() {
+            return None;
+        }
+        let (info, age) = match now {
+            Some((info, age)) => (Some(info), age),
+            None => (None, std::time::Duration::ZERO),
+        };
+
+        let mut covers = self.audio_covers.borrow_mut();
+        let wanted = info.as_ref().and_then(|info| info.cover_url.clone());
+        let stale = match (&wanted, covers.get(&key)) {
+            (Some(url), Some(cover)) => cover.url() != url,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if stale && let Some(old) = covers.remove(&key) {
+            if let Some(image) = old.finish() {
+                let mut prev_covers = self.audio_prev_covers.borrow_mut();
+                if let Some(older) = prev_covers.insert(key, image) {
+                    self.audio_cover_drops.borrow_mut().push(older);
+                }
+            }
+        }
+        if let Some(url) = &wanted
+            && !covers.contains_key(&key)
+        {
+            covers.insert(key, rich_content_audio_widget::AudioCover::start(url));
+        }
+        let (cover, cover_loading) = match covers.get_mut(&key) {
+            Some(entry) => {
+                let image = entry.image();
+                let loading = image.is_none() && !entry.failed();
+                (image, loading)
+            },
+            None => (None, false),
+        };
+        drop(covers);
+
+        // A decoded cover replaces the one being kept from the previous
+        // track (queued for release); until then that one stays shown.
+        let mut prev_covers = self.audio_prev_covers.borrow_mut();
+        let shown_cover = match cover {
+            Some(image) => {
+                if let Some(old) = prev_covers.remove(&key)
+                    && !std::sync::Arc::ptr_eq(&old, &image)
+                {
+                    self.audio_cover_drops.borrow_mut().push(old);
+                }
+                Some(image)
+            },
+            None => prev_covers.get(&key).cloned(),
+        };
+        drop(prev_covers);
+
+        // The stand-in is the very last resort: only when no cover was
+        // found anywhere - never while one is loading, never while a
+        // station lookup that may still deliver one is under way.
+        let lookup_pending = info.as_ref().is_some_and(|i| i.cover_lookup_pending);
+        let show_placeholder = shown_cover.is_none() && !cover_loading && !lookup_pending;
+        let ready = !lookup_pending && !cover_loading && (shown_cover.is_some() || show_placeholder);
+
+        let (duration, elapsed) = info
+            .as_ref()
+            .map(|info| rich_content_audio_widget::track_times(info.duration_ms, info.remaining_ms, age))
+            .unwrap_or((std::time::Duration::ZERO, std::time::Duration::ZERO));
+        Some(rich_content_audio_widget::AudioNowPlaying {
+            artist: info.as_ref().map(|i| i.artist.clone()).unwrap_or_default(),
+            title: info.as_ref().map(|i| i.title.clone()).unwrap_or_default(),
+            album: info.as_ref().map(|i| i.album.clone()).unwrap_or_default(),
+            year: info.as_ref().and_then(|i| i.year),
+            duration,
+            elapsed,
+            playlist,
+            cover: shown_cover,
+            cover_loading,
+            show_placeholder,
+            ready,
+        })
+    }
+
+    /// Forgets `key`'s cover fetch, queueing its decoded image for GPU
+    /// release.
+    fn clear_audio_cover(&self, key: (u32, u32)) {
+        if let Some(cover) = self.audio_covers.borrow_mut().remove(&key)
+            && let Some(image) = cover.finish()
+        {
+            self.audio_cover_drops.borrow_mut().push(image);
+        }
+        if let Some(image) = self.audio_prev_covers.borrow_mut().remove(&key) {
+            self.audio_cover_drops.borrow_mut().push(image);
+        }
+        self.audio_widget_bounds.borrow_mut().remove(&key);
+    }
+
+    /// Covers no longer shown, for the paint path to release with
+    /// `App::drop_image`.
+    pub fn take_audio_cover_drops(&self) -> Vec<std::sync::Arc<gpui::RenderImage>> {
+        std::mem::take(&mut *self.audio_cover_drops.borrow_mut())
+    }
+
+    /// Records where an audio placement's clickable parts were painted.
+    pub fn record_audio_widget_bounds(&self, session_id: u32, file_id: u32, bounds: rich_content_audio_widget::AudioWidgetBounds) {
+        self.audio_widget_bounds.borrow_mut().insert((session_id, file_id), bounds);
+    }
+
+    /// A click on the "now playing" widget: the cover toggles play/pause,
+    /// previous/next step through the playlist (wrapping), the bar seeks.
+    /// `false` if the click is on none of those.
+    fn handle_audio_widget_click(&mut self, position: gpui::Point<Pixels>) -> bool {
+        enum Hit {
+            Cover,
+            Prev,
+            Next,
+            Bar(Bounds<Pixels>),
+        }
+        let hit = self.audio_widget_bounds.borrow().iter().find_map(|(key, bounds)| {
+            let hit = if bounds.cover.is_some_and(|r| r.contains(&position)) {
+                Hit::Cover
+            } else if bounds.prev.is_some_and(|r| r.contains(&position)) {
+                Hit::Prev
+            } else if bounds.next.is_some_and(|r| r.contains(&position)) {
+                Hit::Next
+            } else if let Some(bar) = bounds.bar.filter(|r| r.contains(&position)) {
+                Hit::Bar(bar)
+            } else {
+                return None;
+            };
+            Some((*key, hit))
+        });
+        let Some(((session_id, file_id), hit)) = hit else {
+            return false;
+        };
+        match hit {
+            Hit::Cover => self.toggle_rich_content_audio_playback(session_id, file_id),
+            Hit::Prev => rich_content_srv_channel::playlist_step(session_id, file_id, -1),
+            Hit::Next => rich_content_srv_channel::playlist_step(session_id, file_id, 1),
+            Hit::Bar(bar) => {
+                if bar.size.width > Pixels::ZERO {
+                    let fraction = ((position.x - bar.origin.x) / bar.size.width).clamp(0.0, 1.0);
+                    self.seek_rich_content_audio_playback(session_id, file_id, fraction);
+                }
+            },
+        }
+        true
     }
 
     /// Tears down every currently open audio player outright (unlike
@@ -3429,6 +3639,7 @@ impl Terminal {
         for (session_id, file_id) in keys {
             self.rich_content_audio_players.borrow_mut().remove(&(session_id, file_id));
             self.rich_content_audio_progress.borrow_mut().remove(&(session_id, file_id));
+            self.clear_audio_cover((session_id, file_id));
         }
     }
 
@@ -3908,6 +4119,9 @@ impl Terminal {
     /// through, confirmed live.
     fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) -> bool {
         log::trace!("handle_rich_content_click: position={position:?}");
+        if self.handle_audio_widget_click(position) {
+            return true;
+        }
         let cell_width = self.last_content.terminal_bounds.cell_width;
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
             let is_audio = self.rich_content_audio_players.borrow().contains_key(&(session_id, file_id));

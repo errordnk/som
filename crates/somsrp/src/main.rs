@@ -1284,16 +1284,32 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     // a URL's own path component might coincidentally end in something
     // that looks like a recognized extension (or might not have one at
     // all — query strings, extension-less API endpoints).
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return stream_url(path, None);
-    }
     if is_playlist_path(path) {
         return stream_playlist(path);
     }
-    // A lone audio file is a one-entry list: its name is its title.
-    let title = std::path::Path::new(path).file_stem().map(|stem| stem.to_string_lossy().into_owned());
-    let position = PlaylistPosition { index: 0, len: 1, title, target: path.to_string() };
-    stream_file_impl(path, audio_stream_index, subtitle_stream_index, Some(&position))
+    // A lone URL or audio file is a one-entry playlist: it gets the same
+    // widget and the same previous/next buttons (which then just start it
+    // over) as a list of many.
+    if let Some(entry) = single_audio_entry(path) {
+        return run_playlist(vec![entry]);
+    }
+    stream_file_impl(path, audio_stream_index, subtitle_stream_index, None)
+}
+
+/// The one-entry playlist a lone URL or audio file stands for, or `None`
+/// for anything else (images, video, markdown: they keep their own,
+/// non-playlist presentation). A file's name is its title; a URL's comes
+/// from the station.
+fn single_audio_entry(target: &str) -> Option<PlaylistEntry> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Some(PlaylistEntry { target: target.to_string(), title: None });
+    }
+    let extension = std::path::Path::new(target).extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "mp3" | "flac" | "ogg" | "oga") {
+        return None;
+    }
+    let title = std::path::Path::new(target).file_stem().map(|stem| stem.to_string_lossy().into_owned());
+    Some(PlaylistEntry { target: target.to_string(), title })
 }
 
 /// Streams an `http://`/`https://` URL directly, WITHOUT `somsrp` ever
@@ -1449,8 +1465,8 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
 /// goes forward and `p` / its previous button back, both wrapping. A track
 /// ends when Som reports natural end-of-playback; a live stream never
 /// ends by itself, so it plays until stepped away from. `q`/`Esc`/
-/// `Ctrl+C` quits the whole playlist. A one-entry list just plays that
-/// entry once. Entries that fail to start (missing file, unreachable URL,
+/// `Ctrl+C` quits the whole playlist. A one-entry list is looped.
+/// Entries that fail to start (missing file, unreachable URL,
 /// unsupported type) are skipped; if every entry in a row fails the last
 /// failure is returned.
 fn stream_playlist(path: &str) -> Result<(), String> {
@@ -1463,7 +1479,11 @@ fn stream_playlist(path: &str) -> Result<(), String> {
     if entries.is_empty() {
         return Err(format!("{path}: playlist has no entries"));
     }
+    run_playlist(entries)
+}
 
+/// Plays `entries` as a circular playlist - see [`stream_playlist`].
+fn run_playlist(entries: Vec<PlaylistEntry>) -> Result<(), String> {
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
     let len = entries.len();
     let mut index = 0usize;
@@ -1495,10 +1515,8 @@ fn stream_playlist(path: &str) -> Result<(), String> {
         if CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        // Natural end of the only entry: done. Otherwise keep circling.
-        if len == 1 && step == 0 {
-            return Ok(());
-        }
+        // The list is a circle, a single entry included: when it ends (or
+        // the user steps) it starts over; only a quit key leaves.
         index = if step < 0 { (index + len - 1) % len } else { (index + 1) % len };
     }
 }
@@ -1908,6 +1926,26 @@ mod tests {
         let absolute = if cfg!(windows) { "C:\\music\\a.mp3" } else { "/music/a.mp3" };
         let entries = parse_m3u(&format!("{absolute}\n"), Some(std::path::Path::new("/elsewhere")));
         assert_eq!(entries, vec![PlaylistEntry { target: absolute.to_string(), title: None }]);
+    }
+
+    #[test]
+    fn a_lone_url_or_audio_file_is_a_one_entry_playlist() {
+        assert_eq!(
+            single_audio_entry("https://stream.radioparadise.com/flacm"),
+            Some(PlaylistEntry { target: "https://stream.radioparadise.com/flacm".to_string(), title: None })
+        );
+        assert_eq!(
+            single_audio_entry("/music/Some Song.FLAC"),
+            Some(PlaylistEntry { target: "/music/Some Song.FLAC".to_string(), title: Some("Some Song".to_string()) })
+        );
+    }
+
+    #[test]
+    fn images_video_and_markdown_are_not_playlists() {
+        assert_eq!(single_audio_entry("photo.png"), None);
+        assert_eq!(single_audio_entry("clip.mkv"), None);
+        assert_eq!(single_audio_entry("notes.md"), None);
+        assert_eq!(single_audio_entry("no_extension"), None);
     }
 
     #[test]

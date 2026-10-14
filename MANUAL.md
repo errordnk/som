@@ -268,7 +268,7 @@ somsrp list.m3u
 
 A playing track gets a "now playing" widget: an artist / album / year line, the cover, the track title and a progress bar with the time left. A line that doesn't fit scrolls sideways; clicking the cover pauses and resumes.
 
-- **Playlists.** A list of more than one entry adds previous/next buttons on both sides of the bar (keys `p` / `n` work too) and plays in a circle. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
+- **Playlists.** Every track has previous/next buttons on both sides of the bar (keys `p` / `n` work too); the list plays in a circle, and a single entry (a lone file or URL counts as a one-entry list) is simply looped. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
 - **Radio.** For Radio Paradise streams the tags, the time left in the track and the cover come from the station's own API. Other streams show the title from the playlist and the elapsed time.
 - **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in.
 

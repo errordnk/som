@@ -3632,12 +3632,16 @@ fn paint_now_playing_audio_widget(
     };
 
     // ---- what to show --------------------------------------------------
-    let (nf_user, nf_disc, nf_year, nf_prev, nf_next, nf_play) = if has_nerd {
-        ("\u{f007}", "\u{f05ee}", "\u{f073}", "\u{f048}", "\u{f051}", "\u{f04b}")
+    let (nf_note, nf_user, nf_disc, nf_year, nf_prev, nf_next, nf_play) = if has_nerd {
+        ("\u{f0387}", "\u{f007}", "\u{f05ee}", "\u{f073}", "\u{f048}", "\u{f051}", "\u{f04b}")
     } else {
-        ("", "", "", "|<", ">|", ">")
+        ("", "", "", "", "|<", ">|", ">")
     };
+    // One line: the track's title first, then artist, album and year.
     let mut info_parts = Vec::new();
+    if !np.title.is_empty() {
+        info_parts.push(format!("{nf_note} {}", np.title));
+    }
     if !np.artist.is_empty() {
         info_parts.push(format!("{nf_user} {}", np.artist));
     }
@@ -3648,7 +3652,6 @@ fn paint_now_playing_audio_widget(
         info_parts.push(format!("{nf_year} {year}"));
     }
     let info_text = info_parts.join("   ");
-    let title_text = np.title.clone();
 
     // Previous/next belong to a playlist track - even to a playlist of one
     // (which just loops). A lone file or URL is announced with length 0.
@@ -3663,13 +3666,15 @@ fn paint_now_playing_audio_widget(
     } else {
         position_fraction.clamp(0.0, 1.0)
     };
-    // A bar from the station's own clock is not seekable; one from the
-    // local player (a file with a known length) is.
+    // The bar and the time left exist only for a track whose length is
+    // known. One from the station's own clock is not seekable; one from
+    // the local player (a file) is.
+    let has_remaining = duration > std::time::Duration::ZERO;
     let seekable = np.duration == std::time::Duration::ZERO && player_duration > std::time::Duration::ZERO;
 
     // ---- geometry ------------------------------------------------------
     let gap = line_height * 0.5;
-    let rows_height = line_height * 4.0 + gap * 3.0; // info, title, bar, times
+    let rows_height = line_height * 2.0 + gap * 2.0; // info line, controls row
     let side_limit = (box_width - cell_width * 6.0).max(Pixels::ZERO);
     let height_limit = (box_height - rows_height).max(Pixels::ZERO);
     let wanted = px(NOW_PLAYING_COVER_PHYSICAL_PX / window.scale_factor());
@@ -3700,8 +3705,8 @@ fn paint_now_playing_audio_widget(
         });
     };
 
-    // 1. artist / album / year
-    paint_line(&info_text, dim_color, y, window, cx);
+    // 1. title / artist / album / year
+    paint_line(&info_text, text_color, y, window, cx);
     y += line_height + gap;
 
     // 2. cover
@@ -3736,56 +3741,59 @@ fn paint_now_playing_audio_widget(
     }
     y += side + gap;
 
-    // 3. title
-    paint_line(&title_text, text_color, y, window, cx);
-    y += line_height + gap;
+    // 3. one controls row, inside the cover's width:
+    //    [prev] elapsed ====progress==== remaining [next]
+    // The bar and the time left are drawn only when the length is known;
+    // the times only once everything else about the track is.
+    let slot = cell_width * 2.0;
+    let time_font = (line_height - px(4.0)).max(px(1.0));
+    let time_y = y + (line_height - time_font) / 2.0;
+    let paint_time = |text: &str, at_x: Pixels, window: &mut Window, cx: &mut App| -> Pixels {
+        let run = TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() };
+        let line = window.text_system().shape_line(text.to_string().into(), time_font, &[run], None);
+        line.paint(point(at_x, time_y), time_font, gpui::TextAlign::Left, None, window, cx).log_err();
+        line.width
+    };
+    let measure_time = |text: &str, window: &mut Window| -> Pixels {
+        let run = TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() };
+        window.text_system().shape_line(text.to_string().into(), time_font, &[run], None).width
+    };
 
-    // 4. [prev] bar [next] - the whole row stays within the cover's width:
-    // with a playlist the two buttons take a slot each at the ends and
-    // the bar only gets what is between them.
-    let slot = if has_playlist { cell_width * 2.0 } else { Pixels::ZERO };
-    // A gap between each button and the bar.
-    let inset = if has_playlist { slot + cell_width } else { Pixels::ZERO };
-    let bar_left = left + inset;
-    let bar_width = (side - inset * 2.0).max(Pixels::ZERO);
-    let bar_bounds = Bounds::new(point(bar_left, y + line_height * 0.4), gpui::size(bar_width, line_height * 0.2));
-    window.paint_quad(fill(bar_bounds, track_color));
-    // Progress and times only once everything else is known.
-    if np.ready && duration > std::time::Duration::ZERO {
-        let filled = Bounds::new(bar_bounds.origin, gpui::size(bar_width * fraction, bar_bounds.size.height));
-        window.paint_quad(fill(filled, fill_color));
-    }
-    if seekable {
-        // A thin bar is hard to hit: the whole row is the target.
-        widget_bounds.bar = Some(Bounds::new(point(bar_left, y), gpui::size(bar_width, line_height)));
-    }
+    let mut x = left;
+    let mut right = left + side;
     if has_playlist {
         let prev = shape(nf_prev, text_color, window);
         let next = shape(nf_next, text_color, window);
         let prev_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));
         let next_slot = Bounds::new(point(left + side - slot, y), gpui::size(slot, line_height));
-        let prev_at = point(prev_slot.origin.x + (slot - prev.width) / 2.0, y);
-        let next_at = point(next_slot.origin.x + (slot - next.width) / 2.0, y);
-        prev.paint(prev_at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
-        next.paint(next_at, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
+        prev.paint(point(prev_slot.origin.x + (slot - prev.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
+        next.paint(point(next_slot.origin.x + (slot - next.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
         widget_bounds.prev = Some(prev_slot);
         widget_bounds.next = Some(next_slot);
+        x += slot + cell_width;
+        right -= slot + cell_width;
     }
-    y += line_height + gap;
-
-    // 5. elapsed on the left, what is left on the right
-    let time_font = (line_height - px(4.0)).max(px(1.0));
-    let time_y = y + (line_height - time_font) / 2.0;
-    let mut paint_time = |text: String, right_aligned: bool, window: &mut Window, cx: &mut App| {
-        let run = TextRun { len: text.len(), font: text_style.font(), color: dim_color, ..Default::default() };
-        let line = window.text_system().shape_line(text.into(), time_font, &[run], None);
-        let x = if right_aligned { left + side - line.width } else { left };
-        line.paint(point(x, time_y), time_font, gpui::TextAlign::Left, None, window, cx).log_err();
-    };
     if np.ready {
-        paint_time(format_clock(elapsed), false, window, cx);
-        if duration > std::time::Duration::ZERO {
-            paint_time(format_clock(duration.saturating_sub(elapsed)), true, window, cx);
+        let elapsed_text = format_clock(elapsed);
+        let elapsed_width = paint_time(&elapsed_text, x, window, cx);
+        x += elapsed_width + cell_width;
+        if has_remaining {
+            let remaining_text = format_clock(duration.saturating_sub(elapsed));
+            let remaining_width = measure_time(&remaining_text, window);
+            paint_time(&remaining_text, right - remaining_width, window, cx);
+            right -= remaining_width + cell_width;
+            if right > x {
+                let bar_bounds = Bounds::new(point(x, y + line_height * 0.4), gpui::size(right - x, line_height * 0.2));
+                window.paint_quad(fill(bar_bounds, track_color));
+                let filled = Bounds::new(bar_bounds.origin, gpui::size((right - x) * fraction, bar_bounds.size.height));
+                window.paint_quad(fill(filled, fill_color));
+                if seekable {
+                    // A thin bar is hard to hit: the whole row is the target.
+                    widget_bounds.bar = Some(Bounds::new(point(x, y), gpui::size(right - x, line_height)));
+                }
+            }
         }
     }
 

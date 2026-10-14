@@ -3562,8 +3562,8 @@ impl Terminal {
             // report) the station's name stays, as at the start and after
             // a station switch.
             title: match &info {
-                Some(info) => info.title.clone(),
-                None => station_title.unwrap_or_default(),
+                Some(info) if !info.title.is_empty() => info.title.clone(),
+                _ => station_title.unwrap_or_default(),
             },
             album: info.as_ref().map(|i| i.album.clone()).unwrap_or_default(),
             year: info.as_ref().and_then(|i| i.year),

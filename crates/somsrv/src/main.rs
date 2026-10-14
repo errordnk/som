@@ -10,7 +10,6 @@
 // Unix (WSL/SSH) profile.
 mod bounds;
 mod http_fetch;
-mod icy;
 mod lua;
 mod now_playing;
 mod redraw;

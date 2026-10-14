@@ -186,9 +186,10 @@ impl CoverCache {
     }
 }
 
-/// The track Radio Paradise has scheduled after the current one: the
-/// first song of the block its player would fetch next
-/// (`get_block?info=true` answers with the upcoming block).
+/// The track Radio Paradise has scheduled after the current one. The
+/// `get_block?info=true` answer lists the songs of a block in play order:
+/// the one after `current` is the next. A block that does not contain
+/// `current` is the upcoming one, and its first song is the next.
 #[derive(Debug, PartialEq, Eq)]
 struct RadioParadiseNext {
     artist: String,
@@ -199,11 +200,23 @@ struct RadioParadiseNext {
     cover: Option<String>,
 }
 
-fn parse_radio_paradise_next(body: &str) -> Option<RadioParadiseNext> {
+fn parse_radio_paradise_next(body: &str, current: (&str, &str)) -> Option<RadioParadiseNext> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let songs = value.get("song")?;
     // The songs come as an object keyed "0", "1", ... (or an array).
-    let song = songs.get("0").or_else(|| songs.get(0))?;
+    let mut songs: Vec<(u32, &serde_json::Value)> = match value.get("song")? {
+        serde_json::Value::Object(map) => map.iter().filter_map(|(k, v)| Some((k.parse().ok()?, v))).collect(),
+        serde_json::Value::Array(list) => list.iter().enumerate().map(|(i, v)| (i as u32, v)).collect(),
+        _ => return None,
+    };
+    songs.sort_by_key(|(index, _)| *index);
+    let same = |song: &serde_json::Value| {
+        let field = |key: &str| song.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        field("artist") == current.0 && field("title") == current.1
+    };
+    let song = match songs.iter().position(|(_, song)| same(song)) {
+        Some(at) => songs.get(at + 1)?.1,
+        None => songs.first()?.1,
+    };
     let text = |key: &str| song.get(key).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let title = text("title");
     if title.is_empty() {
@@ -226,6 +239,17 @@ fn parse_radio_paradise_next(body: &str) -> Option<RadioParadiseNext> {
         duration_ms: u32::try_from(duration_ms).ok()?,
         cover,
     })
+}
+
+/// When `current` is the LAST song of the block in `body`, the event id
+/// to ask `get_block` after for the block that follows it.
+fn radio_paradise_block_continues_after(body: &str, current: (&str, &str)) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let songs = value.get("song")?.as_object()?;
+    let last = songs.keys().filter_map(|k| k.parse::<u32>().ok()).max()?;
+    let song = songs.get(&last.to_string())?;
+    let field = |key: &str| song.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+    (field("artist") == current.0 && field("title") == current.1).then(|| field("event").to_string()).filter(|e| !e.is_empty())
 }
 
 /// One full answer for a Radio Paradise channel, as a ready
@@ -253,11 +277,18 @@ fn radio_paradise_info(
     // What is scheduled next, with its cover already looked up, so the
     // consumer can have the picture ready before the track starts. A
     // failed call just means nothing is announced.
-    let next = http
-        .get_text(&format!("https://api.radioparadise.com/api/get_block?bitrate=4&info=true&chan={chan}"))
-        .ok()
-        .and_then(|body| parse_radio_paradise_next(&body))
-        .filter(|next| !(next.artist == now.artist && next.title == now.title))
+    let block_url = format!("https://api.radioparadise.com/api/get_block?bitrate=4&info=true&chan={chan}");
+    let current = (now.artist.as_str(), now.title.as_str());
+    let block = http.get_text(&block_url).ok();
+    // The last song of a block is followed by the next block's first.
+    let following = block
+        .as_deref()
+        .and_then(|body| radio_paradise_block_continues_after(body, current))
+        .and_then(|event| http.get_text(&format!("{block_url}&event={event}")).ok());
+    let next = block
+        .as_deref()
+        .and_then(|body| parse_radio_paradise_next(body, current))
+        .or_else(|| following.as_deref().and_then(|body| parse_radio_paradise_next(body, ("", ""))))
         .map(|next| NextTrack {
             cover_url: covers.cover(http, &next.artist, &next.album, next.year, current_year, next.cover.clone()),
             artist: next.artist,
@@ -790,12 +821,30 @@ mod tests {
 
     #[test]
     fn the_upcoming_track_is_read_from_the_next_block() {
-        let next = parse_radio_paradise_next(RP_BLOCK).unwrap();
+        let next = parse_radio_paradise_next(RP_BLOCK, ("Someone", "Else")).unwrap();
         assert_eq!((next.artist.as_str(), next.title.as_str()), ("GoGo Penguin", "Saturnine"));
         assert_eq!(next.duration_ms, 287_554);
         assert_eq!(next.year, Some(2023));
         assert_eq!(next.cover.as_deref(), Some("https://img.radioparadise.com/covers/l/19270.jpg"));
-        assert!(parse_radio_paradise_next(r#"{"song":{}}"#).is_none());
+        assert!(parse_radio_paradise_next(r#"{"song":{}}"#, ("", "")).is_none());
+    }
+
+    #[test]
+    fn the_last_song_of_a_block_asks_for_the_block_after_it() {
+        let body = r#"{"song":{"0":{"artist":"A","title":"Now","event":"5"},"1":{"artist":"C","title":"Later","event":"7"}}}"#;
+
+        assert_eq!(radio_paradise_block_continues_after(body, ("C", "Later")).as_deref(), Some("7"));
+        assert_eq!(radio_paradise_block_continues_after(body, ("A", "Now")), None);
+    }
+
+    #[test]
+    fn the_song_after_the_playing_one_in_the_block_is_the_next() {
+        let body = r#"{"song":{"0":{"artist":"A","title":"Now","duration":1000},"1":{"artist":"B","title":"Next","duration":2000},"2":{"artist":"C","title":"Later","duration":3000}}}"#;
+
+        let next = parse_radio_paradise_next(body, ("A", "Now")).unwrap();
+        assert_eq!(next.title, "Next");
+        // The last song of the block has no known successor.
+        assert!(parse_radio_paradise_next(body, ("C", "Later")).is_none());
     }
 
     #[test]

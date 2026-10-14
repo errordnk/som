@@ -45,8 +45,7 @@ pub fn fetch_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, target:
 }
 
 fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> anyhow::Result<()> {
-    // Radio servers interleave the current title into the audio when asked.
-    let response = ureq::get(url).header("Icy-MetaData", "1").call()?;
+    let response = ureq::get(url).call()?;
 
     let content_type_header = response.headers().get(http::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("");
     let content_type = content_type_from_mime(content_type_header, url)
@@ -67,13 +66,6 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
         crate::now_playing::spawn_poller(cache.clone(), session_id, file_id, station, fetch_done.clone());
     }
 
-    let icy_metaint = response
-        .headers()
-        .get("icy-metaint")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|metaint| *metaint > 0);
-
     let mut body = response.into_body();
     let reader = body.as_reader();
     // A URL has no local directory to resolve a nested relative embed
@@ -83,19 +75,7 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
     // absolute URL (or one resolved against the PARENT URL, not a
     // filesystem path) to work at all; that's a real, separate gap this
     // change doesn't attempt to close.
-    // A station without a public API still says what is playing, inside
-    // the stream itself; the metadata is cut out before the audio is
-    // cached. (A station with its own adapter is authoritative.)
-    let result = match icy_metaint {
-        Some(metaint) if content_type == ContentType::Audio && station.is_none() => {
-            let titles = cache.clone();
-            let reader = crate::icy::IcyReader::new(reader, metaint, move |raw| {
-                crate::now_playing::announce_stream_title(&titles, session_id, file_id, &raw);
-            });
-            stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new())
-        },
-        _ => stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new()),
-    };
+    let result = stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new());
     fetch_done.store(true, Ordering::Release);
     result
 }

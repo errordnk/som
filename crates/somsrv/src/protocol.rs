@@ -834,6 +834,22 @@ pub struct NowPlayingInfo {
     /// cover (or settle that there is none) is under way - so a consumer
     /// must not show a stand-in yet. `false` once the answer is final.
     pub cover_lookup_pending: bool,
+    /// The track the station has scheduled after this one, when it says
+    /// so ahead of time: lets the consumer have its picture ready before
+    /// the track starts.
+    pub next: Option<NextTrack>,
+}
+
+/// What a station announces about the track after the current one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextTrack {
+    pub artist: String,
+    pub title: String,
+    pub album: String,
+    pub year: Option<u32>,
+    pub duration_ms: u32,
+    /// Where its cover art can be fetched, already resolved.
+    pub cover_url: Option<String>,
 }
 
 /// Mirrors `crates/terminal/src/rich_content_transport::ContentType`

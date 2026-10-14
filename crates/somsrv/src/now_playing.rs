@@ -15,7 +15,7 @@
 //! without a network.
 
 use crate::srv_cache::SrvCache;
-use somsrv::protocol::{NowPlayingInfo, TrackTags};
+use somsrv::protocol::{NextTrack, NowPlayingInfo, TrackTags};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -148,12 +148,84 @@ fn query_radio_paradise(http: &dyn HttpGet, chan: u8) -> anyhow::Result<RadioPar
     parse_radio_paradise_now(&http.get_text(&format!("https://api.radioparadise.com/api/now_playing?chan={chan}"))?)
 }
 
-/// The cover found for the album last looked up, so the five-second poll
-/// does not repeat the search while the same album plays.
+/// Covers found for the albums looked up lately, so the five-second poll
+/// does not repeat a search while the same album plays - and so the cover
+/// of the upcoming track, looked up while the current one still plays, is
+/// there the moment that track is reported as playing.
 #[derive(Default)]
 struct CoverCache {
-    album: Option<(String, String)>,
-    url: Option<String>,
+    found: Vec<((String, String), Option<String>)>,
+}
+
+/// Albums remembered by [`CoverCache`]: the current and the upcoming one
+/// with room to spare.
+const COVER_CACHE_ALBUMS: usize = 4;
+
+impl CoverCache {
+    /// The cover of `artist`'s `album`, searched once and then remembered;
+    /// `station_cover` is the fallback when the chain finds nothing.
+    fn cover(
+        &mut self,
+        http: &dyn HttpGet,
+        artist: &str,
+        album: &str,
+        year: Option<u32>,
+        current_year: u32,
+        station_cover: Option<String>,
+    ) -> Option<String> {
+        let key = (artist.to_string(), album.to_string());
+        if let Some((_, url)) = self.found.iter().find(|(known, _)| *known == key) {
+            return url.clone();
+        }
+        let url = find_cover(http, artist, album, year, current_year).or(station_cover);
+        if self.found.len() >= COVER_CACHE_ALBUMS {
+            self.found.remove(0);
+        }
+        self.found.push((key, url.clone()));
+        url
+    }
+}
+
+/// The track Radio Paradise has scheduled after the current one: the
+/// first song of the block its player would fetch next
+/// (`get_block?info=true` answers with the upcoming block).
+#[derive(Debug, PartialEq, Eq)]
+struct RadioParadiseNext {
+    artist: String,
+    title: String,
+    album: String,
+    year: Option<u32>,
+    duration_ms: u32,
+    cover: Option<String>,
+}
+
+fn parse_radio_paradise_next(body: &str) -> Option<RadioParadiseNext> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let songs = value.get("song")?;
+    // The songs come as an object keyed "0", "1", ... (or an array).
+    let song = songs.get("0").or_else(|| songs.get(0))?;
+    let text = |key: &str| song.get(key).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let title = text("title");
+    if title.is_empty() {
+        return None;
+    }
+    let duration_ms = match song.get("duration")? {
+        serde_json::Value::String(s) => s.parse::<u64>().ok()?,
+        other => other.as_u64()?,
+    };
+    // The cover is a path under the block's image base.
+    let path = text("cover");
+    let base = value.get("image_base").and_then(|v| v.as_str()).unwrap_or("//img.radioparadise.com/");
+    let base = if base.starts_with("//") { format!("https:{base}") } else { base.to_string() };
+    let cover = (!path.is_empty()).then(|| format!("{base}{path}"));
+    Some(RadioParadiseNext {
+        artist: text("artist"),
+        title,
+        album: text("album"),
+        year: text("year").parse().ok(),
+        duration_ms: u32::try_from(duration_ms).ok()?,
+        cover,
+    })
 }
 
 /// One full answer for a Radio Paradise channel, as a ready
@@ -177,15 +249,23 @@ fn radio_paradise_info(
     // The station's own picture is a centre-cropped square of the
     // artwork, so the full cover from MusicBrainz / Deezer is preferred
     // and the station's is the fallback.
-    let album_key = (now.artist.clone(), now.album.clone());
-    let cover_url = if covers.album.as_ref() == Some(&album_key) {
-        covers.url.clone()
-    } else {
-        let found = find_cover(http, &now.artist, &now.album, now.year, current_year).or(now.cover.clone());
-        covers.album = Some(album_key);
-        covers.url = found.clone();
-        found
-    };
+    let cover_url = covers.cover(http, &now.artist, &now.album, now.year, current_year, now.cover.clone());
+    // What is scheduled next, with its cover already looked up, so the
+    // consumer can have the picture ready before the track starts. A
+    // failed call just means nothing is announced.
+    let next = http
+        .get_text(&format!("https://api.radioparadise.com/api/get_block?bitrate=4&info=true&chan={chan}"))
+        .ok()
+        .and_then(|body| parse_radio_paradise_next(&body))
+        .filter(|next| !(next.artist == now.artist && next.title == now.title))
+        .map(|next| NextTrack {
+            cover_url: covers.cover(http, &next.artist, &next.album, next.year, current_year, next.cover.clone()),
+            artist: next.artist,
+            title: next.title,
+            album: next.album,
+            year: next.year,
+            duration_ms: next.duration_ms,
+        });
     Ok(NowPlayingInfo {
         session_id,
         file_id,
@@ -197,6 +277,7 @@ fn radio_paradise_info(
         remaining_ms: now.remaining_secs.saturating_mul(1000),
         cover_url,
         cover_lookup_pending: false,
+        next,
     })
 }
 
@@ -271,6 +352,7 @@ fn file_info(session_id: u32, file_id: u32, tags: &TrackTags, cover_url: Option<
         remaining_ms: 0,
         cover_url,
         cover_lookup_pending: pending,
+        next: None,
     }
 }
 
@@ -330,6 +412,7 @@ fn stream_info(
         remaining_ms: 0,
         cover_url,
         cover_lookup_pending: pending,
+        next: None,
     }
 }
 
@@ -701,6 +784,47 @@ mod tests {
 
         assert!(searches_after_first > 0);
         assert_eq!(searches_after_first, searches_after_second);
+    }
+
+    const RP_BLOCK: &str = r#"{"event":"9","image_base":"\/\/img.radioparadise.com\/","song":{"0":{"artist":"GoGo Penguin","title":"Saturnine","album":"Everything Is Going to Be OK","year":"2023","duration":287554,"cover":"covers\/l\/19270.jpg"}}}"#;
+
+    #[test]
+    fn the_upcoming_track_is_read_from_the_next_block() {
+        let next = parse_radio_paradise_next(RP_BLOCK).unwrap();
+        assert_eq!((next.artist.as_str(), next.title.as_str()), ("GoGo Penguin", "Saturnine"));
+        assert_eq!(next.duration_ms, 287_554);
+        assert_eq!(next.year, Some(2023));
+        assert_eq!(next.cover.as_deref(), Some("https://img.radioparadise.com/covers/l/19270.jpg"));
+        assert!(parse_radio_paradise_next(r#"{"song":{}}"#).is_none());
+    }
+
+    #[test]
+    fn the_report_carries_the_upcoming_track_with_its_cover() {
+        let mut http = Canned::new();
+        http.answers.insert("now_playing", RP_NOW.to_string());
+        http.answers.insert("nowplaying_list_v2022", RP_LIST.to_string());
+        http.answers.insert("get_block", RP_BLOCK.to_string());
+        let mut covers = CoverCache::default();
+
+        let info = radio_paradise_info(&http, 0, 1, 2, 2026, &mut covers).unwrap();
+
+        let next = info.next.unwrap();
+        assert_eq!(next.title, "Saturnine");
+        assert_eq!(next.duration_ms, 287_554);
+        assert_eq!(next.cover_url.as_deref(), Some("https://img.radioparadise.com/covers/l/19270.jpg"));
+    }
+
+    #[test]
+    fn a_cover_looked_up_ahead_is_not_searched_again_when_its_track_plays() {
+        let http = Canned::new();
+        let mut covers = CoverCache::default();
+        covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", Some(2023), 2026, Some("x".into()));
+        let asked = http.asked.lock().unwrap().len();
+
+        let url = covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", Some(2023), 2026, None);
+
+        assert_eq!(url.as_deref(), Some("x"));
+        assert_eq!(http.asked.lock().unwrap().len(), asked);
     }
 
     #[test]

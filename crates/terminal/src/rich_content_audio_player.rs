@@ -835,6 +835,36 @@ mod tests {
     /// `ContentMetadata::Audio::duration_ms` would carry for it.
     const TEST_FIXTURE_DURATION_MS: u32 = 1000;
 
+    /// Two Ogg-FLAC streams of one second each, back to back - what an
+    /// internet station's metadata-carrying stream looks like across a
+    /// track change.
+    #[test]
+    fn a_chained_ogg_stream_keeps_playing_through_the_track_change() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/chained-flac.ogg");
+        let data = std::fs::read(&path).unwrap();
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.seed_whole_file_for_test(&data, "ogg");
+        let progress = Arc::new(AudioTransferProgress::new());
+        progress.update(data.len() as u64, data.len() as u64);
+        let player = RichContentAudioPlayer::open(srv_state, progress, None).unwrap();
+
+        for _ in 0..200 {
+            if player.shared.decode_finished.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(player.shared.decode_finished.load(Ordering::Acquire));
+        let rate = player.shared.sample_rate.load(Ordering::Acquire) as usize;
+        let channels = player.shared.channels.load(Ordering::Acquire) as usize;
+        let frames = player.shared.samples.lock().unwrap().len() / channels.max(1);
+        assert!(
+            frames >= rate * 19 / 10,
+            "both one-second streams must be decoded, got {frames} frames at {rate} Hz"
+        );
+    }
+
     #[test]
     fn live_trim_keeps_a_bounded_window_behind_the_playhead() {
         let rate = 100u32; // tiny rate keeps the test buffer small

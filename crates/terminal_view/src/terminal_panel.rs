@@ -1249,9 +1249,19 @@ enum RemoteKind {
 }
 
 fn classify_remote(program: &str) -> RemoteKind {
-    match program {
+    // By the program's own file name: a tab's shell carries `ssh` as an
+    // absolute path (`...\System32\OpenSSH\ssh.exe`, see
+    // `windows_openssh_binary`) once it has been built, and a split must
+    // still recognize it - otherwise the split is cloned with the SAME
+    // pane id and shares the first pane's session.
+    let name = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match name.as_str() {
         "ssh" => RemoteKind::Ssh,
-        "wsl" | "wsl.exe" => RemoteKind::Wsl,
+        "wsl" => RemoteKind::Wsl,
         _ => RemoteKind::Local,
     }
 }
@@ -2485,6 +2495,29 @@ mod tmux_shell_wrapping_tests {
         assert_ne!(args[1], "original-pane-id"); // pane_id replaced
         assert_eq!(args[1], fresh_pane_id); // and matches the returned pane_id
         assert_eq!(&args[2..], &["pwsh.exe", "--cursor-shape", "underline", "--scrollback", "10000"]);
+    }
+
+    #[test]
+    fn a_split_of_an_ssh_shell_with_an_absolute_program_path_gets_its_own_pane_id() {
+        // As `tmux_wrapped_shell` builds it on Windows: the real OpenSSH
+        // client by absolute path, not the bare name `ssh`.
+        let program = r"C:\Windows\System32\OpenSSH\ssh.exe";
+        assert!(matches!(classify_remote(program), RemoteKind::Ssh));
+        let args = wrap_remote_command_args(
+            "deb",
+            "original-pane-id",
+            vec!["192.168.50.3".to_string()],
+            CursorShape::Block,
+            None,
+            RemoteKind::Ssh,
+        );
+        let shell = Shell::WithArguments { program: program.to_string(), args, title_override: None };
+        let (rebuilt, fresh_pane_id) =
+            rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("a split must not reuse the pane id");
+        let Shell::WithArguments { args, .. } = &rebuilt else { panic!("expected WithArguments") };
+        assert_ne!(fresh_pane_id, "original-pane-id");
+        assert!(args.contains(&fresh_pane_id));
+        assert!(!args.iter().any(|a| a == "original-pane-id"));
     }
 
     #[test]

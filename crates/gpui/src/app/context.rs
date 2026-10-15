@@ -227,6 +227,7 @@ impl<'a, T: 'static> Context<'a, T> {
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
     pub fn notify(&mut self) {
+        notify_stats::count(std::any::type_name::<T>());
         self.app.notify(self.entity_state.entity_id);
     }
 
@@ -879,5 +880,46 @@ impl<T> Borrow<App> for Context<'_, T> {
 impl<T> BorrowMut<App> for Context<'_, T> {
     fn borrow_mut(&mut self) -> &mut App {
         self.app
+    }
+}
+
+/// Which entity types call `notify` and how often: with `SOM_PERF` set,
+/// every two seconds one line lists them. For the performance work.
+mod notify_stats {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    struct Counts {
+        since: Instant,
+        by_type: HashMap<&'static str, u32>,
+    }
+
+    static COUNTS: Mutex<Option<Counts>> = Mutex::new(None);
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("SOM_PERF").is_some())
+    }
+
+    pub(super) fn count(type_name: &'static str) {
+        if !enabled() {
+            return;
+        }
+        let mut guard = COUNTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counts = guard.get_or_insert_with(|| Counts { since: Instant::now(), by_type: HashMap::new() });
+        *counts.by_type.entry(type_name).or_insert(0) += 1;
+        let elapsed = counts.since.elapsed();
+        if elapsed >= Duration::from_secs(2) {
+            let mut rows: Vec<_> = counts.by_type.drain().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            let text: Vec<String> = rows
+                .iter()
+                .take(6)
+                .map(|(name, n)| format!("{name} {:.0}/s", *n as f32 / elapsed.as_secs_f32()))
+                .collect();
+            log::info!("som_perf: notify by type: {}", text.join(", "));
+            counts.since = Instant::now();
+        }
     }
 }

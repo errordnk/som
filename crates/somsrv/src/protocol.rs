@@ -827,6 +827,8 @@ pub struct CueSheet {
 /// One track of a [`CueSheet`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CueTrack {
+    /// The track's number on the disc (`TRACK NN` of the sheet).
+    pub number: u32,
     /// Where the track starts in the file, in milliseconds.
     pub start_ms: u64,
     pub title: String,

@@ -155,8 +155,8 @@ pub fn parse(text: &str) -> ParsedCue {
 
 impl ParsedCue {
     /// The track list of `file` as Som is told it: tracks that have a
-    /// start, in the order of their offsets, each titled (`Track NN` when
-    /// the sheet gives none). A track whose performer is the album's own
+    /// start, in the order of their offsets (a title may be empty). A
+    /// track whose performer is the album's own
     /// carries none of its own.
     pub fn sheet_for(&self, file: &CueFile, cover: Option<String>) -> CueSheet {
         let mut tracks: Vec<CueTrack> = file
@@ -164,9 +164,9 @@ impl ParsedCue {
             .iter()
             .filter_map(|track| {
                 let start_ms = track.start_ms?;
-                let title = if track.title.is_empty() { format!("Track {:02}", track.number) } else { track.title.clone() };
+                let title = track.title.clone();
                 let artist = if track.performer == self.performer { String::new() } else { track.performer.clone() };
-                Some(CueTrack { start_ms, title, artist })
+                Some(CueTrack { number: track.number, start_ms, title, artist })
             })
             .collect();
         tracks.sort_by_key(|track| track.start_ms);
@@ -295,6 +295,7 @@ mod tests {
         assert_eq!(sheet.tracks.len(), 2);
         assert_eq!(sheet.tracks[0].artist, "");
         assert_eq!(sheet.tracks[0].title, "The Post War Dream");
+        assert_eq!((sheet.tracks[0].number, sheet.tracks[1].number), (1, 2));
     }
 
     #[test]
@@ -315,9 +316,10 @@ mod tests {
     }
 
     #[test]
-    fn a_track_without_a_title_is_numbered() {
+    fn a_track_without_a_title_keeps_its_number() {
         let cue = parse("FILE \"a.flac\" WAVE\n TRACK 07 AUDIO\n  INDEX 01 00:00:00\n");
-        assert_eq!(cue.sheet_for(&cue.files[0], None).tracks[0].title, "Track 07");
+        let track = &cue.sheet_for(&cue.files[0], None).tracks[0];
+        assert_eq!((track.number, track.title.as_str()), (7, ""));
     }
 
     #[test]

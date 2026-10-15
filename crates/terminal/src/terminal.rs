@@ -500,6 +500,7 @@ impl TerminalBuilder {
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_image_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_toggle_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             next_query_request_id: std::cell::Cell::new(0),
             rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -836,6 +837,7 @@ impl TerminalBuilder {
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_image_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            markdown_embedded_toggle_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 next_query_request_id: std::cell::Cell::new(0),
                 rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
@@ -1029,6 +1031,12 @@ pub struct MarkdownEmbeddedMedia {
     /// top-level-only `markdown_base_dirs` map). `None` for every other
     /// media kind, or before metadata has arrived.
     pub markdown_base_dir: Option<String>,
+    /// For an audio embed: when its tags were announced to `somsrv` (which
+    /// then looks the cover up) - `None` until they were. Announced once.
+    pub announced_at: Option<std::time::Instant>,
+    /// For an audio embed: the cover picture's fetch, started once
+    /// `somsrv` reports where the cover is.
+    pub cover: Option<rich_content_audio_widget::AudioCover>,
     /// Decoded pixels/persistent decode state, kind-tagged. See
     /// [`MarkdownEmbeddedPlayer`]'s own doc comment for why images and
     /// audio/video are handled so differently here (recreated every paint
@@ -1082,6 +1090,9 @@ pub enum EmbeddedMediaStatus {
         elapsed: std::time::Duration,
         duration: std::time::Duration,
         position_fraction: f32,
+        /// What the "now playing" widget shows for this file: tags (from
+        /// the file itself, then from `somsrv`'s lookup) and the cover.
+        now_playing: rich_content_audio_widget::AudioNowPlaying,
     },
     ReadyVideo {
         render_image: Option<std::sync::Arc<gpui::RenderImage>>,
@@ -1514,6 +1525,9 @@ pub struct Terminal {
     /// same "record during paint, read during input" split every other
     /// rich-content hit-test rectangle in this file already uses.
     markdown_embedded_image_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
+    /// An embedded audio's cover: a click on it toggles play/pause (the
+    /// "now playing" widget's own convention).
+    markdown_embedded_toggle_bounds: std::cell::RefCell<std::collections::HashMap<((u32, u32), String), Bounds<Pixels>>>,
     /// Monotonically increasing counter for `request_audio_byte_range`'s
     /// `request_id` — see that method's own doc comment for why
     /// correctness doesn't depend on global uniqueness here, just on
@@ -2612,6 +2626,7 @@ impl Terminal {
                     self.markdown_embedded_seek_bar_bounds.borrow_mut().remove(&hosted_key);
                     self.markdown_embedded_controls_bounds.borrow_mut().remove(&hosted_key);
                     self.markdown_embedded_image_bounds.borrow_mut().remove(&hosted_key);
+                    self.markdown_embedded_toggle_bounds.borrow_mut().remove(&hosted_key);
                 }
             }
             self.markdown_base_dirs.borrow_mut().remove(&key);
@@ -2910,6 +2925,8 @@ impl Terminal {
                 content_type: None,
                 audio_duration_ms: None,
                 markdown_base_dir: None,
+                announced_at: None,
+                cover: None,
                 player: MarkdownEmbeddedPlayer::None,
             });
     }
@@ -3012,6 +3029,19 @@ impl Terminal {
                         out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
                         continue;
                     };
+                    // The file's own tags go to `somsrv` once, exactly as
+                    // `somsrp` does for a local file: it looks the cover up
+                    // by artist and album and pushes the answer back.
+                    if entry.announced_at.is_none()
+                        && let Some(file_tags) = player.tags()
+                    {
+                        let mut tags = file_tags.unwrap_or_default();
+                        if tags.title.is_empty() {
+                            tags.title = embedded_file_stem(dest_url);
+                        }
+                        rich_content_srv_channel::announce_track(entry.session_id, entry.file_id, dest_url.clone(), tags);
+                        entry.announced_at = Some(std::time::Instant::now());
+                    }
                     // Non-blocking — opens the `cpal` device/stream the
                     // first paint after the decode thread has a sample
                     // rate/channel count; a no-op once already open. See
@@ -3029,6 +3059,65 @@ impl Terminal {
                         continue;
                     }
                     let duration_ms = entry.audio_duration_ms.unwrap_or(0);
+
+                    // What `somsrv` found out (cover location) on top of
+                    // the file's own tags.
+                    let reported = entry.state.now_playing().map(|(info, _)| info);
+                    let waiting_for_answer = match (&reported, entry.announced_at) {
+                        (None, Some(at)) => at.elapsed() < std::time::Duration::from_secs(3),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let lookup_pending =
+                        waiting_for_answer || reported.as_ref().is_some_and(|info| info.cover_lookup_pending);
+                    let wanted_cover = reported.as_ref().and_then(|info| info.cover_url.clone());
+                    let stale = match (&wanted_cover, &entry.cover) {
+                        (Some(url), Some(cover)) => cover.url() != url,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if stale {
+                        entry.cover = None;
+                    }
+                    if let Some(url) = &wanted_cover
+                        && entry.cover.is_none()
+                    {
+                        entry.cover = Some(rich_content_audio_widget::AudioCover::start(url));
+                    }
+                    let (cover, cover_loading) = match entry.cover.as_mut() {
+                        Some(entry_cover) => {
+                            let image = entry_cover.image();
+                            let loading = image.is_none() && !entry_cover.failed();
+                            (image, loading)
+                        },
+                        None => (None, false),
+                    };
+                    let file_tags = player.tags().flatten().unwrap_or_default();
+                    let (artist, title, album, year) = match &reported {
+                        Some(info) if !info.title.is_empty() => {
+                            (info.artist.clone(), info.title.clone(), info.album.clone(), info.year)
+                        },
+                        _ => (file_tags.artist.clone(), file_tags.title.clone(), file_tags.album.clone(), file_tags.year),
+                    };
+                    let title = if title.is_empty() { embedded_file_stem(dest_url) } else { title };
+                    let show_placeholder = cover.is_none() && !cover_loading && !lookup_pending;
+                    let ready = !lookup_pending && !cover_loading && (cover.is_some() || show_placeholder);
+                    let now_playing = rich_content_audio_widget::AudioNowPlaying {
+                        artist,
+                        title,
+                        album,
+                        year,
+                        duration: std::time::Duration::ZERO,
+                        elapsed: std::time::Duration::ZERO,
+                        playlist: None,
+                        cover,
+                        cover_loading,
+                        show_placeholder,
+                        ready,
+                        cue_track: false,
+                        can_prev: true,
+                        can_next: true,
+                    };
                     out.push((
                         dest_url.clone(),
                         EmbeddedMediaStatus::ReadyAudio {
@@ -3036,6 +3125,7 @@ impl Terminal {
                             elapsed: player.elapsed(),
                             duration: std::time::Duration::from_millis(duration_ms as u64),
                             position_fraction: player.position_fraction(duration_ms),
+                            now_playing,
                         },
                     ));
                 },
@@ -4284,6 +4374,12 @@ impl Terminal {
         self.markdown_embedded_image_bounds.borrow_mut().insert((host, dest_url.to_string()), bounds);
     }
 
+    /// Where an embedded audio's cover was painted this frame - a click
+    /// there toggles play/pause.
+    pub fn record_markdown_embedded_toggle_bounds(&self, host: (u32, u32), dest_url: &str, bounds: Bounds<Pixels>) {
+        self.markdown_embedded_toggle_bounds.borrow_mut().insert((host, dest_url.to_string()), bounds);
+    }
+
     /// Persists `bounds` as the widget's actual stop-icon rectangle —
     /// same reasoning as [`Self::record_rich_content_seek_bar_bounds`].
     pub fn record_rich_content_stop_icon_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
@@ -4570,6 +4666,21 @@ impl Terminal {
                 let (host, dest_url) = key.clone();
                 drop(image_bounds_map);
                 self.copy_markdown_embedded_image_to_clipboard(host, &dest_url, cx);
+                return true;
+            }
+        }
+
+        // An embedded audio's cover toggles play/pause.
+        {
+            let toggle_map = self.markdown_embedded_toggle_bounds.borrow();
+            let hit = toggle_map.iter().find(|(_, bounds)| bounds.contains(&position)).map(|(key, _)| key.clone());
+            drop(toggle_map);
+            if let Some(key) = hit {
+                if let Some(entry) = self.markdown_embedded_media.borrow().get(&key)
+                    && let MarkdownEmbeddedPlayer::Audio(player) = &entry.player
+                {
+                    player.toggle_play_pause();
+                }
                 return true;
             }
         }
@@ -6336,6 +6447,13 @@ impl Terminal {
 }
 
 // Helper function to convert a grid row to a string
+/// The file name of an embedded media's `dest_url` without its extension - what an
+/// untagged audio file is titled by.
+fn embedded_file_stem(dest_url: &str) -> String {
+    let name = dest_url.rsplit(['/', '\\']).next().unwrap_or(dest_url);
+    name.rsplit_once('.').map(|(stem, _)| stem).filter(|stem| !stem.is_empty()).unwrap_or(name).to_string()
+}
+
 pub fn row_to_string(row: &Row<Cell>) -> String {
     row[..Column(row.len())]
         .iter()

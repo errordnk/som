@@ -238,6 +238,52 @@ struct SharedPcm {
     /// show a distinct "loading"/"buffering" state without needing to
     /// join a thread handle to check.
     decode_finished: AtomicBool,
+    /// The file's own tags, once its format has been probed: `None` until
+    /// then, `Some(None)` for a file that carries none.
+    tags: Mutex<Option<Option<somsrv::protocol::TrackTags>>>,
+}
+
+/// The title / artist / album / year tags of a probed file (ID3, Vorbis
+/// comments, ...), or `None` when there are none to speak of.
+fn tags_of(probed: &mut symphonia::core::probe::ProbeResult) -> Option<somsrv::protocol::TrackTags> {
+    use symphonia::core::meta::{MetadataRevision, StandardTagKey};
+
+    let mut tags = somsrv::protocol::TrackTags::default();
+    let mut album_artist = String::new();
+    let mut absorb = |revision: &MetadataRevision| {
+        for tag in revision.tags() {
+            let value = tag.value.to_string();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match tag.std_key {
+                Some(StandardTagKey::TrackTitle) if tags.title.is_empty() => tags.title = value.to_string(),
+                Some(StandardTagKey::Artist) if tags.artist.is_empty() => tags.artist = value.to_string(),
+                Some(StandardTagKey::AlbumArtist) if album_artist.is_empty() => album_artist = value.to_string(),
+                Some(StandardTagKey::Album) if tags.album.is_empty() => tags.album = value.to_string(),
+                Some(StandardTagKey::Date | StandardTagKey::OriginalDate | StandardTagKey::ReleaseDate)
+                    if tags.year.is_none() =>
+                {
+                    tags.year = value.get(..4).and_then(|year| year.parse().ok());
+                },
+                _ => {},
+            }
+        }
+    };
+    if let Some(metadata) = probed.metadata.get()
+        && let Some(revision) = metadata.current()
+    {
+        absorb(revision);
+    }
+    if let Some(revision) = probed.format.metadata().current() {
+        absorb(revision);
+    }
+    if tags.artist.is_empty() {
+        tags.artist = album_artist;
+    }
+    let empty = tags.title.is_empty() && tags.artist.is_empty() && tags.album.is_empty() && tags.year.is_none();
+    (!empty).then_some(tags)
 }
 
 /// Runs on a dedicated background thread for the lifetime of one
@@ -332,6 +378,8 @@ fn run_decode_loop(
             },
         }
     };
+
+    *shared.tags.lock().unwrap_or_else(|p| p.into_inner()) = Some(tags_of(&mut probed));
 
     let track = probed.format.tracks().iter().find(|t| t.id == track_id).expect("found above");
     let time_base = track.codec_params.time_base;
@@ -685,6 +733,7 @@ impl RichContentAudioPlayer {
             sample_rate: std::sync::atomic::AtomicU32::new(0),
             channels: std::sync::atomic::AtomicU32::new(0),
             decode_finished: AtomicBool::new(false),
+            tags: Mutex::new(None),
         });
         let decode_stop = Arc::new(AtomicBool::new(false));
         let position_frames = Arc::new(AtomicU64::new(0));
@@ -858,6 +907,12 @@ impl RichContentAudioPlayer {
     /// Where playback is, in frames from the start of the stream.
     pub fn playhead_frames(&self) -> u64 {
         self.position_frames.load(Ordering::Acquire)
+    }
+
+    /// The file's own tags: `None` until its format has been probed,
+    /// `Some(None)` for a file that carries none.
+    pub fn tags(&self) -> Option<Option<somsrv::protocol::TrackTags>> {
+        self.shared.tags.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Output sample rate (`0` until the format is known).
@@ -1048,6 +1103,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         false
+    }
+
+    #[test]
+    fn the_players_probe_reads_the_files_tags() {
+        let player = open_player_on("tagged-tone.flac");
+        assert!(eventually(|| player.tags().is_some()), "the format was never probed");
+        let tags = player.tags().flatten().expect("the fixture has tags");
+        assert_eq!(tags.title, "Test Title");
+        assert_eq!(tags.artist, "Test Artist");
+        assert_eq!(tags.album, "Test Album");
+        assert_eq!(tags.year, Some(2011));
+    }
+
+    #[test]
+    fn a_file_without_tags_reports_none_once_probed() {
+        let player = open_player_on("tone.flac");
+        assert!(eventually(|| player.tags().is_some()), "the format was never probed");
+        assert_eq!(player.tags(), Some(None));
     }
 
     #[test]

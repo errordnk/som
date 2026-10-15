@@ -44,13 +44,18 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     ("usvg::parser", log::LevelFilter::Error),
 ];
 
+/// Sets the environment filter. The FIRST one wins: with `RUST_LOG`/
+/// `ZED_LOG` set, `zlog::init` installs it and the later call carrying the
+/// level from settings.json is ignored - the environment overrides the
+/// settings file, and a second call used to panic at startup.
 pub fn init_env_filter(filter: env_config::EnvFilter) {
+    if ENV_FILTER.get().is_some() {
+        return;
+    }
     if let Some(level_max) = filter.level_global {
         LEVEL_ENABLED_MAX_STATIC.store(level_max as u8, Ordering::Release)
     }
-    if ENV_FILTER.set(filter).is_err() {
-        panic!("Environment filter cannot be initialized twice");
-    }
+    ENV_FILTER.get_or_init(|| filter);
 }
 
 pub fn is_possibly_enabled_level(level: log::Level) -> bool {

@@ -1916,6 +1916,13 @@ fn paint_rich_content_placements(
     // that same color, not a separate "is the overall theme light"
     // signal that could disagree with it (e.g. a dark widget background
     // against an otherwise light theme, or vice versa).
+    // The display decides which size of cover gets pulled (600 px up to a
+    // 1920 px wide display, 1200 px beyond), not the window on it.
+    let display_physical_width = window
+        .display(cx)
+        .map(|display| (f32::from(display.bounds().size.width) * window.scale_factor()).round() as u32)
+        .unwrap_or(0);
+    terminal.read(cx).set_display_physical_width(display_physical_width);
     let widget_bg_is_light = {
         let bg = rich_content_widget_bg(cx);
         // Standard relative-luminance weighting (ITU-R BT.601) — cheap

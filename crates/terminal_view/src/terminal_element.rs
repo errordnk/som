@@ -3624,10 +3624,19 @@ fn paint_top_level_audio_widget(
     Some((bounds, bar_bounds_out, Some(stop_bounds)))
 }
 
-/// Logical width, in physical pixels, a cover is shown at: the cover art
-/// itself is at most this many pixels square, so 1:1 is as sharp as it
-/// gets.
-const NOW_PLAYING_COVER_PHYSICAL_PX: f32 = 600.0;
+/// The side of the cover, in physical pixels, for a window
+/// `window_physical_width` pixels wide: 600 up to a 1K window (1024), 900
+/// up to a 2K one (2048), 1200 beyond (4K). The widget still shrinks it to
+/// whatever its box can hold.
+fn now_playing_cover_physical_px(window_physical_width: f32) -> f32 {
+    if window_physical_width <= 1024.0 {
+        600.0
+    } else if window_physical_width <= 2048.0 {
+        900.0
+    } else {
+        1200.0
+    }
+}
 
 /// Seconds as `m:ss`, or `h:mm:ss` from one hour up.
 fn format_clock(d: std::time::Duration) -> String {
@@ -3797,7 +3806,8 @@ fn paint_now_playing_audio_in_box(
     let rows_height = line_height * 2.0 + gap * 2.0; // info line, controls row
     let side_limit = (box_width - cell_width * 6.0).max(Pixels::ZERO);
     let height_limit = (box_height - rows_height).max(Pixels::ZERO);
-    let wanted = px(NOW_PLAYING_COVER_PHYSICAL_PX / window.scale_factor());
+    let window_physical_width = f32::from(window.viewport_size().width) * window.scale_factor();
+    let wanted = px(now_playing_cover_physical_px(window_physical_width) / window.scale_factor());
     let side = wanted.min(side_limit).min(height_limit);
     let block_height = rows_height + side;
     let left = box_origin.x + (box_width - side) / 2.0;
@@ -4883,6 +4893,15 @@ mod tests {
         // Negative: lines -7, -6, -5, -4
         assert_eq!(negative_filtered.first().unwrap().point.line, Line(-7));
         assert_eq!(negative_filtered.last().unwrap().point.line, Line(-4));
+    }
+
+    #[test]
+    fn the_cover_grows_with_the_window() {
+        assert_eq!(now_playing_cover_physical_px(800.0), 600.0);
+        assert_eq!(now_playing_cover_physical_px(1024.0), 600.0);
+        assert_eq!(now_playing_cover_physical_px(1920.0), 900.0);
+        assert_eq!(now_playing_cover_physical_px(2048.0), 900.0);
+        assert_eq!(now_playing_cover_physical_px(3840.0), 1200.0);
     }
 
     #[test]

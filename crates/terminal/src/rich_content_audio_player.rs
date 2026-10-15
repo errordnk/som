@@ -940,6 +940,19 @@ impl RichContentAudioPlayer {
         self.position_frames.store(target, Ordering::Release);
     }
 
+    /// Jumps playback to `position_ms` of the stream, exactly: the frame
+    /// is rounded UP so the playhead's own millisecond reading is never
+    /// short of the target (a track's start must not read as the end of
+    /// the one before it). A no-op until the sample rate is known.
+    pub fn seek_to_ms(&self, position_ms: u64) {
+        let sample_rate = self.shared.sample_rate.load(Ordering::Acquire) as u64;
+        if sample_rate == 0 {
+            return;
+        }
+        let frame = (position_ms * sample_rate).div_ceil(1000);
+        self.position_frames.store(frame, Ordering::Release);
+    }
+
     fn total_frames_for(&self, duration_ms: u32) -> u64 {
         let sample_rate = self.shared.sample_rate.load(Ordering::Acquire);
         if sample_rate == 0 {
@@ -1076,6 +1089,19 @@ mod tests {
             let (base, end) = player.buffered_range();
             base == 0 && end > 0
         }));
+    }
+
+    #[test]
+    fn a_seek_to_a_millisecond_never_reads_short_of_it() {
+        let mut player = open_player_on("tone.flac");
+        wait_for_decode(&mut player);
+        let rate = player.sample_rate() as u64;
+        assert!(rate > 0);
+        // A rate that does not divide a millisecond evenly.
+        for ms in [1u64, 437, 438_760, 179_333] {
+            player.seek_to_ms(ms);
+            assert!(player.playhead_frames() * 1000 / rate >= ms, "{ms} ms read short");
+        }
     }
 
     #[test]

@@ -268,7 +268,7 @@ somsrp list.m3u
 
 A playing track gets a "now playing" widget: an artist / album / year line, the cover, the track title and a progress bar with the time left. A line that doesn't fit scrolls sideways; clicking the cover pauses and resumes.
 
-- **Playlists.** Every track of an `.m3u` playlist has previous/next buttons on both sides of the bar (keys `p` / `n` work too); the list plays in a circle, and a playlist of one entry is simply looped. A lone file or URL has no buttons and plays once. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
+- **Playlists.** Every track of an `.m3u` playlist has previous/next buttons on both sides of the bar (keys `p` / `n` work too; so do `Left`/`Up` for previous and `Right`/`Down` for next, and `Space` toggles play/pause); the list plays in a circle, and a playlist of one entry is simply looped. A lone file or URL has no buttons and plays once. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
 - **Radio.** A stream whose server name contains `radioparadise` gets the full widget: tags, time left in the track and the cover come from the station's own API. Every other station plays as a continuous stream: the artist and title come from the stream's own metadata (ICY, where the station sends it; the playlist title is shown until then), the album and cover are looked up by track (Deezer, then iTunes) with the DNA stand-in only if nothing is found, and the time shown is the time elapsed since it started - there is no time left, as a live stream has no known length.
 - **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in.
 

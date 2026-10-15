@@ -3685,6 +3685,31 @@ impl Terminal {
         true
     }
 
+    /// A key press for the "now playing" widget on screen: space toggles
+    /// play/pause, left/up step to the previous track, right/down to the
+    /// next. `false` when no widget is painted or it has no such control
+    /// (no previous/next for a lone file), so the key goes on to the
+    /// terminal as usual.
+    pub fn handle_audio_widget_key(&mut self, key: &str) -> bool {
+        let target = self.audio_widget_bounds.borrow().iter().find_map(|(id, bounds)| {
+            let available = match key {
+                "space" => bounds.cover.is_some(),
+                "left" | "up" | "right" | "down" => bounds.prev.is_some() && bounds.next.is_some(),
+                _ => false,
+            };
+            available.then_some(*id)
+        });
+        let Some((session_id, file_id)) = target else {
+            return false;
+        };
+        match key {
+            "space" => self.toggle_rich_content_audio_playback(session_id, file_id),
+            "left" | "up" => rich_content_srv_channel::playlist_step(session_id, file_id, -1),
+            _ => rich_content_srv_channel::playlist_step(session_id, file_id, 1),
+        }
+        true
+    }
+
     /// Tears down every currently open audio player outright (unlike
     /// [`Self::stop_rich_content_audio_playback`], which merely pauses
     /// and rewinds one). Called when a real `clear`/screen-erase escape

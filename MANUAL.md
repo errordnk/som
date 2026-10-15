@@ -254,7 +254,9 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 
 ## Images in the terminal (Som Rich Protocol)
 
-Som implements its own binary protocol for streaming rich content (currently images/GIFs, with audio/markdown/video reserved for later) through the PTY — the `somsrp` tool bundled alongside Som is the reference client: `somsrp some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
+Som implements its own binary protocol for streaming rich content (images/GIFs, audio, video and markdown) through the PTY — the `somsrp` tool bundled alongside Som is the reference client: `somsrp some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
+
+**Markdown documents.** `somsrp doc.md` renders a markdown file, and `![alt](path-or-URL)` embeds media into it: images and GIFs, audio (the same "now playing" widget as for a track played directly - tags from the file, the cover looked up by artist and album), video, and other `.md` files (laid out inline, nesting allowed, cycles refused). A `{...}` block right after the link sets the placement: `left`/`center`/`right`, `top`/`middle`/`bottom`, `NN%` (width), a bare `NN` (height in rows), `float` (text wraps around it). Several embeds on one line form a **row** that shares one band - `![](cover.png){40%} ![](track.flac){60%}`: each takes its `NN%`, the ones without a width share what is left equally, and any text between them keeps them apart.
 
 ### Audio, internet radio and playlists
 

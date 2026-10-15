@@ -3668,6 +3668,11 @@ impl Terminal {
             show_placeholder,
             ready,
             cue_track: cue_view.is_some(),
+            can_prev: cue_view.as_ref().is_none_or(|(.., index)| *index > 0),
+            can_next: match (&cue, &cue_view) {
+                (Some(sheet), Some((.., index))) => index + 1 < sheet.tracks.len(),
+                _ => true,
+            },
         })
     }
 
@@ -3700,14 +3705,15 @@ impl Terminal {
     }
 
     /// Previous (`-1`) or next (`1`) track: inside a CUE sheet that is a
-    /// seek to the neighbouring track's start (the list is a circle),
-    /// otherwise a step of the playlist runner.
+    /// seek to the neighbouring track's start (nothing before the first
+    /// track or after the last), otherwise a step of the playlist runner.
     fn step_audio_track(&self, key: (u32, u32), delta: i32) {
         match self.cue_position(key) {
             Some((sheet, index, ..)) => {
-                let count = sheet.tracks.len() as i64;
-                let target = (index as i64 + delta as i64).rem_euclid(count) as usize;
-                self.seek_audio_to_ms(key, sheet.tracks[target].start_ms);
+                let target = index as i64 + delta as i64;
+                if target >= 0 && (target as usize) < sheet.tracks.len() {
+                    self.seek_audio_to_ms(key, sheet.tracks[target as usize].start_ms);
+                }
             },
             None => rich_content_srv_channel::playlist_step(key.0, key.1, delta),
         }
@@ -3798,7 +3804,12 @@ impl Terminal {
         let target = self.audio_widget_bounds.borrow().iter().find_map(|(id, bounds)| {
             let available = match key {
                 "space" => bounds.cover.is_some(),
-                "left" | "up" | "right" | "down" => bounds.prev.is_some() && bounds.next.is_some(),
+                // A CUE sheet's buttons may be disabled at its ends, but
+                // its arrow keys still belong to the widget.
+                "left" | "up" | "right" | "down" => {
+                    bounds.cover.is_some()
+                        && (bounds.prev.is_some() || bounds.next.is_some() || self.cue_position(*id).is_some())
+                },
                 _ => false,
             };
             available.then_some(*id)

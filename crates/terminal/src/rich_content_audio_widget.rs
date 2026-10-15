@@ -51,6 +51,10 @@ pub struct AudioNowPlaying {
     /// and a click on it seeks inside it, though the track has no clock
     /// of its own.
     pub cue_track: bool,
+    /// Whether the previous / next button works. A CUE sheet is not a
+    /// circle: its first track has no previous, its last no next.
+    pub can_prev: bool,
+    pub can_next: bool,
 }
 
 /// The index of the CUE track `position_ms` falls in: the last one that

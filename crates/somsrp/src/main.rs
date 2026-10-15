@@ -1507,9 +1507,9 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
 }
 
 /// Plays a CUE sheet. A file that holds several of its tracks is played
-/// whole, as one placement the player cuts into tracks by the sheet; a
-/// file with a single track is an ordinary entry. Several files make a
-/// playlist of their entries. Like every list it is a circle.
+/// whole, as one placement the player cuts into tracks by the sheet, once
+/// from first track to last; a file with a single track is an ordinary
+/// entry. Several files make a (circular) playlist of their entries.
 fn stream_cue(path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading cue sheet {path}: {e}"))?;
     let parsed = cue::parse(&cue::decode_text(&bytes));
@@ -1533,6 +1533,18 @@ fn stream_cue(path: &str) -> Result<(), String> {
     }
     if entries.is_empty() {
         return Err(format!("{path}: the cue sheet lists no tracks"));
+    }
+    // One file cut into tracks plays through once - it is not a circle.
+    if entries.len() == 1 && entries[0].cue.is_some() {
+        let entry = &entries[0];
+        let position = PlaylistPosition {
+            index: 0,
+            len: 1,
+            title: entry.title.clone(),
+            target: entry.target.clone(),
+            cue: entry.cue.clone(),
+        };
+        return stream_file_impl(&entry.target, None, None, Some(&position));
     }
     run_playlist(entries)
 }

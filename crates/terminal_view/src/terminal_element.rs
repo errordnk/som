@@ -3763,16 +3763,17 @@ fn paint_now_playing_audio_widget(
     let mut x = left;
     let mut right = left + side;
     if has_playlist {
-        let prev = shape(nf_prev, text_color, window);
-        let next = shape(nf_next, text_color, window);
+        // A disabled button is dimmed and takes no clicks.
+        let prev = shape(nf_prev, if np.can_prev { text_color } else { dim_color }, window);
+        let next = shape(nf_next, if np.can_next { text_color } else { dim_color }, window);
         let prev_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));
         let next_slot = Bounds::new(point(left + side - slot, y), gpui::size(slot, line_height));
         prev.paint(point(prev_slot.origin.x + (slot - prev.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
             .log_err();
         next.paint(point(next_slot.origin.x + (slot - next.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
             .log_err();
-        widget_bounds.prev = Some(prev_slot);
-        widget_bounds.next = Some(next_slot);
+        widget_bounds.prev = np.can_prev.then_some(prev_slot);
+        widget_bounds.next = np.can_next.then_some(next_slot);
         x += slot + cell_width;
         right -= slot + cell_width;
     }

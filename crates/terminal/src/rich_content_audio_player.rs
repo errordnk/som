@@ -244,6 +244,12 @@ struct SharedPcm {
     /// The file's length in milliseconds when its container says (a FLAC's
     /// stream info does), `0` when it does not.
     duration_ms: std::sync::atomic::AtomicU32,
+    /// Which output stream is the live one. A stream's callback plays only
+    /// while its own epoch is this value - so when the stream is replaced
+    /// (the default output device changed) the old one goes silent the
+    /// instant the new one is taking over, and two callbacks never advance
+    /// the playhead at once.
+    stream_epoch: AtomicU64,
 }
 
 /// The title / artist / album / year tags of a probed file (ID3, Vorbis
@@ -678,6 +684,14 @@ pub struct RichContentAudioPlayer {
     /// this whole struct, must stay on whichever thread creates it (the
     /// paint/main thread, same as every other `Terminal` field).
     _stream: Option<cpal::Stream>,
+    /// The output device `_stream` was opened on.
+    device_id: Option<cpal::DeviceId>,
+    /// When the system's default output device was last looked at - see
+    /// [`Self::follow_default_device`].
+    device_checked_at: std::time::Instant,
+    /// The default device whose stream failed to open last, so a failure is
+    /// reported once rather than twice a second.
+    follow_failed_for: Option<cpal::DeviceId>,
     /// Signals the background decode thread to stop — set on `Drop` so
     /// the thread doesn't keep polling a cache file that no longer has
     /// a live player watching it. Not joined (same reasoning `somsrp`'s
@@ -744,6 +758,7 @@ impl RichContentAudioPlayer {
             decode_finished: AtomicBool::new(false),
             tags: Mutex::new(None),
             duration_ms: std::sync::atomic::AtomicU32::new(0),
+            stream_epoch: AtomicU64::new(0),
         });
         let decode_stop = Arc::new(AtomicBool::new(false));
         let position_frames = Arc::new(AtomicU64::new(0));
@@ -760,6 +775,9 @@ impl RichContentAudioPlayer {
         Ok(Self {
             shared,
             _stream: None,
+            device_id: None,
+            device_checked_at: std::time::Instant::now(),
+            follow_failed_for: None,
             decode_stop,
             position_frames,
             playing: Arc::new(AtomicBool::new(false)),
@@ -780,6 +798,7 @@ impl RichContentAudioPlayer {
     /// A no-op returning `true` if the stream is already open.
     pub fn poll_ready(&mut self) -> bool {
         if self._stream.is_some() {
+            self.follow_default_device();
             return true;
         }
         let sample_rate = self.shared.sample_rate.load(Ordering::Acquire);
@@ -789,10 +808,18 @@ impl RichContentAudioPlayer {
         }
         let channels = channels as u16;
 
-        match Self::open_device(sample_rate, channels, self.shared.clone(), self.position_frames.clone(), self.playing.clone())
-        {
-            Ok(stream) => {
+        let epoch = self.shared.stream_epoch.load(Ordering::Acquire);
+        match Self::open_device(
+            sample_rate,
+            channels,
+            self.shared.clone(),
+            self.position_frames.clone(),
+            self.playing.clone(),
+            epoch,
+        ) {
+            Ok((stream, device_id)) => {
                 self._stream = Some(stream);
+                self.device_id = device_id;
                 true
             },
             Err(err) => {
@@ -800,6 +827,67 @@ impl RichContentAudioPlayer {
                 self.decode_stop.store(true, Ordering::Relaxed);
                 self.shared.decode_finished.store(true, Ordering::Release);
                 false
+            },
+        }
+    }
+
+    /// Moves the output onto the system's default output device when that
+    /// changes. The stream is opened on the endpoint that was the default
+    /// at that moment (`cpal` resolves it with `GetDefaultAudioEndpoint`),
+    /// and Windows does not carry such a stream along when the default is
+    /// switched: other applications follow, this one would keep playing on
+    /// the old device. So the default is looked at twice a second and, if
+    /// it is another device, the stream is built again on it - same
+    /// playhead, same play/pause state. The old stream is silenced (by
+    /// epoch) before the new one starts, and kept if the new one cannot be
+    /// opened.
+    fn follow_default_device(&mut self) {
+        const CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+        if self.device_checked_at.elapsed() < CHECK_EVERY {
+            return;
+        }
+        self.device_checked_at = std::time::Instant::now();
+
+        let Some(current) = cpal::default_host().default_output_device().and_then(|device| device.id().ok()) else {
+            return; // No default device right now: keep what we have.
+        };
+        if self.device_id.as_ref() == Some(&current) {
+            self.follow_failed_for = None;
+            return;
+        }
+        if self.follow_failed_for.as_ref() == Some(&current) {
+            return; // Already tried this one; it failed.
+        }
+        let sample_rate = self.shared.sample_rate.load(Ordering::Acquire);
+        let channels = self.shared.channels.load(Ordering::Acquire);
+        if sample_rate == 0 || channels == 0 {
+            return;
+        }
+
+        let old_epoch = self.shared.stream_epoch.load(Ordering::Acquire);
+        let new_epoch = old_epoch.wrapping_add(1);
+        self.shared.stream_epoch.store(new_epoch, Ordering::Release);
+        match Self::open_device(
+            sample_rate,
+            channels as u16,
+            self.shared.clone(),
+            self.position_frames.clone(),
+            self.playing.clone(),
+            new_epoch,
+        ) {
+            Ok((stream, device_id)) => {
+                let previous = self.device_id.as_ref().map_or_else(|| "?".to_string(), |id| id.to_string());
+                log::info!("audio output follows the default device: {previous} -> {current}");
+                // Replacing drops the old stream.
+                self._stream = Some(stream);
+                self.device_id = device_id.or(Some(current));
+                self.follow_failed_for = None;
+            },
+            Err(err) => {
+                // The old stream is still the live one.
+                self.shared.stream_epoch.store(old_epoch, Ordering::Release);
+                log::warn!("audio output could not follow the default device to {current}: {err}");
+                self.follow_failed_for = Some(current);
             },
         }
     }
@@ -828,9 +916,11 @@ impl RichContentAudioPlayer {
         shared: Arc<SharedPcm>,
         position_frames: Arc<AtomicU64>,
         playing: Arc<AtomicBool>,
-    ) -> Result<cpal::Stream, String> {
+        epoch: u64,
+    ) -> Result<(cpal::Stream, Option<cpal::DeviceId>), String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| "no default output audio device".to_string())?;
+        let device_id = device.id().ok();
         let config = cpal::StreamConfig { channels, sample_rate, buffer_size: cpal::BufferSize::Default };
 
         let cb_shared = shared;
@@ -842,6 +932,13 @@ impl RichContentAudioPlayer {
             .build_output_stream(
                 &config,
                 move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    // Not the live stream any more (the output moved to
+                    // another device): silence, and leave the playhead to
+                    // the stream that took over.
+                    if cb_shared.stream_epoch.load(Ordering::Acquire) != epoch {
+                        output.fill(0.0);
+                        return;
+                    }
                     if !cb_playing.load(Ordering::Acquire) {
                         output.fill(0.0);
                         return;
@@ -886,7 +983,7 @@ impl RichContentAudioPlayer {
             )
             .map_err(|e| format!("building output stream: {e}"))?;
         stream.play().map_err(|e| format!("starting output stream: {e}"))?;
-        Ok(stream)
+        Ok((stream, device_id))
     }
 
     pub fn is_playing(&self) -> bool {

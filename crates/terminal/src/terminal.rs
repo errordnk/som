@@ -476,6 +476,7 @@ impl TerminalBuilder {
             audio_cover_drops: std::cell::RefCell::new(Vec::new()),
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -813,6 +814,7 @@ impl TerminalBuilder {
                 audio_cover_drops: std::cell::RefCell::new(Vec::new()),
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1308,6 +1310,10 @@ pub struct Terminal {
     /// `rich_content_audio_widget::TrackTimeline`.
     audio_timelines:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::TrackTimeline>>,
+    /// The time left as drawn - see `rich_content_audio_widget::
+    /// DisplayedRemaining`.
+    audio_displayed_remaining:
+        std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::DisplayedRemaining>>,
     /// Audio placements whose source has ended for good (`somsrv` pushed
     /// `StopPlayback`: a playlist moved on, the sender exited). Never
     /// reopened - unlike `rich_content_audio_stopped`, which a screen
@@ -3648,6 +3654,16 @@ impl Terminal {
                     Some((heard, Some(remaining))) => {
                         let duration = std::time::Duration::from_millis(heard.duration_ms as u64);
                         let remaining = remaining.min(duration);
+                        // What the timeline computed drives everything
+                        // that acts; the number drawn only moves onto it
+                        // when the two differ by more than a second.
+                        let remaining = self
+                            .audio_displayed_remaining
+                            .borrow_mut()
+                            .entry(key)
+                            .or_default()
+                            .update(&heard, remaining, playhead, rate)
+                            .min(duration);
                         (Some(heard), duration, duration - remaining, false)
                     },
                     // No length known (a station's in-stream title, a
@@ -3831,6 +3847,7 @@ impl Terminal {
         }
         self.audio_widget_bounds.borrow_mut().remove(&key);
         self.audio_timelines.borrow_mut().remove(&key);
+        self.audio_displayed_remaining.borrow_mut().remove(&key);
     }
 
     /// Covers no longer shown, for the paint path to release with

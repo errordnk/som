@@ -1082,6 +1082,15 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        // The "now playing" widget takes bare space and the arrow keys.
+        let keystroke = &event.keystroke;
+        if !keystroke.modifiers.modified()
+            && self.terminal.update(cx, |terminal, _| terminal.handle_audio_widget_key(keystroke.key.as_str()))
+        {
+            cx.stop_propagation();
+            return;
+        }
+
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }

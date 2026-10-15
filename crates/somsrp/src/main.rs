@@ -1685,8 +1685,19 @@ fn stream_file_impl(
         print_audio_placeholder_grid(session_id, file_id)?;
         if let Some(position) = playlist {
             // The tags of a CUE sheet's file describe the whole disc, not a
-            // track; the sheet itself is announced instead.
-            let tags = if position.cue.is_some() { None } else { read_audio_tags(path) };
+            // track; the sheet itself is announced instead. A sheet with no
+            // picture next to it gets its cover looked up by performer and
+            // album, as for a local file with tags.
+            let tags = match &position.cue {
+                Some(sheet) if sheet.cover.is_none() => Some(somsrv::protocol::TrackTags {
+                    title: sheet.album.clone(),
+                    artist: sheet.artist.clone(),
+                    album: sheet.album.clone(),
+                    year: sheet.year,
+                }),
+                Some(_) => None,
+                None => read_audio_tags(path),
+            };
             announce_track(ids, position, tags);
             if let Some(sheet) = &position.cue {
                 announce_cue(ids, sheet);

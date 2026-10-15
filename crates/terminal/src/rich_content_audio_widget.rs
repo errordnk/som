@@ -257,6 +257,25 @@ impl DisplayedRemaining {
     }
 }
 
+/// The widest display (physical pixels) that gets the 600 px covers; a
+/// wider one gets 1200 px.
+const SMALL_COVER_DISPLAY_MAX_WIDTH: u32 = 1920;
+
+/// The url of the cover to pull for a display `display_physical_width`
+/// pixels wide. `somsrv` always answers with the 1200 px form (iTunes
+/// `1200x1200bb`, Deezer `1200x1200`, Cover Art Archive `front-1200`); a
+/// display up to 1920 pixels wide gets the 600 px one instead (`600x600`,
+/// `front-500`), since a larger picture is only downscaled there. A
+/// local path, a url of another shape and an unknown width (`0`) are
+/// left as they are.
+pub fn cover_url_for_display(url: &str, display_physical_width: u32) -> String {
+    let is_web_url = url.starts_with("http://") || url.starts_with("https://");
+    if !is_web_url || display_physical_width == 0 || display_physical_width > SMALL_COVER_DISPLAY_MAX_WIDTH {
+        return url.to_string();
+    }
+    url.replace("1200x1200", "600x600").replace("/front-1200", "/front-500")
+}
+
 /// One placement's cover-art fetch and its decoded image.
 pub struct AudioCover {
     started: std::time::Instant,
@@ -269,12 +288,16 @@ pub struct AudioCover {
 }
 
 impl AudioCover {
-    /// Starts fetching `url` as a Som-minted resource. Subscribes BEFORE
-    /// requesting, the order `request_fetch_resource` requires.
-    pub fn start(url: &str) -> Self {
+    /// Starts fetching `url` as a Som-minted resource - at the size the
+    /// display of `display_physical_width` pixels calls for (see
+    /// [`cover_url_for_display`]). Subscribes BEFORE requesting, the
+    /// order `request_fetch_resource` requires. [`Self::url`] stays the
+    /// url as given, which is what callers compare to tell a new cover.
+    pub fn start(url: &str, display_physical_width: u32) -> Self {
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
         let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id);
-        rich_content_srv_channel::request_fetch_resource(session_id, file_id, url.to_string(), None);
+        let fetch_url = cover_url_for_display(url, display_physical_width);
+        rich_content_srv_channel::request_fetch_resource(session_id, file_id, fetch_url, None);
         Self { started: std::time::Instant::now(), url: url.to_string(), session_id, file_id, state, content_type: None, player: None }
     }
 
@@ -367,6 +390,37 @@ mod tests {
             .iter()
             .map(|&start_ms| somsrv::protocol::CueTrack { start_ms, ..Default::default() })
             .collect()
+    }
+
+    #[test]
+    fn a_display_up_to_1920_pulls_the_600_px_covers() {
+        assert_eq!(
+            cover_url_for_display("https://is1-ssl.mzstatic.com/image/thumb/a/1200x1200bb.jpg", 1920),
+            "https://is1-ssl.mzstatic.com/image/thumb/a/600x600bb.jpg"
+        );
+        assert_eq!(
+            cover_url_for_display("https://cdn-images.dzcdn.net/images/cover/x/1200x1200-000000-80-0-0.jpg", 1366),
+            "https://cdn-images.dzcdn.net/images/cover/x/600x600-000000-80-0-0.jpg"
+        );
+        assert_eq!(
+            cover_url_for_display("https://coverartarchive.org/release/abc/front-1200", 1920),
+            "https://coverartarchive.org/release/abc/front-500"
+        );
+    }
+
+    #[test]
+    fn a_larger_display_pulls_the_1200_px_covers_as_they_are() {
+        let url = "https://coverartarchive.org/release/abc/front-1200";
+        assert_eq!(cover_url_for_display(url, 1921), url);
+        assert_eq!(cover_url_for_display(url, 3840), url);
+        // Width not known yet: untouched.
+        assert_eq!(cover_url_for_display(url, 0), url);
+    }
+
+    #[test]
+    fn a_local_path_is_never_rewritten() {
+        let path = r"C:\musicP0x1200ront.jpg";
+        assert_eq!(cover_url_for_display(path, 1920), path);
     }
 
     #[test]

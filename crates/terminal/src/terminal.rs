@@ -144,6 +144,78 @@ const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_milli
 /// way calling this on every single frame did (confirmed live).
 const FORCE_REDRAW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
+/// How the view is told about new terminal output - see
+/// `Terminal::emit_wakeup_throttled`. `SOM_REDRAW_QUIET_MS` and
+/// `SOM_REDRAW_MAX_MS` override the values (for measuring).
+#[derive(Clone, Copy)]
+struct WakeupPacing {
+    /// A pause in the output this long ends a burst.
+    quiet: std::time::Duration,
+    /// The longest a burst goes without a draw.
+    max_wait: std::time::Duration,
+    /// Output arriving this long after the previous piece starts a burst
+    /// anew: it is drawn at once.
+    leading_idle: std::time::Duration,
+}
+
+fn wakeup_pacing() -> WakeupPacing {
+    static PACING: std::sync::OnceLock<WakeupPacing> = std::sync::OnceLock::new();
+    *PACING.get_or_init(|| {
+        let millis = |name: &str, default: u64| {
+            let value = std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default);
+            std::time::Duration::from_millis(value)
+        };
+        WakeupPacing {
+            quiet: millis("SOM_REDRAW_QUIET_MS", 60),
+            max_wait: millis("SOM_REDRAW_MAX_MS", 250),
+            leading_idle: millis("SOM_REDRAW_IDLE_MS", 100),
+        }
+    })
+}
+
+/// Event counters for the performance work: with `SOM_PERF` set, every two
+/// seconds one line says how often the terminal woke up and how often that
+/// forced a redraw.
+mod perf {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    static WAKEUPS: AtomicU32 = AtomicU32::new(0);
+    static FORCED: AtomicU32 = AtomicU32::new(0);
+    static SINCE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("SOM_PERF").is_some())
+    }
+
+    pub(super) fn forced_redraw() {
+        if enabled() {
+            FORCED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn wakeup() {
+        if !enabled() {
+            return;
+        }
+        WAKEUPS.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut since = SINCE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started = *since.get_or_insert(now);
+        let elapsed = now - started;
+        if elapsed >= Duration::from_secs(2) {
+            log::info!(
+                "som_perf: terminal woke up {:.0}/s, forced a redraw {:.0}/s",
+                WAKEUPS.swap(0, Ordering::Relaxed) as f32 / elapsed.as_secs_f32(),
+                FORCED.swap(0, Ordering::Relaxed) as f32 / elapsed.as_secs_f32(),
+            );
+            *since = Some(now);
+        }
+    }
+}
+
 /// Inserts Zed-specific environment variables for terminal sessions.
 /// Used by both local terminals and remote terminals (via SSH).
 pub fn insert_zed_terminal_env(
@@ -478,6 +550,9 @@ impl TerminalBuilder {
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
             grid_generation: std::cell::Cell::new(0),
+            last_wakeup_emit: std::cell::Cell::new(None),
+            last_wakeup_seen: std::cell::Cell::new(None),
+            wakeup_pending: std::cell::Cell::new(false),
             placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
             last_full_placeholder_scan: std::cell::Cell::new(None),
             markdown_origins_cache: std::cell::RefCell::new(None),
@@ -820,6 +895,9 @@ impl TerminalBuilder {
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
                 grid_generation: std::cell::Cell::new(0),
+                last_wakeup_emit: std::cell::Cell::new(None),
+                last_wakeup_seen: std::cell::Cell::new(None),
+                wakeup_pending: std::cell::Cell::new(false),
                 placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
                 last_full_placeholder_scan: std::cell::Cell::new(None),
                 markdown_origins_cache: std::cell::RefCell::new(None),
@@ -1327,6 +1405,13 @@ pub struct Terminal {
     /// path's grid scans for placeholder cells look at their own copy of
     /// this to know whether there is anything new to find.
     grid_generation: std::cell::Cell<u64>,
+    /// When the view was last told there is new output to draw, and whether
+    /// a trailing notification is already waiting for the end of the
+    /// interval - see `emit_wakeup_throttled`.
+    last_wakeup_emit: std::cell::Cell<Option<Instant>>,
+    /// When the last piece of output was seen.
+    last_wakeup_seen: std::cell::Cell<Option<Instant>>,
+    wakeup_pending: std::cell::Cell<bool>,
     /// `grid_generation` as of the last scan of the live screen for
     /// placeholder cells.
     placeholders_scanned_generation: std::cell::Cell<u64>,
@@ -1655,6 +1740,74 @@ impl TaskStatus {
 const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
 
 impl Terminal {
+    /// Tells the view the terminal has something new to draw.
+    ///
+    /// Output usually arrives in many small pieces (a full-screen program
+    /// redraws over some hundreds of milliseconds, one piece per console
+    /// frame), and a window redraw per piece cost ~2 ms each, 30 times a
+    /// second - for a screen that only looks different once the piece
+    /// train is over. So:
+    /// - the first piece after a quiet moment is drawn at once (typing
+    ///   echoes without delay);
+    /// - the rest of a burst is drawn when the output pauses for
+    ///   [`WakeupPacing::quiet`], or at the latest [`WakeupPacing::max_wait`]
+    ///   after the last draw - never lost, never more often than that.
+    fn emit_wakeup_throttled(&mut self, cx: &mut Context<Self>) {
+        let pacing = wakeup_pacing();
+        let now = Instant::now();
+        let previous_wake = self.last_wakeup_seen.replace(Some(now));
+        let burst = previous_wake.is_some_and(|at| now.duration_since(at) < pacing.leading_idle);
+        if !burst && !self.wakeup_pending.get() {
+            self.emit_wakeup_now(cx);
+            return;
+        }
+        if self.wakeup_pending.replace(true) {
+            // The waiting task re-reads `last_wakeup_seen` when its timer
+            // ends.
+            return;
+        }
+        cx.spawn(async move |terminal, cx| {
+            loop {
+                let delay = terminal.update(cx, |terminal, _| terminal.wakeup_delay(pacing))?;
+                match delay {
+                    Some(delay) => cx.background_executor().timer(delay).await,
+                    None => break,
+                }
+            }
+            terminal.update(cx, |terminal, cx| {
+                terminal.wakeup_pending.set(false);
+                terminal.emit_wakeup_now(cx);
+            })
+        })
+        .detach();
+    }
+
+    /// How much longer a pending notification should wait; `None` when it
+    /// is time.
+    fn wakeup_delay(&self, pacing: WakeupPacing) -> Option<std::time::Duration> {
+        let now = Instant::now();
+        let since_wake = self.last_wakeup_seen.get().map_or(pacing.quiet, |at| now.duration_since(at));
+        let since_draw = self.last_wakeup_emit.get().map_or(pacing.max_wait, |at| now.duration_since(at));
+        if since_wake >= pacing.quiet || since_draw >= pacing.max_wait {
+            return None;
+        }
+        Some((pacing.quiet - since_wake).min(pacing.max_wait - since_draw))
+    }
+
+    fn emit_wakeup_now(&mut self, cx: &mut Context<Self>) {
+        self.last_wakeup_emit.set(Some(Instant::now()));
+        cx.emit(Event::Wakeup);
+        // A plain `cx.emit(Event::Wakeup)` only marks the window dirty for
+        // whatever repaint the platform decides to run on its own; under a
+        // sustained burst of output that repaint can be starved (see
+        // `rich_content_force_redraw_due`), so a draw is forced - at the
+        // same throttle the rich-content commands use.
+        if self.rich_content_force_redraw_due() {
+            perf::forced_redraw();
+            cx.force_redraw_windows();
+        }
+    }
+
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
         match event {
             AlacTermEvent::Title(title) => {
@@ -1837,11 +1990,11 @@ impl Terminal {
             }
             AlacTermEvent::Wakeup => {
                 self.grid_generation.set(self.grid_generation.get().wrapping_add(1));
-                cx.emit(Event::Wakeup);
-
+                perf::wakeup();
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
                     info.emit_title_changed_if_changed(cx);
                 }
+                self.emit_wakeup_throttled(cx);
 
                 // A plain `cx.emit(Event::Wakeup)` only marks the window
                 // dirty for whatever repaint the platform decides to run
@@ -1862,9 +2015,6 @@ impl Terminal {
                 // gets the same guarantee without adding a second,
                 // independent forced-redraw budget that could double the
                 // effective rate when both fire close together.
-                if self.rich_content_force_redraw_due() {
-                    cx.force_redraw_windows();
-                }
             }
             AlacTermEvent::ColorRequest(index, format) => {
                 // Unlike `PtyWrite` (see its doc comment above), this
@@ -5541,6 +5691,9 @@ impl Terminal {
         self.events.push_back(InternalEvent::SetSelection(None));
 
         self.keyboard_input_sent = true;
+        if let TerminalType::Pty { info, .. } = &self.terminal_type {
+            info.note_input();
+        }
         let input = input.into();
         #[cfg(any(test, feature = "test-support"))]
         self.input_log.push(input.to_vec());

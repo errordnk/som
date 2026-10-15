@@ -787,6 +787,55 @@ fn best_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<ffmpe
     non_mjpeg.filter(|s| s.parameters().medium() == ffmpeg::media::Type::Video).or_else(|| ictx.streams().best(ffmpeg::media::Type::Video))
 }
 
+/// Opens the video's audio on the system's current default output device:
+/// the stream, and the id of the device it went to (so a later change of the
+/// default can be noticed - see the decode loop). `None` when there is no
+/// device or the stream cannot be built; the video then plays silently.
+fn build_audio_output(
+    rate: u32,
+    shared_audio: &Arc<SharedAudio>,
+    playing: &Arc<AtomicBool>,
+) -> Option<(cpal::Stream, Option<cpal::DeviceId>)> {
+    let host = cpal::default_host();
+    let Some(device) = host.default_output_device() else {
+        log::warn!("video's audio: no default output audio device");
+        return None;
+    };
+    let device_id = device.id().ok();
+    let config =
+        cpal::StreamConfig { channels: OUTPUT_CHANNELS, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+    let cb_shared = shared_audio.clone();
+    let cb_playing = playing.clone();
+    let stream = match device.build_output_stream(
+        &config,
+        move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+            if !cb_playing.load(Ordering::Acquire) {
+                output.fill(0.0);
+                return;
+            }
+            let mut samples = cb_shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+            let available = samples.len().min(output.len());
+            for (dst, src) in output[..available].iter_mut().zip(samples.drain(..available)) {
+                *dst = src;
+            }
+            output[available..].fill(0.0);
+        },
+        |err| log::error!("video's audio cpal output stream error: {err}"),
+        None,
+    ) {
+        Ok(stream) => stream,
+        Err(e) => {
+            log::warn!("video's audio build_output_stream failed: {e}");
+            return None;
+        },
+    };
+    if let Err(e) = stream.play() {
+        log::warn!("video's audio stream.play() failed: {e}");
+        return None;
+    }
+    Some((stream, device_id))
+}
+
 /// Runs on a dedicated background thread for the lifetime of one
 /// [`RichContentVideoPlayer`] — mirrors
 /// [`crate::rich_content_audio_player::run_decode_loop`]'s shape closely,
@@ -1037,49 +1086,18 @@ fn run_decode_loop(
         // `resampled_audio`'s plane actually contains.
         shared_audio.sample_rate.store(rate as u64, Ordering::Release);
         shared_audio.channels.store(OUTPUT_CHANNELS as u64, Ordering::Release);
-        let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
-            log::warn!("video's audio: no default output audio device");
-            return None;
-        };
-        let config =
-            cpal::StreamConfig { channels: OUTPUT_CHANNELS, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
-        let cb_shared = shared_audio.clone();
-        let cb_playing = playing.clone();
-        let stream = match device.build_output_stream(
-            &config,
-            move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                if !cb_playing.load(Ordering::Acquire) {
-                    output.fill(0.0);
-                    return;
-                }
-                let mut samples = cb_shared.samples.lock().unwrap_or_else(|p| p.into_inner());
-                let available = samples.len().min(output.len());
-                for (dst, src) in output[..available].iter_mut().zip(samples.drain(..available)) {
-                    *dst = src;
-                }
-                output[available..].fill(0.0);
-            },
-            |err| log::error!("video's audio cpal output stream error: {err}"),
-            None,
-        ) {
-            Ok(stream) => stream,
-            Err(e) => {
-                log::warn!("video's audio build_output_stream failed: {e}");
-                return None;
-            },
-        };
-        if let Err(e) = stream.play() {
-            log::warn!("video's audio stream.play() failed: {e}");
-            return None;
-        }
-        Some(stream)
+        build_audio_output(rate, &shared_audio, &playing)
     });
     // Not read past this point — kept alive only so dropping the decode
     // loop's local scope (thread exit) tears the device stream down; see
     // `RichContentAudioPlayer::_stream`'s identical reasoning for why a
     // `cpal::Stream` handle itself is never otherwise touched.
-    let _audio_output_stream = audio_output;
+    let audio_rate = audio_decoder.as_ref().map(|decoder| decoder.rate()).filter(|rate| *rate > 0);
+    let (mut _audio_output_stream, mut audio_device_id) = match audio_output {
+        Some((stream, device_id)) => (Some(stream), device_id),
+        None => (None, None),
+    };
+    let mut device_checked_at = Instant::now();
     if audio_decoder.is_none() {
         // No usable audio track — never write into a buffer nothing will
         // ever drain, and skip decoding audio packets below entirely.
@@ -1320,6 +1338,37 @@ fn run_decode_loop(
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
+        }
+
+        // The audio stream was opened on whatever the default output device
+        // was then and Windows does not move it when the default changes
+        // (other programs follow, this would keep playing on the old
+        // device): twice a second the default is looked at and the stream
+        // is built again on a new one.
+        if let Some(rate) = audio_rate
+            && device_checked_at.elapsed() >= Duration::from_millis(500)
+        {
+            device_checked_at = Instant::now();
+            let current = cpal::default_host().default_output_device().and_then(|device| device.id().ok());
+            if let Some(current) = current
+                && audio_device_id.as_ref() != Some(&current)
+            {
+                // Dropped first: the callback drains a shared buffer, two
+                // streams would drain it twice as fast.
+                _audio_output_stream = None;
+                match build_audio_output(rate, &shared_audio, &playing) {
+                    Some((stream, device_id)) => {
+                        log::info!("video's audio follows the default device -> {current}");
+                        _audio_output_stream = Some(stream);
+                        audio_device_id = device_id.or(Some(current));
+                    },
+                    None => {
+                        // Try again at the next look rather than playing
+                        // on without a stream for good.
+                        audio_device_id = None;
+                    },
+                }
+            }
         }
 
         // Paused (and a frame already exists to show): don't decode any

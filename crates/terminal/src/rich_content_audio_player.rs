@@ -390,7 +390,10 @@ fn run_decode_loop(
                             },
                             // A reader that cannot seek after all: keep
                             // the whole file from here on.
-                            Err(_) => windowed = false,
+                            Err(err) => {
+                                log::warn!("audio seek to {seconds:.1} s failed, decoding on without a window: {err}");
+                                windowed = false;
+                            },
                         }
                         continue;
                     },
@@ -787,9 +790,15 @@ impl RichContentAudioPlayer {
                     let samples = cb_shared.samples.lock().unwrap_or_else(|p| p.into_inner());
                     let base = cb_shared.base_frames.load(Ordering::Acquire);
                     let total_frames_available = base + (samples.len() / channels_usize.max(1)) as u64;
-                    // A live stream's head is trimmed away; never index
-                    // below what is still buffered.
-                    let mut frame = cb_position.load(Ordering::Acquire).max(base);
+                    // The playhead was moved behind what is still buffered
+                    // (a seek back): silence until the decoder has
+                    // re-seeked there - moving the playhead up to the
+                    // buffer here would throw the seek target away.
+                    let mut frame = cb_position.load(Ordering::Acquire);
+                    if frame < base {
+                        output.fill(0.0);
+                        return;
+                    }
                     for out_frame in output.chunks_mut(channels_usize) {
                         if frame >= total_frames_available {
                             // Either genuinely at the end (decode
@@ -1102,6 +1111,30 @@ mod tests {
             player.seek_to_ms(ms);
             assert!(player.playhead_frames() * 1000 / rate >= ms, "{ms} ms read short");
         }
+    }
+
+    #[test]
+    fn a_seek_back_while_playing_is_not_overwritten_by_the_output() {
+        let mut player = open_player_on("long-tone.flac");
+        wait_for_decode(&mut player);
+        let rate = player.sample_rate() as u64;
+        player.set_playing(true);
+        // Far ahead first, so the window has moved well past the start.
+        player.seek_to_fraction(0.75, 120_000);
+        assert!(eventually(|| player.buffered_range().0 > 60 * rate));
+
+        // Back to 10 s while it plays: the playhead must stay there.
+        player.seek_to_fraction(10.0 / 120.0, 120_000);
+        assert!(eventually(|| {
+            let (base, end) = player.buffered_range();
+            base <= 10 * rate && end > 10 * rate
+        }));
+        let position = player.playhead_frames();
+        assert!(
+            position >= 10 * rate && position < 20 * rate,
+            "playhead at {} s after seeking back to 10 s",
+            position / rate
+        );
     }
 
     #[test]

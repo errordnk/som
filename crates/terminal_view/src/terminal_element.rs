@@ -3020,31 +3020,43 @@ fn paint_rich_content_markdown_widget(
                     let seek_bar_bounds = paint_embedded_media_controls_row(controls_bounds, *is_playing, *elapsed, *duration, *position_fraction, layout, window, cx);
                     embedded_controls_bounds.push((image.dest_url.clone(), controls_bounds, seek_bar_bounds));
                 },
-                Some(terminal::EmbeddedMediaStatus::ReadyAudio { is_playing, elapsed, duration, position_fraction }) => {
-                    // No picture to letterbox — the reserved band shows a
-                    // plain placeholder fill plus the file name, matching
-                    // the Loading/Failed image branches' own visual
-                    // convention, with the controls row directly below.
-                    window.paint_quad(fill(box_bounds, gpui::rgba(0x2a2a3aff)));
-                    let label_text = if image.alt.is_empty() { format!("♪ {}", image.dest_url) } else { format!("♪ {}", image.alt) };
-                    let run = TextRun {
-                        len: label_text.len(),
-                        font: prose_font.clone(),
-                        color: gpui::rgba(0xa6adc8ff).into(),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
+                Some(terminal::EmbeddedMediaStatus::ReadyAudio { is_playing, elapsed, duration, position_fraction, now_playing }) => {
+                    // The same "now playing" widget a `somsrp` audio gets -
+                    // title, artist, album and year, the cover (the file's
+                    // own tags, then whatever `somsrv`'s lookup found) and
+                    // one controls row - in this embed's box.
+                    window.paint_quad(fill(box_bounds, rich_content_widget_bg(cx)));
+                    let placeholder = if now_playing.cover.is_none() && now_playing.show_placeholder {
+                        let bg = rich_content_widget_bg(cx);
+                        let is_light = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 0.5;
+                        terminal::rich_content_audio_widget::placeholder_image(is_light)
+                    } else {
+                        None
                     };
-                    let shaped = window.text_system().shape_line(label_text.into(), base_font_size, &[run], None);
-                    let label_position = point(
-                        box_bounds.origin.x + (box_bounds.size.width - shaped.width).max(Pixels::ZERO) / 2.0,
-                        box_bounds.origin.y + (box_bounds.size.height - line_height) / 2.0,
+                    let (widget_bounds, needs_repaint) = paint_now_playing_audio_in_box(
+                        now_playing,
+                        placeholder,
+                        *is_playing,
+                        *elapsed,
+                        *duration,
+                        *position_fraction,
+                        box_bounds,
+                        layout,
+                        window,
+                        cx,
                     );
-                    shaped.paint(label_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
-                    let controls_bounds =
-                        Bounds::new(point(box_bounds.origin.x, box_bounds.bottom()), gpui::size(box_bounds.size.width, line_height));
-                    let seek_bar_bounds = paint_embedded_media_controls_row(controls_bounds, *is_playing, *elapsed, *duration, *position_fraction, layout, window, cx);
-                    embedded_controls_bounds.push((image.dest_url.clone(), controls_bounds, seek_bar_bounds));
+                    if needs_repaint {
+                        *any_nested_loading = true;
+                    }
+                    if let Some(cover) = widget_bounds.cover {
+                        terminal.read(cx).record_markdown_embedded_toggle_bounds(host, &image.dest_url, cover);
+                    }
+                    let no_controls = Bounds::new(box_bounds.origin, gpui::size(Pixels::ZERO, Pixels::ZERO));
+                    embedded_controls_bounds.push((
+                        image.dest_url.clone(),
+                        widget_bounds.bar.unwrap_or(no_controls),
+                        widget_bounds.bar,
+                    ));
                 },
                 // Unreachable in practice — `image.kind == Markdown` is
                 // handled entirely by the early-return branch above,
@@ -3591,8 +3603,6 @@ fn paint_now_playing_audio_widget(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<(Bounds<Pixels>, terminal::rich_content_audio_widget::AudioWidgetBounds, bool)> {
-    use terminal::rich_content_audio_widget::AudioWidgetBounds;
-
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let display_line = origin_line + layout.display_offset as i32;
@@ -3613,6 +3623,46 @@ fn paint_now_playing_audio_widget(
     let box_origin = point(origin.x + origin_column as f32 * cell_width, origin.y + first_visible as f32 * line_height);
     let bounds = Bounds::new(box_origin, gpui::size(box_width, box_height));
     window.paint_quad(fill(bounds, rich_content_widget_bg(cx)));
+
+    let (widget_bounds, needs_repaint) = paint_now_playing_audio_in_box(
+        np,
+        placeholder,
+        is_playing,
+        player_elapsed,
+        player_duration,
+        position_fraction,
+        bounds,
+        layout,
+        window,
+        cx,
+    );
+    Some((bounds, widget_bounds, needs_repaint))
+}
+
+/// The body of the "now playing" widget, painted into `bounds` (its
+/// background is the caller's): the top-level placement's reserved box, or
+/// the box of an audio file embedded in a markdown document. Returns the
+/// clickable parts and whether anything on it keeps changing.
+#[allow(clippy::too_many_arguments)]
+fn paint_now_playing_audio_in_box(
+    np: &terminal::rich_content_audio_widget::AudioNowPlaying,
+    placeholder: Option<std::sync::Arc<gpui::RenderImage>>,
+    is_playing: bool,
+    player_elapsed: std::time::Duration,
+    player_duration: std::time::Duration,
+    position_fraction: f32,
+    bounds: Bounds<Pixels>,
+    layout: &LayoutState,
+    window: &mut Window,
+    cx: &mut App,
+) -> (terminal::rich_content_audio_widget::AudioWidgetBounds, bool) {
+    use terminal::rich_content_audio_widget::AudioWidgetBounds;
+
+    let cell_width = layout.dimensions.cell_width;
+    let line_height = layout.dimensions.line_height;
+    let box_origin = bounds.origin;
+    let box_width = bounds.size.width;
+    let box_height = bounds.size.height;
 
     let text_color = gpui::white();
     let dim_color: Hsla = gpui::rgba(0x9399b2ff).into();
@@ -3800,7 +3850,7 @@ fn paint_now_playing_audio_widget(
     }
 
     let needs_repaint = scrolling || np.cover_loading || is_playing || !np.ready;
-    Some((bounds, widget_bounds, needs_repaint))
+    (widget_bounds, needs_repaint)
 }
 
 fn format_duration(d: std::time::Duration) -> String {

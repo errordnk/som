@@ -28,9 +28,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// one request per second; a lookup here needs one search call.
 const USER_AGENT: &str = concat!("Som/", env!("CARGO_PKG_VERSION"), " (https://github.com/errordnk/som)");
 
-/// The widest cover that is ever shown; a source's own URL is asked for
-/// this size where it lets the caller choose.
-const COVER_PIXELS: u32 = 600;
+/// The widest cover that is ever shown (the widget goes up to 1200 px on a
+/// 4K window); a source's own URL is asked for this size where it lets the
+/// caller choose.
+const COVER_PIXELS: u32 = 1200;
 
 /// Minimal blocking HTTP surface used by every lookup in this module.
 pub trait HttpGet {
@@ -629,11 +630,14 @@ fn musicbrainz_cover_from_search(
         if !names_match(title, album) {
             continue;
         }
-        // 500 px is the largest archive thumbnail not above the 600 px
-        // cap that is always generated.
-        let cover = format!("https://coverartarchive.org/{kind}/{id}/front-500");
-        if http.exists(&cover) {
-            return Some(cover);
+        // The archive's thumbnails come in 250 / 500 / 1200 px; the big
+        // one is made on demand and may be missing, the middle one is
+        // always there.
+        for size in ["1200", "500"] {
+            let cover = format!("https://coverartarchive.org/{kind}/{id}/front-{size}");
+            if http.exists(&cover) {
+                return Some(cover);
+            }
         }
     }
     None
@@ -886,6 +890,18 @@ mod tests {
     }
 
     #[test]
+    fn the_big_archive_thumbnail_is_preferred_when_it_exists() {
+        let mut http = Canned::new();
+        http.answers.insert("musicbrainz.org", r#"{"releases":[{"id":"abc","title":"Dawn of Awareness"}]}"#.to_string());
+        http.existing.push("release/abc/front-1200");
+        http.existing.push("release/abc/front-500");
+
+        let cover = musicbrainz_cover(&http, "MonoMono", "Dawn of Awareness");
+
+        assert_eq!(cover.as_deref(), Some("https://coverartarchive.org/release/abc/front-1200"));
+    }
+
+    #[test]
     fn old_album_prefers_musicbrainz_and_cover_archive() {
         let mut http = Canned::new();
         http.answers.insert(
@@ -911,7 +927,7 @@ mod tests {
 
         let cover = find_cover(&http, "Some Artist", "Fresh Album", Some(2026), 2026);
 
-        assert_eq!(cover.as_deref(), Some("https://cdn.example/cover/abc/600x600-000000-80-0-0.jpg"));
+        assert_eq!(cover.as_deref(), Some("https://cdn.example/cover/abc/1200x1200-000000-80-0-0.jpg"));
         assert!(!http.asked.lock().unwrap().iter().any(|u| u.contains("musicbrainz")));
     }
 
@@ -927,7 +943,7 @@ mod tests {
 
         let cover = find_cover(&http, "Band", "Old Album", Some(1999), 2026);
 
-        assert_eq!(cover.as_deref(), Some("https://cdn.example/x/600x600-1.jpg"));
+        assert_eq!(cover.as_deref(), Some("https://cdn.example/x/1200x1200-1.jpg"));
     }
 
     const ITUNES_HIT: &str = r#"{"results":[{"collectionName":"Boy Alone","artistName":"Omah Lay","artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Music/abc/source/100x100bb.jpg"}]}"#;
@@ -943,7 +959,7 @@ mod tests {
 
         assert_eq!(
             cover.as_deref(),
-            Some("https://is1-ssl.mzstatic.com/image/thumb/Music/abc/source/600x600bb.jpg")
+            Some("https://is1-ssl.mzstatic.com/image/thumb/Music/abc/source/1200x1200bb.jpg")
         );
     }
 
@@ -1058,7 +1074,7 @@ mod tests {
         let info = resolve_stream_info(&http, 1, 2, "Daft Punk", "Get Lucky");
 
         assert_eq!(info.album, "Random Access Memories");
-        assert_eq!(info.cover_url.as_deref(), Some("https://cdn.example/c/600x600-000000-80-0-0.jpg"));
+        assert_eq!(info.cover_url.as_deref(), Some("https://cdn.example/c/1200x1200-000000-80-0-0.jpg"));
         assert!(!info.cover_lookup_pending);
     }
 
@@ -1075,7 +1091,7 @@ mod tests {
         let info = resolve_stream_info(&http, 1, 2, "Daft Punk", "Get Lucky");
 
         assert_eq!(info.album, "RAM");
-        assert_eq!(info.cover_url.as_deref(), Some("https://x/600x600bb.jpg"));
+        assert_eq!(info.cover_url.as_deref(), Some("https://x/1200x1200bb.jpg"));
     }
 
     #[test]

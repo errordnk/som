@@ -3058,6 +3058,13 @@ impl Terminal {
                         out.push((dest_url.clone(), EmbeddedMediaStatus::Loading));
                         continue;
                     }
+                    // An embedded file arrives with no length from the
+                    // sender; its own container usually has one.
+                    if entry.audio_duration_ms.is_none_or(|ms| ms == 0)
+                        && let Some(ms) = player.duration_ms()
+                    {
+                        entry.audio_duration_ms = Some(ms);
+                    }
                     let duration_ms = entry.audio_duration_ms.unwrap_or(0);
 
                     // What `somsrv` found out (cover location) on top of

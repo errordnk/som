@@ -83,14 +83,19 @@ fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> 
     // absolute URL (or one resolved against the PARENT URL, not a
     // filesystem path) to work at all; that's a real, separate gap this
     // change doesn't attempt to close.
-    // A station without a public API still says what is playing, inside
-    // the stream itself; the metadata is cut out before the audio is
-    // cached. (A station with its own adapter is authoritative.)
+    // A station that answers with `icy-metaint` has put metadata blocks
+    // into the audio; they are ALWAYS cut out before the audio is cached
+    // (left in, they corrupt the codec stream - an Ogg page fails its
+    // CRC). A station without a public API says what is playing in them;
+    // one with its own adapter is authoritative, its blocks are dropped.
     let result = match icy_metaint {
-        Some(metaint) if content_type == ContentType::Audio && station.is_none() => {
+        Some(metaint) if content_type == ContentType::Audio => {
             let titles = cache.clone();
+            let announce = station.is_none();
             let reader = crate::icy::IcyReader::new(reader, metaint, move |raw| {
-                crate::now_playing::announce_stream_title(&titles, session_id, file_id, &raw);
+                if announce {
+                    crate::now_playing::announce_stream_title(&titles, session_id, file_id, &raw);
+                }
             });
             stream_reader_into_cache(cache, session_id, file_id, reader, total_size, content_type, String::new())
         },

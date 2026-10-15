@@ -5,7 +5,14 @@ use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 use std::num::NonZeroU32;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
@@ -97,7 +104,21 @@ pub struct PtyProcessInfo {
     pid_getter: ProcessIdGetter,
     pub current: RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
+    /// When the last refresh was started - see [`MIN_REFRESH_INTERVAL`].
+    last_refresh: Mutex<Option<Instant>>,
+    /// A refresh is already waiting for the end of the minimum interval.
+    trailing_refresh_scheduled: AtomicBool,
 }
+
+/// The least time between two looks at the child process (its name and
+/// working directory). Every look is a snapshot of ALL processes of the
+/// machine plus reads of the child's memory - hundreds of processes and
+/// thousands of threads - and used to run after every burst of terminal
+/// output: a full-screen program redrawing once a second kept a thread
+/// pool worker busy at 10+% of a core. A title that is up to a second
+/// late is not noticed; the last look of a burst is not lost (see
+/// `emit_title_changed_if_changed`).
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl PtyProcessInfo {
     pub fn new(pty: &Pty) -> PtyProcessInfo {
@@ -114,6 +135,8 @@ impl PtyProcessInfo {
             pid_getter: ProcessIdGetter::new(pty),
             current: RwLock::new(None),
             task: Mutex::new(None),
+            last_refresh: Mutex::new(None),
+            trailing_refresh_scheduled: AtomicBool::new(false),
         }
     }
 
@@ -191,10 +214,32 @@ impl PtyProcessInfo {
     }
 
     /// Updates the cached process info, emitting a [`Event::TitleChanged`] event if the Zed-relevant info has changed
+    ///
+    /// At most once per [`MIN_REFRESH_INTERVAL`]: a call inside the interval
+    /// schedules ONE look for its end instead, so a change that happens
+    /// right after a look is still picked up.
     pub fn emit_title_changed_if_changed(self: &Arc<Self>, cx: &mut Context<'_, Terminal>) {
         if self.task.lock().is_some() {
             return;
         }
+        let since_last = self.last_refresh.lock().map(|at| at.elapsed());
+        if let Some(since_last) = since_last
+            && since_last < MIN_REFRESH_INTERVAL
+        {
+            if !self.trailing_refresh_scheduled.swap(true, Ordering::AcqRel) {
+                let wait = MIN_REFRESH_INTERVAL - since_last;
+                let this = self.clone();
+                let timer = cx.background_executor().timer(wait);
+                cx.spawn(async move |term, cx| {
+                    timer.await;
+                    this.trailing_refresh_scheduled.store(false, Ordering::Release);
+                    term.update(cx, |_, cx| this.emit_title_changed_if_changed(cx)).ok();
+                })
+                .detach();
+            }
+            return;
+        }
+        *self.last_refresh.lock() = Some(Instant::now());
         let this = self.clone();
         let has_changed = cx.background_executor().spawn(async move {
             let previous = this.current.read().clone();

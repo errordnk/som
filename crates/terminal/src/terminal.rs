@@ -6022,9 +6022,19 @@ impl Terminal {
                 self.write_to_pty(bytes);
             }
         } else {
+            // A mouse move is only worth a redraw when it changes what is
+            // drawn: it dropped a hovered link, or queued a look for one
+            // (which needs a paint pass to be processed at all). Moving the
+            // pointer over the window used to redraw it for every event -
+            // hundreds a second.
+            let had_hovered_word = self.last_content.last_hovered_word.is_some();
+            let queued_before = self.events.len();
             self.schedule_find_hyperlink(e.modifiers, e.position);
+            let dropped_hovered_word = had_hovered_word && self.last_content.last_hovered_word.is_none();
+            if dropped_hovered_word || self.events.len() != queued_before {
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
     fn schedule_find_hyperlink(&mut self, modifiers: Modifiers, position: Point<Pixels>) {

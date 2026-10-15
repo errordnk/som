@@ -210,6 +210,53 @@ impl TrackTimeline {
     }
 }
 
+/// The time left as the widget DRAWS it, kept apart from the one the
+/// timeline computes. The timeline is always right about when a track
+/// ends (it is what switches tracks); but each fresh station report moves
+/// its end by a fraction of a second or a second (the station's clock
+/// ticks in whole seconds), and following that would make the number on
+/// screen jitter. So the number counts down with the playhead on its own
+/// and is moved onto the recomputed time only when the two differ by more
+/// than [`DISPLAY_DRIFT_SECS`].
+#[derive(Default)]
+pub struct DisplayedRemaining {
+    track: Option<(String, String, u32)>,
+    /// The time left at the moment the number was last set...
+    remaining: Duration,
+    /// ...and where the playhead was then, in frames.
+    playhead_frames: f64,
+}
+
+/// How far (seconds) the number on screen may sit from the recomputed time
+/// left before it is moved.
+const DISPLAY_DRIFT_SECS: f64 = 1.0;
+
+impl DisplayedRemaining {
+    /// The time left to draw, given the timeline's `model` value for the
+    /// track `info` with the playhead at `playhead_frames` (`rate` frames
+    /// per second).
+    pub fn update(
+        &mut self,
+        info: &somsrv::protocol::NowPlayingInfo,
+        model: Duration,
+        playhead_frames: f64,
+        rate: f64,
+    ) -> Duration {
+        let track = (info.artist.clone(), info.title.clone(), info.duration_ms);
+        if rate > 0.0 && self.track.as_ref() == Some(&track) {
+            let walked = (playhead_frames - self.playhead_frames) / rate;
+            let local = (self.remaining.as_secs_f64() - walked).max(0.0);
+            if (local - model.as_secs_f64()).abs() <= DISPLAY_DRIFT_SECS {
+                return Duration::from_secs_f64(local);
+            }
+        }
+        self.track = Some(track);
+        self.remaining = model;
+        self.playhead_frames = playhead_frames;
+        model
+    }
+}
+
 /// One placement's cover-art fetch and its decoded image.
 pub struct AudioCover {
     started: std::time::Instant,
@@ -425,6 +472,48 @@ mod tests {
 
         let (_, remaining) = timeline.current(3000.0, 100.0).unwrap();
         assert_eq!(remaining, Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn the_displayed_time_ignores_a_correction_of_a_second_or_less() {
+        let mut shown = DisplayedRemaining::default();
+        let track = info("one", 200_000, 0);
+        // 100 frames/s. First sight: 20 s left at frame 3000.
+        assert_eq!(shown.update(&track, Duration::from_secs(20), 3000.0, 100.0), Duration::from_secs(20));
+        // 5 s later the timeline says 14.2 s (a 0.8 s correction of its
+        // end): the number keeps counting from what it had, 15 s.
+        assert_eq!(shown.update(&track, Duration::from_millis(14_200), 3500.0, 100.0), Duration::from_secs(15));
+        // Exactly one second off is still no reason to move it.
+        assert_eq!(shown.update(&track, Duration::from_secs(14), 3500.0, 100.0), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn the_displayed_time_follows_a_correction_of_more_than_a_second() {
+        let mut shown = DisplayedRemaining::default();
+        let track = info("one", 200_000, 0);
+        shown.update(&track, Duration::from_secs(20), 3000.0, 100.0);
+        // 5 s later the timeline says 12 s: three seconds off -> moved.
+        assert_eq!(shown.update(&track, Duration::from_secs(12), 3500.0, 100.0), Duration::from_secs(12));
+        // And it counts down from there.
+        assert_eq!(shown.update(&track, Duration::from_millis(11_300), 3600.0, 100.0), Duration::from_secs(11));
+    }
+
+    #[test]
+    fn a_new_track_resets_the_displayed_time() {
+        let mut shown = DisplayedRemaining::default();
+        shown.update(&info("one", 200_000, 0), Duration::from_secs(20), 3000.0, 100.0);
+        let next = info("two", 180_000, 0);
+        assert_eq!(shown.update(&next, Duration::from_secs(180), 5000.0, 100.0), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn the_displayed_time_follows_a_seek() {
+        let mut shown = DisplayedRemaining::default();
+        let track = info("one", 200_000, 0);
+        shown.update(&track, Duration::from_secs(100), 1000.0, 100.0);
+        // The playhead jumps back 30 s: the model says 130 s, the local
+        // count says 130 s too - no jump between the two.
+        assert_eq!(shown.update(&track, Duration::from_secs(130), -2000.0 + 1000.0, 100.0), Duration::from_secs(130));
     }
 
     #[test]

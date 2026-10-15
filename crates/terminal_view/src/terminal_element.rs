@@ -1775,6 +1775,61 @@ fn fit_into_box(image_size: gpui::Size<gpui::DevicePixels>, box_bounds: Bounds<P
 /// Pulled out as a standalone function (rather than left inline in
 /// `paint_rich_content_markdown_widget`) specifically so it's unit-
 /// testable as pure arithmetic, without needing a `Window`.
+/// The boxes of a ROW of embeds sharing one band, left to right: widths
+/// from each embed's `NN%` (the rest shared equally between those with
+/// none; weights over 100% are scaled down to fit), two cells between
+/// neighbours. Each box keeps its own vertical attrs (`top`/`middle`/
+/// `bottom`, `height_rows`); horizontally it simply fills its slot.
+fn embed_row_boxes(
+    attrs: &[crate::markdown_styling::EmbedAttrs],
+    at: Point<Pixels>,
+    full_width: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let count = attrs.len().max(1);
+    let available = (full_width - cell_width * 2.0).max(cell_width);
+    let gap = cell_width * 2.0;
+    let usable = (available - gap * (count - 1) as f32).max(cell_width * count as f32);
+
+    let given: u32 = attrs.iter().filter_map(|a| a.width_percent).sum();
+    let unspecified = attrs.iter().filter(|a| a.width_percent.is_none()).count() as u32;
+    let share = if unspecified == 0 {
+        0.0
+    } else if given >= 100 {
+        // Nothing left over for the ones without a width: they get an
+        // equal part of what the others were given on average.
+        (given as f32 / (count as u32 - unspecified).max(1) as f32).max(1.0)
+    } else {
+        (100 - given) as f32 / unspecified as f32
+    };
+    let weights: Vec<f32> = attrs.iter().map(|a| a.width_percent.map(|p| p as f32).unwrap_or(share).max(1.0)).collect();
+    let total: f32 = weights.iter().sum();
+
+    let mut boxes = Vec::with_capacity(count);
+    let mut x = at.x + cell_width;
+    for (attr, weight) in attrs.iter().zip(&weights) {
+        let slot_width = usable * (weight / total);
+        // `embed_box_bounds` insets by one cell on each side: ask it for
+        // a slot padded by exactly that, at the slot's own left edge.
+        let slot_attrs = crate::markdown_styling::EmbedAttrs {
+            width_percent: None,
+            position: crate::markdown_styling::EmbedPosition::Left,
+            float: false,
+            ..*attr
+        };
+        boxes.push(embed_box_bounds(
+            &slot_attrs,
+            point(x - cell_width, at.y),
+            slot_width + cell_width * 2.0,
+            cell_width,
+            line_height,
+        ));
+        x += slot_width + gap;
+    }
+    boxes
+}
+
 fn embed_box_bounds(
     attrs: &crate::markdown_styling::EmbedAttrs,
     at: Point<Pixels>,
@@ -2928,16 +2983,29 @@ fn paint_rich_content_markdown_widget(
             discovered.push(image.dest_url.clone());
         }
 
-        if let Some(image) = &line.embedded_media
-            && image.kind != crate::markdown_styling::EmbeddedMediaKind::Markdown
+        if let Some(first_embed) = &line.embedded_media
+            && first_embed.kind != crate::markdown_styling::EmbeddedMediaKind::Markdown
         {
+            // A row of embeds (`![](a.png) ![](b.flac)` on one line)
+            // paints each in its own slot of the one shared band.
+            let row_boxes = if line.row_siblings.is_empty() {
+                None
+            } else {
+                let attrs: Vec<crate::markdown_styling::EmbedAttrs> =
+                    std::iter::once(first_embed.attrs).chain(line.row_siblings.iter().map(|m| m.attrs)).collect();
+                Some(embed_row_boxes(&attrs, at, width, cell_width, line_height))
+            };
+            for (item_index, image) in std::iter::once(first_embed).chain(line.row_siblings.iter()).enumerate() {
             discovered.push(image.dest_url.clone());
             // Box geometry honors the embed's `{...}` attrs (position/
             // width/height) — see `embed_box_bounds`'s own doc comment.
             // With no attrs block (`EmbedAttrs::default()`), this
             // reproduces the old fixed full-width-minus-insets,
             // EMBEDDED_IMAGE_ROWS-tall box exactly.
-            let box_bounds = embed_box_bounds(&image.attrs, at, width, cell_width, line_height);
+            let box_bounds = match &row_boxes {
+                Some(boxes) => boxes[item_index],
+                None => embed_box_bounds(&image.attrs, at, width, cell_width, line_height),
+            };
             match embedded.get(&image.dest_url) {
                 Some(terminal::EmbeddedMediaStatus::ReadyImage { render_image, frame_index, .. }) => {
                     let fit = fit_into_box(render_image.size(*frame_index), box_bounds);
@@ -3065,6 +3133,7 @@ fn paint_rich_content_markdown_widget(
                 // because `EmbeddedMediaStatus` is one enum shared across
                 // all kinds, so this match must stay exhaustive.
                 Some(terminal::EmbeddedMediaStatus::ReadyMarkdown { .. }) => {},
+            }
             }
             continue;
         }
@@ -4814,6 +4883,44 @@ mod tests {
         // Negative: lines -7, -6, -5, -4
         assert_eq!(negative_filtered.first().unwrap().point.line, Line(-7));
         assert_eq!(negative_filtered.last().unwrap().point.line, Line(-4));
+    }
+
+    #[test]
+    fn a_row_without_widths_splits_the_band_equally_with_a_gap() {
+        let attrs = vec![crate::markdown_styling::EmbedAttrs::default(); 2];
+        let cell = px(8.0);
+        let boxes = embed_row_boxes(&attrs, point(px(0.0), px(0.0)), px(208.0), cell, px(16.0));
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].size.width, boxes[1].size.width);
+        // 208 - 2 cells of inset = 192; minus a 2-cell gap = 176 -> 88 each.
+        assert_eq!(boxes[0].size.width, px(88.0));
+        assert_eq!(boxes[0].origin.x, px(8.0));
+        assert_eq!(boxes[1].origin.x, px(8.0) + px(88.0) + px(16.0));
+    }
+
+    #[test]
+    fn a_rows_percentages_are_shares_of_the_band() {
+        let attrs = vec![
+            crate::markdown_styling::EmbedAttrs { width_percent: Some(25), ..Default::default() },
+            crate::markdown_styling::EmbedAttrs { width_percent: Some(75), ..Default::default() },
+        ];
+        let boxes = embed_row_boxes(&attrs, point(px(0.0), px(0.0)), px(208.0), px(8.0), px(16.0));
+        assert_eq!(boxes[0].size.width, px(44.0));
+        assert_eq!(boxes[1].size.width, px(132.0));
+    }
+
+    #[test]
+    fn the_unspecified_share_what_the_given_widths_leave() {
+        let attrs = vec![
+            crate::markdown_styling::EmbedAttrs { width_percent: Some(50), ..Default::default() },
+            crate::markdown_styling::EmbedAttrs::default(),
+            crate::markdown_styling::EmbedAttrs::default(),
+        ];
+        let boxes = embed_row_boxes(&attrs, point(px(0.0), px(0.0)), px(208.0), px(8.0), px(16.0));
+        // 192 - 2 gaps (32) = 160: 50% = 80, the other two 25% = 40 each.
+        assert_eq!(boxes[0].size.width, px(80.0));
+        assert_eq!(boxes[1].size.width, px(40.0));
+        assert_eq!(boxes[2].size.width, px(40.0));
     }
 
     #[test]

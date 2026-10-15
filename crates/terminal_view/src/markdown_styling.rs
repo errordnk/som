@@ -82,6 +82,10 @@ pub struct LaidOutLine {
     /// variant. Covers images, audio, and video — see [`EmbeddedMedia`]'s
     /// own doc comment for why one type serves all three kinds.
     pub embedded_media: Option<EmbeddedMedia>,
+    /// More embeds sharing this embed's band: `![](a.png) ![](b.flac)` on
+    /// one source line is one ROW of embeds, not a stack of bands. Empty
+    /// for a lone embed (and for every line that carries none).
+    pub row_siblings: Vec<EmbeddedMedia>,
     /// The byte range in the ORIGINAL markdown source text this line's
     /// content was drawn from — the union of every source event's own
     /// range that contributed a span to this line (see the main parsing
@@ -434,6 +438,13 @@ pub fn layout_markdown_with_nested(
     // `MarkdownEvent::Text` arm below for why this can't just check
     // `pending_image` (already `None` by the time `{params}` arrives).
     let mut awaiting_attrs_for: Option<usize> = None;
+    // Whether the pending attrs block belongs to the LAST sibling of that
+    // row rather than to the row's first embed.
+    let mut awaiting_attrs_sibling = false;
+    // The first line of the band of the embed just before this point in
+    // the paragraph, while nothing but whitespace has come since - the
+    // next embed then joins its row. Cleared by anything else.
+    let mut last_embed_row: Option<usize> = None;
 
     let finish_line = |lines: &mut Vec<LaidOutLine>, current: &mut LaidOutLine, heading_level: Option<u8>, in_code_block: bool, in_block_quote: bool| {
         current.heading_level = heading_level;
@@ -471,6 +482,15 @@ pub fn layout_markdown_with_nested(
             Some(existing) => existing.start.min(_range.start)..existing.end.max(_range.end),
             None => _range.clone(),
         });
+        // Anything but an image or whitespace between two embeds ends
+        // their row.
+        match event {
+            MarkdownEvent::Start(MarkdownTag::Image { .. }) | MarkdownEvent::End(MarkdownTagEnd::Image) => {},
+            MarkdownEvent::Start(_) | MarkdownEvent::End(_) | MarkdownEvent::HardBreak | MarkdownEvent::Rule => {
+                last_embed_row = None;
+            },
+            _ => {},
+        }
         match event {
             MarkdownEvent::Start(tag) => match tag {
                 MarkdownTag::Heading { level, .. } => {
@@ -562,6 +582,22 @@ pub fn layout_markdown_with_nested(
                 MarkdownTagEnd::Image => {
                     if let Some(mut image) = pending_image.take() {
                         image.alt = std::mem::take(&mut image_alt);
+                        // A non-markdown embed straight after another one
+                        // (only spaces between) joins its row.
+                        let joins_row = last_embed_row.filter(|row| {
+                            image.kind != EmbeddedMediaKind::Markdown
+                                && current.spans.iter().all(|span| span.text.trim().is_empty())
+                                && lines.get(*row).and_then(|line| line.embedded_media.as_ref()).is_some_and(|first| {
+                                    first.kind != EmbeddedMediaKind::Markdown
+                                })
+                        });
+                        if let Some(row) = joins_row {
+                            current.spans.clear();
+                            lines[row].row_siblings.push(image);
+                            awaiting_attrs_for = Some(row);
+                            awaiting_attrs_sibling = true;
+                            continue;
+                        }
                         // An image inside a paragraph splits it: flush
                         // whatever prose was in progress as its own row
                         // first, so the image block always starts at a
@@ -636,6 +672,8 @@ pub fn layout_markdown_with_nested(
                                 },
                             }
                             awaiting_attrs_for = Some(row_index);
+                            awaiting_attrs_sibling = false;
+                            last_embed_row = None;
                         } else {
                             lines.push(LaidOutLine {
                                 embedded_media: Some(image),
@@ -647,6 +685,8 @@ pub fn layout_markdown_with_nested(
                                 lines.push(LaidOutLine::default());
                             }
                             awaiting_attrs_for = Some(row_index);
+                            awaiting_attrs_sibling = false;
+                            last_embed_row = Some(row_index);
                         }
                     }
                 },
@@ -662,10 +702,17 @@ pub fn layout_markdown_with_nested(
                 // is already `None`. Must be intercepted here, before it
                 // falls through to becoming a visible prose span below.
                 if let Some(row_index) = awaiting_attrs_for.take() {
+                    let for_sibling = std::mem::take(&mut awaiting_attrs_sibling);
                     if let Some(rest) = text.strip_prefix('{') {
                         if let Some(close) = rest.find('}') {
                             let attrs_body = &rest[..close];
-                            if let Some(LaidOutLine { embedded_media: Some(media), .. }) = lines.get_mut(row_index) {
+                            if for_sibling {
+                                if let Some(sibling) =
+                                    lines.get_mut(row_index).and_then(|line| line.row_siblings.last_mut())
+                                {
+                                    sibling.attrs = parse_embed_attrs(attrs_body);
+                                }
+                            } else if let Some(LaidOutLine { embedded_media: Some(media), .. }) = lines.get_mut(row_index) {
                                 media.attrs = parse_embed_attrs(attrs_body);
                             }
                             let remainder = &rest[close + 1..];
@@ -674,6 +721,9 @@ pub fn layout_markdown_with_nested(
                                 // event is ordinary prose — falls through
                                 // to the ordinary span-building path below
                                 // with the attrs prefix already stripped.
+                                if !remainder.trim().is_empty() {
+                                    last_embed_row = None;
+                                }
                                 current.spans.push(StyledSpan {
                                     text: remainder.to_string(),
                                     emphasis: inline.emphasis(),
@@ -700,6 +750,9 @@ pub fn layout_markdown_with_nested(
                 if pending_image.is_some() {
                     image_alt.push_str(&text);
                     continue;
+                }
+                if !text.trim().is_empty() {
+                    last_embed_row = None;
                 }
                 let is_code = matches!(event, MarkdownEvent::Code) || in_code_block;
                 if text.is_empty() {
@@ -901,6 +954,7 @@ fn wrap_paragraph_line(line: LaidOutLine, wrapper: &mut gpui::LineWrapperHandle,
             is_code_block: false,
             is_block_quote: line.is_block_quote,
             embedded_media: None,
+            row_siblings: Vec::new(),
             // Every wrapped visual row inherits the FULL pre-wrap
             // source range — see `LaidOutLine::source_range`'s own doc
             // comment for why a wrapped row doesn't track which literal
@@ -1212,6 +1266,54 @@ mod tests {
         let image_rows: Vec<_> = lines.iter().filter(|l| l.embedded_media.is_some()).collect();
         assert_eq!(image_rows.len(), 1, "an image row must never be split by the wrap pass");
         assert_eq!(lines.len(), EMBEDDED_IMAGE_ROWS, "wrapping must not change an image's reserved row count");
+    }
+
+    #[test]
+    fn embeds_on_one_line_share_one_band() {
+        let lines = layout_markdown("![a](a.png) ![b](b.flac)", None);
+        assert_eq!(lines.len(), EMBEDDED_IMAGE_ROWS, "two embeds in a row must reserve ONE band");
+        let first = lines[0].embedded_media.as_ref().expect("first embed");
+        assert_eq!(first.dest_url, "a.png");
+        assert_eq!(lines[0].row_siblings.len(), 1);
+        assert_eq!(lines[0].row_siblings[0].dest_url, "b.flac");
+        assert_eq!(lines[0].row_siblings[0].kind, EmbeddedMediaKind::Audio);
+    }
+
+    #[test]
+    fn a_row_keeps_every_embeds_own_attrs() {
+        let lines = layout_markdown("![](a.png){40%} ![](b.png){60%} ![](c.png)", None);
+        assert_eq!(lines.len(), EMBEDDED_IMAGE_ROWS);
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.width_percent, Some(40));
+        assert_eq!(lines[0].row_siblings.len(), 2);
+        assert_eq!(lines[0].row_siblings[0].attrs.width_percent, Some(60));
+        assert_eq!(lines[0].row_siblings[1].attrs.width_percent, None);
+    }
+
+    #[test]
+    fn text_between_embeds_keeps_them_apart() {
+        let lines = layout_markdown("![](a.png) and ![](b.png)", None);
+        assert!(lines.iter().all(|line| line.row_siblings.is_empty()));
+        assert!(lines.len() >= EMBEDDED_IMAGE_ROWS * 2);
+    }
+
+    #[test]
+    fn embeds_in_separate_paragraphs_are_not_a_row() {
+        let lines = layout_markdown("![](a.png)\n\n![](b.png)", None);
+        assert!(lines.iter().all(|line| line.row_siblings.is_empty()));
+        assert_eq!(lines.iter().filter(|line| line.embedded_media.is_some()).count(), 2);
+    }
+
+    #[test]
+    fn a_nested_markdown_embed_is_never_part_of_a_row() {
+        let lines = layout_markdown("![](a.png) ![](b.md)", None);
+        assert!(lines.iter().all(|line| line.row_siblings.is_empty()));
+    }
+
+    #[test]
+    fn a_single_embed_has_no_siblings() {
+        let lines = layout_markdown("![](a.png){50%}", None);
+        assert!(lines[0].row_siblings.is_empty());
+        assert_eq!(lines[0].embedded_media.as_ref().unwrap().attrs.width_percent, Some(50));
     }
 
     #[test]

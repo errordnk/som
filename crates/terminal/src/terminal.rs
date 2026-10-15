@@ -4676,11 +4676,7 @@ impl Terminal {
             let hit = toggle_map.iter().find(|(_, bounds)| bounds.contains(&position)).map(|(key, _)| key.clone());
             drop(toggle_map);
             if let Some(key) = hit {
-                if let Some(entry) = self.markdown_embedded_media.borrow().get(&key)
-                    && let MarkdownEmbeddedPlayer::Audio(player) = &entry.player
-                {
-                    player.toggle_play_pause();
-                }
+                self.toggle_markdown_embedded_playback(&key);
                 return true;
             }
         }
@@ -4696,15 +4692,7 @@ impl Terminal {
 
         let offset_x = position.x - controls_bounds.origin.x;
         if offset_x < cell_width * 2.0 {
-            let mut embedded = self.markdown_embedded_media.borrow_mut();
-            if let Some(entry) = embedded.get_mut(&key) {
-                match &entry.player {
-                    MarkdownEmbeddedPlayer::Audio(player) => player.toggle_play_pause(),
-                    #[cfg(target_os = "windows")]
-                    MarkdownEmbeddedPlayer::Video(player) => player.toggle_play_pause(),
-                    _ => {},
-                }
-            }
+            self.toggle_markdown_embedded_playback(&key);
             return true;
         }
 
@@ -4738,6 +4726,39 @@ impl Terminal {
             _ => {},
         }
         true
+    }
+
+    /// Play/pause for one embedded audio/video. Pressing play on one that
+    /// has reached its end starts it over - exactly what the top-level
+    /// players do - instead of flipping a flag that nothing then acts on.
+    fn toggle_markdown_embedded_playback(&self, key: &((u32, u32), String)) {
+        let embedded = self.markdown_embedded_media.borrow();
+        let Some(entry) = embedded.get(key) else {
+            return;
+        };
+        match &entry.player {
+            MarkdownEmbeddedPlayer::Audio(player) => {
+                let duration_ms = entry.audio_duration_ms.unwrap_or(0);
+                if !player.is_playing() && player.is_finished(duration_ms) {
+                    player.seek_to_fraction(0.0, duration_ms);
+                }
+                player.toggle_play_pause();
+            },
+            #[cfg(target_os = "windows")]
+            MarkdownEmbeddedPlayer::Video(player) => {
+                if player.is_finished()
+                    && !player.is_playing()
+                    && let Some(progress) = self.markdown_embedded_video_progress.borrow().get(key)
+                {
+                    let (session_id, file_id) = (entry.session_id, entry.file_id);
+                    player.seek_to_fraction(0.0, progress, |offset, len| {
+                        rich_content_srv_channel::request_byte_range(session_id, file_id, offset, len);
+                    });
+                }
+                player.toggle_play_pause();
+            },
+            _ => {},
+        }
     }
 
     /// Computes a seek fraction (0.0..=1.0) from `position`'s horizontal

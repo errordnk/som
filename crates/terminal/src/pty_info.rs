@@ -108,17 +108,28 @@ pub struct PtyProcessInfo {
     last_refresh: Mutex<Option<Instant>>,
     /// A refresh is already waiting for the end of the minimum interval.
     trailing_refresh_scheduled: AtomicBool,
+    /// When the user last sent input to the terminal.
+    last_input: Mutex<Option<Instant>>,
 }
 
 /// The least time between two looks at the child process (its name and
-/// working directory). Every look is a snapshot of ALL processes of the
-/// machine plus reads of the child's memory - hundreds of processes and
-/// thousands of threads - and used to run after every burst of terminal
-/// output: a full-screen program redrawing once a second kept a thread
-/// pool worker busy at 10+% of a core. A title that is up to a second
-/// late is not noticed; the last look of a burst is not lost (see
-/// `emit_title_changed_if_changed`).
+/// working directory) while the user is typing. Every look is a snapshot of
+/// ALL processes of the machine plus reads of the child's memory - hundreds
+/// of processes and thousands of threads, ~5 ms - and used to run after
+/// every burst of terminal output: a full-screen program redrawing once a
+/// second kept a thread pool worker busy at 10+% of a core. A title that is
+/// up to a second late is not noticed; the last look of a burst is not lost
+/// (see `emit_title_changed_if_changed`).
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long after the user's last input the child's name and directory may
+/// have changed because of it (a command started, `cd`, a command ended) -
+/// looks happen at [`MIN_REFRESH_INTERVAL`] within it.
+const INPUT_WINDOW: Duration = Duration::from_secs(3);
+
+/// The least time between looks when the user has not typed for a while:
+/// what the child is can only change on its own then.
+const IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl PtyProcessInfo {
     pub fn new(pty: &Pty) -> PtyProcessInfo {
@@ -137,6 +148,7 @@ impl PtyProcessInfo {
             task: Mutex::new(None),
             last_refresh: Mutex::new(None),
             trailing_refresh_scheduled: AtomicBool::new(false),
+            last_input: Mutex::new(None),
         }
     }
 
@@ -222,12 +234,17 @@ impl PtyProcessInfo {
         if self.task.lock().is_some() {
             return;
         }
+        // Output alone (a full-screen program redrawing) never changes
+        // what the child is; typing does. So: promptly after input, rarely
+        // otherwise.
+        let after_input = self.last_input.lock().is_some_and(|at| at.elapsed() < INPUT_WINDOW);
+        let min_interval = if after_input { MIN_REFRESH_INTERVAL } else { IDLE_REFRESH_INTERVAL };
         let since_last = self.last_refresh.lock().map(|at| at.elapsed());
         if let Some(since_last) = since_last
-            && since_last < MIN_REFRESH_INTERVAL
+            && since_last < min_interval
         {
-            if !self.trailing_refresh_scheduled.swap(true, Ordering::AcqRel) {
-                let wait = MIN_REFRESH_INTERVAL - since_last;
+            if after_input && !self.trailing_refresh_scheduled.swap(true, Ordering::AcqRel) {
+                let wait = min_interval - since_last;
                 let this = self.clone();
                 let timer = cx.background_executor().timer(wait);
                 cx.spawn(async move |term, cx| {
@@ -243,7 +260,11 @@ impl PtyProcessInfo {
         let this = self.clone();
         let has_changed = cx.background_executor().spawn(async move {
             let previous = this.current.read().clone();
+            let started = Instant::now();
             let current = this.load();
+            if std::env::var_os("SOM_PERF").is_some() {
+                log::info!("som_perf: looked at the child process in {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+            }
             let has_changed = match (previous.as_ref(), current.as_ref()) {
                 (None, None) => false,
                 (Some(prev), Some(now)) => prev.cwd != now.cwd || prev.name != now.name,
@@ -267,5 +288,11 @@ impl PtyProcessInfo {
 
     pub fn pid(&self) -> Option<Pid> {
         self.pid_getter.pid()
+    }
+
+    /// The user sent input: what the child is may change shortly (see
+    /// [`INPUT_WINDOW`]).
+    pub fn note_input(&self) {
+        *self.last_input.lock() = Some(Instant::now());
     }
 }

@@ -857,6 +857,34 @@ pub fn request_fetch_resource(session_id: u32, file_id: u32, target: String, bas
     });
 }
 
+/// Tells `somsrv` the tags of the audio file `(session_id, file_id)` is
+/// playing (`SrvRequest::AnnounceTrack`, the same message `somsrp` sends
+/// for a local file), so it looks the cover up by artist and album and
+/// pushes the answer to this key's subscribers. For a file embedded in a
+/// markdown document, where no `somsrp` is involved at all. Fire and
+/// forget: without it the embed just shows no cover.
+pub fn announce_track(session_id: u32, file_id: u32, target: String, tags: somsrv::protocol::TrackTags) {
+    std::thread::spawn(move || {
+        let result = connect_and_handshake().and_then(|connection| {
+            send(
+                &connection,
+                &SrvRequest::AnnounceTrack {
+                    session_id,
+                    file_id,
+                    title: None,
+                    index: 0,
+                    len: 0,
+                    target,
+                    tags: Some(tags),
+                },
+            )
+        });
+        if let Err(err) = result {
+            log::debug!("failed to send somsrv AnnounceTrack for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
+}
+
 fn try_request_fetch_resource(session_id: u32, file_id: u32, target: &str, base_dir: Option<String>) -> anyhow::Result<()> {
     let connection = connect_and_handshake()?;
     send(&connection, &SrvRequest::FetchResource { session_id, file_id, target: target.to_string(), base_dir })?;

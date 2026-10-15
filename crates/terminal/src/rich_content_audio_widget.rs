@@ -117,10 +117,6 @@ struct TrackSpan {
     end_frame: f64,
 }
 
-/// How far (seconds) a fresh report of the track being shown may put its
-/// end from where it already is before the end is moved.
-const TIME_CORRECTION_THRESHOLD_SECS: f64 = 1.0;
-
 /// How early (seconds) a track may be shown before its computed start.
 const START_TOLERANCE_SECS: f64 = 1.0;
 
@@ -164,17 +160,11 @@ impl TrackTimeline {
 
         if let Some(span) = self.spans.iter_mut().find(|span| same_track(&span.info, info)) {
             // A fresh report of the same track corrects its end (the
-            // start of an open-ended one stays where it first appeared) -
-            // but only when it really disagrees: a station's clock ticks
-            // in whole seconds, and moving the end by a fraction of one
-            // would make the time left jitter on screen for nothing.
+            // start of an open-ended one stays where it first appeared).
             span.info = info.clone();
             if info.duration_ms > 0 {
-                let disagreement = if span.end_frame.is_finite() { (end_frame - span.end_frame).abs() } else { f64::INFINITY };
-                if disagreement > TIME_CORRECTION_THRESHOLD_SECS * rate {
-                    span.start_frame = start_frame;
-                    span.end_frame = end_frame;
-                }
+                span.start_frame = start_frame;
+                span.end_frame = end_frame;
             }
             return;
         }
@@ -438,36 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn a_report_within_a_second_does_not_move_the_end() {
-        let mut timeline = TrackTimeline::default();
-        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
-        // Half a second of whole-second clock noise: ignored.
-        timeline.observe(2, &info("one", 200_000, 19_500), Duration::ZERO, 3000.0, 100.0);
-
-        let (_, remaining) = timeline.current(3000.0, 100.0).unwrap();
-        assert_eq!(remaining, Some(Duration::from_secs(20)));
-    }
-
-    #[test]
-    fn a_report_more_than_a_second_off_moves_the_end() {
-        let mut timeline = TrackTimeline::default();
-        timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
-        timeline.observe(2, &info("one", 200_000, 18_000), Duration::ZERO, 3000.0, 100.0);
-
-        let (_, remaining) = timeline.current(3000.0, 100.0).unwrap();
-        assert_eq!(remaining, Some(Duration::from_secs(18)));
-    }
-
-    #[test]
     fn a_fresh_report_of_the_same_track_corrects_its_end() {
         let mut timeline = TrackTimeline::default();
         timeline.observe(1, &info("one", 200_000, 20_000), Duration::ZERO, 3000.0, 100.0);
-        // Five seconds later the station says 13 s are left: the end sits
-        // two seconds from where it was (clock drift).
-        timeline.observe(2, &info("one", 200_000, 13_000), Duration::ZERO, 3500.0, 100.0);
+        // Five seconds later the station says 14 s are left (clock drift).
+        timeline.observe(2, &info("one", 200_000, 14_000), Duration::ZERO, 3500.0, 100.0);
 
         let (_, remaining) = timeline.current(3500.0, 100.0).unwrap();
-        assert_eq!(remaining, Some(Duration::from_secs(13)));
+        assert_eq!(remaining, Some(Duration::from_secs(14)));
     }
 
     #[test]

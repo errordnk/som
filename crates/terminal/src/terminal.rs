@@ -477,6 +477,10 @@ impl TerminalBuilder {
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
+            grid_generation: std::cell::Cell::new(0),
+            placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
+            last_full_placeholder_scan: std::cell::Cell::new(None),
+            markdown_origins_cache: std::cell::RefCell::new(None),
             rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -815,6 +819,10 @@ impl TerminalBuilder {
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
+                grid_generation: std::cell::Cell::new(0),
+                placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
+                last_full_placeholder_scan: std::cell::Cell::new(None),
+                markdown_origins_cache: std::cell::RefCell::new(None),
                 rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1314,6 +1322,21 @@ pub struct Terminal {
     /// DisplayedRemaining`.
     audio_displayed_remaining:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::DisplayedRemaining>>,
+    /// Bumped whenever the grid's content may have changed (the child
+    /// process produced output, an internal event edited it). The paint
+    /// path's grid scans for placeholder cells look at their own copy of
+    /// this to know whether there is anything new to find.
+    grid_generation: std::cell::Cell<u64>,
+    /// `grid_generation` as of the last scan of the live screen for
+    /// placeholder cells.
+    placeholders_scanned_generation: std::cell::Cell<u64>,
+    /// When the WHOLE grid (scrollback included) was last scanned for
+    /// placeholder cells - done rarely, see `poll_rich_content_srv_
+    /// subscriptions`.
+    last_full_placeholder_scan: std::cell::Cell<Option<Instant>>,
+    /// `markdown_placement_origins`' answer for `grid_generation`.
+    markdown_origins_cache:
+        std::cell::RefCell<Option<(u64, std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry>)>>,
     /// Audio placements whose source has ended for good (`somsrv` pushed
     /// `StopPlayback`: a playlist moved on, the sender exited). Never
     /// reopened - unlike `rich_content_audio_stopped`, which a screen
@@ -1813,6 +1836,7 @@ impl Terminal {
                 //NOOP, Handled in render
             }
             AlacTermEvent::Wakeup => {
+                self.grid_generation.set(self.grid_generation.get().wrapping_add(1));
                 cx.emit(Event::Wakeup);
 
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
@@ -1923,6 +1947,9 @@ impl Terminal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Whatever this event is, it may edit the grid (a clear, the
+        // resize rewrite of the placeholder grids, a scroll).
+        self.grid_generation.set(self.grid_generation.get().wrapping_add(1));
         match event {
             &InternalEvent::Resize(mut new_bounds) => {
                 trace!("Resizing: new_bounds={new_bounds:?}");
@@ -2490,15 +2517,41 @@ impl Terminal {
     /// placeholder grid scrolled fully off-screen before this method's
     /// old viewport-only scan ever ran, leaving `rich_content_cache.
     /// all_known_ids()` permanently empty for it.
+    ///
+    /// Runs every paint of every pane, with the terminal lock held for its
+    /// whole scan - so it must not walk tens of thousands of scrollback
+    /// lines each time (that starved the PTY thread of the same lock: a
+    /// key pressed in another pane took a second to echo while a track
+    /// played and repainted all panes continuously). The live screen is
+    /// scanned only when the grid changed since the last scan, which is
+    /// where a new placement always first appears; the whole grid (the
+    /// safety net for placements scrolled out of sight, and the only
+    /// place eviction of vanished ones is decided) only every
+    /// [`FULL_PLACEHOLDER_SCAN_INTERVAL`].
     pub fn poll_rich_content_srv_subscriptions(&mut self) {
         use kitty_graphics_placeholder::{PlaceholderCell, decode_placeholder_cell};
+
+        let now = Instant::now();
+        let full_scan_due = self
+            .last_full_placeholder_scan
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= FULL_PLACEHOLDER_SCAN_INTERVAL);
+        let generation = self.grid_generation.get();
+        if !full_scan_due && self.placeholders_scanned_generation.get() == generation {
+            return;
+        }
+        self.placeholders_scanned_generation.set(generation);
 
         let mut ids: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         {
             let term = self.term.lock();
             let grid = term.grid();
-            let top = grid.topmost_line().0;
-            let bottom = grid.bottommost_line().0;
+            let (top, bottom) = if full_scan_due {
+                (grid.topmost_line().0, grid.bottommost_line().0)
+            } else {
+                // Just the live screen: lines `0..screen_lines`.
+                (0, grid.screen_lines() as i32 - 1)
+            };
             for line_num in top..=bottom {
                 let row = &grid[Line(line_num)];
                 for cell in row.into_iter() {
@@ -2526,7 +2579,11 @@ impl Terminal {
             self.ensure_rich_content_srv_subscription(session_id, file_id);
         }
 
-        self.evict_vanished_image_gif_markdown_placements(&ids);
+        // Only a scan of the whole grid knows what has really vanished.
+        if full_scan_due {
+            self.last_full_placeholder_scan.set(Some(now));
+            self.evict_vanished_image_gif_markdown_placements(&ids);
+        }
     }
 
     /// Drops every in-memory image/GIF/markdown placement whose id is no
@@ -3264,6 +3321,20 @@ impl Terminal {
     pub fn markdown_placement_origins(
         &self,
     ) -> std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry> {
+        // A scan of the whole grid; repeating it for a grid that has not
+        // changed is what the cache is for.
+        let generation = self.grid_generation.get();
+        if let Some((cached_generation, cached)) = self.markdown_origins_cache.borrow().as_ref()
+            && *cached_generation == generation
+        {
+            return cached.clone();
+        }
+        let geometry = self.scan_markdown_placement_origins();
+        *self.markdown_origins_cache.borrow_mut() = Some((generation, geometry.clone()));
+        geometry
+    }
+
+    fn scan_markdown_placement_origins(&self) -> std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry> {
         use kitty_graphics_placeholder::{PlaceholderCell, decode_placeholder_cell};
 
         let mut geometry: std::collections::HashMap<(u32, u32), MarkdownPlacementGeometry> = std::collections::HashMap::new();
@@ -6498,6 +6569,10 @@ fn embedded_file_stem(dest_url: &str) -> String {
     let name = dest_url.rsplit(['/', '\\']).next().unwrap_or(dest_url);
     name.rsplit_once('.').map(|(stem, _)| stem).filter(|stem| !stem.is_empty()).unwrap_or(name).to_string()
 }
+
+/// How often the whole grid, scrollback included, is scanned for rich-content
+/// placeholder cells (see `Terminal::poll_rich_content_srv_subscriptions`).
+const FULL_PLACEHOLDER_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn row_to_string(row: &Row<Cell>) -> String {
     row[..Column(row.len())]

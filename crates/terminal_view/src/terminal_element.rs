@@ -2063,7 +2063,13 @@ fn paint_rich_content_placements(
         // `cx` still held.
         let markdown_paint_inputs: Vec<_> = {
             let terminal_ref = terminal.read(cx);
-            let markdown_geometry = terminal_ref.markdown_placement_origins();
+            // A scan of the whole grid: only worth it with a markdown
+            // placement to find.
+            let markdown_geometry = if markdown_placements.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                terminal_ref.markdown_placement_origins()
+            };
             markdown_placements
                 .iter()
                 .filter_map(|(session_id, file_id, rendered_text)| {
@@ -3824,9 +3830,13 @@ fn paint_now_playing_audio_in_box(
         let line = shape(text, color, window);
         let line_box = Bounds::new(point(left, at_y), gpui::size(side.max(cell_width), line_height));
         let overflow = line.width - line_box.size.width;
-        let x = if overflow > Pixels::ZERO {
+        let x = if overflow > Pixels::ZERO && is_playing {
             scrolling = true;
             left - px(crate::marquee::offset_at(f32::from(overflow), secs))
+        } else if overflow > Pixels::ZERO {
+            // Paused: the line stands still at its start - sliding it
+            // would keep every frame repainting for nothing.
+            left
         } else {
             left + (line_box.size.width - line.width) / 2.0
         };

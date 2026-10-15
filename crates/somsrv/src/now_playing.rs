@@ -155,7 +155,7 @@ fn query_radio_paradise(http: &dyn HttpGet, chan: u8) -> anyhow::Result<RadioPar
 /// there the moment that track is reported as playing.
 #[derive(Default)]
 struct CoverCache {
-    found: Vec<((String, String), Option<String>)>,
+    found: Vec<((String, String, String), Option<String>)>,
 }
 
 /// Albums remembered by [`CoverCache`]: the current and the upcoming one
@@ -163,22 +163,29 @@ struct CoverCache {
 const COVER_CACHE_ALBUMS: usize = 4;
 
 impl CoverCache {
-    /// The cover of `artist`'s `album`, searched once and then remembered;
-    /// `station_cover` is the fallback when the chain finds nothing.
+    /// The cover of `artist`'s `album` (the track is `title`), searched
+    /// once and then remembered. In order: the album's cover from the
+    /// archive / Deezer / iTunes, then the cover of the track itself
+    /// (Deezer, iTunes) for an album they do not know by name, then the
+    /// station's own picture (`station_cover`) - a cropped square, the
+    /// last resort before the stand-in.
     fn cover(
         &mut self,
         http: &dyn HttpGet,
         artist: &str,
         album: &str,
+        title: &str,
         year: Option<u32>,
         current_year: u32,
         station_cover: Option<String>,
     ) -> Option<String> {
-        let key = (artist.to_string(), album.to_string());
+        let key = (artist.to_string(), album.to_string(), title.to_string());
         if let Some((_, url)) = self.found.iter().find(|(known, _)| *known == key) {
             return url.clone();
         }
-        let url = find_cover(http, artist, album, year, current_year).or(station_cover);
+        let url = find_cover(http, artist, album, year, current_year)
+            .or_else(|| find_track_cover(http, artist, title).map(|(_, cover)| cover))
+            .or(station_cover);
         if self.found.len() >= COVER_CACHE_ALBUMS {
             self.found.remove(0);
         }
@@ -274,7 +281,7 @@ fn radio_paradise_info(
     // The station's own picture is a centre-cropped square of the
     // artwork, so the full cover from MusicBrainz / Deezer is preferred
     // and the station's is the fallback.
-    let cover_url = covers.cover(http, &now.artist, &now.album, now.year, current_year, now.cover.clone());
+    let cover_url = covers.cover(http, &now.artist, &now.album, &now.title, now.year, current_year, now.cover.clone());
     // What is scheduled next, with its cover already looked up, so the
     // consumer can have the picture ready before the track starts. A
     // failed call just means nothing is announced.
@@ -291,7 +298,7 @@ fn radio_paradise_info(
         .and_then(|body| parse_radio_paradise_next(body, current))
         .or_else(|| following.as_deref().and_then(|body| parse_radio_paradise_next(body, ("", ""))))
         .map(|next| NextTrack {
-            cover_url: covers.cover(http, &next.artist, &next.album, next.year, current_year, next.cover.clone()),
+            cover_url: covers.cover(http, &next.artist, &next.album, &next.title, next.year, current_year, next.cover.clone()),
             artist: next.artist,
             title: next.title,
             album: next.album,
@@ -871,13 +878,29 @@ mod tests {
     fn a_cover_looked_up_ahead_is_not_searched_again_when_its_track_plays() {
         let http = Canned::new();
         let mut covers = CoverCache::default();
-        covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", Some(2023), 2026, Some("x".into()));
+        covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", "Saturnine", Some(2023), 2026, Some("x".into()));
         let asked = http.asked.lock().unwrap().len();
 
-        let url = covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", Some(2023), 2026, None);
+        let url = covers.cover(&http, "GoGo Penguin", "Everything Is Going to Be OK", "Saturnine", Some(2023), 2026, None);
 
         assert_eq!(url.as_deref(), Some("x"));
         assert_eq!(http.asked.lock().unwrap().len(), asked);
+    }
+
+    #[test]
+    fn a_track_cover_beats_the_stations_cropped_picture() {
+        let mut http = Canned::new();
+        http.answers.insert("now_playing", RP_NOW.to_string());
+        http.answers.insert("nowplaying_list_v2022", RP_LIST.to_string());
+        // The album is unknown by name, the track is on Deezer.
+        http.answers.insert(
+            "api.deezer.com/search?q",
+            r#"{"data":[{"title":"Tire Loma Da Nigbehin","artist":{"name":"MonoMono"},"album":{"title":"A Single","cover_xl":"https://cdn.example/t/1000x1000-1.jpg"}}]}"#.to_string(),
+        );
+
+        let info = radio_paradise_info(&http, 3, 1, 2, 2026, &mut CoverCache::default()).unwrap();
+
+        assert_eq!(info.cover_url.as_deref(), Some("https://cdn.example/t/1200x1200-1.jpg"));
     }
 
     #[test]

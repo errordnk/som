@@ -477,7 +477,6 @@ impl TerminalBuilder {
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
-            display_physical_width: std::cell::Cell::new(0),
             rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -816,7 +815,6 @@ impl TerminalBuilder {
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
-                display_physical_width: std::cell::Cell::new(0),
                 rich_content_audio_dead: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_audio_stopped: std::cell::RefCell::new(std::collections::HashSet::new()),
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1316,9 +1314,6 @@ pub struct Terminal {
     /// DisplayedRemaining`.
     audio_displayed_remaining:
         std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::DisplayedRemaining>>,
-    /// Width, in physical pixels, of the display the window is on - set by
-    /// the paint path each frame. Decides which size of cover is pulled.
-    display_physical_width: std::cell::Cell<u32>,
     /// Audio placements whose source has ended for good (`somsrv` pushed
     /// `StopPlayback`: a playlist moved on, the sender exited). Never
     /// reopened - unlike `rich_content_audio_stopped`, which a screen
@@ -3100,7 +3095,7 @@ impl Terminal {
                     if let Some(url) = &wanted_cover
                         && entry.cover.is_none()
                     {
-                        entry.cover = Some(rich_content_audio_widget::AudioCover::start(url, self.display_physical_width.get()));
+                        entry.cover = Some(rich_content_audio_widget::AudioCover::start(url));
                     }
                     let (cover, cover_loading) = match entry.cover.as_mut() {
                         Some(entry_cover) => {
@@ -3718,7 +3713,7 @@ impl Terminal {
                     if let Some(image) = other.and_then(|ahead| ahead.finish()) {
                         self.audio_cover_drops.borrow_mut().push(image);
                     }
-                    rich_content_audio_widget::AudioCover::start(url, self.display_physical_width.get())
+                    rich_content_audio_widget::AudioCover::start(url)
                 },
             };
             covers.insert(key, cover);
@@ -3737,9 +3732,7 @@ impl Terminal {
         if let Some(url) = &announced_cover
             && wanted.as_ref() != Some(url)
         {
-            let ahead = upcoming.entry(key).or_insert_with(|| {
-                rich_content_audio_widget::AudioCover::start(url, self.display_physical_width.get())
-            });
+            let ahead = upcoming.entry(key).or_insert_with(|| rich_content_audio_widget::AudioCover::start(url));
             // Advances the download and decode while the current one plays.
             ahead.image();
         }
@@ -3794,12 +3787,6 @@ impl Terminal {
                 _ => true,
             },
         })
-    }
-
-    /// Records the width in physical pixels of the display the window is
-    /// on (see `display_physical_width`).
-    pub fn set_display_physical_width(&self, width: u32) {
-        self.display_physical_width.set(width);
     }
 
     /// Where the CUE sheet of `key`'s file puts the playhead: the sheet,

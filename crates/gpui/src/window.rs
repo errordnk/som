@@ -957,6 +957,94 @@ enum InputModality {
     Keyboard,
 }
 
+/// Frame timing for the performance work: with the environment variable
+/// `SOM_PERF` set, every two seconds one line says how many frames were
+/// drawn and what drawing the element tree and presenting it took on
+/// average. Costs two clock reads per frame without it.
+mod frame_stats {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    struct Stats {
+        window_started: Instant,
+        frames: u32,
+        draw: Duration,
+        present: Duration,
+        worst: Duration,
+        prepaint: Duration,
+        paint: Duration,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Option<Stats>> = const { RefCell::new(None) };
+    }
+
+    fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("SOM_PERF").is_some())
+    }
+
+    pub(super) fn record(draw_started: Instant, present_started: Instant, finished: Instant) {
+        if !enabled() {
+            return;
+        }
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            let stats = stats.get_or_insert_with(|| Stats {
+                window_started: draw_started,
+                frames: 0,
+                draw: Duration::ZERO,
+                present: Duration::ZERO,
+                worst: Duration::ZERO,
+                prepaint: Duration::ZERO,
+                paint: Duration::ZERO,
+            });
+            stats.frames += 1;
+            let draw = present_started - draw_started;
+            stats.draw += draw;
+            stats.present += finished - present_started;
+            stats.worst = stats.worst.max(finished - draw_started);
+            let elapsed = finished - stats.window_started;
+            if elapsed >= Duration::from_secs(2) {
+                log::info!(
+                    "som_perf: {:.1} s: {} frames ({:.1}/s), draw avg {:.2} ms (prepaint {:.2}, paint {:.2}), present avg {:.2} ms, worst frame {:.1} ms, busy {:.1}%",
+                    elapsed.as_secs_f32(),
+                    stats.frames,
+                    stats.frames as f32 / elapsed.as_secs_f32(),
+                    stats.draw.as_secs_f32() * 1000.0 / stats.frames as f32,
+                    stats.prepaint.as_secs_f32() * 1000.0 / stats.frames as f32,
+                    stats.paint.as_secs_f32() * 1000.0 / stats.frames as f32,
+                    stats.present.as_secs_f32() * 1000.0 / stats.frames as f32,
+                    stats.worst.as_secs_f32() * 1000.0,
+                    (stats.draw + stats.present).as_secs_f32() / elapsed.as_secs_f32() * 100.0,
+                );
+                stats.window_started = finished;
+                stats.frames = 0;
+                stats.draw = Duration::ZERO;
+                stats.present = Duration::ZERO;
+                stats.worst = Duration::ZERO;
+                stats.prepaint = Duration::ZERO;
+                stats.paint = Duration::ZERO;
+            }
+        });
+    }
+
+    /// Adds one frame's prepaint and paint times (called from `draw_roots`,
+    /// before `record` closes the frame).
+    pub(super) fn phases(prepaint: Duration, paint: Duration) {
+        if !enabled() {
+            return;
+        }
+        STATS.with(|stats| {
+            if let Some(stats) = stats.borrow_mut().as_mut() {
+                stats.prepaint += prepaint;
+                stats.paint += paint;
+            }
+        });
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1515,9 +1603,12 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                let draw_started = Instant::now();
                                 let arena_clear_needed = window.draw(cx);
+                                let present_started = Instant::now();
                                 window.present();
                                 arena_clear_needed.clear();
+                                frame_stats::record(draw_started, present_started, Instant::now());
                             })
                             .log_err();
                     })
@@ -2787,6 +2878,7 @@ impl Window {
         };
 
         // Layout all root elements.
+        let prepaint_started = Instant::now();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
 
@@ -2817,7 +2909,9 @@ impl Window {
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        let paint_started = Instant::now();
         root_element.paint(self, cx);
+        frame_stats::phases(paint_started - prepaint_started, paint_started.elapsed());
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);

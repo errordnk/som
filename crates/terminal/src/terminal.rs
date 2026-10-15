@@ -3517,7 +3517,12 @@ impl Terminal {
                 session_id,
                 file_id,
                 artist: if track.artist.is_empty() { sheet.artist.clone() } else { track.artist.clone() },
-                title: track.title.clone(),
+                // The disc's own numbering leads the title: "3. Name".
+                title: if track.title.is_empty() {
+                    format!("Track {}", track.number)
+                } else {
+                    format!("{}. {}", track.number, track.title)
+                },
                 album: sheet.album.clone(),
                 year: sheet.year,
                 duration_ms: u32::try_from(length).unwrap_or(0),
@@ -3689,11 +3694,9 @@ impl Terminal {
     /// Moves the playhead of the audio placement `key` to `position_ms`
     /// of its file.
     fn seek_audio_to_ms(&self, key: (u32, u32), position_ms: u64) {
-        let file_ms = self.rich_content_cache.audio_metadata(key.0, key.1).map(|(.., d)| d as u64).unwrap_or(0);
-        if file_ms == 0 {
-            return;
+        if let Some(player) = self.rich_content_audio_players.borrow().get(&key) {
+            player.seek_to_ms(position_ms);
         }
-        self.seek_rich_content_audio_playback(key.0, key.1, (position_ms as f64 / file_ms as f64) as f32);
     }
 
     /// Previous (`-1`) or next (`1`) track: inside a CUE sheet that is a

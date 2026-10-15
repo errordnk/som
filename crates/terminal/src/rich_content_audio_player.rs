@@ -241,6 +241,9 @@ struct SharedPcm {
     /// The file's own tags, once its format has been probed: `None` until
     /// then, `Some(None)` for a file that carries none.
     tags: Mutex<Option<Option<somsrv::protocol::TrackTags>>>,
+    /// The file's length in milliseconds when its container says (a FLAC's
+    /// stream info does), `0` when it does not.
+    duration_ms: std::sync::atomic::AtomicU32,
 }
 
 /// The title / artist / album / year tags of a probed file (ID3, Vorbis
@@ -383,6 +386,12 @@ fn run_decode_loop(
 
     let track = probed.format.tracks().iter().find(|t| t.id == track_id).expect("found above");
     let time_base = track.codec_params.time_base;
+    if let (Some(frames), Some(rate)) = (track.codec_params.n_frames, track.codec_params.sample_rate)
+        && rate > 0
+    {
+        let duration_ms = u32::try_from(frames.saturating_mul(1000) / rate as u64).unwrap_or(0);
+        shared.duration_ms.store(duration_ms, Ordering::Release);
+    }
     let Ok(mut decoder) = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
     else {
         return;
@@ -734,6 +743,7 @@ impl RichContentAudioPlayer {
             channels: std::sync::atomic::AtomicU32::new(0),
             decode_finished: AtomicBool::new(false),
             tags: Mutex::new(None),
+            duration_ms: std::sync::atomic::AtomicU32::new(0),
         });
         let decode_stop = Arc::new(AtomicBool::new(false));
         let position_frames = Arc::new(AtomicU64::new(0));
@@ -913,6 +923,15 @@ impl RichContentAudioPlayer {
     /// `Some(None)` for a file that carries none.
     pub fn tags(&self) -> Option<Option<somsrv::protocol::TrackTags>> {
         self.shared.tags.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The file's length in milliseconds, when its container states it:
+    /// `None` until probed, and for formats that do not say (a bare MP3).
+    pub fn duration_ms(&self) -> Option<u32> {
+        match self.shared.duration_ms.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Output sample rate (`0` until the format is known).

@@ -144,6 +144,11 @@ fn srgb_to_y(color: Hsla, constants: &APCAConstants) -> f32 {
 ///
 /// This implementation gradually adjusts the lightness while preserving the hue and
 /// saturation as much as possible, only falling back to black/white when necessary.
+///
+/// Remembered per `(foreground, background, minimum)`: a terminal asks this for
+/// every cell of every frame, with a handful of distinct color pairs, and the
+/// computation (several `powf`, a binary search of lightness) was the largest
+/// part of the UI thread's own work for a full-screen program.
 pub fn ensure_minimum_contrast(
     foreground: Hsla,
     background: Hsla,
@@ -152,6 +157,39 @@ pub fn ensure_minimum_contrast(
     if minimum_apca_contrast <= 0.0 {
         return foreground;
     }
+
+    /// Entries kept before the cache starts over.
+    const CACHE_LIMIT: usize = 4096;
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<[u32; 9], Hsla>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = [
+        foreground.h.to_bits(),
+        foreground.s.to_bits(),
+        foreground.l.to_bits(),
+        foreground.a.to_bits(),
+        background.h.to_bits(),
+        background.s.to_bits(),
+        background.l.to_bits(),
+        background.a.to_bits(),
+        minimum_apca_contrast.to_bits(),
+    ];
+    if let Some(found) = CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        return found;
+    }
+    let adjusted = compute_minimum_contrast(foreground, background, minimum_apca_contrast);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, adjusted);
+    });
+    adjusted
+}
+
+fn compute_minimum_contrast(foreground: Hsla, background: Hsla, minimum_apca_contrast: f32) -> Hsla {
 
     let current_contrast = apca_contrast(foreground, background).abs();
 

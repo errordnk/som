@@ -334,6 +334,7 @@ fn run_decode_loop(
     };
 
     let track = probed.format.tracks().iter().find(|t| t.id == track_id).expect("found above");
+    let time_base = track.codec_params.time_base;
     let Ok(mut decoder) = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
     else {
         return;
@@ -341,24 +342,85 @@ fn run_decode_loop(
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
+    // A FLAC or MP3 file (known length) is decoded through a bounded
+    // window around the playhead - not into memory whole - and a jump
+    // outside the window is a real seek of the container. Other formats
+    // (Ogg, whose chained streams do not survive a seek) keep decoding
+    // everything.
+    let codec = track.codec_params.codec;
+    let mut windowed = srv_state.total_size() > 0
+        && (codec == symphonia::core::codecs::CODEC_TYPE_FLAC || codec == symphonia::core::codecs::CODEC_TYPE_MP3);
+    // Set once the reader has run out of audio: the thread then idles,
+    // ready to seek back when the playhead is moved into the file again.
+    let mut at_eof = false;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
+
+        if windowed {
+            let channels = shared.channels.load(Ordering::Acquire) as usize;
+            let rate = shared.sample_rate.load(Ordering::Acquire) as u64;
+            if channels > 0 && rate > 0 {
+                let position = position_frames.load(Ordering::Acquire);
+                let (base, end) = {
+                    let samples = shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+                    let base = shared.base_frames.load(Ordering::Acquire);
+                    (base, base + (samples.len() / channels) as u64)
+                };
+                match window_action(position, base, end, rate, at_eof) {
+                    WindowAction::Seek => {
+                        let seconds = position as f64 / rate as f64;
+                        match seek_decoder(&mut probed.format, track_id, seconds) {
+                            Ok(actual_ts) => {
+                                decoder.reset();
+                                let new_base = match time_base {
+                                    Some(time_base) => {
+                                        let time = time_base.calc_time(actual_ts);
+                                        ((time.seconds as f64 + time.frac) * rate as f64).round() as u64
+                                    },
+                                    None => actual_ts,
+                                };
+                                let mut samples = shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+                                samples.clear();
+                                shared.base_frames.store(new_base, Ordering::Release);
+                                shared.decode_finished.store(false, Ordering::Release);
+                                at_eof = false;
+                            },
+                            // A reader that cannot seek after all: keep
+                            // the whole file from here on.
+                            Err(_) => windowed = false,
+                        }
+                        continue;
+                    },
+                    WindowAction::Wait => {
+                        std::thread::sleep(WINDOW_IDLE_INTERVAL);
+                        continue;
+                    },
+                    WindowAction::Decode => {},
+                }
+            }
+        } else if at_eof {
+            return;
+        }
+
         let packet = match probed.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => {
                 let total_size = progress.total_size();
                 if total_size > 0 && progress.contiguous_len() >= total_size {
                     shared.decode_finished.store(true, Ordering::Release);
-                    return; // Ran out of bytes AND the file is fully downloaded — real EOF.
+                    at_eof = true; // Ran out of bytes AND the file is fully downloaded - real EOF.
+                    continue;
                 }
                 std::thread::sleep(DECODE_RETRY_INTERVAL);
                 continue;
             },
             Err(_) => {
                 shared.decode_finished.store(true, Ordering::Release);
-                return; // A genuine (non-truncation) format error — nothing more to decode.
+                at_eof = true; // A genuine (non-truncation) format error - nothing more to decode.
+                continue;
             },
         };
         if packet.track_id() != track_id {
@@ -367,13 +429,14 @@ fn run_decode_loop(
 
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            // A single malformed packet is skippable — same tolerance
+            // A single malformed packet is skippable - same tolerance
             // principle used throughout this protocol's decode paths.
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(SymphoniaError::IoError(_)) => continue,
             Err(_) => {
                 shared.decode_finished.store(true, Ordering::Release);
-                return;
+                at_eof = true;
+                continue;
             },
         };
 
@@ -387,13 +450,98 @@ fn run_decode_loop(
         buf.copy_interleaved_ref(decoded);
         let mut samples = shared.samples.lock().unwrap_or_else(|p| p.into_inner());
         samples.extend_from_slice(buf.samples());
-        // Unknown total length == live stream: nothing will ever seek
-        // back into it, so keep only a bounded window.
+        let channels = shared.channels.load(Ordering::Acquire) as usize;
+        let rate = shared.sample_rate.load(Ordering::Acquire);
         if srv_state.total_size() == 0 {
-            let channels = shared.channels.load(Ordering::Acquire) as usize;
-            let rate = shared.sample_rate.load(Ordering::Acquire);
+            // Unknown total length == live stream: nothing will ever seek
+            // back into it, so keep only a bounded window.
             trim_live_buffer(&mut samples, &shared.base_frames, &position_frames, channels, rate);
+        } else if windowed {
+            trim_behind_playhead(&mut samples, &shared.base_frames, &position_frames, channels, rate);
         }
+    }
+}
+
+/// How much of a file is decoded ahead of the playhead; the decoder waits
+/// when it is that far in front.
+const WINDOW_AHEAD_SECS: u64 = 20;
+/// How much already-played audio of a file is kept behind the playhead, so
+/// a short step back costs nothing.
+const WINDOW_BEHIND_SECS: u64 = 10;
+/// A playhead further than this beyond what is decoded is reached by a
+/// seek instead of decoding everything in between.
+const WINDOW_SEEK_AHEAD_SECS: u64 = 3;
+/// How long an idle decode thread (waiting, or at the end of the file)
+/// sleeps between looks at the playhead.
+const WINDOW_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowAction {
+    /// Decode the next packet.
+    Decode,
+    /// Enough is decoded ahead of the playhead (or the file is over and
+    /// the playhead is inside what is kept).
+    Wait,
+    /// The playhead is outside the decoded window: seek the container
+    /// there and start over.
+    Seek,
+}
+
+/// What the decoder should do given the playhead `position` and the
+/// decoded window `[base, end)` (all in frames at `rate`).
+fn window_action(position: u64, base: u64, end: u64, rate: u64, at_eof: bool) -> WindowAction {
+    if position < base {
+        return WindowAction::Seek;
+    }
+    if position > end + WINDOW_SEEK_AHEAD_SECS * rate {
+        return WindowAction::Seek;
+    }
+    if at_eof {
+        return WindowAction::Wait;
+    }
+    if end.saturating_sub(position) > WINDOW_AHEAD_SECS * rate {
+        return WindowAction::Wait;
+    }
+    WindowAction::Decode
+}
+
+/// Seeks `format` to `seconds` and returns the timestamp it actually
+/// landed on (in the track's own time base) - at or just before the
+/// target. Fails for a reader that cannot seek.
+fn seek_decoder(
+    format: &mut Box<dyn symphonia::core::formats::FormatReader>,
+    track_id: u32,
+    seconds: f64,
+) -> Result<u64, symphonia::core::errors::Error> {
+    use symphonia::core::formats::{SeekMode, SeekTo};
+    use symphonia::core::units::Time;
+    let time = Time::new(seconds.trunc() as u64, seconds.fract());
+    let seeked = format.seek(SeekMode::Coarse, SeekTo::Time { time, track_id: Some(track_id) })?;
+    Ok(seeked.actual_ts)
+}
+
+/// Drops audio more than [`WINDOW_BEHIND_SECS`] behind the playhead of a
+/// file. Called with `samples`' lock held, like [`trim_live_buffer`].
+fn trim_behind_playhead(
+    samples: &mut Vec<f32>,
+    base_frames: &AtomicU64,
+    position_frames: &AtomicU64,
+    channels: usize,
+    sample_rate: u32,
+) {
+    if channels == 0 || sample_rate == 0 {
+        return;
+    }
+    let rate = sample_rate as u64;
+    let base = base_frames.load(Ordering::Acquire);
+    let position = position_frames.load(Ordering::Acquire);
+    let keep_from = position.saturating_sub(WINDOW_BEHIND_SECS * rate);
+    // Whole-second batches, so a packet-by-packet decode does not memmove
+    // the buffer every time.
+    if keep_from >= base + rate {
+        let drop_frames = (keep_from - base) as usize;
+        samples.drain(..(drop_frames * channels).min(samples.len()));
+        base_frames.store(keep_from, Ordering::Release);
     }
 }
 
@@ -708,6 +856,16 @@ impl RichContentAudioPlayer {
         self.shared.sample_rate.load(Ordering::Acquire)
     }
 
+    /// The frames currently held in memory, `[start, end)` counted from
+    /// the start of the stream.
+    #[cfg(test)]
+    fn buffered_range(&self) -> (u64, u64) {
+        let channels = self.shared.channels.load(Ordering::Acquire) as usize;
+        let samples = self.shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+        let base = self.shared.base_frames.load(Ordering::Acquire);
+        (base, base + (samples.len() / channels.max(1)) as u64)
+    }
+
     /// Frames decoded so far, counted from the start of the stream
     /// (including any head already trimmed from a live buffer).
     pub fn decoded_frames_total(&self) -> u64 {
@@ -845,6 +1003,89 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Opens a player on a whole fixture file, like [`open_test_player`].
+    fn open_player_on(name: &str) -> RichContentAudioPlayer {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures").join(name);
+        let data = std::fs::read(&path).unwrap();
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.seed_whole_file_for_test(&data, extension);
+        let progress = Arc::new(AudioTransferProgress::new());
+        progress.update(data.len() as u64, data.len() as u64);
+        RichContentAudioPlayer::open(srv_state, progress, None).unwrap()
+    }
+
+    /// Polls `condition` for up to five seconds.
+    fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..250 {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn the_window_decodes_waits_and_seeks() {
+        let rate = 100;
+        // Nothing decoded yet.
+        assert_eq!(window_action(0, 0, 0, rate, false), WindowAction::Decode);
+        // 20 s decoded ahead of the playhead: enough.
+        assert_eq!(window_action(0, 0, 2_100, rate, false), WindowAction::Wait);
+        assert_eq!(window_action(1_000, 0, 2_100, rate, false), WindowAction::Decode);
+        // Behind the kept window, or far beyond what is decoded: seek.
+        assert_eq!(window_action(500, 1_000, 3_000, rate, false), WindowAction::Seek);
+        assert_eq!(window_action(5_000, 0, 3_000, rate, false), WindowAction::Seek);
+        // A little past the end is reached by decoding on.
+        assert_eq!(window_action(3_100, 0, 3_000, rate, false), WindowAction::Decode);
+        // At the end of the file the thread idles inside the kept window.
+        assert_eq!(window_action(2_000, 0, 3_000, rate, true), WindowAction::Wait);
+    }
+
+    #[test]
+    fn a_long_file_is_decoded_through_a_bounded_window_and_seeks_both_ways() {
+        // 120 s at 8 kHz mono.
+        let mut player = open_player_on("long-tone.flac");
+        wait_for_decode(&mut player);
+        assert!(player.is_ready());
+        let rate = player.sample_rate() as u64;
+        assert_eq!(rate, 8000);
+
+        // Paused at the start: only the window ahead is held, not the file.
+        assert!(eventually(|| player.buffered_range().1 > 0));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (base, end) = player.buffered_range();
+        assert_eq!(base, 0);
+        assert!(end <= (WINDOW_AHEAD_SECS + 2) * rate, "decoded {} s ahead", end / rate);
+
+        // Far ahead: a seek, and the window is now around 90 s.
+        player.seek_to_fraction(0.75, 120_000);
+        assert!(eventually(|| {
+            let (base, end) = player.buffered_range();
+            base > 60 * rate && end > 90 * rate
+        }));
+        let (base, end) = player.buffered_range();
+        assert!(end - base <= (WINDOW_AHEAD_SECS + WINDOW_BEHIND_SECS + 12) * rate);
+
+        // And back to the start again.
+        player.seek_to_fraction(0.0, 120_000);
+        assert!(eventually(|| {
+            let (base, end) = player.buffered_range();
+            base == 0 && end > 0
+        }));
+    }
+
+    #[test]
+    fn playback_reaches_the_end_of_a_windowed_file() {
+        let mut player = open_player_on("long-tone.flac");
+        wait_for_decode(&mut player);
+        // Jump near the end and let it play out.
+        player.seek_to_fraction(0.99, 120_000);
+        player.set_playing(true);
+        assert!(eventually(|| player.is_finished(120_000)));
     }
 
     /// The fixture is a 1-second tone — `1000` ms is what a real

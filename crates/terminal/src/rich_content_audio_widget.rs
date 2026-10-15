@@ -47,6 +47,16 @@ pub struct AudioNowPlaying {
     /// "none". Times are only shown from then on - before it they would
     /// be a meaningless `0:00`.
     pub ready: bool,
+    /// `true` for a track of a CUE sheet: the bar covers just this track
+    /// and a click on it seeks inside it, though the track has no clock
+    /// of its own.
+    pub cue_track: bool,
+}
+
+/// The index of the CUE track `position_ms` falls in: the last one that
+/// has started (the first one for a position before any of them).
+pub fn cue_track_index(tracks: &[somsrv::protocol::CueTrack], position_ms: u64) -> usize {
+    tracks.partition_point(|track| track.start_ms <= position_ms).saturating_sub(1)
 }
 
 /// Where the widget's clickable parts were painted this frame.
@@ -300,6 +310,30 @@ pub fn placeholder_image(is_light: bool) -> Option<Arc<RenderImage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cue_tracks(starts: &[u64]) -> Vec<somsrv::protocol::CueTrack> {
+        starts
+            .iter()
+            .map(|&start_ms| somsrv::protocol::CueTrack { start_ms, ..Default::default() })
+            .collect()
+    }
+
+    #[test]
+    fn the_cue_track_is_the_last_one_that_has_started() {
+        let tracks = cue_tracks(&[0, 179_000, 438_000]);
+        assert_eq!(cue_track_index(&tracks, 0), 0);
+        assert_eq!(cue_track_index(&tracks, 178_999), 0);
+        assert_eq!(cue_track_index(&tracks, 179_000), 1);
+        assert_eq!(cue_track_index(&tracks, 5_000_000), 2);
+    }
+
+    #[test]
+    fn before_the_first_cue_track_starts_the_first_is_shown() {
+        // A hidden lead-in: the first track starts two seconds in.
+        let tracks = cue_tracks(&[2_000, 100_000]);
+        assert_eq!(cue_track_index(&tracks, 500), 0);
+        assert_eq!(cue_track_index(&[], 500), 0);
+    }
 
     fn info(title: &str, duration_ms: u32, remaining_ms: u32) -> somsrv::protocol::NowPlayingInfo {
         somsrv::protocol::NowPlayingInfo {

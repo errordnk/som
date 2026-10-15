@@ -679,6 +679,12 @@ pub enum SrvRequest {
     /// id at all) — same "already gone, nothing to do" tolerance every
     /// other best-effort message in this protocol already has.
     StopPlayback { session_id: u32, file_id: u32 },
+    /// Sent by `somsrp` playing a CUE sheet: the track list of the one
+    /// audio file behind `(session_id, file_id)`. `somsrv` stores it and
+    /// pushes `SrvResponse::CueSheet` to the key's subscribers, so Som
+    /// can show the track the playhead is in and step between tracks by
+    /// seeking inside the one file.
+    AnnounceCue { session_id: u32, file_id: u32, sheet: CueSheet },
 }
 
 /// daemon -> `somsrp`/other SRP clients, answering a `SrvRequest`.
@@ -799,6 +805,33 @@ pub enum SrvResponse {
     /// `title` is the entry's name from the playlist (`#EXTINF`), e.g. the
     /// station - what stays on screen between a stream's songs.
     Playlist { session_id: u32, file_id: u32, index: u32, len: u32, title: Option<String> },
+    /// Pushed to subscribers with the track list of the key's CUE sheet
+    /// - see `SrvRequest::AnnounceCue`. Also replayed to a late
+    /// subscriber.
+    CueSheet { session_id: u32, file_id: u32, sheet: CueSheet },
+}
+
+/// The track list of a CUE sheet, as the player needs it: one audio file
+/// cut into `tracks` by their start offsets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CueSheet {
+    pub album: String,
+    /// The album's performer; a track without its own uses this.
+    pub artist: String,
+    pub year: Option<u32>,
+    /// Where the album's picture is (a path, found next to the sheet).
+    pub cover: Option<String>,
+    pub tracks: Vec<CueTrack>,
+}
+
+/// One track of a [`CueSheet`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CueTrack {
+    /// Where the track starts in the file, in milliseconds.
+    pub start_ms: u64,
+    pub title: String,
+    /// Empty when the track has no performer of its own.
+    pub artist: String,
 }
 
 /// Tags read from a local audio file (title / artist / album / year).

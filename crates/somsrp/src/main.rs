@@ -14,6 +14,7 @@
 //! depended on that machinery, see those functions' own doc comments —
 //! and stays on the PTY, since it's how Som learns a placement exists at
 //! all before any payload bytes arrive.
+mod cue;
 mod raw_mode;
 mod srv_channel;
 
@@ -820,6 +821,8 @@ struct PlaylistPosition {
     title: Option<String>,
     /// The path or URL being played.
     target: String,
+    /// The CUE sheet the file is played from, if it is one.
+    cue: Option<somsrv::protocol::CueSheet>,
 }
 
 /// One playable entry of a parsed playlist.
@@ -827,6 +830,8 @@ struct PlaylistPosition {
 struct PlaylistEntry {
     target: String,
     title: Option<String>,
+    /// Set for a file played as the tracks of a CUE sheet.
+    cue: Option<somsrv::protocol::CueSheet>,
 }
 
 /// Announces `position` for `ids` to Som (via `somsrv`). Failure only
@@ -847,6 +852,17 @@ fn announce_track(ids: SrpIds, position: &PlaylistPosition, tags: Option<somsrv:
     });
     if let Err(err) = result {
         eprint!("somsrp: could not announce the track: {err}\r\n");
+    }
+}
+
+/// Announces a CUE sheet's track list for `ids` to Som (via `somsrv`).
+fn announce_cue(ids: SrpIds, sheet: &somsrv::protocol::CueSheet) {
+    let (session_id, file_id) = ids;
+    let result = srv_channel::SrvChannel::connect()
+        .and_then(|channel| channel.announce_cue(session_id, file_id, sheet.clone()));
+    if let Err(err) = result {
+        eprint!("somsrp: could not announce the track list: {err}
+");
     }
 }
 
@@ -1348,6 +1364,9 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     if is_playlist_path(path) {
         return stream_playlist(path);
     }
+    if path.to_ascii_lowercase().ends_with(".cue") {
+        return stream_cue(path);
+    }
     // A lone URL or audio file gets the same widget as a playlist track,
     // but no previous/next buttons and no looping: it plays once.
     if let Some(entry) = single_audio_entry(path) {
@@ -1360,7 +1379,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 /// announced with a playlist length of `0` - "not in a playlist" - so Som
 /// shows its title but no previous/next buttons.
 fn run_standalone(entry: PlaylistEntry) -> Result<(), String> {
-    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone() };
+    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone(), cue: None };
     if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
         stream_url(&entry.target, &position)
     } else {
@@ -1373,14 +1392,14 @@ fn run_standalone(entry: PlaylistEntry) -> Result<(), String> {
 /// name is its title; a URL's comes from the station.
 fn single_audio_entry(target: &str) -> Option<PlaylistEntry> {
     if target.starts_with("http://") || target.starts_with("https://") {
-        return Some(PlaylistEntry { target: target.to_string(), title: None });
+        return Some(PlaylistEntry { target: target.to_string(), title: None, cue: None });
     }
     let extension = std::path::Path::new(target).extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
     if !matches!(extension.as_str(), "mp3" | "flac" | "ogg" | "oga") {
         return None;
     }
     let title = std::path::Path::new(target).file_stem().map(|stem| stem.to_string_lossy().into_owned());
-    Some(PlaylistEntry { target: target.to_string(), title })
+    Some(PlaylistEntry { target: target.to_string(), title, cue: None })
 }
 
 /// Streams an `http://`/`https://` URL directly, WITHOUT `somsrp` ever
@@ -1487,6 +1506,37 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
     }
 }
 
+/// Plays a CUE sheet. A file that holds several of its tracks is played
+/// whole, as one placement the player cuts into tracks by the sheet; a
+/// file with a single track is an ordinary entry. Several files make a
+/// playlist of their entries. Like every list it is a circle.
+fn stream_cue(path: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading cue sheet {path}: {e}"))?;
+    let parsed = cue::parse(&cue::decode_text(&bytes));
+    let sheet_path = std::path::Path::new(path);
+    let cover = cue::find_cover(sheet_path).map(|cover| cover.to_string_lossy().into_owned());
+    let mut entries = Vec::new();
+    for file in &parsed.files {
+        let sheet = parsed.sheet_for(file, cover.clone());
+        if sheet.tracks.is_empty() {
+            continue;
+        }
+        let audio = cue::find_audio_file(sheet_path, &file.name)
+            .ok_or_else(|| format!("{path}: the audio file {:?} was not found next to the sheet", file.name))?;
+        let target = audio.to_string_lossy().into_owned();
+        if sheet.tracks.len() == 1 {
+            let title = Some(sheet.tracks[0].title.clone());
+            entries.push(PlaylistEntry { target, title, cue: None });
+        } else {
+            entries.push(PlaylistEntry { target, title: None, cue: Some(sheet) });
+        }
+    }
+    if entries.is_empty() {
+        return Err(format!("{path}: the cue sheet lists no tracks"));
+    }
+    run_playlist(entries)
+}
+
 /// `.m3u`/`.m3u8` - the extensions `somsrp` treats as a playlist.
 fn is_playlist_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -1523,7 +1573,7 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
             (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
             _ => line.to_string(),
         };
-        entries.push(PlaylistEntry { target, title: pending_title.take() });
+        entries.push(PlaylistEntry { target, title: pending_title.take(), cue: None });
     }
     entries
 }
@@ -1563,7 +1613,7 @@ fn run_playlist(entries: Vec<PlaylistEntry>) -> Result<(), String> {
         }
         PLAYLIST_STEP.store(0, std::sync::atomic::Ordering::Release);
         let entry = &entries[index];
-        let position = PlaylistPosition { index, len, title: entry.title.clone(), target: entry.target.clone() };
+        let position = PlaylistPosition { index, len, title: entry.title.clone(), target: entry.target.clone(), cue: entry.cue.clone() };
         let result = if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
             stream_url(&entry.target, &position)
         } else {
@@ -1634,7 +1684,13 @@ fn stream_file_impl(
         clear_screen_and_home_cursor();
         print_audio_placeholder_grid(session_id, file_id)?;
         if let Some(position) = playlist {
-            announce_track(ids, position, read_audio_tags(path));
+            // The tags of a CUE sheet's file describe the whole disc, not a
+            // track; the sheet itself is announced instead.
+            let tags = if position.cue.is_some() { None } else { read_audio_tags(path) };
+            announce_track(ids, position, tags);
+            if let Some(sheet) = &position.cue {
+                announce_cue(ids, sheet);
+            }
         }
 
         // Streams off disk in bounded chunks rather than reading the
@@ -1974,8 +2030,9 @@ mod tests {
                 PlaylistEntry {
                     target: "https://stream.radioparadise.com/world-etc-flac".to_string(),
                     title: Some("Radio Paradise".to_string()),
+                    cue: None,
                 },
-                PlaylistEntry { target: "http://example.com/a.mp3".to_string(), title: None },
+                PlaylistEntry { target: "http://example.com/a.mp3".to_string(), title: None, cue: None },
             ]
         );
     }
@@ -1992,7 +2049,7 @@ mod tests {
     fn m3u_leaves_absolute_paths_alone() {
         let absolute = if cfg!(windows) { "C:\\music\\a.mp3" } else { "/music/a.mp3" };
         let entries = parse_m3u(&format!("{absolute}\n"), Some(std::path::Path::new("/elsewhere")));
-        assert_eq!(entries, vec![PlaylistEntry { target: absolute.to_string(), title: None }]);
+        assert_eq!(entries, vec![PlaylistEntry { target: absolute.to_string(), title: None, cue: None }]);
     }
 
     #[test]
@@ -2031,11 +2088,11 @@ mod tests {
     fn a_lone_url_or_audio_file_is_played_standalone() {
         assert_eq!(
             single_audio_entry("https://stream.radioparadise.com/flacm"),
-            Some(PlaylistEntry { target: "https://stream.radioparadise.com/flacm".to_string(), title: None })
+            Some(PlaylistEntry { target: "https://stream.radioparadise.com/flacm".to_string(), title: None, cue: None })
         );
         assert_eq!(
             single_audio_entry("/music/Some Song.FLAC"),
-            Some(PlaylistEntry { target: "/music/Some Song.FLAC".to_string(), title: Some("Some Song".to_string()) })
+            Some(PlaylistEntry { target: "/music/Some Song.FLAC".to_string(), title: Some("Some Song".to_string()), cue: None })
         );
     }
 

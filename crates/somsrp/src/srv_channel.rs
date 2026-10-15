@@ -183,6 +183,12 @@ impl SrvChannel {
     ) -> Result<(), String> {
         send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags })
     }
+
+    /// Tells `somsrv` the track list of the CUE sheet `(session_id,
+    /// file_id)` plays. See `SrvRequest::AnnounceCue`.
+    pub fn announce_cue(&self, session_id: u32, file_id: u32, sheet: somsrv::protocol::CueSheet) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::AnnounceCue { session_id, file_id, sheet })
+    }
 }
 
 impl std::fmt::Debug for Incoming {

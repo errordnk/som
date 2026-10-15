@@ -178,6 +178,9 @@ pub struct SrvProgressState {
     /// The playlist's own name for this entry (`#EXTINF`), e.g. the
     /// station - what stays shown between a stream's songs.
     station_title: Mutex<Option<String>>,
+    /// The CUE sheet of this key's file (`SrvResponse::CueSheet`): the
+    /// album is one file cut into tracks by start offsets.
+    cue_sheet: Mutex<Option<somsrv::protocol::CueSheet>>,
 }
 
 impl SrvProgressState {
@@ -193,6 +196,11 @@ impl SrvProgressState {
     /// The playlist's name for this entry, if it has one.
     pub fn station_title(&self) -> Option<String> {
         self.station_title.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The CUE sheet this key's file is played from, if any.
+    pub fn cue_sheet(&self) -> Option<somsrv::protocol::CueSheet> {
+        self.cue_sheet.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// How many `NowPlaying` pushes have arrived so far.
@@ -908,6 +916,11 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             {
                 *state.playlist.lock().unwrap_or_else(|p| p.into_inner()) = Some((index, len));
                 *state.station_title.lock().unwrap_or_else(|p| p.into_inner()) = title;
+            },
+            SrvResponse::CueSheet { session_id: response_session, file_id: response_file, sheet }
+                if response_session == session_id && response_file == file_id =>
+            {
+                *state.cue_sheet.lock().unwrap_or_else(|p| p.into_inner()) = Some(sheet);
             },
             // The daemon's direct reply to our own `UnsubscribeProgress`
             // (see that variant's own doc comment) — this connection is

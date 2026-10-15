@@ -3625,13 +3625,13 @@ fn paint_top_level_audio_widget(
 }
 
 /// The side of the cover, in physical pixels, for a window
-/// `window_physical_width` pixels wide: 600 up to a 1K window (1024), 900
-/// up to a 2K one (2048), 1200 beyond (4K). The widget still shrinks it to
-/// whatever its box can hold.
+/// `window_physical_width` pixels wide: 600 up to a 1K window (1920), 900
+/// up to a 2K one (2560), 1200 beyond (up to 4K, 3840). The widget still
+/// shrinks it to whatever its box can hold.
 fn now_playing_cover_physical_px(window_physical_width: f32) -> f32 {
-    if window_physical_width <= 1024.0 {
+    if window_physical_width <= 1920.0 {
         600.0
-    } else if window_physical_width <= 2048.0 {
+    } else if window_physical_width <= 2560.0 {
         900.0
     } else {
         1200.0
@@ -4898,9 +4898,9 @@ mod tests {
     #[test]
     fn the_cover_grows_with_the_window() {
         assert_eq!(now_playing_cover_physical_px(800.0), 600.0);
-        assert_eq!(now_playing_cover_physical_px(1024.0), 600.0);
-        assert_eq!(now_playing_cover_physical_px(1920.0), 900.0);
-        assert_eq!(now_playing_cover_physical_px(2048.0), 900.0);
+        assert_eq!(now_playing_cover_physical_px(1920.0), 600.0);
+        assert_eq!(now_playing_cover_physical_px(1921.0), 900.0);
+        assert_eq!(now_playing_cover_physical_px(2560.0), 900.0);
         assert_eq!(now_playing_cover_physical_px(3840.0), 1200.0);
     }
 

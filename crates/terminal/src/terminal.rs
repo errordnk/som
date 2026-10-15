@@ -3469,8 +3469,9 @@ impl Terminal {
         let key = (session_id, file_id);
         let state = self.rich_content_srv_progress.borrow().get(&key).cloned()?;
         let now = state.now_playing();
+        let cue = state.cue_sheet().filter(|sheet| !sheet.tracks.is_empty());
         let playlist = state.playlist();
-        if now.is_none() && playlist.is_none() {
+        if now.is_none() && playlist.is_none() && cue.is_none() {
             return None;
         }
         let station_title = state.station_title();
@@ -3493,7 +3494,41 @@ impl Terminal {
             .as_ref()
             .and_then(|(reported, _)| reported.next.as_ref())
             .and_then(|next| next.cover_url.clone());
+        // A CUE sheet: the track is the one the playhead is in, by the
+        // sheet's start offsets - no station, no clock but the player's.
+        let cue_view = cue.as_ref().map(|sheet| {
+            let file_ms =
+                self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d as u64).unwrap_or(0);
+            let playhead_ms = clock.map(|(playhead, _, rate)| (playhead / rate * 1000.0) as u64).unwrap_or(0);
+            let index = rich_content_audio_widget::cue_track_index(&sheet.tracks, playhead_ms);
+            let track = &sheet.tracks[index];
+            let end = sheet.tracks.get(index + 1).map(|next| next.start_ms).unwrap_or(file_ms);
+            let length = end.saturating_sub(track.start_ms);
+            let elapsed = playhead_ms.saturating_sub(track.start_ms).min(length);
+            let info = somsrv::protocol::NowPlayingInfo {
+                session_id,
+                file_id,
+                artist: if track.artist.is_empty() { sheet.artist.clone() } else { track.artist.clone() },
+                title: track.title.clone(),
+                album: sheet.album.clone(),
+                year: sheet.year,
+                duration_ms: u32::try_from(length).unwrap_or(0),
+                remaining_ms: u32::try_from(length - elapsed).unwrap_or(0),
+                cover_url: sheet.cover.clone(),
+                cover_lookup_pending: false,
+                next: None,
+            };
+            (info, std::time::Duration::from_millis(length), std::time::Duration::from_millis(elapsed), index)
+        });
+        let playlist = match (&cue, &cue_view) {
+            (Some(sheet), Some((.., index))) => Some((*index as u32, sheet.tracks.len() as u32)),
+            _ => playlist,
+        };
         let (info, duration, elapsed, track_ended) = match (now, clock) {
+            _ if cue_view.is_some() => cue_view
+                .as_ref()
+                .map(|(info, duration, elapsed, _)| (Some(info.clone()), *duration, *elapsed, false))
+                .unwrap_or((None, std::time::Duration::ZERO, std::time::Duration::ZERO, false)),
             (Some((reported, age)), Some((playhead, decoded, rate))) => {
                 let generation = state.now_playing_generation();
                 let mut timelines = self.audio_timelines.borrow_mut();
@@ -3593,7 +3628,13 @@ impl Terminal {
         // station lookup that may still deliver one is under way.
         let lookup_pending = info.as_ref().is_some_and(|i| i.cover_lookup_pending);
         let show_placeholder = shown_cover.is_none() && !cover_loading && !lookup_pending && !track_ended;
-        let ready = !lookup_pending && !cover_loading && !track_ended && (shown_cover.is_some() || show_placeholder);
+        // A CUE track is not placed until the player's clock runs.
+        let waiting_for_player = cue_view.is_some() && clock.is_none();
+        let ready = !lookup_pending
+            && !cover_loading
+            && !track_ended
+            && !waiting_for_player
+            && (shown_cover.is_some() || show_placeholder);
 
         Some(rich_content_audio_widget::AudioNowPlaying {
             artist: info.as_ref().map(|i| i.artist.clone()).unwrap_or_default(),
@@ -3613,7 +3654,52 @@ impl Terminal {
             cover_loading,
             show_placeholder,
             ready,
+            cue_track: cue_view.is_some(),
         })
+    }
+
+    /// Where the CUE sheet of `key`'s file puts the playhead: the sheet,
+    /// the index of the track it is in and that track's `[start, end)` in
+    /// milliseconds. `None` without a sheet.
+    fn cue_position(&self, key: (u32, u32)) -> Option<(somsrv::protocol::CueSheet, usize, u64, u64)> {
+        let state = self.rich_content_srv_progress.borrow().get(&key).cloned()?;
+        let sheet = state.cue_sheet().filter(|sheet| !sheet.tracks.is_empty())?;
+        let file_ms = self.rich_content_cache.audio_metadata(key.0, key.1).map(|(.., d)| d as u64).unwrap_or(0);
+        let playhead_ms = self
+            .rich_content_audio_players
+            .borrow()
+            .get(&key)
+            .filter(|player| player.sample_rate() > 0)
+            .map(|player| player.playhead_frames() * 1000 / player.sample_rate() as u64)
+            .unwrap_or(0);
+        let index = rich_content_audio_widget::cue_track_index(&sheet.tracks, playhead_ms);
+        let start = sheet.tracks[index].start_ms;
+        let end = sheet.tracks.get(index + 1).map(|next| next.start_ms).unwrap_or(file_ms);
+        Some((sheet, index, start, end))
+    }
+
+    /// Moves the playhead of the audio placement `key` to `position_ms`
+    /// of its file.
+    fn seek_audio_to_ms(&self, key: (u32, u32), position_ms: u64) {
+        let file_ms = self.rich_content_cache.audio_metadata(key.0, key.1).map(|(.., d)| d as u64).unwrap_or(0);
+        if file_ms == 0 {
+            return;
+        }
+        self.seek_rich_content_audio_playback(key.0, key.1, (position_ms as f64 / file_ms as f64) as f32);
+    }
+
+    /// Previous (`-1`) or next (`1`) track: inside a CUE sheet that is a
+    /// seek to the neighbouring track's start (the list is a circle),
+    /// otherwise a step of the playlist runner.
+    fn step_audio_track(&self, key: (u32, u32), delta: i32) {
+        match self.cue_position(key) {
+            Some((sheet, index, ..)) => {
+                let count = sheet.tracks.len() as i64;
+                let target = (index as i64 + delta as i64).rem_euclid(count) as usize;
+                self.seek_audio_to_ms(key, sheet.tracks[target].start_ms);
+            },
+            None => rich_content_srv_channel::playlist_step(key.0, key.1, delta),
+        }
     }
 
     /// Forgets `key`'s cover fetch, queueing its decoded image for GPU
@@ -3673,12 +3759,19 @@ impl Terminal {
         };
         match hit {
             Hit::Cover => self.toggle_rich_content_audio_playback(session_id, file_id),
-            Hit::Prev => rich_content_srv_channel::playlist_step(session_id, file_id, -1),
-            Hit::Next => rich_content_srv_channel::playlist_step(session_id, file_id, 1),
+            Hit::Prev => self.step_audio_track((session_id, file_id), -1),
+            Hit::Next => self.step_audio_track((session_id, file_id), 1),
             Hit::Bar(bar) => {
                 if bar.size.width > Pixels::ZERO {
                     let fraction = ((position.x - bar.origin.x) / bar.size.width).clamp(0.0, 1.0);
-                    self.seek_rich_content_audio_playback(session_id, file_id, fraction);
+                    match self.cue_position((session_id, file_id)) {
+                        // The bar covers one track of the file.
+                        Some((_, _, start, end)) if end > start => {
+                            let target = start as f64 + (end - start) as f64 * fraction as f64;
+                            self.seek_audio_to_ms((session_id, file_id), target as u64);
+                        },
+                        _ => self.seek_rich_content_audio_playback(session_id, file_id, fraction),
+                    }
                 }
             },
         }
@@ -3704,8 +3797,8 @@ impl Terminal {
         };
         match key {
             "space" => self.toggle_rich_content_audio_playback(session_id, file_id),
-            "left" | "up" => rich_content_srv_channel::playlist_step(session_id, file_id, -1),
-            _ => rich_content_srv_channel::playlist_step(session_id, file_id, 1),
+            "left" | "up" => self.step_audio_track((session_id, file_id), -1),
+            _ => self.step_audio_track((session_id, file_id), 1),
         }
         true
     }

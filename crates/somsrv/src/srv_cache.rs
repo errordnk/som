@@ -147,6 +147,8 @@ struct Inner {
     now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
     /// `(index, len)` of the playlist entry a key is (`set_playlist`).
     playlists: HashMap<CacheKey, (u32, u32, Option<String>)>,
+    /// The CUE sheet a key plays (`set_cue_sheet`).
+    cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -341,6 +343,9 @@ impl SrvCache {
         if let Some((index, len, title)) = inner.playlists.get(&key).cloned() {
             let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title });
         }
+        if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
+            let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
+        }
         inner.subscribers.entry(key).or_default().push(send);
     }
 
@@ -405,6 +410,19 @@ impl SrvCache {
                 }
             }
         }
+    }
+
+    /// Records the CUE sheet `(session_id, file_id)` plays and pushes it
+    /// to the key's subscribers.
+    pub fn set_cue_sheet(&self, session_id: u32, file_id: u32, sheet: somsrv::protocol::CueSheet) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        if let Some(subscribers) = inner.subscribers.get(&key) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::CueSheet { session_id, file_id, sheet: sheet.clone() });
+            }
+        }
+        inner.cue_sheets.insert(key, sheet);
     }
 
     /// Forwards a previous/next request to the key's registered range

@@ -551,6 +551,9 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     crate::now_playing::announce_file_tags(cache.clone(), session_id, file_id, tags);
                 }
             }
+            SrvRequest::AnnounceCue { session_id, file_id, sheet } => {
+                cache.set_cue_sheet(session_id, file_id, sheet);
+            }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {
                 cache.route_playlist_step(session_id, file_id, delta);
             }

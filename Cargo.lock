@@ -7324,6 +7324,8 @@ dependencies = [
 name = "somsrp"
 version = "0.7.0"
 dependencies = [
+ "chardetng",
+ "encoding_rs",
  "ffmpeg-next",
  "image",
  "libc",

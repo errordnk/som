@@ -3496,7 +3496,15 @@ impl Terminal {
             .and_then(|next| next.cover_url.clone());
         // A CUE sheet: the track is the one the playhead is in, by the
         // sheet's start offsets - no station, no clock but the player's.
+        // With no picture next to the sheet the cover comes from the
+        // lookup by performer and album that `somsrp` asked `somsrv` for.
+        let looked_up = now.as_ref().map(|(reported, _)| (reported.cover_url.clone(), reported.cover_lookup_pending));
         let cue_view = cue.as_ref().map(|sheet| {
+            let (cover_url, lookup_pending) = match (&sheet.cover, &looked_up) {
+                (Some(cover), _) => (Some(cover.clone()), false),
+                (None, Some((url, pending))) => (url.clone(), *pending),
+                (None, None) => (None, true),
+            };
             let file_ms =
                 self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d as u64).unwrap_or(0);
             let playhead_ms = clock.map(|(playhead, _, rate)| (playhead / rate * 1000.0) as u64).unwrap_or(0);
@@ -3514,8 +3522,8 @@ impl Terminal {
                 year: sheet.year,
                 duration_ms: u32::try_from(length).unwrap_or(0),
                 remaining_ms: u32::try_from(length - elapsed).unwrap_or(0),
-                cover_url: sheet.cover.clone(),
-                cover_lookup_pending: false,
+                cover_url,
+                cover_lookup_pending: lookup_pending,
                 next: None,
             };
             (info, std::time::Duration::from_millis(length), std::time::Duration::from_millis(elapsed), index)

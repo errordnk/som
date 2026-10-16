@@ -3,6 +3,9 @@
 /// The service's id.
 pub const ID: &str = "yandex";
 
+/// The station of "My Wave": the radio built from the account's tastes.
+pub const MY_WAVE: &str = "user:onyourwave";
+
 /// The path segments of a `music.yandex.*` URL (query and fragment cut
 /// off), or `None` for any other target.
 fn music_path(url: &str) -> Option<Vec<&str>> {
@@ -46,13 +49,13 @@ pub fn parse_track_url(url: &str) -> Option<TrackRef> {
 /// track.
 pub fn radio_station(target: &str) -> Option<String> {
     if target == "yandex:wave" {
-        return Some("user:onyourwave".to_string());
+        return Some(MY_WAVE.to_string());
     }
     if let Some(id) = target.strip_prefix("yandex:track:") {
         return (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())).then(|| format!("track:{id}"));
     }
     let path = music_path(target)?;
-    (path.is_empty() || path == ["home"]).then(|| "user:onyourwave".to_string())
+    (path.is_empty() || path == ["home"]).then(|| MY_WAVE.to_string())
 }
 
 #[cfg(test)]

@@ -555,7 +555,10 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                 cache.set_cue_sheet(session_id, file_id, sheet);
             }
             SrvRequest::ResolvePlaylist { url } => {
-                let answer = match crate::yandex_music::resolve_list(&url) {
+                let resolved = crate::services::for_url(&url)
+                    .ok_or_else(|| anyhow::anyhow!("not a link of a streaming service: {url}"))
+                    .and_then(|service| service.list_tracks(&url));
+                let answer = match resolved {
                     Ok(tracks) => SrvResponse::PlaylistResolved { tracks },
                     Err(err) => {
                         log::warn!("resolving the playlist {url:?} failed: {err:#}");
@@ -564,19 +567,25 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                 };
                 send_srv(&connection, &writer, &answer)?;
             }
-            SrvRequest::WaveTracks { station, queue } => {
-                let answer = match crate::yandex_music::wave_tracks(&station, queue.as_deref()) {
-                    Ok((batch_id, tracks)) => SrvResponse::WaveTracks { batch_id, tracks },
+            SrvRequest::RadioTracks { service, station, queue } => {
+                let batch = crate::services::by_id(&service)
+                    .ok_or_else(|| anyhow::anyhow!("unknown streaming service {service:?}"))
+                    .and_then(|service| service.radio_tracks(&station, queue.as_deref()));
+                let answer = match batch {
+                    Ok((batch_id, tracks)) => SrvResponse::RadioTracks { batch_id, tracks },
                     Err(err) => {
-                        log::warn!("the wave {station:?} failed: {err:#}");
+                        log::warn!("the radio {station:?} failed: {err:#}");
                         SrvResponse::PlaylistResolveFailed { reason: format!("{err:#}") }
                     },
                 };
                 send_srv(&connection, &writer, &answer)?;
             }
-            SrvRequest::WaveFeedback { station, batch_id, event, track_id, played_seconds } => {
-                if let Err(err) = crate::yandex_music::wave_feedback(&station, &batch_id, event, &track_id, played_seconds) {
-                    log::warn!("feedback to the wave {station:?} failed: {err:#}");
+            SrvRequest::RadioFeedback { service, station, batch_id, event, track_id, played_seconds } => {
+                let sent = crate::services::by_id(&service)
+                    .ok_or_else(|| anyhow::anyhow!("unknown streaming service {service:?}"))
+                    .and_then(|service| service.radio_feedback(&station, &batch_id, event, &track_id, played_seconds));
+                if let Err(err) = sent {
+                    log::warn!("feedback to the radio {station:?} failed: {err:#}");
                 }
             }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {

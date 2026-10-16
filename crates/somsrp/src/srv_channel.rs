@@ -177,33 +177,43 @@ impl SrvChannel {
         }
     }
 
-    /// Asks the daemon for the next batch of a Yandex Music wave station,
-    /// continuing after `queue` (`SrvRequest::WaveTracks`): the batch id and
+    /// Asks the daemon for the next batch of a streaming service's radio,
+    /// continuing after `queue` (`SrvRequest::RadioTracks`): the batch id and
     /// its tracks.
-    pub fn wave_tracks(&self, station: &str, queue: Option<&str>) -> Result<(String, Vec<somsrv::protocol::WaveTrack>), String> {
-        send(&self.connection, &SrvRequest::WaveTracks { station: station.to_string(), queue: queue.map(str::to_string) })?;
+    pub fn radio_tracks(
+        &self,
+        service: &str,
+        station: &str,
+        queue: Option<&str>,
+    ) -> Result<(String, Vec<somsrv::protocol::RadioTrack>), String> {
+        send(
+            &self.connection,
+            &SrvRequest::RadioTracks { service: service.to_string(), station: station.to_string(), queue: queue.map(str::to_string) },
+        )?;
         loop {
             match read_any(&self.connection)? {
-                Incoming::Response(SrvResponse::WaveTracks { batch_id, tracks }) => return Ok((batch_id, tracks)),
+                Incoming::Response(SrvResponse::RadioTracks { batch_id, tracks }) => return Ok((batch_id, tracks)),
                 Incoming::Response(SrvResponse::PlaylistResolveFailed { reason }) => return Err(reason),
                 _ => continue,
             }
         }
     }
 
-    /// Tells a wave station what the listener did (`SrvRequest::WaveFeedback`);
+    /// Tells a radio what the listener did (`SrvRequest::RadioFeedback`);
     /// nothing is answered.
-    pub fn wave_feedback(
+    pub fn radio_feedback(
         &self,
+        service: &str,
         station: &str,
         batch_id: &str,
-        event: somsrv::protocol::WaveEvent,
+        event: somsrv::protocol::RadioEvent,
         track_id: &str,
         played_seconds: f32,
     ) -> Result<(), String> {
         send(
             &self.connection,
-            &SrvRequest::WaveFeedback {
+            &SrvRequest::RadioFeedback {
+                service: service.to_string(),
                 station: station.to_string(),
                 batch_id: batch_id.to_string(),
                 event,

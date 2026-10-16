@@ -823,8 +823,9 @@ struct PlaylistPosition {
     target: String,
     /// The CUE sheet the file is played from, if it is one.
     cue: Option<somsrv::protocol::CueSheet>,
-    /// `false` when the list does not wrap around (a Yandex Music album or
-    /// wave): previous is unavailable on the first entry, next on the last.
+    /// `false` when the list does not wrap around (a streaming service's
+    /// album or radio): previous is unavailable on the first entry, next on
+    /// the last.
     looping: bool,
 }
 
@@ -1371,11 +1372,15 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     if path.to_ascii_lowercase().ends_with(".cue") {
         return stream_cue(path);
     }
-    if let Some(station) = yandex_wave_station(path) {
-        return stream_wave(&station);
-    }
-    if is_yandex_list_url(path) {
-        return stream_yandex_list(path);
+    match somsrv::service_link::classify(path) {
+        Some(somsrv::service_link::ServiceLink { service, kind: somsrv::service_link::LinkKind::Radio { station } }) => {
+            return stream_radio(service, &station);
+        },
+        Some(somsrv::service_link::ServiceLink { kind: somsrv::service_link::LinkKind::List, .. }) => {
+            return stream_service_list(path);
+        },
+        // A track of a service plays as the URL it is.
+        _ => {},
     }
     // A lone URL or audio file gets the same widget as a playlist track,
     // but no previous/next buttons and no looping: it plays once.
@@ -1560,85 +1565,69 @@ fn stream_cue(path: &str) -> Result<(), String> {
     run_playlist(entries, true)
 }
 
-/// A Yandex Music album or playlist link (not a single track): only
-/// `somsrv`, which holds the service's token, can list its tracks.
-fn is_yandex_list_url(target: &str) -> bool {
-    let Some(rest) = target.strip_prefix("https://").or_else(|| target.strip_prefix("http://")) else {
-        return false;
-    };
-    let Some((host, path)) = rest.split_once('/') else {
-        return false;
-    };
-    host.strip_prefix("www.").unwrap_or(host).starts_with("music.yandex.")
-        && !path.contains("/track/")
-        && (path.starts_with("album/") || path.starts_with("playlists/") || (path.starts_with("users/") && path.contains("/playlists/")))
+/// The streaming-service radio a target asks for: the service's id and the
+/// service's own name of the station.
+fn radio_target(target: &str) -> Option<(&'static str, String)> {
+    match somsrv::service_link::classify(target)? {
+        somsrv::service_link::ServiceLink { service, kind: somsrv::service_link::LinkKind::Radio { station } } => Some((service, station)),
+        _ => None,
+    }
 }
 
-/// The Yandex Music "wave" station a target asks for: `yandex:wave` and
-/// the service's home page are "My Wave"; `yandex:track:<id>` is the wave
-/// built from one track.
-fn yandex_wave_station(target: &str) -> Option<String> {
-    if target == "yandex:wave" {
-        return Some("user:onyourwave".to_string());
-    }
-    if let Some(id) = target.strip_prefix("yandex:track:")
-        && !id.is_empty()
-        && id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Some(format!("track:{id}"));
-    }
-    let rest = target.strip_prefix("https://").or_else(|| target.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let path = path.split(['?', '#']).next().unwrap_or("").trim_matches('/');
-    (host.strip_prefix("www.").unwrap_or(host).starts_with("music.yandex.") && (path.is_empty() || path == "home"))
-        .then(|| "user:onyourwave".to_string())
-}
-
-/// The Yandex Music wave a playlist stands for: its one line. The wave is
-/// endless and plays on its own, so it cannot share a playlist with other
-/// entries (`Err`); a playlist without a wave line is `Ok(None)`.
-fn wave_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<String>, String> {
-    let Some(station) = entries.iter().find_map(|entry| yandex_wave_station(&entry.target)) else {
+/// The radio a playlist stands for: its one line. A radio is endless and
+/// plays on its own, so it cannot share a playlist with other entries
+/// (`Err`); a playlist without a radio line is `Ok(None)`.
+fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, String)>, String> {
+    let Some(radio) = entries.iter().find_map(|entry| radio_target(&entry.target)) else {
         return Ok(None);
     };
     if entries.len() > 1 {
-        return Err("a Yandex Music wave plays on its own, it cannot share a playlist with other entries".to_string());
+        return Err("a radio plays on its own, it cannot share a playlist with other entries".to_string());
     }
-    Ok(Some(station))
+    Ok(Some(radio))
 }
 
-/// A track of the wave being played, with the batch it came in (the
-/// station's feedback names it).
-struct WaveEntry {
-    track: somsrv::protocol::WaveTrack,
+/// A track of the radio being played, with the batch it came in (the
+/// service's feedback names it).
+struct RadioEntry {
+    track: somsrv::protocol::RadioTrack,
     batch_id: String,
 }
 
-/// Tells `station` what happened to a track. A failure is only worth a
-/// line on the terminal: the wave plays on without feedback.
-fn wave_feedback(station: &str, entry: Option<&WaveEntry>, batch_id: &str, event: somsrv::protocol::WaveEvent, played_seconds: f32) {
+/// Tells the radio what happened to a track. A failure is only worth a
+/// line on the terminal: the radio plays on without feedback.
+fn radio_feedback(
+    service: &str,
+    station: &str,
+    entry: Option<&RadioEntry>,
+    batch_id: &str,
+    event: somsrv::protocol::RadioEvent,
+    played_seconds: f32,
+) {
     let track_id = entry.map(|entry| entry.track.id.as_str()).unwrap_or("");
-    let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.wave_feedback(station, batch_id, event, track_id, played_seconds));
+    let result = srv_channel::SrvChannel::connect()
+        .and_then(|channel| channel.radio_feedback(service, station, batch_id, event, track_id, played_seconds));
     if let Err(err) = result {
-        eprint!("somsrp: could not report to the wave: {err}\r\n");
+        eprint!("somsrp: could not report to the radio: {err}\r\n");
     }
 }
 
-/// Plays a wave station: an endless run of tracks the service picks, in
-/// batches. `n` / the next button goes to the next track, `p` / previous
-/// back along what was already played (the service keeps no such history,
-/// so it is kept here). What was heard, finished or skipped, is reported
-/// to the station so it adapts. `q`/`Esc`/`Ctrl+C` quits.
-fn stream_wave(station: &str) -> Result<(), String> {
-    use somsrv::protocol::WaveEvent;
+/// Plays a streaming service's radio: an endless run of tracks the service
+/// picks, in batches. `n` / the next button goes to the next track, `p` /
+/// previous back along what was already played (the service keeps no such
+/// history, so it is kept here). What was heard, finished or skipped, is
+/// reported to the radio so it adapts. `q`/`Esc`/`Ctrl+C` quits.
+fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
+    use somsrv::protocol::RadioEvent;
 
-    /// This many tracks in a row failing to start ends the wave.
+    /// This many tracks in a row failing to start ends the radio.
     const MAX_FAILURES_IN_A_ROW: usize = 3;
 
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
-    let (batch_id, tracks) = srv_channel::SrvChannel::connect()?.wave_tracks(station, None).map_err(|reason| format!("{station}: {reason}"))?;
-    wave_feedback(station, None, &batch_id, WaveEvent::RadioStarted, 0.0);
-    let mut played: Vec<WaveEntry> = tracks.into_iter().map(|track| WaveEntry { track, batch_id: batch_id.clone() }).collect();
+    let (batch_id, tracks) =
+        srv_channel::SrvChannel::connect()?.radio_tracks(service, station, None).map_err(|reason| format!("{station}: {reason}"))?;
+    radio_feedback(service, station, None, &batch_id, RadioEvent::RadioStarted, 0.0);
+    let mut played: Vec<RadioEntry> = tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone() }).collect();
     let mut cursor = 0usize;
     let mut failures_in_a_row = 0usize;
     loop {
@@ -1656,7 +1645,7 @@ fn stream_wave(station: &str) -> Result<(), String> {
             cue: None,
             looping: false,
         };
-        wave_feedback(station, Some(entry), &entry.batch_id, WaveEvent::TrackStarted, 0.0);
+        radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::TrackStarted, 0.0);
         let started = std::time::Instant::now();
         let result = stream_url(&entry.track.target, &position);
         let step = PLAYLIST_STEP.swap(0, std::sync::atomic::Ordering::AcqRel);
@@ -1666,8 +1655,8 @@ fn stream_wave(station: &str) -> Result<(), String> {
                 failures_in_a_row = 0;
                 // Going back says nothing about the track.
                 match step {
-                    0 => wave_feedback(station, Some(entry), &entry.batch_id, WaveEvent::TrackFinished, heard),
-                    1.. => wave_feedback(station, Some(entry), &entry.batch_id, WaveEvent::Skip, heard),
+                    0 => radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::TrackFinished, heard),
+                    1.. => radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::Skip, heard),
                     _ => {},
                 }
             },
@@ -1688,19 +1677,21 @@ fn stream_wave(station: &str) -> Result<(), String> {
         cursor += 1;
         if cursor >= played.len() {
             let last_id = played[played.len() - 1].track.id.clone();
-            let (batch_id, tracks) =
-                srv_channel::SrvChannel::connect()?.wave_tracks(station, Some(&last_id)).map_err(|reason| format!("{station}: {reason}"))?;
-            played.extend(tracks.into_iter().map(|track| WaveEntry { track, batch_id: batch_id.clone() }));
+            let (batch_id, tracks) = srv_channel::SrvChannel::connect()?
+                .radio_tracks(service, station, Some(&last_id))
+                .map_err(|reason| format!("{station}: {reason}"))?;
+            played.extend(tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone() }));
             if cursor >= played.len() {
-                return Err(format!("{station}: the station gave no more tracks"));
+                return Err(format!("{station}: the radio gave no more tracks"));
             }
         }
     }
 }
 
-/// Plays a Yandex Music album or playlist track after track, once: unlike
-/// a local playlist it does not wrap around - see [`run_playlist`].
-fn stream_yandex_list(url: &str) -> Result<(), String> {
+/// Plays an album or playlist of a streaming service track after track,
+/// once: unlike a local playlist it does not wrap around - see
+/// [`run_playlist`].
+fn stream_service_list(url: &str) -> Result<(), String> {
     let channel = srv_channel::SrvChannel::connect()?;
     let tracks = channel.resolve_playlist(url).map_err(|reason| format!("{url}: {reason}"))?;
     let entries = tracks
@@ -1740,8 +1731,8 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
         if line.starts_with('#') {
             continue;
         }
-        // `yandex:` is the scheme of a Yandex Music wave, not a file name.
-        let is_url = line.starts_with("http://") || line.starts_with("https://") || line.starts_with("yandex:");
+        // A service's own name (`yandex:wave`) is not a file name either.
+        let is_url = line.starts_with("http://") || line.starts_with("https://") || somsrv::service_link::classify(line).is_some();
         let path = std::path::Path::new(line);
         let target = match (is_url, path.is_absolute(), base_dir) {
             (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
@@ -1772,8 +1763,8 @@ fn stream_playlist(path: &str) -> Result<(), String> {
     if entries.is_empty() {
         return Err(format!("{path}: playlist has no entries"));
     }
-    if let Some(station) = wave_in_playlist(&entries).map_err(|reason| format!("{path}: {reason}"))? {
-        return stream_wave(&station);
+    if let Some((service, station)) = radio_in_playlist(&entries).map_err(|reason| format!("{path}: {reason}"))? {
+        return stream_radio(service, &station);
     }
     run_playlist(entries, true)
 }
@@ -2324,35 +2315,11 @@ yandex:wave
     }
 
     #[test]
-    fn a_playlist_of_one_wave_line_is_the_wave() {
+    fn a_playlist_of_one_radio_line_is_the_radio() {
         let entry = |target: &str| PlaylistEntry { target: target.to_string(), title: None, cue: None };
-        assert_eq!(wave_in_playlist(&[entry("https://music.yandex.ru/")]), Ok(Some("user:onyourwave".to_string())));
-        assert_eq!(wave_in_playlist(&[entry("yandex:track:38526")]), Ok(Some("track:38526".to_string())));
-        assert_eq!(wave_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
-        assert!(wave_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
-    }
-
-    #[test]
-    fn waves_are_asked_for_by_name_or_by_the_home_page() {
-        assert_eq!(yandex_wave_station("yandex:wave").as_deref(), Some("user:onyourwave"));
-        assert_eq!(yandex_wave_station("yandex:track:38526").as_deref(), Some("track:38526"));
-        assert_eq!(yandex_wave_station("https://music.yandex.ru/").as_deref(), Some("user:onyourwave"));
-        assert_eq!(yandex_wave_station("https://music.yandex.ru/home?x=1").as_deref(), Some("user:onyourwave"));
-        assert_eq!(yandex_wave_station("https://music.yandex.com").as_deref(), Some("user:onyourwave"));
-        assert_eq!(yandex_wave_station("yandex:track:"), None);
-        assert_eq!(yandex_wave_station("yandex:track:../x"), None);
-        assert_eq!(yandex_wave_station("https://music.yandex.ru/album/1"), None);
-        assert_eq!(yandex_wave_station("https://example.com/"), None);
-    }
-
-    #[test]
-    fn yandex_lists_are_told_from_tracks() {
-        assert!(is_yandex_list_url("https://music.yandex.ru/album/9158345"));
-        assert!(is_yandex_list_url("https://music.yandex.ru/users/someone/playlists/1003"));
-        assert!(is_yandex_list_url("https://music.yandex.com/playlists/ab12-cd34"));
-        assert!(!is_yandex_list_url("https://music.yandex.ru/album/9158345/track/10994777"));
-        assert!(!is_yandex_list_url("https://music.yandex.ru/track/10994777"));
-        assert!(!is_yandex_list_url("https://example.com/album/1"));
-        assert!(!is_yandex_list_url("/home/user/album/1"));
+        assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
+        assert_eq!(radio_in_playlist(&[entry("yandex:track:38526")]), Ok(Some(("yandex", "track:38526".to_string()))));
+        assert_eq!(radio_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
+        assert!(radio_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
     }
 }

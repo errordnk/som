@@ -690,34 +690,35 @@ pub enum SrvRequest {
     /// can show the track the playhead is in and step between tracks by
     /// seeking inside the one file.
     AnnounceCue { session_id: u32, file_id: u32, sheet: CueSheet },
-    /// Asks `somsrv` to turn a link to a list of tracks (a Yandex Music
-    /// album or playlist) into the tracks' own links, which only it can
-    /// do: it holds the service's token. Answered with
+    /// Asks `somsrv` to turn a link to a list of tracks (an album or a
+    /// playlist of a streaming service) into the tracks' own links, which
+    /// only it can do: it holds the service's credentials. Answered with
     /// `SrvResponse::PlaylistResolved` or `SrvResponse::PlaylistResolveFailed`.
     ResolvePlaylist { url: String },
-    /// Asks for the next batch of a Yandex Music "wave" station (`station`
-    /// like `user:onyourwave` or `track:<id>`); `queue` is the track the
-    /// listener has reached, so the batch continues after it. Answered
-    /// with `SrvResponse::WaveTracks` or `SrvResponse::PlaylistResolveFailed`.
-    WaveTracks { station: String, queue: Option<String> },
-    /// Tells the station what the listener did, so it can adapt;
+    /// Asks for the next batch of a streaming service's endless radio
+    /// (`service` is its id, `station` the service's own name of the radio,
+    /// like `user:onyourwave`); `queue` is the track the listener has
+    /// reached, so the batch continues after it. Answered with
+    /// `SrvResponse::RadioTracks` or `SrvResponse::PlaylistResolveFailed`.
+    RadioTracks { service: String, station: String, queue: Option<String> },
+    /// Tells the radio what the listener did, so it can adapt;
     /// fire-and-forget (nothing is answered). `batch_id` is the one the
     /// track came in; `played_seconds` is how long it was heard.
-    WaveFeedback { station: String, batch_id: String, event: WaveEvent, track_id: String, played_seconds: f32 },
+    RadioFeedback { service: String, station: String, batch_id: String, event: RadioEvent, track_id: String, played_seconds: f32 },
 }
 
-/// What a listener did to a track of a wave station.
+/// What a listener did to a track of a radio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WaveEvent {
+pub enum RadioEvent {
     RadioStarted,
     TrackStarted,
     TrackFinished,
     Skip,
 }
 
-/// One track of a wave batch.
+/// One track of a radio batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaveTrack {
+pub struct RadioTrack {
     pub id: String,
     pub title: String,
     /// The link that plays it.
@@ -834,9 +835,9 @@ pub enum SrvResponse {
     FetchFailed { session_id: u32, file_id: u32, reason: String },
     /// Answers `SrvRequest::ResolvePlaylist`: the tracks to play, in order.
     PlaylistResolved { tracks: Vec<ResolvedTrack> },
-    /// Answers `SrvRequest::WaveTracks`: the next tracks of the station and
+    /// Answers `SrvRequest::RadioTracks`: the next tracks of the radio and
     /// the id of the batch they came in.
-    WaveTracks { batch_id: String, tracks: Vec<WaveTrack> },
+    RadioTracks { batch_id: String, tracks: Vec<RadioTrack> },
     /// Answers `SrvRequest::ResolvePlaylist` when the list could not be
     /// resolved; `reason` is meant to be shown as it is.
     PlaylistResolveFailed { reason: String },

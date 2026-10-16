@@ -16,6 +16,7 @@ mod now_playing;
 mod redraw;
 mod relay;
 mod server;
+mod services;
 mod session;
 mod single_instance;
 mod srv_cache;

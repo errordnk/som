@@ -690,16 +690,11 @@ pub enum SrvRequest {
     /// can show the track the playhead is in and step between tracks by
     /// seeking inside the one file.
     AnnounceCue { session_id: u32, file_id: u32, sheet: CueSheet },
-    /// Asks `somsrv` to turn a link to a list of tracks (an album or a
-    /// playlist of a streaming service) into the tracks' own links, which
-    /// only it can do: it holds the service's credentials. Answered with
-    /// `SrvResponse::PlaylistResolved` or `SrvResponse::PlaylistResolveFailed`.
-    ResolvePlaylist { url: String },
     /// Asks for the next batch of a streaming service's endless radio
     /// (`service` is its id, `station` the service's own name of the radio,
     /// like `user:onyourwave`); `queue` is the track the listener has
     /// reached, so the batch continues after it. Answered with
-    /// `SrvResponse::RadioTracks` or `SrvResponse::PlaylistResolveFailed`.
+    /// `SrvResponse::RadioTracks` or `SrvResponse::RadioFailed`.
     RadioTracks { service: String, station: String, queue: Option<String> },
     /// Tells the radio what the listener did, so it can adapt;
     /// fire-and-forget (nothing is answered). `batch_id` is the one the
@@ -833,14 +828,12 @@ pub enum SrvResponse {
     /// of this today (a markdown widget showing "failed to load"), which
     /// has no need to branch on failure kind.
     FetchFailed { session_id: u32, file_id: u32, reason: String },
-    /// Answers `SrvRequest::ResolvePlaylist`: the tracks to play, in order.
-    PlaylistResolved { tracks: Vec<ResolvedTrack> },
     /// Answers `SrvRequest::RadioTracks`: the next tracks of the radio and
     /// the id of the batch they came in.
     RadioTracks { batch_id: String, tracks: Vec<RadioTrack> },
-    /// Answers `SrvRequest::ResolvePlaylist` when the list could not be
-    /// resolved; `reason` is meant to be shown as it is.
-    PlaylistResolveFailed { reason: String },
+    /// Answers `SrvRequest::RadioTracks` when the batch could not be
+    /// fetched; `reason` is meant to be shown as it is.
+    RadioFailed { reason: String },
     /// Pushed to every `SubscribeProgress` subscriber of the key whenever
     /// `somsrv` learns what an internet-radio stream it is fetching is
     /// currently playing - see [`NowPlayingInfo`]. The latest one is also
@@ -886,14 +879,6 @@ pub struct CueSheet {
 /// A playlist wraps around unless it says otherwise.
 fn default_looping() -> bool {
     true
-}
-
-/// One track of a resolved playlist: what to show for it and the link that
-/// plays it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedTrack {
-    pub title: String,
-    pub target: String,
 }
 
 /// One track of a [`CueSheet`].

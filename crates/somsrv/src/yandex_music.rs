@@ -17,8 +17,8 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use crate::services::{OpenedTrack, StreamingService, TrackInfo};
-use somsrv::protocol::{RadioEvent, RadioTrack, ResolvedTrack};
-use somsrv::service_link::yandex::{ListRef, TrackRef, parse_list_url, parse_track_url};
+use somsrv::protocol::{RadioEvent, RadioTrack};
+use somsrv::service_link::yandex::{TrackRef, parse_track_url};
 use std::io::Read;
 use std::time::Duration;
 
@@ -243,15 +243,13 @@ fn file_info(agent: &ureq::Agent, token: &str, track: &TrackRef) -> anyhow::Resu
     parse_file_info(&api_get(agent, token, "file info", &format!("{API_BASE}/get-file-info?{query}"))?)
 }
 
-/// One track of an album, playlist or wave answer: its id and the link
-/// that plays it, titled "artist - title". `item` is the entry the track
-/// sits in (a playlist entry may carry the album id). `None` for a track
-/// the service marks unavailable.
-fn listed_track(track: &serde_json::Value, item: &serde_json::Value) -> Option<(String, ResolvedTrack)> {
+/// One track of a radio batch: its id, the "artist - title" to show and the
+/// link that plays it. `None` for a track the service marks unavailable.
+fn batch_track(track: &serde_json::Value) -> Option<(String, String, String)> {
     if track.get("available").and_then(|v| v.as_bool()) == Some(false) {
         return None;
     }
-    let id = match track.get("id").or_else(|| item.get("id"))? {
+    let id = match track.get("id")? {
         serde_json::Value::String(id) => id.clone(),
         other => other.as_u64()?.to_string(),
     };
@@ -263,41 +261,13 @@ fn listed_track(track: &serde_json::Value, item: &serde_json::Value) -> Option<(
         .unwrap_or_default();
     let album_id = track
         .pointer("/albums/0/id")
-        .or_else(|| item.get("albumId"))
         .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)));
     let target = match album_id {
         Some(album) => format!("https://music.yandex.ru/album/{album}/track/{id}"),
         None => format!("https://music.yandex.ru/track/{id}"),
     };
     let title = if artist.is_empty() { title } else { format!("{artist} - {title}") };
-    Some((id, ResolvedTrack { title, target }))
-}
-
-/// The tracks of an album or playlist answer, in order, as links that play.
-/// A track the service marks unavailable is left out. A playlist keeps a
-/// track under a `track` key, an album directly.
-pub fn parse_list_tracks(json: &str, list: &ListRef) -> anyhow::Result<Vec<ResolvedTrack>> {
-    let value: serde_json::Value = serde_json::from_str(json)?;
-    let result = value.get("result").ok_or_else(|| anyhow::anyhow!("no list in the reply: {}", api_error(&value)))?;
-    let mut items: Vec<&serde_json::Value> = Vec::new();
-    match list {
-        ListRef::Album { .. } => {
-            for volume in result.get("volumes").and_then(|v| v.as_array()).into_iter().flatten() {
-                items.extend(volume.as_array().into_iter().flatten());
-            }
-        },
-        ListRef::UserPlaylist { .. } | ListRef::SharedPlaylist { .. } => {
-            items.extend(result.get("tracks").and_then(|v| v.as_array()).into_iter().flatten());
-        },
-    }
-    let tracks = items
-        .into_iter()
-        .filter_map(|item| listed_track(item.get("track").unwrap_or(item), item).map(|(_, track)| track))
-        .collect::<Vec<_>>();
-    if tracks.is_empty() {
-        anyhow::bail!("the list has no playable tracks");
-    }
-    Ok(tracks)
+    Some((id, title, target))
 }
 
 /// A station is `<type>:<tag>` (`user:onyourwave`, `track:38526`); nothing
@@ -321,8 +291,8 @@ pub fn parse_radio(json: &str) -> anyhow::Result<(String, Vec<RadioTrack>)> {
         .into_iter()
         .flatten()
         .filter_map(|item| {
-            let (id, one) = listed_track(item.get("track")?, item)?;
-            Some(RadioTrack { id, title: one.title, target: one.target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false) })
+            let (id, title, target) = batch_track(item.get("track")?)?;
+            Some(RadioTrack { id, title, target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false) })
         })
         .collect::<Vec<_>>();
     if tracks.is_empty() {
@@ -398,18 +368,6 @@ pub fn radio_feedback(station: &str, batch_id: &str, event: RadioEvent, track_id
     Ok(())
 }
 
-/// The tracks of a Yandex Music album or playlist link.
-pub fn resolve_list(url: &str) -> anyhow::Result<Vec<ResolvedTrack>> {
-    let list = parse_list_url(url).ok_or_else(|| anyhow::anyhow!("not a Yandex Music album or playlist link: {url}"))?;
-    let (token, agent) = signed_in_agent()?;
-    let api_path = match &list {
-        ListRef::Album { id } => format!("albums/{id}/with-tracks"),
-        ListRef::UserPlaylist { owner, kind } => format!("users/{owner}/playlists/{kind}"),
-        ListRef::SharedPlaylist { uuid } => format!("playlist/{uuid}"),
-    };
-    parse_list_tracks(&api_get(&agent, &token, "track list", &format!("{API_BASE}/{api_path}"))?, &list)
-}
-
 /// Asks the service for the track's tags and stream and opens the stream.
 fn open(track: &TrackRef) -> anyhow::Result<OpenedTrack> {
     let (token, agent) = signed_in_agent()?;
@@ -444,10 +402,6 @@ impl StreamingService for YandexMusic {
     fn open_track(&self, url: &str) -> anyhow::Result<OpenedTrack> {
         let track = parse_track_url(url).ok_or_else(|| anyhow::anyhow!("not a Yandex Music track link: {url}"))?;
         open(&track)
-    }
-
-    fn list_tracks(&self, url: &str) -> anyhow::Result<Vec<ResolvedTrack>> {
-        resolve_list(url)
     }
 
     fn radio_tracks(&self, station: &str, queue: Option<&str>) -> anyhow::Result<(String, Vec<RadioTrack>)> {
@@ -523,33 +477,6 @@ mod tests {
         assert_eq!(info.url, "https://strm.example/x");
         assert_eq!(info.key.as_deref(), Some("00112233445566778899aabbccddeeff"));
         assert_eq!(info.codec, "flac");
-    }
-
-    #[test]
-    fn an_album_lists_its_available_tracks_in_order() {
-        let json = r#"{"result":{"volumes":[
-            [{"id":"1","title":"One","available":true,"artists":[{"name":"A"}],"albums":[{"id":77}]},
-             {"id":2,"title":"Gone","available":false,"artists":[],"albums":[{"id":77}]}],
-            [{"id":"3","title":"Three","artists":[{"name":"A"},{"name":"B"}],"albums":[{"id":77}]}]]}}"#;
-        let tracks = parse_list_tracks(json, &ListRef::Album { id: "77".into() }).expect("tracks");
-        assert_eq!(
-            tracks,
-            vec![
-                ResolvedTrack { title: "A - One".into(), target: "https://music.yandex.ru/album/77/track/1".into() },
-                ResolvedTrack { title: "A, B - Three".into(), target: "https://music.yandex.ru/album/77/track/3".into() },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_playlist_reads_tracks_under_the_track_key() {
-        let json = r#"{"result":{"tracks":[
-            {"id":5,"albumId":"9","track":{"id":"5","title":"Five","artists":[{"name":"X"}],"albums":[{"id":9}]}},
-            {"id":6,"track":{"id":6,"title":"Six","artists":[]}}]}}"#;
-        let tracks = parse_list_tracks(json, &ListRef::UserPlaylist { owner: "o".into(), kind: "1".into() }).expect("tracks");
-        assert_eq!(tracks[0].target, "https://music.yandex.ru/album/9/track/5");
-        assert_eq!(tracks[1], ResolvedTrack { title: "Six".into(), target: "https://music.yandex.ru/track/6".into() });
-        assert!(parse_list_tracks(r#"{"result":{"tracks":[]}}"#, &ListRef::SharedPlaylist { uuid: "u".into() }).is_err());
     }
 
     #[test]

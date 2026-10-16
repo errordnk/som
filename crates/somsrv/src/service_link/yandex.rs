@@ -3,16 +3,6 @@
 /// The service's id.
 pub const ID: &str = "yandex";
 
-/// A link to a list of tracks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListRef {
-    Album { id: String },
-    /// `users/<owner>/playlists/<kind>`.
-    UserPlaylist { owner: String, kind: String },
-    /// `playlists/<uuid>`: the shared form of a playlist link.
-    SharedPlaylist { uuid: String },
-}
-
 /// The path segments of a `music.yandex.*` URL (query and fragment cut
 /// off), or `None` for any other target.
 fn music_path(url: &str) -> Option<Vec<&str>> {
@@ -23,23 +13,6 @@ fn music_path(url: &str) -> Option<Vec<&str>> {
     }
     let path = path.split(['?', '#']).next().unwrap_or("");
     Some(path.split('/').filter(|segment| !segment.is_empty()).collect())
-}
-
-/// `https://music.yandex.ru/album/N`, `…/users/<owner>/playlists/<kind>` or
-/// `…/playlists/<uuid>`; a link to one track of an album is a track, not
-/// a list.
-pub fn parse_list_url(url: &str) -> Option<ListRef> {
-    if parse_track_url(url).is_some() {
-        return None;
-    }
-    match music_path(url)?.as_slice() {
-        ["album", id] if id.bytes().all(|byte| byte.is_ascii_digit()) => Some(ListRef::Album { id: (*id).to_string() }),
-        ["users", owner, "playlists", kind] if kind.bytes().all(|byte| byte.is_ascii_digit()) => {
-            Some(ListRef::UserPlaylist { owner: (*owner).to_string(), kind: (*kind).to_string() })
-        },
-        ["playlists", uuid] => Some(ListRef::SharedPlaylist { uuid: (*uuid).to_string() }),
-        _ => None,
-    }
 }
 
 /// A track a link points at.
@@ -100,22 +73,6 @@ mod tests {
         assert_eq!(parse_track_url("https://music.yandex.ru/track/abc"), None);
         assert_eq!(parse_track_url("https://example.com/track/1"), None);
         assert_eq!(parse_track_url("/home/user/track/1"), None);
-    }
-
-    #[test]
-    fn list_links_are_recognized() {
-        assert_eq!(parse_list_url("https://music.yandex.ru/album/9158345"), Some(ListRef::Album { id: "9158345".into() }));
-        assert_eq!(
-            parse_list_url("https://music.yandex.ru/users/someone/playlists/1003?utm=1"),
-            Some(ListRef::UserPlaylist { owner: "someone".into(), kind: "1003".into() })
-        );
-        assert_eq!(
-            parse_list_url("https://music.yandex.com/playlists/ab12-cd34"),
-            Some(ListRef::SharedPlaylist { uuid: "ab12-cd34".into() })
-        );
-        assert_eq!(parse_list_url("https://music.yandex.ru/album/9158345/track/10994777"), None);
-        assert_eq!(parse_list_url("https://music.yandex.ru/artist/1"), None);
-        assert_eq!(parse_list_url("https://example.com/album/1"), None);
     }
 
     #[test]

@@ -164,19 +164,6 @@ impl SrvChannel {
     /// the old player would keep sounding with no widget left to reach
     /// it. Best sent on a fresh one-shot connection - a connection busy
     /// serving a long `FetchResource` cannot read further requests.
-    /// Asks the daemon for the tracks of a Yandex Music album or playlist
-    /// link (`SrvRequest::ResolvePlaylist`) and waits for its answer.
-    pub fn resolve_playlist(&self, url: &str) -> Result<Vec<somsrv::protocol::ResolvedTrack>, String> {
-        send(&self.connection, &SrvRequest::ResolvePlaylist { url: url.to_string() })?;
-        loop {
-            match read_any(&self.connection)? {
-                Incoming::Response(SrvResponse::PlaylistResolved { tracks }) => return Ok(tracks),
-                Incoming::Response(SrvResponse::PlaylistResolveFailed { reason }) => return Err(reason),
-                _ => continue,
-            }
-        }
-    }
-
     /// Asks the daemon for the next batch of a streaming service's radio,
     /// continuing after `queue` (`SrvRequest::RadioTracks`): the batch id and
     /// its tracks.
@@ -193,7 +180,7 @@ impl SrvChannel {
         loop {
             match read_any(&self.connection)? {
                 Incoming::Response(SrvResponse::RadioTracks { batch_id, tracks }) => return Ok((batch_id, tracks)),
-                Incoming::Response(SrvResponse::PlaylistResolveFailed { reason }) => return Err(reason),
+                Incoming::Response(SrvResponse::RadioFailed { reason }) => return Err(reason),
                 _ => continue,
             }
         }

@@ -7258,6 +7258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "socks"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
+dependencies = [
+ "byteorder",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "som"
 version = "0.7.0"
 dependencies = [
@@ -7340,11 +7351,15 @@ dependencies = [
 name = "somsrv"
 version = "0.7.0"
 dependencies = [
+ "aes",
  "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "bincode",
  "futures",
+ "hex",
+ "hmac",
  "http",
  "libc",
  "log",
@@ -7355,6 +7370,8 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_json_lenient",
+ "sha2",
  "smol",
  "sysinfo 0.37.2",
  "ureq",
@@ -8808,6 +8825,7 @@ dependencies = [
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
+ "socks",
  "ureq-proto",
  "utf8-zero",
  "webpki-roots",

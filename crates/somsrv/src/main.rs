@@ -20,6 +20,7 @@ mod session;
 mod single_instance;
 mod srv_cache;
 mod term_size;
+mod yandex_music;
 
 /// Parsed command line — two shapes depending on whether this process is
 /// starting as a RELAY (Som's direct PTY child, the normal case) or the

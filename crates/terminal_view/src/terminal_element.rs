@@ -3946,6 +3946,37 @@ fn paint_now_playing_audio_in_box(
         x += slot + cell_width;
         right -= slot + cell_width;
     }
+    if let Some(radio) = np.radio {
+        // A radio's icons flank the clock: the wave of the playing track
+        // (dim until switched on, lit while it is the radio being played)
+        // after previous, the like (filled and red when liked) before next.
+        let (heart_on, heart_off, wave) = if has_nerd {
+            let wave = ['\u{f095b}', '\u{f147a}']
+                .into_iter()
+                .find(|glyph| window.text_system().has_glyph_for_char(resolved_font_id, *glyph))
+                .map(|glyph| glyph.to_string())
+                .unwrap_or_else(|| "\u{2248}".to_string());
+            ("\u{f004}".to_string(), "\u{f08a}".to_string(), wave)
+        } else {
+            ("<3".to_string(), "<3".to_string(), "~".to_string())
+        };
+        let wave_color: Hsla = if radio.track_wave { fill_color.into() } else { dim_color };
+        let like_color: Hsla = if radio.liked { gpui::rgba(0xf38ba8ff).into() } else { dim_color };
+        let wave_line = shape(&wave, wave_color, window);
+        let like_line = shape(if radio.liked { &heart_on } else { &heart_off }, like_color, window);
+        let wave_slot = Bounds::new(point(x, y), gpui::size(slot, line_height));
+        let like_slot = Bounds::new(point(right - slot, y), gpui::size(slot, line_height));
+        wave_line
+            .paint(point(wave_slot.origin.x + (slot - wave_line.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
+        like_line
+            .paint(point(like_slot.origin.x + (slot - like_line.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
+        widget_bounds.wave = Some(wave_slot);
+        widget_bounds.like = Some(like_slot);
+        x += slot + cell_width;
+        right -= slot + cell_width;
+    }
     if np.ready {
         let elapsed_text = format_clock(elapsed);
         let elapsed_width = paint_time(&elapsed_text, x, window, cx);

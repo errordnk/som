@@ -185,6 +185,9 @@ pub struct SrvProgressState {
     /// `false` when that playlist does not wrap around (`SrvResponse::
     /// Playlist::looping`).
     playlist_looping: AtomicBool,
+    /// `(liked, track_wave)` from the latest `SrvResponse::RadioState`: what
+    /// the radio icons show for this key's track.
+    radio_state: Mutex<Option<(bool, bool)>>,
     /// The playlist's own name for this entry (`#EXTINF`), e.g. the
     /// station - what stays shown between a stream's songs.
     station_title: Mutex<Option<String>>,
@@ -221,6 +224,12 @@ impl SrvProgressState {
     /// `(index, len)` of this key's playlist entry, if it is part of one.
     pub fn playlist(&self) -> Option<(u32, u32)> {
         *self.playlist.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What the radio icons show - `(liked, track_wave)` - when this key's
+    /// track belongs to a radio.
+    pub fn radio_state(&self) -> Option<(bool, bool)> {
+        *self.radio_state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Whether the key's playlist wraps around (previous on the first
@@ -756,6 +765,19 @@ pub fn playlist_step(session_id: u32, file_id: u32, delta: i32) {
     });
 }
 
+/// Sends `SrvRequest::RadioControl` on a fresh, one-shot connection - a
+/// click on the like or the wave icon of a radio widget. Fire-and-forget on
+/// a background thread, for the same reason [`playlist_step`] is.
+pub fn radio_control(session_id: u32, file_id: u32, control: somsrv::protocol::RadioControl) {
+    std::thread::spawn(move || {
+        let result = connect_and_handshake()
+            .and_then(|connection| send(&connection, &SrvRequest::RadioControl { session_id, file_id, control }));
+        if let Err(err) = result {
+            log::debug!("failed to send somsrv RadioControl for {session_id:#x}:{file_id:#x}: {err:#}");
+        }
+    });
+}
+
 /// Sends `SrvRequest::EndPlayback` on a fresh, one-shot connection —
 /// Som's own signal (mirroring [`request_byte_range`]'s exact shape and
 /// same fire-and-forget-on-a-background-thread reasoning, see that
@@ -971,6 +993,11 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
                 *state.playlist.lock().unwrap_or_else(|p| p.into_inner()) = Some((index, len));
                 state.playlist_looping.store(looping, Ordering::Release);
                 *state.station_title.lock().unwrap_or_else(|p| p.into_inner()) = title;
+            },
+            SrvResponse::RadioState { session_id: response_session, file_id: response_file, liked, track_wave }
+                if response_session == session_id && response_file == file_id =>
+            {
+                *state.radio_state.lock().unwrap_or_else(|p| p.into_inner()) = Some((liked, track_wave));
             },
             SrvResponse::CueSheet { session_id: response_session, file_id: response_file, sheet }
                 if response_session == session_id && response_file == file_id =>

@@ -3364,6 +3364,7 @@ impl Terminal {
                         ready,
                         cue_track: false,
                         finite_track: false,
+                        radio: None,
                         can_prev: true,
                         can_next: true,
                     };
@@ -4041,6 +4042,7 @@ impl Terminal {
             ready,
             cue_track: cue_view.is_some(),
             finite_track: finite && cue_view.is_none() && duration > std::time::Duration::ZERO,
+            radio: state.radio_state().map(|(liked, track_wave)| rich_content_audio_widget::RadioIcons { liked, track_wave }),
             // A CUE sheet and a list that does not wrap end at their ends.
             can_prev: match (&cue_view, playlist, state.playlist_looping()) {
                 (Some((.., index)), ..) => *index > 0,
@@ -4174,6 +4176,8 @@ impl Terminal {
             Cover,
             Prev,
             Next,
+            Like,
+            Wave,
             Bar(Bounds<Pixels>),
         }
         let hit = self.audio_widget_bounds.borrow().iter().find_map(|(key, bounds)| {
@@ -4183,6 +4187,10 @@ impl Terminal {
                 Hit::Prev
             } else if bounds.next.is_some_and(|r| r.contains(&position)) {
                 Hit::Next
+            } else if bounds.like.is_some_and(|r| r.contains(&position)) {
+                Hit::Like
+            } else if bounds.wave.is_some_and(|r| r.contains(&position)) {
+                Hit::Wave
             } else if let Some(bar) = bounds.bar.filter(|r| r.contains(&position)) {
                 Hit::Bar(bar)
             } else {
@@ -4197,6 +4205,8 @@ impl Terminal {
             Hit::Cover => self.toggle_rich_content_audio_playback(session_id, file_id),
             Hit::Prev => self.step_audio_track((session_id, file_id), -1),
             Hit::Next => self.step_audio_track((session_id, file_id), 1),
+            Hit::Like => rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::ToggleLike),
+            Hit::Wave => rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::ToggleTrackWave),
             Hit::Bar(bar) => {
                 if bar.size.width > Pixels::ZERO {
                     let fraction = ((position.x - bar.origin.x) / bar.size.width).clamp(0.0, 1.0);

@@ -55,6 +55,9 @@ pub struct AudioNowPlaying {
     /// Yandex Music track): the time shown is the player's own and the bar
     /// can be seeked, unlike a live station's track timed by its clock.
     pub finite_track: bool,
+    /// The track belongs to a streaming service's radio: the like and the
+    /// wave icons are shown.
+    pub radio: Option<RadioIcons>,
     /// Whether the previous / next button works. A CUE sheet is not a
     /// circle: its first track has no previous, its last no next.
     pub can_prev: bool,
@@ -67,6 +70,15 @@ pub fn cue_track_index(tracks: &[somsrv::protocol::CueTrack], position_ms: u64) 
     tracks.partition_point(|track| track.start_ms <= position_ms).saturating_sub(1)
 }
 
+/// What a radio widget's two icons show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadioIcons {
+    /// The track is liked.
+    pub liked: bool,
+    /// The radio is the one built from a track, not the session's own.
+    pub track_wave: bool,
+}
+
 /// Where the widget's clickable parts were painted this frame.
 #[derive(Clone, Copy, Default)]
 pub struct AudioWidgetBounds {
@@ -76,6 +88,10 @@ pub struct AudioWidgetBounds {
     pub next: Option<Bounds<Pixels>>,
     /// The progress bar; clicking seeks when the track has a duration.
     pub bar: Option<Bounds<Pixels>>,
+    /// The like icon of a radio widget.
+    pub like: Option<Bounds<Pixels>>,
+    /// The icon that switches to the radio built from the playing track.
+    pub wave: Option<Bounds<Pixels>>,
 }
 
 /// `(duration, elapsed)` of a station's current track, `remaining_ms`

@@ -149,6 +149,8 @@ struct Inner {
     playlists: HashMap<CacheKey, (u32, u32, Option<String>, bool)>,
     /// The CUE sheet a key plays (`set_cue_sheet`).
     cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
+    /// `(liked, track_wave)` the radio icons show for a key (`set_radio_state`).
+    radio_states: HashMap<CacheKey, (bool, bool)>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -343,6 +345,9 @@ impl SrvCache {
         if let Some((index, len, title, looping)) = inner.playlists.get(&key).cloned() {
             let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title, looping });
         }
+        if let Some((liked, track_wave)) = inner.radio_states.get(&key).copied() {
+            let _ = send(SrvResponse::RadioState { session_id, file_id, liked, track_wave });
+        }
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
         }
@@ -424,6 +429,28 @@ impl SrvCache {
             }
         }
         inner.cue_sheets.insert(key, sheet);
+    }
+
+    /// Records what the radio icons show for `(session_id, file_id)` and
+    /// pushes it to the key's subscribers.
+    pub fn set_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        if let Some(subscribers) = inner.subscribers.get(&key) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::RadioState { session_id, file_id, liked, track_wave });
+            }
+        }
+        inner.radio_states.insert(key, (liked, track_wave));
+    }
+
+    /// Forwards a click on a radio icon to the key's registered range
+    /// responder (the radio runner). Silently a no-op without one.
+    pub fn route_radio_control(&self, session_id: u32, file_id: u32, control: somsrv::protocol::RadioControl) {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(route) = inner.range_response_routes.get(&(session_id, file_id)) {
+            let _ = route(SrvRequest::RadioControl { session_id, file_id, control });
+        }
     }
 
     /// Forwards a previous/next request to the key's registered range
@@ -1270,5 +1297,23 @@ mod tests {
             vec![(0, 2, Some("Radio Paradise - Main Mix".to_string()))],
             "a late subscriber must learn the station's name too"
         );
+    }
+
+    #[test]
+    fn radio_state_is_pushed_and_replayed() {
+        let cache = SrvCache::new();
+        cache.set_radio_state(1, 2, true, false);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        cache.subscribe(1, 2, Arc::new(move |response| {
+            if let SrvResponse::RadioState { liked, track_wave, .. } = response {
+                sink.lock().unwrap().push((liked, track_wave));
+            }
+            Ok(())
+        }));
+        cache.set_radio_state(1, 2, true, true);
+
+        assert_eq!(*seen.lock().unwrap(), vec![(true, false), (true, true)], "a late subscriber learns the state, then every change");
     }
 }

@@ -575,6 +575,20 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     log::warn!("feedback to the radio {station:?} failed: {err:#}");
                 }
             }
+            SrvRequest::RadioLike { service, track_id, liked } => {
+                let done = crate::services::by_id(&service)
+                    .ok_or_else(|| anyhow::anyhow!("unknown streaming service {service:?}"))
+                    .and_then(|service| service.set_like(&track_id, liked));
+                if let Err(err) = done {
+                    log::warn!("liking track {track_id:?} failed: {err:#}");
+                }
+            }
+            SrvRequest::RadioControl { session_id, file_id, control } => {
+                cache.route_radio_control(session_id, file_id, control);
+            }
+            SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave } => {
+                cache.set_radio_state(session_id, file_id, liked, track_wave);
+            }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {
                 cache.route_playlist_step(session_id, file_id, delta);
             }

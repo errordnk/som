@@ -11,8 +11,6 @@ pub mod yandex;
 pub enum LinkKind {
     /// One track.
     Track,
-    /// A finite list of tracks (an album, a playlist): played once.
-    List,
     /// An endless radio the service picks the tracks of (Yandex Music's
     /// "My Wave"); `station` is the service's own name of it.
     Radio { station: String },
@@ -34,9 +32,6 @@ pub fn classify(target: &str) -> Option<ServiceLink> {
     if yandex::parse_track_url(target).is_some() {
         return Some(ServiceLink { service: yandex::ID, kind: LinkKind::Track });
     }
-    if yandex::parse_list_url(target).is_some() {
-        return Some(ServiceLink { service: yandex::ID, kind: LinkKind::List });
-    }
     None
 }
 
@@ -48,8 +43,7 @@ mod tests {
     fn a_target_is_told_by_what_it_stands_for() {
         let yandex = |kind| Some(ServiceLink { service: "yandex", kind });
         assert_eq!(classify("https://music.yandex.ru/album/9158345/track/10994777"), yandex(LinkKind::Track));
-        assert_eq!(classify("https://music.yandex.ru/album/9158345"), yandex(LinkKind::List));
-        assert_eq!(classify("https://music.yandex.ru/users/someone/playlists/1003"), yandex(LinkKind::List));
+        assert_eq!(classify("https://music.yandex.ru/album/9158345"), None);
         assert_eq!(classify("yandex:wave"), yandex(LinkKind::Radio { station: "user:onyourwave".into() }));
         assert_eq!(classify("https://music.yandex.ru/"), yandex(LinkKind::Radio { station: "user:onyourwave".into() }));
         assert_eq!(classify("https://stream.radioparadise.com/flacm"), None);

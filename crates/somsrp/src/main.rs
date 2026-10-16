@@ -1571,11 +1571,22 @@ fn radio_target(target: &str) -> Option<(&'static str, String)> {
     }
 }
 
-/// The radio a playlist stands for: its one line. A radio is endless and
+/// A playlist line that names Yandex Music at all: in a playlist it stands
+/// for the service's radio, whatever else the line says.
+fn names_yandex(line: &str) -> bool {
+    line.to_ascii_lowercase().contains("yandex")
+}
+
+/// The radio a playlist stands for: its one line - a Yandex Music one is
+/// "My Wave" unless it asks for the wave of a track. A radio is endless and
 /// plays on its own, so it cannot share a playlist with other entries
 /// (`Err`); a playlist without a radio line is `Ok(None)`.
 fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, String)>, String> {
-    let Some(radio) = entries.iter().find_map(|entry| radio_target(&entry.target)) else {
+    let radio = entries.iter().find_map(|entry| {
+        radio_target(&entry.target)
+            .or_else(|| names_yandex(&entry.target).then(|| (somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string())))
+    });
+    let Some(radio) = radio else {
         return Ok(None);
     };
     if entries.len() > 1 {
@@ -1715,8 +1726,8 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
         if line.starts_with('#') {
             continue;
         }
-        // A service's own name (`yandex:wave`) is not a file name either.
-        let is_url = line.starts_with("http://") || line.starts_with("https://") || somsrv::service_link::classify(line).is_some();
+        // A line naming the radio service is not a file name either.
+        let is_url = line.starts_with("http://") || line.starts_with("https://") || names_yandex(line);
         let path = std::path::Path::new(line);
         let target = match (is_url, path.is_absolute(), base_dir) {
             (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
@@ -2304,6 +2315,9 @@ yandex:wave
         assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
         assert_eq!(radio_in_playlist(&[entry("yandex:track:38526")]), Ok(Some(("yandex", "track:38526".to_string()))));
         assert_eq!(radio_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
+        // Any line that names Yandex stands for My Wave.
+        assert_eq!(radio_in_playlist(&[entry("Yandex Music")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
+        assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/album/1/track/2")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
         assert!(radio_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
     }
 }

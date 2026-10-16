@@ -700,6 +700,27 @@ pub enum SrvRequest {
     /// fire-and-forget (nothing is answered). `batch_id` is the one the
     /// track came in; `played_seconds` is how long it was heard.
     RadioFeedback { service: String, station: String, batch_id: String, event: RadioEvent, track_id: String, played_seconds: f32 },
+    /// Likes (`liked`) or un-likes a track of the account; fire-and-forget.
+    RadioLike { service: String, track_id: String, liked: bool },
+    /// Sent by Som on a fresh, one-shot connection when the user clicks one
+    /// of the radio widget's icons. Routed like `PlaylistStep` to the key's
+    /// registered range responder - the radio runner - which owns the
+    /// state they change. Silently dropped if that runner is gone.
+    RadioControl { session_id: u32, file_id: u32, control: RadioControl },
+    /// Sent by the radio runner: what the widget's radio icons show for
+    /// the key's track. `somsrv` stores it and pushes `SrvResponse::RadioState`
+    /// to the key's subscribers (and replays it to a late one).
+    AnnounceRadioState { session_id: u32, file_id: u32, liked: bool, track_wave: bool },
+}
+
+/// What a click on an icon of the radio widget asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RadioControl {
+    /// Like the track, or take the like back.
+    ToggleLike,
+    /// Switch between the radio the session started with and the radio
+    /// built from the track that is playing.
+    ToggleTrackWave,
 }
 
 /// What a listener did to a track of a radio.
@@ -834,6 +855,10 @@ pub enum SrvResponse {
     /// Answers `SrvRequest::RadioTracks` when the batch could not be
     /// fetched; `reason` is meant to be shown as it is.
     RadioFailed { reason: String },
+    /// Pushed to subscribers with what the radio icons show for the key's
+    /// track - see `SrvRequest::AnnounceRadioState`. Also replayed to a late
+    /// subscriber.
+    RadioState { session_id: u32, file_id: u32, liked: bool, track_wave: bool },
     /// Pushed to every `SubscribeProgress` subscriber of the key whenever
     /// `somsrv` learns what an internet-radio stream it is fetching is
     /// currently playing - see [`NowPlayingInfo`]. The latest one is also

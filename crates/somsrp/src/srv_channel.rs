@@ -210,6 +210,17 @@ impl SrvChannel {
         )
     }
 
+    /// Likes (`liked`) or un-likes a track (`SrvRequest::RadioLike`).
+    pub fn radio_like(&self, service: &str, track_id: &str, liked: bool) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::RadioLike { service: service.to_string(), track_id: track_id.to_string(), liked })
+    }
+
+    /// Tells `somsrv` what the radio icons of `(session_id, file_id)` show
+    /// (`SrvRequest::AnnounceRadioState`).
+    pub fn announce_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave })
+    }
+
     pub fn stop_playback(&self, session_id: u32, file_id: u32) -> Result<(), String> {
         send(&self.connection, &SrvRequest::StopPlayback { session_id, file_id })
     }

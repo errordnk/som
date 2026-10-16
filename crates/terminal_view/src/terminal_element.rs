@@ -3928,7 +3928,9 @@ fn paint_now_playing_audio_in_box(
         let elapsed_width = paint_time(&elapsed_text, x, window, cx);
         x += elapsed_width + cell_width;
         if has_remaining {
-            let remaining_text = format_clock(duration.saturating_sub(elapsed));
+            // Both numbers count whole seconds from the same instant, so
+            // they change together: one frame a second shows both.
+            let remaining_text = format_clock(remaining_whole_seconds(duration, elapsed));
             let remaining_width = measure_time(&remaining_text, window);
             paint_time(&remaining_text, right - remaining_width, window, cx);
             right -= remaining_width + cell_width;
@@ -3952,6 +3954,14 @@ fn paint_now_playing_audio_in_box(
     let clock = is_playing.then(|| until_next_second(elapsed));
     let repaint_after = [marquee_wake, loading, clock].into_iter().flatten().min();
     (widget_bounds, repaint_after)
+}
+
+/// The time left as the difference of whole seconds: `duration` and
+/// `elapsed` both cut to whole seconds first. Subtracting the exact values
+/// made the left-over number tick at another moment of each second than the
+/// elapsed one, so two frames a second.
+fn remaining_whole_seconds(duration: std::time::Duration, elapsed: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(duration.as_secs().saturating_sub(elapsed.as_secs()))
 }
 
 /// How long until the whole-second clock of a track at `elapsed` shows the
@@ -4921,6 +4931,16 @@ mod tests {
         // Negative: lines -7, -6, -5, -4
         assert_eq!(negative_filtered.first().unwrap().point.line, Line(-7));
         assert_eq!(negative_filtered.last().unwrap().point.line, Line(-4));
+    }
+
+    #[test]
+    fn the_time_left_ticks_together_with_the_time_played() {
+        let duration = std::time::Duration::from_millis(355_700);
+        // The played clock shows 3 from 3.0 s to 3.999 s; so must the left-over.
+        let at = |ms| remaining_whole_seconds(duration, std::time::Duration::from_millis(ms));
+        assert_eq!(at(3_000), at(3_999));
+        assert_ne!(at(3_999), at(4_000));
+        assert_eq!(at(3_000).as_secs(), 352);
     }
 
     #[test]

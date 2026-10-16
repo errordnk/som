@@ -44,21 +44,21 @@ pub fn fetch_and_stream(cache: &SrvCache, session_id: u32, file_id: u32, target:
     }
 }
 
-/// A Yandex Music track link: the service's own API gives the encrypted
+/// A track link of a streaming service: the service's own API gives the
 /// stream and the tags, the cache gets plain audio.
-fn fetch_yandex_track(cache: &SrvCache, session_id: u32, file_id: u32, track: &crate::yandex_music::TrackRef) -> anyhow::Result<()> {
-    let opened = crate::yandex_music::open_track(track)?;
-    let meta = &opened.meta;
+fn fetch_service_track(cache: &SrvCache, session_id: u32, file_id: u32, service: &dyn crate::services::StreamingService, url: &str) -> anyhow::Result<()> {
+    let opened = service.open_track(url)?;
+    let info = &opened.info;
     cache.set_now_playing(NowPlayingInfo {
         session_id,
         file_id,
-        artist: meta.artist.clone(),
-        title: meta.title.clone(),
-        album: meta.album.clone(),
-        year: meta.year,
-        duration_ms: meta.duration_ms,
-        remaining_ms: meta.duration_ms,
-        cover_url: meta.cover_url.clone(),
+        artist: info.artist.clone(),
+        title: info.title.clone(),
+        album: info.album.clone(),
+        year: info.year,
+        duration_ms: info.duration_ms,
+        remaining_ms: info.duration_ms,
+        cover_url: info.cover_url.clone(),
         cover_lookup_pending: false,
         next: None,
     });
@@ -66,8 +66,11 @@ fn fetch_yandex_track(cache: &SrvCache, session_id: u32, file_id: u32, track: &c
 }
 
 fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> anyhow::Result<()> {
-    if let Some(track) = crate::yandex_music::parse_track_url(url) {
-        return fetch_yandex_track(cache, session_id, file_id, &track);
+    if let Some(link) = somsrv::service_link::classify(url)
+        && link.kind == somsrv::service_link::LinkKind::Track
+        && let Some(service) = crate::services::by_id(link.service)
+    {
+        return fetch_service_track(cache, session_id, file_id, service, url);
     }
     // Radio servers interleave the current title into the audio when asked.
     let response = ureq::get(url).header("Icy-MetaData", "1").call()?;

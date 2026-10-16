@@ -551,6 +551,7 @@ impl TerminalBuilder {
             audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
             grid_generation: std::cell::Cell::new(0),
             last_wakeup_emit: std::cell::Cell::new(None),
+            redraw_due: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_wakeup_seen: std::cell::Cell::new(None),
             wakeup_pending: std::cell::Cell::new(false),
             placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
@@ -896,6 +897,7 @@ impl TerminalBuilder {
                 audio_displayed_remaining: std::cell::RefCell::new(std::collections::HashMap::new()),
                 grid_generation: std::cell::Cell::new(0),
                 last_wakeup_emit: std::cell::Cell::new(None),
+                redraw_due: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 last_wakeup_seen: std::cell::Cell::new(None),
                 wakeup_pending: std::cell::Cell::new(false),
                 placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
@@ -1409,6 +1411,9 @@ pub struct Terminal {
     /// a trailing notification is already waiting for the end of the
     /// interval - see `emit_wakeup_throttled`.
     last_wakeup_emit: std::cell::Cell<Option<Instant>>,
+    /// When the redraw requested by [`Terminal::schedule_redraw`] is due,
+    /// if one is waiting.
+    redraw_due: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
     /// When the last piece of output was seen.
     last_wakeup_seen: std::cell::Cell<Option<Instant>>,
     wakeup_pending: std::cell::Cell<bool>,
@@ -4008,6 +4013,31 @@ impl Terminal {
                 _ => true,
             },
         })
+    }
+
+    /// Asks for ONE redraw of the window `after` from now - for a widget
+    /// whose picture changes at its own pace (the seconds of a clock, the
+    /// slide of a long title) instead of the display's refresh rate. A
+    /// request that is already waiting for an earlier moment covers this
+    /// one. Called from the paint path.
+    pub fn schedule_redraw(&self, after: std::time::Duration, window: &gpui::Window, cx: &gpui::App) {
+        let due = Instant::now() + after;
+        {
+            let mut waiting = self.redraw_due.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if waiting.is_some_and(|waiting| waiting <= due) {
+                return;
+            }
+            *waiting = Some(due);
+        }
+        let pending = self.redraw_due.clone();
+        let handle = window.window_handle();
+        let timer = cx.background_executor().timer(after);
+        cx.spawn(async move |cx| {
+            timer.await;
+            *pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            util::ResultExt::log_err(handle.update(cx, |_, window, _| window.refresh()));
+        })
+        .detach();
     }
 
     /// Where the CUE sheet of `key`'s file puts the playhead: the sheet,

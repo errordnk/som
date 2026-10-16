@@ -544,15 +544,40 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::Handshake(_) => {
                 log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
             }
-            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags } => {
+            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping } => {
                 let lookup_pending = crate::now_playing::station_for_url(&target).is_some();
-                cache.set_playlist(session_id, file_id, title, index, len, lookup_pending);
+                cache.set_playlist(session_id, file_id, title, index, len, looping, lookup_pending);
                 if let Some(tags) = tags {
                     crate::now_playing::announce_file_tags(cache.clone(), session_id, file_id, tags);
                 }
             }
             SrvRequest::AnnounceCue { session_id, file_id, sheet } => {
                 cache.set_cue_sheet(session_id, file_id, sheet);
+            }
+            SrvRequest::ResolvePlaylist { url } => {
+                let answer = match crate::yandex_music::resolve_list(&url) {
+                    Ok(tracks) => SrvResponse::PlaylistResolved { tracks },
+                    Err(err) => {
+                        log::warn!("resolving the playlist {url:?} failed: {err:#}");
+                        SrvResponse::PlaylistResolveFailed { reason: format!("{err:#}") }
+                    },
+                };
+                send_srv(&connection, &writer, &answer)?;
+            }
+            SrvRequest::WaveTracks { station, queue } => {
+                let answer = match crate::yandex_music::wave_tracks(&station, queue.as_deref()) {
+                    Ok((batch_id, tracks)) => SrvResponse::WaveTracks { batch_id, tracks },
+                    Err(err) => {
+                        log::warn!("the wave {station:?} failed: {err:#}");
+                        SrvResponse::PlaylistResolveFailed { reason: format!("{err:#}") }
+                    },
+                };
+                send_srv(&connection, &writer, &answer)?;
+            }
+            SrvRequest::WaveFeedback { station, batch_id, event, track_id, played_seconds } => {
+                if let Err(err) = crate::yandex_music::wave_feedback(&station, &batch_id, event, &track_id, played_seconds) {
+                    log::warn!("feedback to the wave {station:?} failed: {err:#}");
+                }
             }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {
                 cache.route_playlist_step(session_id, file_id, delta);

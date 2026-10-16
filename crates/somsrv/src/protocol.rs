@@ -583,6 +583,11 @@ pub enum SrvRequest {
         len: u32,
         target: String,
         tags: Option<TrackTags>,
+        /// `false` for a list that does not wrap around (a Yandex Music
+        /// album or wave): previous is unavailable on the first entry,
+        /// next on the last. A client that does not send it gets `true`.
+        #[serde(default = "default_looping")]
+        looping: bool,
     },
     /// Sent by Som on a fresh, one-shot connection when the user presses
     /// previous (`delta: -1`) or next (`delta: 1`) on a playlist
@@ -685,6 +690,40 @@ pub enum SrvRequest {
     /// can show the track the playhead is in and step between tracks by
     /// seeking inside the one file.
     AnnounceCue { session_id: u32, file_id: u32, sheet: CueSheet },
+    /// Asks `somsrv` to turn a link to a list of tracks (a Yandex Music
+    /// album or playlist) into the tracks' own links, which only it can
+    /// do: it holds the service's token. Answered with
+    /// `SrvResponse::PlaylistResolved` or `SrvResponse::PlaylistResolveFailed`.
+    ResolvePlaylist { url: String },
+    /// Asks for the next batch of a Yandex Music "wave" station (`station`
+    /// like `user:onyourwave` or `track:<id>`); `queue` is the track the
+    /// listener has reached, so the batch continues after it. Answered
+    /// with `SrvResponse::WaveTracks` or `SrvResponse::PlaylistResolveFailed`.
+    WaveTracks { station: String, queue: Option<String> },
+    /// Tells the station what the listener did, so it can adapt;
+    /// fire-and-forget (nothing is answered). `batch_id` is the one the
+    /// track came in; `played_seconds` is how long it was heard.
+    WaveFeedback { station: String, batch_id: String, event: WaveEvent, track_id: String, played_seconds: f32 },
+}
+
+/// What a listener did to a track of a wave station.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaveEvent {
+    RadioStarted,
+    TrackStarted,
+    TrackFinished,
+    Skip,
+}
+
+/// One track of a wave batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaveTrack {
+    pub id: String,
+    pub title: String,
+    /// The link that plays it.
+    pub target: String,
+    /// Whether the account has already liked it.
+    pub liked: bool,
 }
 
 /// daemon -> `somsrp`/other SRP clients, answering a `SrvRequest`.
@@ -793,6 +832,14 @@ pub enum SrvResponse {
     /// of this today (a markdown widget showing "failed to load"), which
     /// has no need to branch on failure kind.
     FetchFailed { session_id: u32, file_id: u32, reason: String },
+    /// Answers `SrvRequest::ResolvePlaylist`: the tracks to play, in order.
+    PlaylistResolved { tracks: Vec<ResolvedTrack> },
+    /// Answers `SrvRequest::WaveTracks`: the next tracks of the station and
+    /// the id of the batch they came in.
+    WaveTracks { batch_id: String, tracks: Vec<WaveTrack> },
+    /// Answers `SrvRequest::ResolvePlaylist` when the list could not be
+    /// resolved; `reason` is meant to be shown as it is.
+    PlaylistResolveFailed { reason: String },
     /// Pushed to every `SubscribeProgress` subscriber of the key whenever
     /// `somsrv` learns what an internet-radio stream it is fetching is
     /// currently playing - see [`NowPlayingInfo`]. The latest one is also
@@ -804,7 +851,18 @@ pub enum SrvResponse {
     ///
     /// `title` is the entry's name from the playlist (`#EXTINF`), e.g. the
     /// station - what stays on screen between a stream's songs.
-    Playlist { session_id: u32, file_id: u32, index: u32, len: u32, title: Option<String> },
+    ///
+    /// `looping` is `false` for a list that does not wrap around - see
+    /// `SrvRequest::AnnounceTrack`.
+    Playlist {
+        session_id: u32,
+        file_id: u32,
+        index: u32,
+        len: u32,
+        title: Option<String>,
+        #[serde(default = "default_looping")]
+        looping: bool,
+    },
     /// Pushed to subscribers with the track list of the key's CUE sheet
     /// - see `SrvRequest::AnnounceCue`. Also replayed to a late
     /// subscriber.
@@ -822,6 +880,19 @@ pub struct CueSheet {
     /// Where the album's picture is (a path, found next to the sheet).
     pub cover: Option<String>,
     pub tracks: Vec<CueTrack>,
+}
+
+/// A playlist wraps around unless it says otherwise.
+fn default_looping() -> bool {
+    true
+}
+
+/// One track of a resolved playlist: what to show for it and the link that
+/// plays it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTrack {
+    pub title: String,
+    pub target: String,
 }
 
 /// One track of a [`CueSheet`].

@@ -16,6 +16,7 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use somsrv::protocol::{ResolvedTrack, WaveEvent, WaveTrack};
 use std::io::Read;
 use std::time::Duration;
 
@@ -33,6 +34,40 @@ const TRANSPORT: &str = "encraw";
 /// may be a plain MP3 whatever is asked.
 const QUALITY: &str = "lossless";
 const CODECS: [&str; 2] = ["flac", "mp3"];
+
+/// A link to a list of tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListRef {
+    Album { id: String },
+    /// `users/<owner>/playlists/<kind>`.
+    UserPlaylist { owner: String, kind: String },
+    /// `playlists/<uuid>`: the shared form of a playlist link.
+    SharedPlaylist { uuid: String },
+}
+
+/// `https://music.yandex.ru/album/N`, `…/users/<owner>/playlists/<kind>` or
+/// `…/playlists/<uuid>`; a link to one track of an album is a track, not
+/// a list.
+pub fn parse_list_url(url: &str) -> Option<ListRef> {
+    if parse_track_url(url).is_some() {
+        return None;
+    }
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    if !host.strip_prefix("www.").unwrap_or(host).starts_with("music.yandex.") {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    match segments.as_slice() {
+        ["album", id] if id.bytes().all(|byte| byte.is_ascii_digit()) => Some(ListRef::Album { id: (*id).to_string() }),
+        ["users", owner, "playlists", kind] if kind.bytes().all(|byte| byte.is_ascii_digit()) => {
+            Some(ListRef::UserPlaylist { owner: (*owner).to_string(), kind: (*kind).to_string() })
+        },
+        ["playlists", uuid] => Some(ListRef::SharedPlaylist { uuid: (*uuid).to_string() }),
+        _ => None,
+    }
+}
 
 /// A track a link points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +252,15 @@ fn load_account() -> anyhow::Result<Account> {
     Ok(account_from_settings(&text))
 }
 
+/// The account's token and a client set up for it (with its proxy).
+fn signed_in_agent() -> anyhow::Result<(String, ureq::Agent)> {
+    let account = load_account()?;
+    let token = account
+        .token
+        .ok_or_else(|| anyhow::anyhow!("no Yandex Music token: set music.yandex.token in settings.json"))?;
+    Ok((token, agent(account.proxy.as_deref())?))
+}
+
 /// An opened track: its (decrypted) audio, size and tags.
 pub struct OpenedTrack {
     pub reader: Box<dyn Read + Send>,
@@ -251,6 +295,24 @@ fn api_get(agent: &ureq::Agent, token: &str, what: &str, url: &str) -> anyhow::R
     Ok(body)
 }
 
+fn api_post(agent: &ureq::Agent, token: &str, what: &str, url: &str, json_body: &str) -> anyhow::Result<String> {
+    let mut response = agent
+        .post(url)
+        .header("Authorization", format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT_HEADER)
+        .header("User-Agent", USER_AGENT)
+        .header("Content-Type", "application/json")
+        .send(json_body)
+        .map_err(|err| anyhow::anyhow!("Yandex Music {what} request failed: {err}"))?;
+    let status = response.status();
+    let body = response.body_mut().read_to_string()?;
+    if !status.is_success() {
+        let said: String = body.chars().take(300).collect();
+        anyhow::bail!("Yandex Music {what} answered {status}: {said}");
+    }
+    Ok(body)
+}
+
 /// The stream of the best quality the account is entitled to.
 fn file_info(agent: &ureq::Agent, token: &str, track: &TrackRef) -> anyhow::Result<FileInfo> {
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -264,13 +326,176 @@ fn file_info(agent: &ureq::Agent, token: &str, track: &TrackRef) -> anyhow::Resu
     parse_file_info(&api_get(agent, token, "file info", &format!("{API_BASE}/get-file-info?{query}"))?)
 }
 
+/// One track of an album, playlist or wave answer: its id and the link
+/// that plays it, titled "artist - title". `item` is the entry the track
+/// sits in (a playlist entry may carry the album id). `None` for a track
+/// the service marks unavailable.
+fn listed_track(track: &serde_json::Value, item: &serde_json::Value) -> Option<(String, ResolvedTrack)> {
+    if track.get("available").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let id = match track.get("id").or_else(|| item.get("id"))? {
+        serde_json::Value::String(id) => id.clone(),
+        other => other.as_u64()?.to_string(),
+    };
+    let title = track.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let artist = track
+        .get("artists")
+        .and_then(|v| v.as_array())
+        .map(|artists| artists.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str())).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    let album_id = track
+        .pointer("/albums/0/id")
+        .or_else(|| item.get("albumId"))
+        .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)));
+    let target = match album_id {
+        Some(album) => format!("https://music.yandex.ru/album/{album}/track/{id}"),
+        None => format!("https://music.yandex.ru/track/{id}"),
+    };
+    let title = if artist.is_empty() { title } else { format!("{artist} - {title}") };
+    Some((id, ResolvedTrack { title, target }))
+}
+
+/// The tracks of an album or playlist answer, in order, as links that play.
+/// A track the service marks unavailable is left out. A playlist keeps a
+/// track under a `track` key, an album directly.
+pub fn parse_list_tracks(json: &str, list: &ListRef) -> anyhow::Result<Vec<ResolvedTrack>> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let result = value.get("result").ok_or_else(|| anyhow::anyhow!("no list in the reply: {}", api_error(&value)))?;
+    let mut items: Vec<&serde_json::Value> = Vec::new();
+    match list {
+        ListRef::Album { .. } => {
+            for volume in result.get("volumes").and_then(|v| v.as_array()).into_iter().flatten() {
+                items.extend(volume.as_array().into_iter().flatten());
+            }
+        },
+        ListRef::UserPlaylist { .. } | ListRef::SharedPlaylist { .. } => {
+            items.extend(result.get("tracks").and_then(|v| v.as_array()).into_iter().flatten());
+        },
+    }
+    let tracks = items
+        .into_iter()
+        .filter_map(|item| listed_track(item.get("track").unwrap_or(item), item).map(|(_, track)| track))
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        anyhow::bail!("the list has no playable tracks");
+    }
+    Ok(tracks)
+}
+
+/// A station is `<type>:<tag>` (`user:onyourwave`, `track:38526`); nothing
+/// else may reach the URL path it is put into.
+fn valid_station(station: &str) -> anyhow::Result<()> {
+    let plain = !station.is_empty() && station.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'));
+    if !plain || !station.contains(':') {
+        anyhow::bail!("not a station name: {station:?}");
+    }
+    Ok(())
+}
+
+/// The batch of a `rotor/station/.../tracks` answer: its id and tracks.
+pub fn parse_wave(json: &str) -> anyhow::Result<(String, Vec<WaveTrack>)> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let result = value.get("result").ok_or_else(|| anyhow::anyhow!("no batch in the reply: {}", api_error(&value)))?;
+    let batch_id = result.get("batchId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let tracks = result
+        .get("sequence")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let (id, one) = listed_track(item.get("track")?, item)?;
+            Some(WaveTrack { id, title: one.title, target: one.target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false) })
+        })
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        anyhow::bail!("the station gave no tracks");
+    }
+    Ok((batch_id, tracks))
+}
+
+/// The next batch of a wave station, continuing after `queue`.
+pub fn wave_tracks(station: &str, queue: Option<&str>) -> anyhow::Result<(String, Vec<WaveTrack>)> {
+    valid_station(station)?;
+    if let Some(queue) = queue
+        && !queue.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        anyhow::bail!("not a track id: {queue:?}");
+    }
+    let (token, agent) = signed_in_agent()?;
+    let mut url = format!("{API_BASE}/rotor/station/{station}/tracks?settings2=true");
+    if let Some(queue) = queue {
+        url.push_str(&format!("&queue={queue}"));
+    }
+    parse_wave(&api_get(&agent, &token, "wave", &url)?)
+}
+
+/// `2026-10-16T08:12:30.123Z` for `unix_millis`: the time format the rotor
+/// feedback is dated in.
+pub fn iso_timestamp(unix_millis: u64) -> String {
+    let seconds = unix_millis / 1000;
+    let (days, in_day) = (seconds / 86400, seconds % 86400);
+    // Civil date from a day count (Howard Hinnant's algorithm).
+    let shifted = days as i64 + 719468;
+    let era = shifted.div_euclid(146097);
+    let day_of_era = shifted.rem_euclid(146097);
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        in_day / 3600,
+        in_day % 3600 / 60,
+        in_day % 60,
+        unix_millis % 1000
+    )
+}
+
+/// The JSON a feedback event is sent as.
+pub fn feedback_body(event: WaveEvent, track_id: &str, played_seconds: f32, timestamp: &str) -> String {
+    let body = match event {
+        WaveEvent::RadioStarted => serde_json::json!({"type": "radioStarted", "timestamp": timestamp, "from": "mobile-radio-user-onyourwave-default"}),
+        WaveEvent::TrackStarted => serde_json::json!({"type": "trackStarted", "timestamp": timestamp, "trackId": track_id}),
+        WaveEvent::TrackFinished => {
+            serde_json::json!({"type": "trackFinished", "timestamp": timestamp, "trackId": track_id, "totalPlayedSeconds": played_seconds})
+        },
+        WaveEvent::Skip => serde_json::json!({"type": "skip", "timestamp": timestamp, "trackId": track_id, "totalPlayedSeconds": played_seconds}),
+    };
+    body.to_string()
+}
+
+/// Tells a wave station what happened to a track.
+pub fn wave_feedback(station: &str, batch_id: &str, event: WaveEvent, track_id: &str, played_seconds: f32) -> anyhow::Result<()> {
+    valid_station(station)?;
+    if !batch_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')) {
+        anyhow::bail!("not a batch id: {batch_id:?}");
+    }
+    let (token, agent) = signed_in_agent()?;
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+    let body = feedback_body(event, track_id, played_seconds, &iso_timestamp(millis));
+    let url = format!("{API_BASE}/rotor/station/{station}/feedback?batch-id={batch_id}");
+    api_post(&agent, &token, "wave feedback", &url, &body)?;
+    Ok(())
+}
+
+/// The tracks of a Yandex Music album or playlist link.
+pub fn resolve_list(url: &str) -> anyhow::Result<Vec<ResolvedTrack>> {
+    let list = parse_list_url(url).ok_or_else(|| anyhow::anyhow!("not a Yandex Music album or playlist link: {url}"))?;
+    let (token, agent) = signed_in_agent()?;
+    let api_path = match &list {
+        ListRef::Album { id } => format!("albums/{id}/with-tracks"),
+        ListRef::UserPlaylist { owner, kind } => format!("users/{owner}/playlists/{kind}"),
+        ListRef::SharedPlaylist { uuid } => format!("playlist/{uuid}"),
+    };
+    parse_list_tracks(&api_get(&agent, &token, "track list", &format!("{API_BASE}/{api_path}"))?, &list)
+}
+
 /// Asks the service for the track's tags and stream and opens the stream.
 pub fn open_track(track: &TrackRef) -> anyhow::Result<OpenedTrack> {
-    let account = load_account()?;
-    let token = account
-        .token
-        .ok_or_else(|| anyhow::anyhow!("no Yandex Music token: set music.yandex.token in settings.json"))?;
-    let agent = agent(account.proxy.as_deref())?;
+    let (token, agent) = signed_in_agent()?;
 
     let meta = parse_track_meta(&api_get(&agent, &token, "track tags", &format!("{API_BASE}/tracks?track-ids={}", track.track_id))?)?;
 
@@ -375,6 +600,101 @@ mod tests {
         assert_eq!(info.url, "https://strm.example/x");
         assert_eq!(info.key.as_deref(), Some("00112233445566778899aabbccddeeff"));
         assert_eq!(info.codec, "flac");
+    }
+
+    #[test]
+    fn list_links_are_recognized() {
+        assert_eq!(parse_list_url("https://music.yandex.ru/album/9158345"), Some(ListRef::Album { id: "9158345".into() }));
+        assert_eq!(
+            parse_list_url("https://music.yandex.ru/users/someone/playlists/1003?utm=1"),
+            Some(ListRef::UserPlaylist { owner: "someone".into(), kind: "1003".into() })
+        );
+        assert_eq!(
+            parse_list_url("https://music.yandex.com/playlists/ab12-cd34"),
+            Some(ListRef::SharedPlaylist { uuid: "ab12-cd34".into() })
+        );
+        assert_eq!(parse_list_url("https://music.yandex.ru/album/9158345/track/10994777"), None);
+        assert_eq!(parse_list_url("https://music.yandex.ru/artist/1"), None);
+        assert_eq!(parse_list_url("https://example.com/album/1"), None);
+    }
+
+    #[test]
+    fn an_album_lists_its_available_tracks_in_order() {
+        let json = r#"{"result":{"volumes":[
+            [{"id":"1","title":"One","available":true,"artists":[{"name":"A"}],"albums":[{"id":77}]},
+             {"id":2,"title":"Gone","available":false,"artists":[],"albums":[{"id":77}]}],
+            [{"id":"3","title":"Three","artists":[{"name":"A"},{"name":"B"}],"albums":[{"id":77}]}]]}}"#;
+        let tracks = parse_list_tracks(json, &ListRef::Album { id: "77".into() }).expect("tracks");
+        assert_eq!(
+            tracks,
+            vec![
+                ResolvedTrack { title: "A - One".into(), target: "https://music.yandex.ru/album/77/track/1".into() },
+                ResolvedTrack { title: "A, B - Three".into(), target: "https://music.yandex.ru/album/77/track/3".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_playlist_reads_tracks_under_the_track_key() {
+        let json = r#"{"result":{"tracks":[
+            {"id":5,"albumId":"9","track":{"id":"5","title":"Five","artists":[{"name":"X"}],"albums":[{"id":9}]}},
+            {"id":6,"track":{"id":6,"title":"Six","artists":[]}}]}}"#;
+        let tracks = parse_list_tracks(json, &ListRef::UserPlaylist { owner: "o".into(), kind: "1".into() }).expect("tracks");
+        assert_eq!(tracks[0].target, "https://music.yandex.ru/album/9/track/5");
+        assert_eq!(tracks[1], ResolvedTrack { title: "Six".into(), target: "https://music.yandex.ru/track/6".into() });
+        assert!(parse_list_tracks(r#"{"result":{"tracks":[]}}"#, &ListRef::SharedPlaylist { uuid: "u".into() }).is_err());
+    }
+
+    #[test]
+    fn a_wave_batch_is_parsed() {
+        let json = r#"{"result":{"batchId":"1792-362","sequence":[
+            {"type":"track","liked":true,"track":{"id":"38526","title":"Roads","artists":[{"name":"Portishead"}],"albums":[{"id":3193}]}},
+            {"type":"track","liked":false,"track":{"id":80041888,"title":"Take Me Away","artists":[{"name":"Monolink"}],"albums":[{"id":14617746}]}},
+            {"type":"track","track":{"id":"9","title":"Gone","available":false}}]}}"#;
+        let (batch, tracks) = parse_wave(json).expect("batch");
+        assert_eq!(batch, "1792-362");
+        assert_eq!(tracks.len(), 2, "an unavailable track is left out");
+        assert_eq!(
+            tracks[0],
+            WaveTrack {
+                id: "38526".into(),
+                title: "Portishead - Roads".into(),
+                target: "https://music.yandex.ru/album/3193/track/38526".into(),
+                liked: true,
+            }
+        );
+        assert_eq!(tracks[1].id, "80041888");
+        assert!(!tracks[1].liked);
+        assert!(parse_wave(r#"{"result":{"batchId":"b","sequence":[]}}"#).is_err());
+    }
+
+    #[test]
+    fn only_station_names_reach_the_url() {
+        assert!(valid_station("user:onyourwave").is_ok());
+        assert!(valid_station("track:38526").is_ok());
+        assert!(valid_station("").is_err());
+        assert!(valid_station("noseparator").is_err());
+        assert!(valid_station("user:../account").is_err());
+        assert!(valid_station("user:a?b=c").is_err());
+    }
+
+    #[test]
+    fn the_feedback_timestamp_is_iso_utc() {
+        assert_eq!(iso_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(951_782_400_123), "2000-02-29T00:00:00.123Z");
+        assert_eq!(iso_timestamp(1_792_139_758_049), "2026-10-16T08:35:58.049Z");
+    }
+
+    #[test]
+    fn feedback_bodies_carry_what_the_station_needs() {
+        let started: serde_json::Value = serde_json::from_str(&feedback_body(WaveEvent::TrackStarted, "38526", 0.0, "T")).expect("json");
+        assert_eq!((started["type"].as_str(), started["trackId"].as_str()), (Some("trackStarted"), Some("38526")));
+        let skipped: serde_json::Value = serde_json::from_str(&feedback_body(WaveEvent::Skip, "38526", 12.5, "T")).expect("json");
+        assert_eq!(skipped["type"], "skip");
+        assert_eq!(skipped["totalPlayedSeconds"], 12.5);
+        let radio: serde_json::Value = serde_json::from_str(&feedback_body(WaveEvent::RadioStarted, "", 0.0, "T")).expect("json");
+        assert_eq!(radio["type"], "radioStarted");
+        assert!(radio.get("trackId").is_none());
     }
 
     #[test]

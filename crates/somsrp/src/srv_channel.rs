@@ -164,6 +164,55 @@ impl SrvChannel {
     /// the old player would keep sounding with no widget left to reach
     /// it. Best sent on a fresh one-shot connection - a connection busy
     /// serving a long `FetchResource` cannot read further requests.
+    /// Asks the daemon for the tracks of a Yandex Music album or playlist
+    /// link (`SrvRequest::ResolvePlaylist`) and waits for its answer.
+    pub fn resolve_playlist(&self, url: &str) -> Result<Vec<somsrv::protocol::ResolvedTrack>, String> {
+        send(&self.connection, &SrvRequest::ResolvePlaylist { url: url.to_string() })?;
+        loop {
+            match read_any(&self.connection)? {
+                Incoming::Response(SrvResponse::PlaylistResolved { tracks }) => return Ok(tracks),
+                Incoming::Response(SrvResponse::PlaylistResolveFailed { reason }) => return Err(reason),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Asks the daemon for the next batch of a Yandex Music wave station,
+    /// continuing after `queue` (`SrvRequest::WaveTracks`): the batch id and
+    /// its tracks.
+    pub fn wave_tracks(&self, station: &str, queue: Option<&str>) -> Result<(String, Vec<somsrv::protocol::WaveTrack>), String> {
+        send(&self.connection, &SrvRequest::WaveTracks { station: station.to_string(), queue: queue.map(str::to_string) })?;
+        loop {
+            match read_any(&self.connection)? {
+                Incoming::Response(SrvResponse::WaveTracks { batch_id, tracks }) => return Ok((batch_id, tracks)),
+                Incoming::Response(SrvResponse::PlaylistResolveFailed { reason }) => return Err(reason),
+                _ => continue,
+            }
+        }
+    }
+
+    /// Tells a wave station what the listener did (`SrvRequest::WaveFeedback`);
+    /// nothing is answered.
+    pub fn wave_feedback(
+        &self,
+        station: &str,
+        batch_id: &str,
+        event: somsrv::protocol::WaveEvent,
+        track_id: &str,
+        played_seconds: f32,
+    ) -> Result<(), String> {
+        send(
+            &self.connection,
+            &SrvRequest::WaveFeedback {
+                station: station.to_string(),
+                batch_id: batch_id.to_string(),
+                event,
+                track_id: track_id.to_string(),
+                played_seconds,
+            },
+        )
+    }
+
     pub fn stop_playback(&self, session_id: u32, file_id: u32) -> Result<(), String> {
         send(&self.connection, &SrvRequest::StopPlayback { session_id, file_id })
     }
@@ -180,8 +229,9 @@ impl SrvChannel {
         len: u32,
         target: String,
         tags: Option<somsrv::protocol::TrackTags>,
+        looping: bool,
     ) -> Result<(), String> {
-        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags })
+        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping })
     }
 
     /// Tells `somsrv` the track list of the CUE sheet `(session_id,

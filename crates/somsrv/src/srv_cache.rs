@@ -146,7 +146,7 @@ struct Inner {
     /// replayed to a subscriber that arrives later.
     now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
     /// `(index, len)` of the playlist entry a key is (`set_playlist`).
-    playlists: HashMap<CacheKey, (u32, u32, Option<String>)>,
+    playlists: HashMap<CacheKey, (u32, u32, Option<String>, bool)>,
     /// The CUE sheet a key plays (`set_cue_sheet`).
     cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
 }
@@ -340,8 +340,8 @@ impl SrvCache {
         if let Some(info) = inner.now_playing.get(&key) {
             let _ = send(SrvResponse::NowPlaying(info.clone()));
         }
-        if let Some((index, len, title)) = inner.playlists.get(&key).cloned() {
-            let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title });
+        if let Some((index, len, title, looping)) = inner.playlists.get(&key).cloned() {
+            let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title, looping });
         }
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
@@ -359,13 +359,14 @@ impl SrvCache {
         title: Option<String>,
         index: u32,
         len: u32,
+        looping: bool,
         lookup_pending: bool,
     ) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         let title = title.filter(|t| !t.trim().is_empty());
-        inner.playlists.insert(key, (index, len, title.clone()));
-        let mut pushes = vec![SrvResponse::Playlist { session_id, file_id, index, len, title: title.clone() }];
+        inner.playlists.insert(key, (index, len, title.clone(), looping));
+        let mut pushes = vec![SrvResponse::Playlist { session_id, file_id, index, len, title: title.clone(), looping }];
         if title.is_none() && lookup_pending && !inner.now_playing.contains_key(&key) {
             // No title to show, but a lookup is coming: say so, so the
             // consumer holds back its stand-in picture.
@@ -1191,7 +1192,7 @@ mod tests {
         let cache = SrvCache::new();
         let seen = collect_now_playing(&cache);
 
-        cache.set_playlist(1, 2, Some("Radio Paradise".to_string()), 0, 2, true);
+        cache.set_playlist(1, 2, Some("Radio Paradise".to_string()), 0, 2, true, true);
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -1204,7 +1205,7 @@ mod tests {
         let cache = SrvCache::new();
         let seen = collect_now_playing(&cache);
 
-        cache.set_playlist(1, 2, Some("song".to_string()), 0, 1, false);
+        cache.set_playlist(1, 2, Some("song".to_string()), 0, 1, true, false);
 
         assert!(!seen.lock().unwrap()[0].cover_lookup_pending);
     }
@@ -1214,7 +1215,7 @@ mod tests {
         let cache = SrvCache::new();
         let seen = collect_now_playing(&cache);
 
-        cache.set_playlist(1, 2, None, 0, 2, true);
+        cache.set_playlist(1, 2, None, 0, 2, true, true);
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -1225,7 +1226,7 @@ mod tests {
     #[test]
     fn a_real_answer_replaces_the_announced_placeholder_info() {
         let cache = SrvCache::new();
-        cache.set_playlist(1, 2, Some("announced".to_string()), 0, 2, true);
+        cache.set_playlist(1, 2, Some("announced".to_string()), 0, 2, true, true);
         let seen = collect_now_playing(&cache);
         // Late subscriber gets the announced info replayed...
         assert!(seen.lock().unwrap()[0].cover_lookup_pending);
@@ -1253,7 +1254,7 @@ mod tests {
     #[test]
     fn playlist_push_carries_the_entry_title_and_is_replayed() {
         let cache = SrvCache::new();
-        cache.set_playlist(1, 2, Some("Radio Paradise - Main Mix".to_string()), 0, 2, true);
+        cache.set_playlist(1, 2, Some("Radio Paradise - Main Mix".to_string()), 0, 2, true, true);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();

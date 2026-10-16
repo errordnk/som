@@ -3363,6 +3363,7 @@ impl Terminal {
                         show_placeholder,
                         ready,
                         cue_track: false,
+                        finite_track: false,
                         can_prev: true,
                         can_next: true,
                     };
@@ -3889,11 +3890,20 @@ impl Terminal {
             (Some(sheet), Some((.., index))) => Some((*index as u32, sheet.tracks.len() as u32)),
             _ => playlist,
         };
+        // A stream with a known size ends; a station's endless one has none.
+        let finite = self.rich_content_cache.total_size(session_id, file_id) > 0;
         let (info, duration, elapsed, track_ended) = match (now, clock) {
             _ if cue_view.is_some() => cue_view
                 .as_ref()
                 .map(|(info, duration, elapsed, _)| (Some(info.clone()), *duration, *elapsed, false))
                 .unwrap_or((None, std::time::Duration::ZERO, std::time::Duration::ZERO, false)),
+            // A finite track (known length, a stream that ends): the player's
+            // clock is the time, there is no live edge to pin a report to.
+            (Some((reported, _)), Some((playhead, _, rate))) if finite && reported.duration_ms > 0 => {
+                let duration = std::time::Duration::from_millis(reported.duration_ms as u64);
+                let elapsed = std::time::Duration::from_secs_f64((playhead / rate).max(0.0)).min(duration);
+                (Some(reported), duration, elapsed, false)
+            },
             (Some((reported, age)), Some((playhead, decoded, rate))) => {
                 let generation = state.now_playing_generation();
                 let mut timelines = self.audio_timelines.borrow_mut();
@@ -4030,9 +4040,16 @@ impl Terminal {
             show_placeholder,
             ready,
             cue_track: cue_view.is_some(),
-            can_prev: cue_view.as_ref().is_none_or(|(.., index)| *index > 0),
-            can_next: match (&cue, &cue_view) {
-                (Some(sheet), Some((.., index))) => index + 1 < sheet.tracks.len(),
+            finite_track: finite && cue_view.is_none() && duration > std::time::Duration::ZERO,
+            // A CUE sheet and a list that does not wrap end at their ends.
+            can_prev: match (&cue_view, playlist, state.playlist_looping()) {
+                (Some((.., index)), ..) => *index > 0,
+                (None, Some((index, _)), false) => index > 0,
+                _ => true,
+            },
+            can_next: match (&cue, &cue_view, playlist, state.playlist_looping()) {
+                (Some(sheet), Some((.., index)), ..) => index + 1 < sheet.tracks.len(),
+                (None, None, Some((index, len)), false) => index + 1 < len,
                 _ => true,
             },
         })
@@ -4081,6 +4098,20 @@ impl Terminal {
         let start = sheet.tracks[index].start_ms;
         let end = sheet.tracks.get(index + 1).map(|next| next.start_ms).unwrap_or(file_ms);
         Some((sheet, index, start, end))
+    }
+
+    /// The length the service reported for the track of `(session_id,
+    /// file_id)` when its stream is finite (it has a known size), else `0`.
+    fn finite_track_duration_ms(&self, session_id: u32, file_id: u32) -> u32 {
+        if self.rich_content_cache.total_size(session_id, file_id) == 0 {
+            return 0;
+        }
+        self.rich_content_srv_progress
+            .borrow()
+            .get(&(session_id, file_id))
+            .and_then(|state| state.now_playing())
+            .map(|(info, _)| info.duration_ms)
+            .unwrap_or(0)
     }
 
     /// Moves the playhead of the audio placement `key` to `position_ms`
@@ -4281,8 +4312,12 @@ impl Terminal {
     /// by whichever route — sequential stream or range response — fills
     /// the gap first) produces samples that far.
     pub fn seek_rich_content_audio_playback(&self, session_id: u32, file_id: u32, fraction: f32) {
-        let duration_ms =
-            self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d).unwrap_or(0);
+        let duration_ms = match self.rich_content_cache.audio_metadata(session_id, file_id).map(|(.., d)| d) {
+            Some(duration_ms) if duration_ms > 0 => duration_ms,
+            // A fetched track carries no length of its own: the length the
+            // service reported is the timeline, if the stream is finite.
+            _ => self.finite_track_duration_ms(session_id, file_id),
+        };
         if let Some(player) = self.rich_content_audio_players.borrow().get(&(session_id, file_id)) {
             player.seek_to_fraction(fraction, duration_ms);
         }

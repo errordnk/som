@@ -51,6 +51,10 @@ pub struct AudioNowPlaying {
     /// and a click on it seeks inside it, though the track has no clock
     /// of its own.
     pub cue_track: bool,
+    /// The track has a known length and plays from a finite stream (a
+    /// Yandex Music track): the time shown is the player's own and the bar
+    /// can be seeked, unlike a live station's track timed by its clock.
+    pub finite_track: bool,
     /// Whether the previous / next button works. A CUE sheet is not a
     /// circle: its first track has no previous, its last no next.
     pub can_prev: bool,

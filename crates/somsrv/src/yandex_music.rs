@@ -212,14 +212,14 @@ fn api_get(agent: &ureq::Agent, token: &str, what: &str, url: &str) -> anyhow::R
     Ok(body)
 }
 
-fn api_post(agent: &ureq::Agent, token: &str, what: &str, url: &str, json_body: &str) -> anyhow::Result<String> {
+fn api_post(agent: &ureq::Agent, token: &str, what: &str, url: &str, content_type: &str, body: &str) -> anyhow::Result<String> {
     let mut response = agent
         .post(url)
         .header("Authorization", format!("OAuth {token}"))
         .header("X-Yandex-Music-Client", CLIENT_HEADER)
         .header("User-Agent", USER_AGENT)
-        .header("Content-Type", "application/json")
-        .send(json_body)
+        .header("Content-Type", content_type)
+        .send(body)
         .map_err(|err| anyhow::anyhow!("Yandex Music {what} request failed: {err}"))?;
     let status = response.status();
     let body = response.body_mut().read_to_string()?;
@@ -364,7 +364,30 @@ pub fn radio_feedback(station: &str, batch_id: &str, event: RadioEvent, track_id
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
     let body = feedback_body(event, track_id, played_seconds, &iso_timestamp(millis));
     let url = format!("{API_BASE}/rotor/station/{station}/feedback?batch-id={batch_id}");
-    api_post(&agent, &token, "radio feedback", &url, &body)?;
+    api_post(&agent, &token, "radio feedback", &url, "application/json", &body)?;
+    Ok(())
+}
+
+/// The account's id out of an `account/status` answer.
+pub fn parse_uid(json: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    match value.pointer("/result/account/uid") {
+        Some(serde_json::Value::Number(uid)) => Ok(uid.to_string()),
+        Some(serde_json::Value::String(uid)) if !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()) => Ok(uid.clone()),
+        _ => anyhow::bail!("no account id in the reply: {}", api_error(&value)),
+    }
+}
+
+/// Likes the track, or takes the like back.
+pub fn set_like(track_id: &str, liked: bool) -> anyhow::Result<()> {
+    if track_id.is_empty() || !track_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("not a track id: {track_id:?}");
+    }
+    let (token, agent) = signed_in_agent()?;
+    let uid = parse_uid(&api_get(&agent, &token, "account", &format!("{API_BASE}/account/status"))?)?;
+    let action = if liked { "add-multiple" } else { "remove" };
+    let url = format!("{API_BASE}/users/{uid}/likes/tracks/{action}");
+    api_post(&agent, &token, "like", &url, "application/x-www-form-urlencoded", &format!("track-ids={track_id}"))?;
     Ok(())
 }
 
@@ -410,6 +433,10 @@ impl StreamingService for YandexMusic {
 
     fn radio_feedback(&self, station: &str, batch_id: &str, event: RadioEvent, track_id: &str, played_seconds: f32) -> anyhow::Result<()> {
         radio_feedback(station, batch_id, event, track_id, played_seconds)
+    }
+
+    fn set_like(&self, track_id: &str, liked: bool) -> anyhow::Result<()> {
+        set_like(track_id, liked)
     }
 }
 
@@ -529,6 +556,14 @@ mod tests {
         let radio: serde_json::Value = serde_json::from_str(&feedback_body(RadioEvent::RadioStarted, "", 0.0, "T")).expect("json");
         assert_eq!(radio["type"], "radioStarted");
         assert!(radio.get("trackId").is_none());
+    }
+
+    #[test]
+    fn the_account_id_is_read_as_number_or_text() {
+        assert_eq!(parse_uid(r#"{"result":{"account":{"uid":12259205}}}"#).expect("uid"), "12259205");
+        assert_eq!(parse_uid(r#"{"result":{"account":{"uid":"77"}}}"#).expect("uid"), "77");
+        assert!(parse_uid(r#"{"result":{"account":{}}}"#).is_err());
+        assert!(parse_uid(r#"{"result":{"account":{"uid":"../x"}}}"#).is_err());
     }
 
     #[test]

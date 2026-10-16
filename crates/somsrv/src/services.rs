@@ -38,9 +38,12 @@ pub trait StreamingService: Sync {
 
     /// Tells the radio what the listener did to a track, so it adapts.
     fn radio_feedback(&self, station: &str, batch_id: &str, event: RadioEvent, track_id: &str, played_seconds: f32) -> anyhow::Result<()>;
+
+    /// Likes the track, or (`liked == false`) takes the like back.
+    fn set_like(&self, track_id: &str, liked: bool) -> anyhow::Result<()>;
 }
 
-/// The service with this id (`somsrv::service_link::ServiceLink::service`).
+/// The service with this id (`somsrv::service_link::track_service`).
 pub fn by_id(id: &str) -> Option<&'static dyn StreamingService> {
     match id {
         somsrv::service_link::yandex::ID => Some(&crate::yandex_music::YandexMusic),

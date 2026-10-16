@@ -66,10 +66,7 @@ fn fetch_service_track(cache: &SrvCache, session_id: u32, file_id: u32, service:
 }
 
 fn fetch_network(cache: &SrvCache, session_id: u32, file_id: u32, url: &str) -> anyhow::Result<()> {
-    if let Some(link) = somsrv::service_link::classify(url)
-        && link.kind == somsrv::service_link::LinkKind::Track
-        && let Some(service) = crate::services::by_id(link.service)
-    {
+    if let Some(service) = somsrv::service_link::track_service(url).and_then(crate::services::by_id) {
         return fetch_service_track(cache, session_id, file_id, service, url);
     }
     // Radio servers interleave the current title into the audio when asked.

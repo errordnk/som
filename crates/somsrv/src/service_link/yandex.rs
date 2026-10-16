@@ -1,4 +1,4 @@
-//! Yandex Music links: `music.yandex.*` pages and the `yandex:` names.
+//! Yandex Music links: the `music.yandex.*` page of a track.
 
 /// The service's id.
 pub const ID: &str = "yandex";
@@ -44,16 +44,6 @@ pub fn parse_track_url(url: &str) -> Option<TrackRef> {
     Some(TrackRef { track_id: track_id.to_string() })
 }
 
-/// Whether a target asks for "My Wave": `yandex:wave` or the service's
-/// home page. A session always starts there; the wave of a track is
-/// something done within a session, not a way to start one.
-pub fn is_my_wave(target: &str) -> bool {
-    if target == "yandex:wave" {
-        return true;
-    }
-    music_path(target).is_some_and(|path| path.is_empty() || path == ["home"])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,16 +62,5 @@ mod tests {
         assert_eq!(parse_track_url("https://music.yandex.ru/track/abc"), None);
         assert_eq!(parse_track_url("https://example.com/track/1"), None);
         assert_eq!(parse_track_url("/home/user/track/1"), None);
-    }
-
-    #[test]
-    fn my_wave_is_asked_for_by_name_or_by_the_home_page() {
-        assert!(is_my_wave("yandex:wave"));
-        assert!(is_my_wave("https://music.yandex.ru/"));
-        assert!(is_my_wave("https://music.yandex.ru/home?x=1"));
-        assert!(is_my_wave("https://music.yandex.com"));
-        assert!(!is_my_wave("yandex:track:38526"));
-        assert!(!is_my_wave("https://music.yandex.ru/album/1"));
-        assert!(!is_my_wave("https://example.com/"));
     }
 }

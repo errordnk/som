@@ -827,6 +827,9 @@ struct PlaylistPosition {
     /// album or radio): previous is unavailable on the first entry, next on
     /// the last.
     looping: bool,
+    /// The track belongs to a radio: its widget shows the radio's icons
+    /// (see [`announce_radio_state`]).
+    radio: bool,
 }
 
 /// One playable entry of a parsed playlist.
@@ -1372,13 +1375,6 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
     if path.to_ascii_lowercase().ends_with(".cue") {
         return stream_cue(path);
     }
-    match somsrv::service_link::classify(path) {
-        Some(somsrv::service_link::ServiceLink { service, kind: somsrv::service_link::LinkKind::Radio { station } }) => {
-            return stream_radio(service, &station);
-        },
-        // A track of a service plays as the URL it is.
-        _ => {},
-    }
     // A lone URL or audio file gets the same widget as a playlist track,
     // but no previous/next buttons and no looping: it plays once.
     if let Some(entry) = single_audio_entry(path) {
@@ -1391,7 +1387,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 /// announced with a playlist length of `0` - "not in a playlist" - so Som
 /// shows its title but no previous/next buttons.
 fn run_standalone(entry: PlaylistEntry) -> Result<(), String> {
-    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone(), cue: None, looping: true };
+    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone(), cue: None, looping: true, radio: false };
     if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
         stream_url(&entry.target, &position)
     } else {
@@ -1467,6 +1463,13 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
                     ended.store(true, Ordering::Release);
                     return;
                 },
+                Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::RadioControl {
+                    session_id: control_session,
+                    file_id: control_file,
+                    control,
+                })) if (control_session, control_file) == ids => {
+                    handle_radio_control(ids, control);
+                },
                 Ok(srv_channel::Incoming::Request(somsrv::protocol::SrvRequest::PlaylistStep {
                     session_id: step_session,
                     file_id: step_file,
@@ -1482,6 +1485,9 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
 
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     announce_track(ids, playlist, None);
+    if playlist.radio {
+        announce_radio_state(ids);
+    }
     channel.request_fetch_resource(session_id, file_id, url.to_string())?;
     {
         let channel = channel.clone();
@@ -1556,10 +1562,73 @@ fn stream_cue(path: &str) -> Result<(), String> {
             target: entry.target.clone(),
             cue: entry.cue.clone(),
             looping: true,
+            radio: false,
         };
         return stream_file_impl(&entry.target, None, None, Some(&position));
     }
     run_playlist(entries, true)
+}
+
+/// What the user asked of the running radio with its widget's icons, shared
+/// between the runner and the thread that hears the clicks.
+static RADIO_TRACK_WAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The track of the radio that is playing now.
+struct CurrentRadioTrack {
+    service: &'static str,
+    id: String,
+    liked: bool,
+}
+
+static CURRENT_RADIO_TRACK: std::sync::Mutex<Option<CurrentRadioTrack>> = std::sync::Mutex::new(None);
+
+/// Likes the user changed during this session, by track id: they outlive
+/// the batch the track came in, which still says what it said then.
+static LIKE_CHOICES: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the track is liked: what the user chose this session, else what
+/// the batch said.
+fn effective_like(track_id: &str, batch_said: bool) -> bool {
+    let choices = LIKE_CHOICES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    choices.iter().rev().find(|(id, _)| id == track_id).map(|(_, liked)| *liked).unwrap_or(batch_said)
+}
+
+/// Tells Som (via `somsrv`) what the radio icons of the track `ids` show:
+/// the like, and whether the radio is the one built from a track.
+fn announce_radio_state(ids: SrpIds) {
+    let (session_id, file_id) = ids;
+    let liked = CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|track| track.liked);
+    let track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
+    let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave));
+    if let Err(err) = result {
+        eprint!("somsrp: could not announce the radio state: {err}\r\n");
+    }
+}
+
+/// A click on one of the radio widget's icons.
+fn handle_radio_control(ids: SrpIds, control: somsrv::protocol::RadioControl) {
+    match control {
+        somsrv::protocol::RadioControl::ToggleLike => {
+            let change = {
+                let mut current = CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                current.as_mut().map(|track| {
+                    track.liked = !track.liked;
+                    (track.service, track.id.clone(), track.liked)
+                })
+            };
+            if let Some((service, track_id, liked)) = change {
+                LIKE_CHOICES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((track_id.clone(), liked));
+                let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.radio_like(service, &track_id, liked));
+                if let Err(err) = result {
+                    eprint!("somsrp: could not send the like: {err}\r\n");
+                }
+            }
+        },
+        somsrv::protocol::RadioControl::ToggleTrackWave => {
+            RADIO_TRACK_WAVE.fetch_xor(true, std::sync::atomic::Ordering::AcqRel);
+        },
+    }
+    announce_radio_state(ids);
 }
 
 /// A playlist line that names Yandex Music at all: in a playlist it stands
@@ -1587,14 +1656,16 @@ fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, 
 struct RadioEntry {
     track: somsrv::protocol::RadioTrack,
     batch_id: String,
+    /// The station the track came from: the radio's feedback is about it.
+    station: String,
 }
 
 /// Tells the radio what happened to a track. A failure is only worth a
 /// line on the terminal: the radio plays on without feedback.
 fn radio_feedback(
     service: &str,
-    station: &str,
     entry: Option<&RadioEntry>,
+    station: &str,
     batch_id: &str,
     event: somsrv::protocol::RadioEvent,
     played_seconds: f32,
@@ -1607,11 +1678,21 @@ fn radio_feedback(
     }
 }
 
+/// The next batch of `station` after the track `queue`, as entries.
+fn fetch_radio_entries(service: &'static str, station: &str, queue: Option<&str>) -> Result<Vec<RadioEntry>, String> {
+    let (batch_id, tracks) =
+        srv_channel::SrvChannel::connect()?.radio_tracks(service, station, queue).map_err(|reason| format!("{station}: {reason}"))?;
+    Ok(tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone(), station: station.to_string() }).collect())
+}
+
 /// Plays a streaming service's radio: an endless run of tracks the service
 /// picks, in batches. `n` / the next button goes to the next track, `p` /
 /// previous back along what was already played (the service keeps no such
 /// history, so it is kept here). What was heard, finished or skipped, is
-/// reported to the radio so it adapts. `q`/`Esc`/`Ctrl+C` quits.
+/// reported to the radio so it adapts. The widget's wave icon switches
+/// between the radio the session started with (`station`) and the radio
+/// built from the track that is playing - from the next track on, the
+/// current one plays out. `q`/`Esc`/`Ctrl+C` quits.
 fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
     use somsrv::protocol::RadioEvent;
 
@@ -1619,10 +1700,15 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
     const MAX_FAILURES_IN_A_ROW: usize = 3;
 
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
-    let (batch_id, tracks) =
-        srv_channel::SrvChannel::connect()?.radio_tracks(service, station, None).map_err(|reason| format!("{station}: {reason}"))?;
-    radio_feedback(service, station, None, &batch_id, RadioEvent::RadioStarted, 0.0);
-    let mut played: Vec<RadioEntry> = tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone() }).collect();
+    RADIO_TRACK_WAVE.store(false, std::sync::atomic::Ordering::Release);
+    let mut played = fetch_radio_entries(service, station, None)?;
+    if let Some(first) = played.first() {
+        radio_feedback(service, None, &first.station, &first.batch_id, RadioEvent::RadioStarted, 0.0);
+    }
+    // Whether the batches now coming are those of a track's wave (a branch
+    // off the main line), and what the main line had queued meanwhile.
+    let mut in_track_wave = false;
+    let mut main_queue: Vec<RadioEntry> = Vec::new();
     let mut cursor = 0usize;
     let mut failures_in_a_row = 0usize;
     loop {
@@ -1631,6 +1717,11 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
         }
         PLAYLIST_STEP.store(0, std::sync::atomic::Ordering::Release);
         let entry = &played[cursor];
+        *CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CurrentRadioTrack {
+            service,
+            id: entry.track.id.clone(),
+            liked: effective_like(&entry.track.id, entry.track.liked),
+        });
         // One more than what is known, so the next button never goes away.
         let position = PlaylistPosition {
             index: cursor,
@@ -1639,8 +1730,9 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             target: entry.track.target.clone(),
             cue: None,
             looping: false,
+            radio: true,
         };
-        radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::TrackStarted, 0.0);
+        radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::TrackStarted, 0.0);
         let started = std::time::Instant::now();
         let result = stream_url(&entry.track.target, &position);
         let step = PLAYLIST_STEP.swap(0, std::sync::atomic::Ordering::AcqRel);
@@ -1650,8 +1742,8 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
                 failures_in_a_row = 0;
                 // Going back says nothing about the track.
                 match step {
-                    0 => radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::TrackFinished, heard),
-                    1.. => radio_feedback(service, station, Some(entry), &entry.batch_id, RadioEvent::Skip, heard),
+                    0 => radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::TrackFinished, heard),
+                    1.. => radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::Skip, heard),
                     _ => {},
                 }
             },
@@ -1669,15 +1761,33 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             cursor = cursor.saturating_sub(1);
             continue;
         }
+        // The wave icon was clicked. The session's own radio is the main
+        // line: the radio of a track branches off it at the track playing
+        // now - what main had queued waits - and clicking again drops the
+        // branch and goes on along main from where it was left.
+        let wanted_track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
+        if wanted_track_wave != in_track_wave {
+            in_track_wave = wanted_track_wave;
+            let current_id = played[cursor].track.id.clone();
+            if in_track_wave {
+                main_queue = played.split_off(cursor + 1);
+                played.extend(fetch_radio_entries(service, &format!("track:{current_id}"), Some(&current_id))?);
+            } else {
+                played.truncate(cursor + 1);
+                if main_queue.is_empty() {
+                    played.extend(fetch_radio_entries(service, station, Some(&current_id))?);
+                } else {
+                    played.append(&mut main_queue);
+                }
+            }
+        }
         cursor += 1;
         if cursor >= played.len() {
-            let last_id = played[played.len() - 1].track.id.clone();
-            let (batch_id, tracks) = srv_channel::SrvChannel::connect()?
-                .radio_tracks(service, station, Some(&last_id))
-                .map_err(|reason| format!("{station}: {reason}"))?;
-            played.extend(tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone() }));
+            let last = played[played.len() - 1].track.id.clone();
+            let radio = played[played.len() - 1].station.clone();
+            played.extend(fetch_radio_entries(service, &radio, Some(&last))?);
             if cursor >= played.len() {
-                return Err(format!("{station}: the radio gave no more tracks"));
+                return Err(format!("{radio}: the radio gave no more tracks"));
             }
         }
     }
@@ -1772,6 +1882,7 @@ fn run_playlist(entries: Vec<PlaylistEntry>, looping: bool) -> Result<(), String
             target: entry.target.clone(),
             cue: entry.cue.clone(),
             looping,
+            radio: false,
         };
         let result = if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
             stream_url(&entry.target, &position)
@@ -2294,6 +2405,17 @@ mod tests {
 yandex:wave
 ", Some(std::path::Path::new("lists")));
         assert_eq!(entries, vec![PlaylistEntry { target: "yandex:wave".to_string(), title: None, cue: None }]);
+    }
+
+    #[test]
+    fn a_like_the_user_chose_outlives_the_batch_it_came_in() {
+        // The batch said "not liked"; the user liked it, then took it back.
+        assert!(!effective_like("track-for-the-like-test", false));
+        LIKE_CHOICES.lock().unwrap().push(("track-for-the-like-test".to_string(), true));
+        assert!(effective_like("track-for-the-like-test", false));
+        LIKE_CHOICES.lock().unwrap().push(("track-for-the-like-test".to_string(), false));
+        assert!(!effective_like("track-for-the-like-test", true), "the latest choice wins over the batch");
+        assert!(effective_like("another-track", true), "a track nothing was chosen for keeps what its batch said");
     }
 
     #[test]

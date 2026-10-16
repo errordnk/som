@@ -554,19 +554,6 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::AnnounceCue { session_id, file_id, sheet } => {
                 cache.set_cue_sheet(session_id, file_id, sheet);
             }
-            SrvRequest::ResolvePlaylist { url } => {
-                let resolved = crate::services::for_url(&url)
-                    .ok_or_else(|| anyhow::anyhow!("not a link of a streaming service: {url}"))
-                    .and_then(|service| service.list_tracks(&url));
-                let answer = match resolved {
-                    Ok(tracks) => SrvResponse::PlaylistResolved { tracks },
-                    Err(err) => {
-                        log::warn!("resolving the playlist {url:?} failed: {err:#}");
-                        SrvResponse::PlaylistResolveFailed { reason: format!("{err:#}") }
-                    },
-                };
-                send_srv(&connection, &writer, &answer)?;
-            }
             SrvRequest::RadioTracks { service, station, queue } => {
                 let batch = crate::services::by_id(&service)
                     .ok_or_else(|| anyhow::anyhow!("unknown streaming service {service:?}"))
@@ -575,7 +562,7 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     Ok((batch_id, tracks)) => SrvResponse::RadioTracks { batch_id, tracks },
                     Err(err) => {
                         log::warn!("the radio {station:?} failed: {err:#}");
-                        SrvResponse::PlaylistResolveFailed { reason: format!("{err:#}") }
+                        SrvResponse::RadioFailed { reason: format!("{err:#}") }
                     },
                 };
                 send_srv(&connection, &writer, &answer)?;

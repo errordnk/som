@@ -1376,9 +1376,6 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
         Some(somsrv::service_link::ServiceLink { service, kind: somsrv::service_link::LinkKind::Radio { station } }) => {
             return stream_radio(service, &station);
         },
-        Some(somsrv::service_link::ServiceLink { kind: somsrv::service_link::LinkKind::List, .. }) => {
-            return stream_service_list(path);
-        },
         // A track of a service plays as the URL it is.
         _ => {},
     }
@@ -1686,19 +1683,6 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             }
         }
     }
-}
-
-/// Plays an album or playlist of a streaming service track after track,
-/// once: unlike a local playlist it does not wrap around - see
-/// [`run_playlist`].
-fn stream_service_list(url: &str) -> Result<(), String> {
-    let channel = srv_channel::SrvChannel::connect()?;
-    let tracks = channel.resolve_playlist(url).map_err(|reason| format!("{url}: {reason}"))?;
-    let entries = tracks
-        .into_iter()
-        .map(|track| PlaylistEntry { target: track.target, title: Some(track.title), cue: None })
-        .collect();
-    run_playlist(entries, false)
 }
 
 /// `.m3u`/`.m3u8` - the extensions `somsrp` treats as a playlist.

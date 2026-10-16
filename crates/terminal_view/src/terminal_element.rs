@@ -1955,6 +1955,22 @@ fn paint_rich_content_placements(
         let mut max_columns_seen: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
         let mut max_rows_seen: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
 
+        // What the placeholder cells on screen say about each placement:
+        // where it starts and how wide and tall it is. A placement is a
+        // block of adjacent cells (a widget's is the whole terminal, many
+        // thousands of cells), so the per-placement totals are kept in a
+        // small list with the last one found tried first, and the maps -
+        // and the cache behind `record_*` - are touched once per
+        // placement, not once per cell (that was seven hash lookups per
+        // cell, every frame).
+        struct Seen {
+            key: (u32, u32),
+            origin: (i32, i32),
+            max_column: u32,
+            max_row: u32,
+        }
+        let mut seen: Vec<Seen> = Vec::new();
+        let mut last_seen: usize = 0;
         for indexed_cell in &terminal.last_content().cells {
             let fg_rgb = match indexed_cell.cell.fg {
                 AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
@@ -1981,34 +1997,40 @@ fn paint_rich_content_placements(
             };
 
             let key = (session_id, file_id);
-            let grid_line = indexed_cell.point.line.0;
-            let grid_column = indexed_cell.point.column.0 as i32;
-            let origin_line = grid_line - row as i32;
-            let origin_column = grid_column - cell_col_in_image as i32;
-            // Every visible cell of the same placement must derive the
-            // exact same origin (they're all offsets from the same
-            // top-left corner) — any one of them is equally authoritative,
-            // so the first cell seen for a given id wins.
-            origins.entry(key).or_insert((origin_line, origin_column));
+            let index = if seen.get(last_seen).is_some_and(|entry| entry.key == key) {
+                last_seen
+            } else if let Some(found) = seen.iter().position(|entry| entry.key == key) {
+                found
+            } else {
+                // Every visible cell of the same placement derives the
+                // exact same origin (they are all offsets from the same
+                // top-left corner), so the first cell seen for an id wins.
+                let origin_line = indexed_cell.point.line.0 - row as i32;
+                let origin_column = indexed_cell.point.column.0 as i32 - cell_col_in_image as i32;
+                seen.push(Seen { key, origin: (origin_line, origin_column), max_column: 0, max_row: 0 });
+                seen.len() - 1
+            };
+            last_seen = index;
+            let entry = &mut seen[index];
+            entry.max_column = entry.max_column.max(cell_col_in_image);
+            entry.max_row = entry.max_row.max(row);
+        }
+        for entry in seen {
+            let (session_id, file_id) = entry.key;
+            origins.insert(entry.key, entry.origin);
             // The placement's real column count can't be recomputed from
-            // the image's own pixel size at paint time (see
-            // `Terminal::record_rich_content_max_column_seen`'s doc
-            // comment): remember the widest column any paint pass has
-            // actually decoded, persisted on the cache entry so a later
-            // paint where the image is only partially visible (scrolled,
-            // or a narrower split) doesn't shrink it back down.
-            terminal.record_rich_content_max_column_seen(session_id, file_id, cell_col_in_image);
-            let entry = max_columns_seen.entry(key).or_insert(0);
-            *entry = (*entry).max(terminal.rich_content_max_column_seen(session_id, file_id).unwrap_or(0));
-            // Vertical counterpart — see `Terminal::
-            // record_rich_content_max_row_seen`'s doc comment for why the
-            // painted height needs this (the sending client's grid row
-            // count rounds UP from the image's real pixel height, so
-            // deriving height purely from the image's own aspect ratio
-            // leaves a visible gap in the last reserved row).
-            terminal.record_rich_content_max_row_seen(session_id, file_id, row);
-            let row_entry = max_rows_seen.entry(key).or_insert(0);
-            *row_entry = (*row_entry).max(terminal.rich_content_max_row_seen(session_id, file_id).unwrap_or(0));
+            // the image's own pixel size at paint time (see `Terminal::
+            // record_rich_content_max_column_seen`'s doc comment): the
+            // widest column any paint pass has decoded is remembered on
+            // the cache entry, so a later paint where the image is only
+            // partly visible (scrolled, or a narrower split) does not
+            // shrink it. Same for the rows (the sending client rounds the
+            // grid's row count up from the image's pixel height, which
+            // would leave a gap in the last reserved row).
+            terminal.record_rich_content_max_column_seen(session_id, file_id, entry.max_column);
+            max_columns_seen.insert(entry.key, terminal.rich_content_max_column_seen(session_id, file_id).unwrap_or(0));
+            terminal.record_rich_content_max_row_seen(session_id, file_id, entry.max_row);
+            max_rows_seen.insert(entry.key, terminal.rich_content_max_row_seen(session_id, file_id).unwrap_or(0));
         }
 
         let placements = terminal.rich_content_placements();

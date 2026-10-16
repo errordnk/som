@@ -131,6 +131,16 @@ impl RichContentPlayer {
 /// perspective ("give me an up-to-date player for this placement, or
 /// nothing yet") — a caller (`Terminal`, see its `rich_content_players`
 /// field) doesn't need to know which case applies.
+impl RichContentPlayer {
+    /// Whether a refresh with `contiguous_len` bytes available would change
+    /// nothing: the picture is complete, or nothing beyond what was already
+    /// decoded has arrived. Lets a caller skip copying the received bytes
+    /// out for a player that has nothing more to take from them.
+    pub fn is_up_to_date(&self, contiguous_len: u64) -> bool {
+        self.complete || contiguous_len <= self.decoded_through
+    }
+}
+
 pub fn refresh_or_create(
     existing: Option<RichContentPlayer>,
     bytes: &[u8],

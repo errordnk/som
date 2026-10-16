@@ -2553,13 +2553,30 @@ impl Terminal {
             // two can momentarily disagree (empty bytes paired with a
             // nonzero watermark).
             state.request_whole_range_once_if_needed(session_id, file_id);
+            // Only pictures have a player here. Audio and video read their
+            // own bytes; copying out everything received so far - the
+            // whole file or hundreds of megabytes of a radio stream - on
+            // every frame for them was the largest cost of a playing
+            // track's frames.
+            if !matches!(
+                content_type,
+                rich_content_transport::ContentType::Gif
+                    | rich_content_transport::ContentType::Jpeg
+                    | rich_content_transport::ContentType::Png
+            ) {
+                continue;
+            }
             let contiguous_len = state.contiguous_len();
             let total_size = state.total_size();
-            let bytes = state.bytes_received_so_far();
             let existing = players.remove(&key);
-            let Some(refreshed) =
-                rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size)
-            else {
+            // A picture that is complete (or has nothing new) needs no bytes.
+            let Some(refreshed) = (match existing {
+                Some(player) if player.is_up_to_date(contiguous_len) => Some(player),
+                existing => {
+                    let bytes = state.bytes_received_so_far();
+                    rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size)
+                },
+            }) else {
                 continue;
             };
             let current_frame = refreshed.current_frame();
@@ -3196,14 +3213,20 @@ impl Terminal {
                 rich_content_transport::ContentType::Gif
                 | rich_content_transport::ContentType::Jpeg
                 | rich_content_transport::ContentType::Png => {
-                    let bytes = entry.state.bytes_received_so_far();
                     let contiguous_len = entry.state.contiguous_len();
                     let total_size = entry.state.total_size();
                     let existing = match std::mem::replace(&mut entry.player, MarkdownEmbeddedPlayer::None) {
                         MarkdownEmbeddedPlayer::Image(player) => Some(player),
                         _ => None,
                     };
-                    match rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size) {
+                    let refreshed = match existing {
+                        Some(player) if player.is_up_to_date(contiguous_len) => Some(player),
+                        existing => {
+                            let bytes = entry.state.bytes_received_so_far();
+                            rich_content_player::refresh_or_create(existing, &bytes, contiguous_len, content_type, total_size)
+                        },
+                    };
+                    match refreshed {
                         Some(player) => {
                             let render_image = player.render_image().clone();
                             let frame_index = player.current_frame();

@@ -3831,8 +3831,9 @@ fn paint_now_playing_audio_in_box(
     // known. One from the station's own clock is not seekable; one from
     // the local player (a file) is.
     let has_remaining = duration > std::time::Duration::ZERO;
-    let seekable =
-        np.cue_track || (np.duration == std::time::Duration::ZERO && player_duration > std::time::Duration::ZERO);
+    let seekable = np.cue_track
+        || np.finite_track
+        || (np.duration == std::time::Duration::ZERO && player_duration > std::time::Duration::ZERO);
 
     // ---- geometry ------------------------------------------------------
     let gap = line_height * 0.5;

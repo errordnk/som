@@ -182,6 +182,9 @@ pub struct SrvProgressState {
     /// `(index, len)` from the latest `SrvResponse::Playlist` - this
     /// key's track is entry `index` of a playlist of `len`.
     playlist: Mutex<Option<(u32, u32)>>,
+    /// `false` when that playlist does not wrap around (`SrvResponse::
+    /// Playlist::looping`).
+    playlist_looping: AtomicBool,
     /// The playlist's own name for this entry (`#EXTINF`), e.g. the
     /// station - what stays shown between a stream's songs.
     station_title: Mutex<Option<String>>,
@@ -218,6 +221,12 @@ impl SrvProgressState {
     /// `(index, len)` of this key's playlist entry, if it is part of one.
     pub fn playlist(&self) -> Option<(u32, u32)> {
         *self.playlist.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the key's playlist wraps around (previous on the first
+    /// entry goes to the last, next on the last to the first).
+    pub fn playlist_looping(&self) -> bool {
+        self.playlist_looping.load(Ordering::Acquire)
     }
 
     pub fn contiguous_len(&self) -> u64 {
@@ -892,6 +901,7 @@ pub fn announce_track(session_id: u32, file_id: u32, target: String, tags: somsr
                     len: 0,
                     target,
                     tags: Some(tags),
+                    looping: true,
                 },
             )
         });
@@ -955,10 +965,11 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
                 *state.now_playing.lock().unwrap_or_else(|p| p.into_inner()) = Some((info, std::time::Instant::now()));
                 state.now_playing_generation.fetch_add(1, Ordering::AcqRel);
             },
-            SrvResponse::Playlist { session_id: response_session, file_id: response_file, index, len, title }
+            SrvResponse::Playlist { session_id: response_session, file_id: response_file, index, len, title, looping }
                 if response_session == session_id && response_file == file_id =>
             {
                 *state.playlist.lock().unwrap_or_else(|p| p.into_inner()) = Some((index, len));
+                state.playlist_looping.store(looping, Ordering::Release);
                 *state.station_title.lock().unwrap_or_else(|p| p.into_inner()) = title;
             },
             SrvResponse::CueSheet { session_id: response_session, file_id: response_file, sheet }

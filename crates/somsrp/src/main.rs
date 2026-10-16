@@ -1573,6 +1573,27 @@ fn stream_cue(path: &str) -> Result<(), String> {
 /// between the runner and the thread that hears the clicks.
 static RADIO_TRACK_WAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What the last click on the wave icon asks of the radio. A branch is
+/// entered at once (the click cuts the track playing, as a "next" does, and
+/// the first track of the new wave plays); going back to main waits for the
+/// next track to start (the track playing plays out). It is the click that
+/// counts, with the track that was playing when it came - not the icon's
+/// state afterwards: switching off and on again within one track is
+/// "branch anew from this track", not "nothing changed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaveRequest {
+    /// Back to the main line: the session's own radio.
+    Main,
+    /// A branch off the main line, the radio built from this track.
+    Branch(String),
+}
+
+static RADIO_WAVE_REQUEST: std::sync::Mutex<Option<WaveRequest>> = std::sync::Mutex::new(None);
+
+/// The step that enters a branch: forward like a "next", but not a skip -
+/// the track was not rejected, a wave was asked of it.
+const WAVE_JUMP: i32 = 2;
+
 /// The track of the radio that is playing now.
 struct CurrentRadioTrack {
     service: &'static str,
@@ -1625,7 +1646,23 @@ fn handle_radio_control(ids: SrpIds, control: somsrv::protocol::RadioControl) {
             }
         },
         somsrv::protocol::RadioControl::ToggleTrackWave => {
-            RADIO_TRACK_WAVE.fetch_xor(true, std::sync::atomic::Ordering::AcqRel);
+            let lit = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
+            let playing = CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|track| track.id.clone());
+            // Lit: back to main. Dim: a branch from the track playing now
+            // (nothing to branch from before the first track starts).
+            let request = match (lit, playing) {
+                (true, _) => Some(WaveRequest::Main),
+                (false, Some(id)) => Some(WaveRequest::Branch(id)),
+                (false, None) => None,
+            };
+            if let Some(request) = request {
+                let branch = matches!(request, WaveRequest::Branch(_));
+                RADIO_TRACK_WAVE.store(!lit, std::sync::atomic::Ordering::Release);
+                *RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request);
+                if branch {
+                    PLAYLIST_STEP.store(WAVE_JUMP, std::sync::atomic::Ordering::Release);
+                }
+            }
         },
     }
     announce_radio_state(ids);
@@ -1685,6 +1722,54 @@ fn fetch_radio_entries(service: &'static str, station: &str, queue: Option<&str>
     Ok(tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone(), station: station.to_string() }).collect())
 }
 
+/// What a click on the wave icon does to the queue when the next track is
+/// about to start (for a branch, the click itself ends the track). The session's own radio (`main_station`) is the main
+/// line; the radio of a track is a branch off it:
+///
+/// - `Branch(from)` makes a branch at the track the click came on: what main
+///   had queued after the track playing now (`cursor`) waits in `main_queue`,
+///   kept as it is however many branches follow, and the tracks queued
+///   from here on are the wave of `from`. A branch made while already in
+///   one drops that branch's queue and starts anew from `from`.
+/// - `Main`, in a branch, drops the branch: the track playing now plays out
+///   and the tracks after it are main's own queue; with none waiting, the
+///   next ones are asked of main.
+///
+/// `fetch(station, after)` gets the next tracks of a station after a track.
+/// Returns whether the radio is in a branch afterwards.
+fn apply_wave_request(
+    request: Option<WaveRequest>,
+    played: &mut Vec<RadioEntry>,
+    cursor: usize,
+    in_branch: bool,
+    main_queue: &mut Vec<RadioEntry>,
+    main_station: &str,
+    mut fetch: impl FnMut(&str, &str) -> Result<Vec<RadioEntry>, String>,
+) -> Result<bool, String> {
+    match request {
+        Some(WaveRequest::Branch(from)) => {
+            if in_branch {
+                played.truncate(cursor + 1);
+            } else {
+                *main_queue = played.split_off(cursor + 1);
+            }
+            played.extend(fetch(&format!("track:{from}"), &from)?);
+            Ok(true)
+        },
+        Some(WaveRequest::Main) if in_branch => {
+            played.truncate(cursor + 1);
+            if main_queue.is_empty() {
+                let current_id = played[cursor].track.id.clone();
+                played.extend(fetch(main_station, &current_id)?);
+            } else {
+                played.append(main_queue);
+            }
+            Ok(false)
+        },
+        Some(WaveRequest::Main) | None => Ok(in_branch),
+    }
+}
+
 /// Plays a streaming service's radio: an endless run of tracks the service
 /// picks, in batches. `n` / the next button goes to the next track, `p` /
 /// previous back along what was already played (the service keeps no such
@@ -1701,13 +1786,14 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
 
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
     RADIO_TRACK_WAVE.store(false, std::sync::atomic::Ordering::Release);
+    *RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let mut played = fetch_radio_entries(service, station, None)?;
     if let Some(first) = played.first() {
         radio_feedback(service, None, &first.station, &first.batch_id, RadioEvent::RadioStarted, 0.0);
     }
-    // Whether the batches now coming are those of a track's wave (a branch
-    // off the main line), and what the main line had queued meanwhile.
-    let mut in_track_wave = false;
+    // Whether the tracks coming are those of a branch off the main line, and
+    // what the main line had queued while the branch plays.
+    let mut in_branch = false;
     let mut main_queue: Vec<RadioEntry> = Vec::new();
     let mut cursor = 0usize;
     let mut failures_in_a_row = 0usize;
@@ -1740,10 +1826,11 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
         match result {
             Ok(()) => {
                 failures_in_a_row = 0;
-                // Going back says nothing about the track.
+                // Going back, or asking a wave of the track, says nothing
+                // bad about it.
                 match step {
                     0 => radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::TrackFinished, heard),
-                    1.. => radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::Skip, heard),
+                    1 => radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::Skip, heard),
                     _ => {},
                 }
             },
@@ -1761,26 +1848,13 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             cursor = cursor.saturating_sub(1);
             continue;
         }
-        // The wave icon was clicked. The session's own radio is the main
-        // line: the radio of a track branches off it at the track playing
-        // now - what main had queued waits - and clicking again drops the
-        // branch and goes on along main from where it was left.
-        let wanted_track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
-        if wanted_track_wave != in_track_wave {
-            in_track_wave = wanted_track_wave;
-            let current_id = played[cursor].track.id.clone();
-            if in_track_wave {
-                main_queue = played.split_off(cursor + 1);
-                played.extend(fetch_radio_entries(service, &format!("track:{current_id}"), Some(&current_id))?);
-            } else {
-                played.truncate(cursor + 1);
-                if main_queue.is_empty() {
-                    played.extend(fetch_radio_entries(service, station, Some(&current_id))?);
-                } else {
-                    played.append(&mut main_queue);
-                }
-            }
-        }
+        // The wave icon was clicked (see [`apply_wave_request`]): a branch
+        // asked for plays at once (the click ended the track), going back to
+        // main waits for here, the end of the track that played out.
+        let request = RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        in_branch = apply_wave_request(request, &mut played, cursor, in_branch, &mut main_queue, station, |radio, after| {
+            fetch_radio_entries(service, radio, Some(after))
+        })?;
         cursor += 1;
         if cursor >= played.len() {
             let last = played[played.len() - 1].track.id.clone();
@@ -2405,6 +2479,77 @@ mod tests {
 yandex:wave
 ", Some(std::path::Path::new("lists")));
         assert_eq!(entries, vec![PlaylistEntry { target: "yandex:wave".to_string(), title: None, cue: None }]);
+    }
+
+    fn radio_entry(id: &str, station: &str) -> RadioEntry {
+        RadioEntry {
+            track: somsrv::protocol::RadioTrack { id: id.to_string(), title: id.to_string(), target: String::new(), liked: false },
+            batch_id: String::new(),
+            station: station.to_string(),
+        }
+    }
+
+    fn ids(entries: &[RadioEntry]) -> Vec<String> {
+        entries.iter().map(|entry| format!("{}@{}", entry.track.id, entry.station)).collect()
+    }
+
+    /// A fetch that answers with two tracks named after what it was asked.
+    fn fake_fetch(station: &str, after: &str) -> Result<Vec<RadioEntry>, String> {
+        Ok(vec![radio_entry(&format!("{after}-a"), station), radio_entry(&format!("{after}-b"), station)])
+    }
+
+    #[test]
+    fn a_branch_is_made_at_the_playing_track_and_mains_queue_waits() {
+        // Main is at m1, with m2 and m3 queued after it.
+        let mut played = vec![radio_entry("m1", "main"), radio_entry("m2", "main"), radio_entry("m3", "main")];
+        let mut main_queue = Vec::new();
+        let in_branch =
+            apply_wave_request(Some(WaveRequest::Branch("m1".into())), &mut played, 0, false, &mut main_queue, "main", fake_fetch).unwrap();
+        assert!(in_branch);
+        assert_eq!(ids(&played), ["m1@main", "m1-a@track:m1", "m1-b@track:m1"]);
+        assert_eq!(ids(&main_queue), ["m2@main", "m3@main"]);
+    }
+
+    #[test]
+    fn back_to_main_plays_the_branchs_track_out_and_goes_on_along_mains_queue() {
+        // In a branch at b1 (b2 queued); main had m2 and m3 waiting.
+        let mut played = vec![radio_entry("m1", "main"), radio_entry("b1", "track:m1"), radio_entry("b2", "track:m1")];
+        let mut main_queue = vec![radio_entry("m2", "main"), radio_entry("m3", "main")];
+        let in_branch = apply_wave_request(Some(WaveRequest::Main), &mut played, 1, true, &mut main_queue, "main", fake_fetch).unwrap();
+        assert!(!in_branch);
+        assert_eq!(ids(&played), ["m1@main", "b1@track:m1", "m2@main", "m3@main"], "b1 plays out, then main's own queue");
+        assert!(main_queue.is_empty());
+    }
+
+    #[test]
+    fn off_and_on_again_within_a_track_branches_anew_from_the_track_heard() {
+        // In a branch at b1; the user clicks off (Main) and on (Branch(b1))
+        // before b1 ends: only the last click is left, and main's queue is
+        // untouched by it.
+        let mut played = vec![radio_entry("m1", "main"), radio_entry("b1", "track:m1"), radio_entry("b2", "track:m1")];
+        let mut main_queue = vec![radio_entry("m2", "main"), radio_entry("m3", "main")];
+        let in_branch =
+            apply_wave_request(Some(WaveRequest::Branch("b1".into())), &mut played, 1, true, &mut main_queue, "main", fake_fetch).unwrap();
+        assert!(in_branch);
+        assert_eq!(ids(&played), ["m1@main", "b1@track:m1", "b1-a@track:b1", "b1-b@track:b1"], "the old branch's b2 is gone");
+        assert_eq!(ids(&main_queue), ["m2@main", "m3@main"], "main's queue still waits");
+    }
+
+    #[test]
+    fn back_to_main_with_nothing_waiting_asks_main_for_more() {
+        let mut played = vec![radio_entry("m1", "main"), radio_entry("b1", "track:m1")];
+        let mut main_queue = Vec::new();
+        apply_wave_request(Some(WaveRequest::Main), &mut played, 1, true, &mut main_queue, "main", fake_fetch).unwrap();
+        assert_eq!(ids(&played), ["m1@main", "b1@track:m1", "b1-a@main", "b1-b@main"]);
+    }
+
+    #[test]
+    fn no_click_or_a_stray_back_to_main_changes_nothing() {
+        let mut played = vec![radio_entry("m1", "main"), radio_entry("m2", "main")];
+        let mut main_queue = Vec::new();
+        assert!(!apply_wave_request(None, &mut played, 0, false, &mut main_queue, "main", fake_fetch).unwrap());
+        assert!(!apply_wave_request(Some(WaveRequest::Main), &mut played, 0, false, &mut main_queue, "main", fake_fetch).unwrap());
+        assert_eq!(ids(&played), ["m1@main", "m2@main"]);
     }
 
     #[test]

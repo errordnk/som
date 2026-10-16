@@ -61,6 +61,13 @@ use std::sync::{Mutex, MutexGuard};
 /// tighter number here.
 const CONSUMED_RETENTION_WINDOW: u64 = 256 * 1024 * 1024;
 
+/// How much already-consumed audio a LIVE stream (a radio station: no
+/// known total size) keeps behind the reader. Nothing ever seeks back into
+/// a live stream and the container reader only steps back within its last
+/// page or two, so a few megabytes are plenty - where the 256 MB window
+/// would fill with hours of a station's audio and stay resident.
+const LIVE_CONSUMED_RETENTION: u64 = 4 * 1024 * 1024;
+
 /// Shared, thread-safe state for one `(session_id, file_id)` placement's
 /// `somsrv` side-channel connection — see this module's own doc comment
 /// for the full reasoning.
@@ -324,7 +331,8 @@ impl SrvProgressState {
         if position <= start {
             return;
         }
-        let evict_up_to = position.saturating_sub(CONSUMED_RETENTION_WINDOW);
+        let window = if self.total_size() == 0 { LIVE_CONSUMED_RETENTION } else { CONSUMED_RETENTION_WINDOW };
+        let evict_up_to = position.saturating_sub(window);
         if evict_up_to <= start {
             return;
         }
@@ -1015,6 +1023,32 @@ fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_stream_keeps_only_a_few_megabytes_behind_the_reader() {
+        // A station: the total size is unknown (0). 24 MiB arrive and are
+        // consumed in 1 MiB pieces.
+        let state = SrvProgressState::default();
+        let piece = vec![0u8; 1024 * 1024];
+        for index in 0..24u64 {
+            state.append_piece_for_test(index * piece.len() as u64, &piece, 0);
+            state.advance_consumed_up_to((index + 1) * piece.len() as u64);
+        }
+        let held = state.buffer.lock().unwrap().len() as u64;
+        assert!(held <= LIVE_CONSUMED_RETENTION, "held {held} bytes behind a live reader");
+    }
+
+    #[test]
+    fn a_file_of_known_size_keeps_its_retention_window() {
+        let state = SrvProgressState::default();
+        let piece = vec![0u8; 1024 * 1024];
+        for index in 0..24u64 {
+            state.append_piece_for_test(index * piece.len() as u64, &piece, 24 * 1024 * 1024);
+            state.advance_consumed_up_to((index + 1) * piece.len() as u64);
+        }
+        // Nothing of 24 MiB is old enough to go under the 256 MB window.
+        assert_eq!(state.buffer.lock().unwrap().len() as u64, 24 * 1024 * 1024);
+    }
 
     #[test]
     fn fetch_failure_is_none_by_default() {

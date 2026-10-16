@@ -1594,6 +1594,19 @@ fn yandex_wave_station(target: &str) -> Option<String> {
         .then(|| "user:onyourwave".to_string())
 }
 
+/// The Yandex Music wave a playlist stands for: its one line. The wave is
+/// endless and plays on its own, so it cannot share a playlist with other
+/// entries (`Err`); a playlist without a wave line is `Ok(None)`.
+fn wave_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<String>, String> {
+    let Some(station) = entries.iter().find_map(|entry| yandex_wave_station(&entry.target)) else {
+        return Ok(None);
+    };
+    if entries.len() > 1 {
+        return Err("a Yandex Music wave plays on its own, it cannot share a playlist with other entries".to_string());
+    }
+    Ok(Some(station))
+}
+
 /// A track of the wave being played, with the batch it came in (the
 /// station's feedback names it).
 struct WaveEntry {
@@ -1727,7 +1740,8 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
         if line.starts_with('#') {
             continue;
         }
-        let is_url = line.starts_with("http://") || line.starts_with("https://");
+        // `yandex:` is the scheme of a Yandex Music wave, not a file name.
+        let is_url = line.starts_with("http://") || line.starts_with("https://") || line.starts_with("yandex:");
         let path = std::path::Path::new(line);
         let target = match (is_url, path.is_absolute(), base_dir) {
             (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
@@ -1757,6 +1771,9 @@ fn stream_playlist(path: &str) -> Result<(), String> {
     let entries = parse_m3u(&text, base_dir);
     if entries.is_empty() {
         return Err(format!("{path}: playlist has no entries"));
+    }
+    if let Some(station) = wave_in_playlist(&entries).map_err(|reason| format!("{path}: {reason}"))? {
+        return stream_wave(&station);
     }
     run_playlist(entries, true)
 }
@@ -2296,6 +2313,23 @@ mod tests {
         assert!(is_playlist_path("radio.m3u"));
         assert!(is_playlist_path("RADIO.M3U8"));
         assert!(!is_playlist_path("radio.mp3"));
+    }
+
+    #[test]
+    fn a_wave_line_is_kept_as_it_is_not_made_a_path() {
+        let entries = parse_m3u("#EXTM3U
+yandex:wave
+", Some(std::path::Path::new("lists")));
+        assert_eq!(entries, vec![PlaylistEntry { target: "yandex:wave".to_string(), title: None, cue: None }]);
+    }
+
+    #[test]
+    fn a_playlist_of_one_wave_line_is_the_wave() {
+        let entry = |target: &str| PlaylistEntry { target: target.to_string(), title: None, cue: None };
+        assert_eq!(wave_in_playlist(&[entry("https://music.yandex.ru/")]), Ok(Some("user:onyourwave".to_string())));
+        assert_eq!(wave_in_playlist(&[entry("yandex:track:38526")]), Ok(Some("track:38526".to_string())));
+        assert_eq!(wave_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
+        assert!(wave_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
     }
 
     #[test]

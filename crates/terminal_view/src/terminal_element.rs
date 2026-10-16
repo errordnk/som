@@ -2198,7 +2198,7 @@ fn paint_rich_content_placements(
                     None
                 };
                 let max_row_seen = max_rows_seen.get(&key).copied();
-                if let Some((bounds, widget_bounds, needs_repaint)) = paint_now_playing_audio_widget(
+                if let Some((bounds, widget_bounds, repaint_after)) = paint_now_playing_audio_widget(
                     &now_playing,
                     placeholder,
                     *is_playing,
@@ -2217,7 +2217,9 @@ fn paint_rich_content_placements(
                     let terminal = terminal.read(cx);
                     terminal.record_rich_content_placement_bounds(session_id, file_id, bounds);
                     terminal.record_audio_widget_bounds(session_id, file_id, widget_bounds);
-                    any_animating |= needs_repaint;
+                    if let Some(after) = repaint_after {
+                        terminal.schedule_redraw(after, window, cx);
+                    }
                 }
                 continue;
             }
@@ -2243,7 +2245,10 @@ fn paint_rich_content_placements(
                     terminal.record_rich_content_stop_icon_bounds(session_id, file_id, stop_bounds);
                 }
             }
-            any_animating |= *is_playing;
+            // The plain controls row only shows seconds.
+            if *is_playing {
+                terminal.read(cx).schedule_redraw(until_next_second(*elapsed), window, cx);
+            }
             continue;
         }
 
@@ -3107,7 +3112,7 @@ fn paint_rich_content_markdown_widget(
                     } else {
                         None
                     };
-                    let (widget_bounds, needs_repaint) = paint_now_playing_audio_in_box(
+                    let (widget_bounds, repaint_after) = paint_now_playing_audio_in_box(
                         now_playing,
                         placeholder,
                         *is_playing,
@@ -3119,8 +3124,8 @@ fn paint_rich_content_markdown_widget(
                         window,
                         cx,
                     );
-                    if needs_repaint {
-                        *any_nested_loading = true;
+                    if let Some(after) = repaint_after {
+                        terminal.read(cx).schedule_redraw(after, window, cx);
                     }
                     if let Some(cover) = widget_bounds.cover {
                         terminal.read(cx).record_markdown_embedded_toggle_bounds(host, &image.dest_url, cover);
@@ -3686,7 +3691,7 @@ fn paint_now_playing_audio_widget(
     layout: &LayoutState,
     window: &mut Window,
     cx: &mut App,
-) -> Option<(Bounds<Pixels>, terminal::rich_content_audio_widget::AudioWidgetBounds, bool)> {
+) -> Option<(Bounds<Pixels>, terminal::rich_content_audio_widget::AudioWidgetBounds, Option<std::time::Duration>)> {
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let display_line = origin_line + layout.display_offset as i32;
@@ -3708,7 +3713,7 @@ fn paint_now_playing_audio_widget(
     let bounds = Bounds::new(box_origin, gpui::size(box_width, box_height));
     window.paint_quad(fill(bounds, rich_content_widget_bg(cx)));
 
-    let (widget_bounds, needs_repaint) = paint_now_playing_audio_in_box(
+    let (widget_bounds, repaint_after) = paint_now_playing_audio_in_box(
         np,
         placeholder,
         is_playing,
@@ -3720,7 +3725,7 @@ fn paint_now_playing_audio_widget(
         window,
         cx,
     );
-    Some((bounds, widget_bounds, needs_repaint))
+    Some((bounds, widget_bounds, repaint_after))
 }
 
 /// The body of the "now playing" widget, painted into `bounds` (its
@@ -3739,7 +3744,7 @@ fn paint_now_playing_audio_in_box(
     layout: &LayoutState,
     window: &mut Window,
     cx: &mut App,
-) -> (terminal::rich_content_audio_widget::AudioWidgetBounds, bool) {
+) -> (terminal::rich_content_audio_widget::AudioWidgetBounds, Option<std::time::Duration>) {
     use terminal::rich_content_audio_widget::AudioWidgetBounds;
 
     let cell_width = layout.dimensions.cell_width;
@@ -3819,8 +3824,8 @@ fn paint_now_playing_audio_in_box(
     let left = box_origin.x + (box_width - side) / 2.0;
     let mut y = box_origin.y + ((box_height - block_height) / 2.0).max(Pixels::ZERO);
 
-    let secs = crate::marquee::now_secs();
-    let mut scrolling = false;
+    // The soonest any line needs another frame to keep sliding.
+    let mut marquee_wake: Option<std::time::Duration> = None;
     // One line of text in a box `side` wide: centered when it fits,
     // otherwise sliding to and fro behind a clip.
     let mut paint_line = |text: &str, color: Hsla, at_y: Pixels, window: &mut Window, cx: &mut App| {
@@ -3831,7 +3836,9 @@ fn paint_now_playing_audio_in_box(
         let line_box = Bounds::new(point(left, at_y), gpui::size(side.max(cell_width), line_height));
         let overflow = line.width - line_box.size.width;
         let x = if overflow > Pixels::ZERO && is_playing {
-            scrolling = true;
+            let secs = crate::marquee::clock_secs(text);
+            let wake = crate::marquee::repaint_in(f32::from(overflow), secs);
+            marquee_wake = Some(marquee_wake.map_or(wake, |soonest| soonest.min(wake)));
             left - px(crate::marquee::offset_at(f32::from(overflow), secs))
         } else if overflow > Pixels::ZERO {
             // Paused: the line stands still at its start - sliding it
@@ -3938,8 +3945,19 @@ fn paint_now_playing_audio_in_box(
         }
     }
 
-    let needs_repaint = scrolling || np.cover_loading || is_playing || !np.ready;
-    (widget_bounds, needs_repaint)
+    // When the widget next needs a frame - not every vsync: a title that
+    // slides at 25 fps (and rests, undrawn, between slides), a picture
+    // still arriving at 10, the seconds of a clock at 1.
+    let loading = (np.cover_loading || !np.ready).then_some(std::time::Duration::from_millis(100));
+    let clock = is_playing.then(|| until_next_second(elapsed));
+    let repaint_after = [marquee_wake, loading, clock].into_iter().flatten().min();
+    (widget_bounds, repaint_after)
+}
+
+/// How long until the whole-second clock of a track at `elapsed` shows the
+/// next second (a little after it, so the frame sees the new value).
+fn until_next_second(elapsed: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_millis(1000 - u64::from(elapsed.subsec_millis()) + 15)
 }
 
 fn format_duration(d: std::time::Duration) -> String {

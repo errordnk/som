@@ -143,6 +143,23 @@ Naming convention: Som-specific tab/pane actions (`NewTab*`, `CloseTab`, `NewPan
 
 Keystroke syntax follows GPUI conventions: lowercase, hyphen-separated modifiers, e.g. `ctrl-shift-c`, `cmd-v`, `alt-f4`.
 
+### `music`
+
+Credentials for the music services Som plays from. Today that is Yandex Music's My Wave only (see [Audio, internet radio and playlists](#audio-internet-radio-and-playlists)).
+
+```json
+"music": {
+  "yandex": { "token": "y0_...", "proxy": "http://host:3128" }
+}
+```
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `yandex.token` | string | none | The account's OAuth token. Open `https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d` in a browser, sign in, and copy the `access_token` value from the address you are sent to (it is valid for about a year). It gives access to the whole Yandex account, so keep `settings.json` private. |
+| `yandex.proxy` | string | none | An `http://` or `socks5://` proxy that only the requests to Yandex Music go through - for a network the service refuses (it answers some countries with HTTP 451). |
+
+The settings are read by `somsrv` on the machine `somsrp` runs on.
+
 ---
 
 ## Default keybindings
@@ -273,6 +290,13 @@ A playing track gets a "now playing" widget: one line with the track title (afte
 - **Playlists.** Every track of an `.m3u` playlist has previous/next buttons on both sides of the bar (keys `p` / `n` work too; so do `Left`/`Up` for previous and `Right`/`Down` for next, and `Space` toggles play/pause); the list plays in a circle, and a playlist of one entry is simply looped. A lone file or URL has no buttons and plays once. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
 - **CUE sheets.** `somsrp album.cue` plays a CD ripped into one `.flac`/`.mp3` file: the sheet's tracks become the list (title and performer per track, album and year from the sheet), the widget shows the track the playhead is in with its own time and bar, previous/next and the arrow keys jump between tracks inside the file (no previous on the first track, no next on the last - the buttons are dimmed there), and the album plays once, front to back. The cover is a `front`/`cover`/`folder` image next to the sheet, or the first image of a `Covers` folder; with none there, the cover is looked up by performer and album like for a local file (MusicBrainz / Cover Art Archive, Deezer, iTunes). The audio file is the sheet's `FILE`, or the same name with a playable extension; a sheet in a Windows code page is read as such.
 - **Radio.** A stream whose server name contains `radioparadise` gets the full widget: tags, time left in the track and the cover come from the station's own API. Every other station plays as a continuous stream: the artist and title come from the stream's own metadata (ICY, where the station sends it; the playlist title is shown until then), the album and cover are looked up by track (Deezer, then iTunes) with the DNA stand-in only if nothing is found, and the time shown is the time elapsed since it started - there is no time left, as a live stream has no known length.
+- **Yandex Music: My Wave.** The one thing Som plays from Yandex Music is the endless radio the service builds from your tastes. Start it from an `.m3u` file with a single line that contains `yandex` (any text will do, e.g. just `yandex`), with the account's token in `settings.json` (see [`music`](#music)):
+
+  ```
+  somsrp wave.m3u
+  ```
+
+  The widget's row is: previous, the wave-of-this-track icon, time played, progress bar, time left, the like, next. *Next* goes to the next track of the wave and never runs out; *previous* goes back along what was already played in this session (the service keeps no such history, `somsrp` does) and is dimmed on the first track; the bar can be clicked to seek. The **wave icon** is dim while you listen to My Wave (the main line). Click it and the radio branches off the track that is playing: that track plays out, then the tracks come from the wave built from it. Click it again and the branch is dropped: you are back on My Wave, where it was left. The **heart** shows whether the track is liked (filled and red when it is); a click likes it or takes the like back. Likes, finished tracks and skips are sent to Yandex Music and are what reshapes your wave. Nothing else of the service is played - no podcasts, collections, albums or audiobooks. A track is played at the quality the account's token is allowed, which for such tokens is MP3 192 kbit/s.
 - **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in.
 
 - **Images are represented as real grid text.** Each streamed image becomes a block of Unicode placeholder cells printed into the terminal's own scrollback, so the terminal's normal scroll/clear/history handling positions and hides the image correctly with no special-casing needed — clearing the screen hides the image, and scrolling moves it exactly like any other line of output.

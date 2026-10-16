@@ -44,18 +44,14 @@ pub fn parse_track_url(url: &str) -> Option<TrackRef> {
     Some(TrackRef { track_id: track_id.to_string() })
 }
 
-/// The "wave" station a target asks for: `yandex:wave` and the service's
-/// home page are "My Wave"; `yandex:track:<id>` is the wave built from one
-/// track.
-pub fn radio_station(target: &str) -> Option<String> {
+/// Whether a target asks for "My Wave": `yandex:wave` or the service's
+/// home page. A session always starts there; the wave of a track is
+/// something done within a session, not a way to start one.
+pub fn is_my_wave(target: &str) -> bool {
     if target == "yandex:wave" {
-        return Some(MY_WAVE.to_string());
+        return true;
     }
-    if let Some(id) = target.strip_prefix("yandex:track:") {
-        return (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())).then(|| format!("track:{id}"));
-    }
-    let path = music_path(target)?;
-    (path.is_empty() || path == ["home"]).then(|| MY_WAVE.to_string())
+    music_path(target).is_some_and(|path| path.is_empty() || path == ["home"])
 }
 
 #[cfg(test)]
@@ -79,15 +75,13 @@ mod tests {
     }
 
     #[test]
-    fn waves_are_asked_for_by_name_or_by_the_home_page() {
-        assert_eq!(radio_station("yandex:wave").as_deref(), Some("user:onyourwave"));
-        assert_eq!(radio_station("yandex:track:38526").as_deref(), Some("track:38526"));
-        assert_eq!(radio_station("https://music.yandex.ru/").as_deref(), Some("user:onyourwave"));
-        assert_eq!(radio_station("https://music.yandex.ru/home?x=1").as_deref(), Some("user:onyourwave"));
-        assert_eq!(radio_station("https://music.yandex.com").as_deref(), Some("user:onyourwave"));
-        assert_eq!(radio_station("yandex:track:"), None);
-        assert_eq!(radio_station("yandex:track:../x"), None);
-        assert_eq!(radio_station("https://music.yandex.ru/album/1"), None);
-        assert_eq!(radio_station("https://example.com/"), None);
+    fn my_wave_is_asked_for_by_name_or_by_the_home_page() {
+        assert!(is_my_wave("yandex:wave"));
+        assert!(is_my_wave("https://music.yandex.ru/"));
+        assert!(is_my_wave("https://music.yandex.ru/home?x=1"));
+        assert!(is_my_wave("https://music.yandex.com"));
+        assert!(!is_my_wave("yandex:track:38526"));
+        assert!(!is_my_wave("https://music.yandex.ru/album/1"));
+        assert!(!is_my_wave("https://example.com/"));
     }
 }

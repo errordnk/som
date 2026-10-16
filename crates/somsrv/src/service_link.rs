@@ -26,8 +26,8 @@ pub struct ServiceLink {
 
 /// The service and kind of `target`, or `None` for anything else.
 pub fn classify(target: &str) -> Option<ServiceLink> {
-    if let Some(station) = yandex::radio_station(target) {
-        return Some(ServiceLink { service: yandex::ID, kind: LinkKind::Radio { station } });
+    if yandex::is_my_wave(target) {
+        return Some(ServiceLink { service: yandex::ID, kind: LinkKind::Radio { station: yandex::MY_WAVE.to_string() } });
     }
     if yandex::parse_track_url(target).is_some() {
         return Some(ServiceLink { service: yandex::ID, kind: LinkKind::Track });
@@ -44,6 +44,7 @@ mod tests {
         let yandex = |kind| Some(ServiceLink { service: "yandex", kind });
         assert_eq!(classify("https://music.yandex.ru/album/9158345/track/10994777"), yandex(LinkKind::Track));
         assert_eq!(classify("https://music.yandex.ru/album/9158345"), None);
+        assert_eq!(classify("yandex:track:38526"), None);
         assert_eq!(classify("yandex:wave"), yandex(LinkKind::Radio { station: "user:onyourwave".into() }));
         assert_eq!(classify("https://music.yandex.ru/"), yandex(LinkKind::Radio { station: "user:onyourwave".into() }));
         assert_eq!(classify("https://stream.radioparadise.com/flacm"), None);

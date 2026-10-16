@@ -1562,37 +1562,24 @@ fn stream_cue(path: &str) -> Result<(), String> {
     run_playlist(entries, true)
 }
 
-/// The streaming-service radio a target asks for: the service's id and the
-/// service's own name of the station.
-fn radio_target(target: &str) -> Option<(&'static str, String)> {
-    match somsrv::service_link::classify(target)? {
-        somsrv::service_link::ServiceLink { service, kind: somsrv::service_link::LinkKind::Radio { station } } => Some((service, station)),
-        _ => None,
-    }
-}
-
 /// A playlist line that names Yandex Music at all: in a playlist it stands
 /// for the service's radio, whatever else the line says.
 fn names_yandex(line: &str) -> bool {
     line.to_ascii_lowercase().contains("yandex")
 }
 
-/// The radio a playlist stands for: its one line - a Yandex Music one is
-/// "My Wave" unless it asks for the wave of a track. A radio is endless and
-/// plays on its own, so it cannot share a playlist with other entries
-/// (`Err`); a playlist without a radio line is `Ok(None)`.
+/// The radio a playlist stands for: its one line - for Yandex Music, "My
+/// Wave", where a session always starts. A radio is endless and plays on
+/// its own, so it cannot share a playlist with other entries (`Err`); a
+/// playlist without a radio line is `Ok(None)`.
 fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, String)>, String> {
-    let radio = entries.iter().find_map(|entry| {
-        radio_target(&entry.target)
-            .or_else(|| names_yandex(&entry.target).then(|| (somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string())))
-    });
-    let Some(radio) = radio else {
+    if !entries.iter().any(|entry| names_yandex(&entry.target)) {
         return Ok(None);
-    };
+    }
     if entries.len() > 1 {
         return Err("a radio plays on its own, it cannot share a playlist with other entries".to_string());
     }
-    Ok(Some(radio))
+    Ok(Some((somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string())))
 }
 
 /// A track of the radio being played, with the batch it came in (the
@@ -2310,14 +2297,15 @@ yandex:wave
     }
 
     #[test]
-    fn a_playlist_of_one_radio_line_is_the_radio() {
+    fn a_playlist_line_naming_yandex_is_my_wave() {
         let entry = |target: &str| PlaylistEntry { target: target.to_string(), title: None, cue: None };
-        assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
-        assert_eq!(radio_in_playlist(&[entry("yandex:track:38526")]), Ok(Some(("yandex", "track:38526".to_string()))));
+        let my_wave = Ok(Some(("yandex", "user:onyourwave".to_string())));
+        assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/")]), my_wave);
+        assert_eq!(radio_in_playlist(&[entry("yandex:wave")]), my_wave);
+        assert_eq!(radio_in_playlist(&[entry("Yandex Music")]), my_wave);
+        // A session always starts with My Wave, a track's wave is no way in.
+        assert_eq!(radio_in_playlist(&[entry("yandex:track:38526")]), my_wave);
         assert_eq!(radio_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
-        // Any line that names Yandex stands for My Wave.
-        assert_eq!(radio_in_playlist(&[entry("Yandex Music")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
-        assert_eq!(radio_in_playlist(&[entry("https://music.yandex.ru/album/1/track/2")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
         assert!(radio_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
     }
 }

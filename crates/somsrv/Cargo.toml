@@ -45,11 +45,15 @@ doctest = false
 workspace = true
 
 [dependencies]
+aes = "0.8"
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
+base64.workspace = true
 bincode.workspace = true
 futures.workspace = true
+hex.workspace = true
+hmac = "0.12"
 http.workspace = true
 log.workspace = true
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
@@ -58,9 +62,11 @@ percent-encoding.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_json_lenient.workspace = true
+sha2.workspace = true
 smol.workspace = true
 sysinfo.workspace = true
-ureq.workspace = true
+ureq = { workspace = true, features = ["socks-proxy"] }
 uuid.workspace = true
 zlog.workspace = true
 

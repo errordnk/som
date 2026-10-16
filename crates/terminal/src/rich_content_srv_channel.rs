@@ -512,7 +512,15 @@ impl SrvProgressState {
             return Vec::new();
         }
         let len = ((contiguous_len - start) as usize).min(buffer.len());
-        buffer.iter().take(len).copied().collect()
+        // Two slice copies, not a byte-by-byte walk of the ring buffer.
+        let (front, back) = buffer.as_slices();
+        let mut bytes = Vec::with_capacity(len);
+        let from_front = front.len().min(len);
+        bytes.extend_from_slice(&front[..from_front]);
+        if len > from_front {
+            bytes.extend_from_slice(&back[..len - from_front]);
+        }
+        bytes
     }
 
     /// Fires a one-time `SrvRequest::RequestByteRange` for the WHOLE file

@@ -1594,6 +1594,18 @@ static RADIO_WAVE_REQUEST: std::sync::Mutex<Option<WaveRequest>> = std::sync::Mu
 /// the track was not rejected, a wave was asked of it.
 const WAVE_JUMP: i32 = 2;
 
+/// What names the track the radio is built from while it is a branch (the
+/// widget shows it in its running line): "artist - title, year".
+static RADIO_WAVE_LABEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The label of the track a branch is made from.
+fn wave_label(track: &somsrv::protocol::RadioTrack) -> String {
+    match track.year {
+        Some(year) => format!("{}, {year}", track.title),
+        None => track.title.clone(),
+    }
+}
+
 /// The track of the radio that is playing now.
 struct CurrentRadioTrack {
     service: &'static str,
@@ -1620,7 +1632,9 @@ fn announce_radio_state(ids: SrpIds) {
     let (session_id, file_id) = ids;
     let liked = CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|track| track.liked);
     let track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
-    let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave));
+    let label = RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let result =
+        srv_channel::SrvChannel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label));
     if let Err(err) = result {
         eprint!("somsrp: could not announce the radio state: {err}\r\n");
     }
@@ -1787,6 +1801,7 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
     RADIO_TRACK_WAVE.store(false, std::sync::atomic::Ordering::Release);
     *RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let mut played = fetch_radio_entries(service, station, None)?;
     if let Some(first) = played.first() {
         radio_feedback(service, None, &first.station, &first.batch_id, RadioEvent::RadioStarted, 0.0);
@@ -1852,9 +1867,20 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
         // asked for plays at once (the click ended the track), going back to
         // main waits for here, the end of the track that played out.
         let request = RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        let branched_from = match &request {
+            Some(WaveRequest::Branch(from)) => Some(from.clone()),
+            _ => None,
+        };
         in_branch = apply_wave_request(request, &mut played, cursor, in_branch, &mut main_queue, station, |radio, after| {
             fetch_radio_entries(service, radio, Some(after))
         })?;
+        // The running line names the track the branch is built from.
+        let label = match (&branched_from, in_branch) {
+            (Some(from), _) => played.iter().find(|entry| entry.track.id == *from).map(|entry| wave_label(&entry.track)),
+            (None, true) => RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone(),
+            (None, false) => None,
+        };
+        *RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = label;
         cursor += 1;
         if cursor >= played.len() {
             let last = played[played.len() - 1].track.id.clone();
@@ -2483,7 +2509,7 @@ yandex:wave
 
     fn radio_entry(id: &str, station: &str) -> RadioEntry {
         RadioEntry {
-            track: somsrv::protocol::RadioTrack { id: id.to_string(), title: id.to_string(), target: String::new(), liked: false },
+            track: somsrv::protocol::RadioTrack { id: id.to_string(), title: id.to_string(), target: String::new(), liked: false, year: None },
             batch_id: String::new(),
             station: station.to_string(),
         }
@@ -2550,6 +2576,15 @@ yandex:wave
         assert!(!apply_wave_request(None, &mut played, 0, false, &mut main_queue, "main", fake_fetch).unwrap());
         assert!(!apply_wave_request(Some(WaveRequest::Main), &mut played, 0, false, &mut main_queue, "main", fake_fetch).unwrap());
         assert_eq!(ids(&played), ["m1@main", "m2@main"]);
+    }
+
+    #[test]
+    fn a_branch_is_named_by_its_track_and_year() {
+        let mut track = radio_entry("m1", "main").track;
+        track.title = "Portishead - Roads".to_string();
+        assert_eq!(wave_label(&track), "Portishead - Roads", "no year known, none shown");
+        track.year = Some(1994);
+        assert_eq!(wave_label(&track), "Portishead - Roads, 1994");
     }
 
     #[test]

@@ -243,9 +243,10 @@ fn file_info(agent: &ureq::Agent, token: &str, track: &TrackRef) -> anyhow::Resu
     parse_file_info(&api_get(agent, token, "file info", &format!("{API_BASE}/get-file-info?{query}"))?)
 }
 
-/// One track of a radio batch: its id, the "artist - title" to show and the
-/// link that plays it. `None` for a track the service marks unavailable.
-fn batch_track(track: &serde_json::Value) -> Option<(String, String, String)> {
+/// One track of a radio batch: its id, the "artist - title" to show, the
+/// link that plays it and its album's year. `None` for a track the service
+/// marks unavailable.
+fn batch_track(track: &serde_json::Value) -> Option<(String, String, String, Option<u32>)> {
     if track.get("available").and_then(|v| v.as_bool()) == Some(false) {
         return None;
     }
@@ -267,7 +268,8 @@ fn batch_track(track: &serde_json::Value) -> Option<(String, String, String)> {
         None => format!("https://music.yandex.ru/track/{id}"),
     };
     let title = if artist.is_empty() { title } else { format!("{artist} - {title}") };
-    Some((id, title, target))
+    let year = track.pointer("/albums/0/year").and_then(|v| v.as_u64()).and_then(|year| u32::try_from(year).ok());
+    Some((id, title, target, year))
 }
 
 /// A station is `<type>:<tag>` (`user:onyourwave`, `track:38526`); nothing
@@ -291,8 +293,8 @@ pub fn parse_radio(json: &str) -> anyhow::Result<(String, Vec<RadioTrack>)> {
         .into_iter()
         .flatten()
         .filter_map(|item| {
-            let (id, title, target) = batch_track(item.get("track")?)?;
-            Some(RadioTrack { id, title, target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false) })
+            let (id, title, target, year) = batch_track(item.get("track")?)?;
+            Some(RadioTrack { id, title, target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false), year })
         })
         .collect::<Vec<_>>();
     if tracks.is_empty() {
@@ -509,7 +511,7 @@ mod tests {
     #[test]
     fn a_radio_batch_is_parsed() {
         let json = r#"{"result":{"batchId":"1792-362","sequence":[
-            {"type":"track","liked":true,"track":{"id":"38526","title":"Roads","artists":[{"name":"Portishead"}],"albums":[{"id":3193}]}},
+            {"type":"track","liked":true,"track":{"id":"38526","title":"Roads","artists":[{"name":"Portishead"}],"albums":[{"id":3193,"year":1994}]}},
             {"type":"track","liked":false,"track":{"id":80041888,"title":"Take Me Away","artists":[{"name":"Monolink"}],"albums":[{"id":14617746}]}},
             {"type":"track","track":{"id":"9","title":"Gone","available":false}}]}}"#;
         let (batch, tracks) = parse_radio(json).expect("batch");
@@ -522,6 +524,7 @@ mod tests {
                 title: "Portishead - Roads".into(),
                 target: "https://music.yandex.ru/album/3193/track/38526".into(),
                 liked: true,
+                year: Some(1994),
             }
         );
         assert_eq!(tracks[1].id, "80041888");

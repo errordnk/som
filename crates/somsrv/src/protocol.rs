@@ -710,7 +710,17 @@ pub enum SrvRequest {
     /// Sent by the radio runner: what the widget's radio icons show for
     /// the key's track. `somsrv` stores it and pushes `SrvResponse::RadioState`
     /// to the key's subscribers (and replays it to a late one).
-    AnnounceRadioState { session_id: u32, file_id: u32, liked: bool, track_wave: bool },
+    ///
+    /// `wave_label` names the track the radio was built from while it is a
+    /// branch ("wave of a track"): the widget shows it in its running line.
+    AnnounceRadioState {
+        session_id: u32,
+        file_id: u32,
+        liked: bool,
+        track_wave: bool,
+        #[serde(default)]
+        wave_label: Option<String>,
+    },
 }
 
 /// What a click on an icon of the radio widget asks for.
@@ -741,6 +751,9 @@ pub struct RadioTrack {
     pub target: String,
     /// Whether the account has already liked it.
     pub liked: bool,
+    /// The year of its album, when the service says.
+    #[serde(default)]
+    pub year: Option<u32>,
 }
 
 /// daemon -> `somsrp`/other SRP clients, answering a `SrvRequest`.
@@ -858,7 +871,14 @@ pub enum SrvResponse {
     /// Pushed to subscribers with what the radio icons show for the key's
     /// track - see `SrvRequest::AnnounceRadioState`. Also replayed to a late
     /// subscriber.
-    RadioState { session_id: u32, file_id: u32, liked: bool, track_wave: bool },
+    RadioState {
+        session_id: u32,
+        file_id: u32,
+        liked: bool,
+        track_wave: bool,
+        #[serde(default)]
+        wave_label: Option<String>,
+    },
     /// Pushed to every `SubscribeProgress` subscriber of the key whenever
     /// `somsrv` learns what an internet-radio stream it is fetching is
     /// currently playing - see [`NowPlayingInfo`]. The latest one is also

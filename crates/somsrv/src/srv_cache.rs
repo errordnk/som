@@ -149,8 +149,9 @@ struct Inner {
     playlists: HashMap<CacheKey, (u32, u32, Option<String>, bool)>,
     /// The CUE sheet a key plays (`set_cue_sheet`).
     cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
-    /// `(liked, track_wave)` the radio icons show for a key (`set_radio_state`).
-    radio_states: HashMap<CacheKey, (bool, bool)>,
+    /// `(liked, track_wave, wave_label)` the radio widget shows for a key
+    /// (`set_radio_state`).
+    radio_states: HashMap<CacheKey, (bool, bool, Option<String>)>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -345,8 +346,8 @@ impl SrvCache {
         if let Some((index, len, title, looping)) = inner.playlists.get(&key).cloned() {
             let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title, looping });
         }
-        if let Some((liked, track_wave)) = inner.radio_states.get(&key).copied() {
-            let _ = send(SrvResponse::RadioState { session_id, file_id, liked, track_wave });
+        if let Some((liked, track_wave, wave_label)) = inner.radio_states.get(&key).cloned() {
+            let _ = send(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label });
         }
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
@@ -433,15 +434,15 @@ impl SrvCache {
 
     /// Records what the radio icons show for `(session_id, file_id)` and
     /// pushes it to the key's subscribers.
-    pub fn set_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool) {
+    pub fn set_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool, wave_label: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         if let Some(subscribers) = inner.subscribers.get(&key) {
             for subscriber in subscribers {
-                let _ = subscriber(SrvResponse::RadioState { session_id, file_id, liked, track_wave });
+                let _ = subscriber(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label: wave_label.clone() });
             }
         }
-        inner.radio_states.insert(key, (liked, track_wave));
+        inner.radio_states.insert(key, (liked, track_wave, wave_label));
     }
 
     /// Forwards a click on a radio icon to the key's registered range
@@ -1302,18 +1303,22 @@ mod tests {
     #[test]
     fn radio_state_is_pushed_and_replayed() {
         let cache = SrvCache::new();
-        cache.set_radio_state(1, 2, true, false);
+        cache.set_radio_state(1, 2, true, false, None);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         cache.subscribe(1, 2, Arc::new(move |response| {
-            if let SrvResponse::RadioState { liked, track_wave, .. } = response {
-                sink.lock().unwrap().push((liked, track_wave));
+            if let SrvResponse::RadioState { liked, track_wave, wave_label, .. } = response {
+                sink.lock().unwrap().push((liked, track_wave, wave_label));
             }
             Ok(())
         }));
-        cache.set_radio_state(1, 2, true, true);
+        cache.set_radio_state(1, 2, true, true, Some("Artist - Song, 1999".to_string()));
 
-        assert_eq!(*seen.lock().unwrap(), vec![(true, false), (true, true)], "a late subscriber learns the state, then every change");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(true, false, None), (true, true, Some("Artist - Song, 1999".to_string()))],
+            "a late subscriber learns the state, then every change"
+        );
     }
 }

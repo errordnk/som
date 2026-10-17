@@ -187,7 +187,7 @@ pub struct SrvProgressState {
     playlist_looping: AtomicBool,
     /// `(liked, track_wave)` from the latest `SrvResponse::RadioState`: what
     /// the radio icons show for this key's track.
-    radio_state: Mutex<Option<(bool, bool)>>,
+    radio_state: Mutex<Option<(bool, bool, Option<String>)>>,
     /// The playlist's own name for this entry (`#EXTINF`), e.g. the
     /// station - what stays shown between a stream's songs.
     station_title: Mutex<Option<String>>,
@@ -228,8 +228,8 @@ impl SrvProgressState {
 
     /// What the radio icons show - `(liked, track_wave)` - when this key's
     /// track belongs to a radio.
-    pub fn radio_state(&self) -> Option<(bool, bool)> {
-        *self.radio_state.lock().unwrap_or_else(|p| p.into_inner())
+    pub fn radio_state(&self) -> Option<(bool, bool, Option<String>)> {
+        self.radio_state.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Whether the key's playlist wraps around (previous on the first
@@ -994,10 +994,10 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
                 state.playlist_looping.store(looping, Ordering::Release);
                 *state.station_title.lock().unwrap_or_else(|p| p.into_inner()) = title;
             },
-            SrvResponse::RadioState { session_id: response_session, file_id: response_file, liked, track_wave }
+            SrvResponse::RadioState { session_id: response_session, file_id: response_file, liked, track_wave, wave_label }
                 if response_session == session_id && response_file == file_id =>
             {
-                *state.radio_state.lock().unwrap_or_else(|p| p.into_inner()) = Some((liked, track_wave));
+                *state.radio_state.lock().unwrap_or_else(|p| p.into_inner()) = Some((liked, track_wave, wave_label));
             },
             SrvResponse::CueSheet { session_id: response_session, file_id: response_file, sheet }
                 if response_session == session_id && response_file == file_id =>

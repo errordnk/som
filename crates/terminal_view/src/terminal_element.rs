@@ -2035,6 +2035,11 @@ fn paint_rich_content_placements(
 
         let placements = terminal.rich_content_placements();
         let audio_placements = terminal.rich_content_audio_placements();
+        // What can be clicked is what this frame paints: the bounds of a
+        // widget that is gone (or was painted once more in the frame that
+        // found its track over) must not take a click meant for the one
+        // that took its place.
+        terminal.clear_audio_widget_bounds();
         let markdown_placements = terminal.rich_content_markdown_placements();
         #[cfg(target_os = "windows")]
         let video_placements = terminal.rich_content_video_placements(widget_bg_is_light);
@@ -3798,7 +3803,18 @@ fn paint_now_playing_audio_in_box(
     } else {
         ("", "", "", "", "|<", ">|", ">")
     };
-    // One line: the track's title first, then artist, album and year.
+    // The glyph of a wave: before the name of the track a branch is built from.
+    let wave_glyph: String = if has_nerd {
+        ['\u{f095b}', '\u{f147a}']
+            .into_iter()
+            .find(|glyph| window.text_system().has_glyph_for_char(resolved_font_id, *glyph))
+            .map(|glyph| glyph.to_string())
+            .unwrap_or_else(|| "\u{2248}".to_string())
+    } else {
+        "~".to_string()
+    };
+    // One line: the track's title first, then artist, album and year - and,
+    // in a branch, the track its wave is built from.
     let mut info_parts = Vec::new();
     if !np.title.is_empty() {
         info_parts.push(format!("{nf_note} {}", np.title));
@@ -3811,6 +3827,9 @@ fn paint_now_playing_audio_in_box(
     }
     if let Some(year) = np.year {
         info_parts.push(format!("{nf_year} {year}"));
+    }
+    if let Some(label) = np.radio.as_ref().and_then(|radio| radio.wave_label.as_deref()) {
+        info_parts.push(format!("{wave_glyph} {label}"));
     }
     let info_text = info_parts.join("   ");
 
@@ -3946,24 +3965,18 @@ fn paint_now_playing_audio_in_box(
         x += slot + cell_width;
         right -= slot + cell_width;
     }
-    if let Some(radio) = np.radio {
+    if let Some(radio) = &np.radio {
         // A radio's icons flank the clock: the wave of the playing track
-        // (dim until switched on, lit while it is the radio being played)
+        // (dim until switched on, red while it is the radio being played)
         // after previous, the like (filled and red when liked) before next.
-        let (heart_on, heart_off, wave) = if has_nerd {
-            let wave = ['\u{f095b}', '\u{f147a}']
-                .into_iter()
-                .find(|glyph| window.text_system().has_glyph_for_char(resolved_font_id, *glyph))
-                .map(|glyph| glyph.to_string())
-                .unwrap_or_else(|| "\u{2248}".to_string());
-            ("\u{f004}".to_string(), "\u{f08a}".to_string(), wave)
-        } else {
-            ("<3".to_string(), "<3".to_string(), "~".to_string())
-        };
-        let wave_color: Hsla = if radio.track_wave { fill_color.into() } else { dim_color };
-        let like_color: Hsla = if radio.liked { gpui::rgba(0xf38ba8ff).into() } else { dim_color };
+        let (heart_on, heart_off) = if has_nerd { ("\u{f004}", "\u{f08a}") } else { ("<3", "<3") };
+        let wave = wave_glyph.clone();
+        // Both icons light up the same red when on.
+        let lit_color: Hsla = gpui::rgba(0xf38ba8ff).into();
+        let wave_color: Hsla = if radio.track_wave { lit_color } else { dim_color };
+        let like_color: Hsla = if radio.liked { lit_color } else { dim_color };
         let wave_line = shape(&wave, wave_color, window);
-        let like_line = shape(if radio.liked { &heart_on } else { &heart_off }, like_color, window);
+        let like_line = shape(if radio.liked { heart_on } else { heart_off }, like_color, window);
         let wave_slot = Bounds::new(point(x, y), gpui::size(slot, line_height));
         let like_slot = Bounds::new(point(right - slot, y), gpui::size(slot, line_height));
         wave_line

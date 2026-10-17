@@ -135,6 +135,11 @@ const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 /// for anything but its first size-set. See `created_at` on `Terminal`.
 const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How often audio is kept going while nothing is painted - see
+/// `Terminal::keep_audio_going`. The end of a track is noticed this late at
+/// most.
+const AUDIO_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Minimum spacing between consecutive `cx.force_redraw_windows()` calls
 /// triggered by rich-content commands — see
 /// `Terminal::rich_content_force_redraw_due`'s doc comment for the full
@@ -1029,6 +1034,20 @@ impl TerminalBuilder {
             }
             anyhow::Ok(())
         });
+        // Playback must not depend on the window being painted: a window that
+        // is covered by others gets no paint messages at all, and the end of a
+        // track, the next track of a playlist or of a radio, only ever
+        // started when the window came back to the front.
+        cx.spawn(async move |terminal, cx| {
+            loop {
+                cx.background_executor().timer(AUDIO_KEEPALIVE_INTERVAL).await;
+                if terminal.update(cx, |terminal, _| terminal.keep_audio_going()).is_err() {
+                    // The terminal is gone.
+                    break;
+                }
+            }
+        })
+        .detach();
         self.terminal
     }
 
@@ -4042,7 +4061,9 @@ impl Terminal {
             ready,
             cue_track: cue_view.is_some(),
             finite_track: finite && cue_view.is_none() && duration > std::time::Duration::ZERO,
-            radio: state.radio_state().map(|(liked, track_wave)| rich_content_audio_widget::RadioIcons { liked, track_wave }),
+            radio: state
+                .radio_state()
+                .map(|(liked, track_wave, wave_label)| rich_content_audio_widget::RadioIcons { liked, track_wave, wave_label }),
             // A CUE sheet and a list that does not wrap end at their ends.
             can_prev: match (&cue_view, playlist, state.playlist_looping()) {
                 (Some((.., index)), ..) => *index > 0,
@@ -4055,6 +4076,21 @@ impl Terminal {
                 _ => true,
             },
         })
+    }
+
+    /// What painting does for audio, without the painting: discovers the
+    /// placements the grid now holds (a radio's next track prints a new one)
+    /// and runs every audio player's bookkeeping - open and autoplay a new
+    /// one, close a finished one and tell `somsrp`. Called on a timer, so it
+    /// goes on while the window is covered and so not painted; harmless
+    /// when it is (painting does the same).
+    fn keep_audio_going(&mut self) {
+        if self.rich_content_srv_progress.borrow().is_empty() && self.rich_content_audio_players.borrow().is_empty() {
+            // No rich content at all: nothing to keep going, nothing to scan.
+            return;
+        }
+        self.poll_rich_content_srv_subscriptions();
+        self.rich_content_audio_placements();
     }
 
     /// Asks for ONE redraw of the window `after` from now - for a widget
@@ -4161,6 +4197,12 @@ impl Terminal {
     /// `App::drop_image`.
     pub fn take_audio_cover_drops(&self) -> Vec<std::sync::Arc<gpui::RenderImage>> {
         std::mem::take(&mut *self.audio_cover_drops.borrow_mut())
+    }
+
+    /// Forgets every audio widget's clickable parts: called before a frame
+    /// paints the widgets, so only what that frame painted can be clicked.
+    pub fn clear_audio_widget_bounds(&self) {
+        self.audio_widget_bounds.borrow_mut().clear();
     }
 
     /// Records where an audio placement's clickable parts were painted.

@@ -71,12 +71,15 @@ pub fn cue_track_index(tracks: &[somsrv::protocol::CueTrack], position_ms: u64) 
 }
 
 /// What a radio widget's two icons show.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RadioIcons {
     /// The track is liked.
     pub liked: bool,
     /// The radio is the one built from a track, not the session's own.
     pub track_wave: bool,
+    /// While it is: the track it was built from ("artist - title, year"),
+    /// for the running line.
+    pub wave_label: Option<String>,
 }
 
 /// Where the widget's clickable parts were painted this frame.

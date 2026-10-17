@@ -217,8 +217,15 @@ impl SrvChannel {
 
     /// Tells `somsrv` what the radio icons of `(session_id, file_id)` show
     /// (`SrvRequest::AnnounceRadioState`).
-    pub fn announce_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool) -> Result<(), String> {
-        send(&self.connection, &SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave })
+    pub fn announce_radio_state(
+        &self,
+        session_id: u32,
+        file_id: u32,
+        liked: bool,
+        track_wave: bool,
+        wave_label: Option<String>,
+    ) -> Result<(), String> {
+        send(&self.connection, &SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave, wave_label })
     }
 
     pub fn stop_playback(&self, session_id: u32, file_id: u32) -> Result<(), String> {

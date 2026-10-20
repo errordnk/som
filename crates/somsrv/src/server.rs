@@ -373,22 +373,33 @@ fn handle_relay(connection: PipeConnection, registry: &SessionRegistry) -> anyho
 
     let result = read_loop(&connection, session);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let closed_for_good = matches!(result, Ok(RelayEnd::ClosedForGood));
+    log::info!(
+        "relay for pane {:?} disconnected (closed for good: {closed_for_good}, tmux: {}): {}",
+        key.1,
+        registered.tmux,
+        match &result {
+            Ok(end) => format!("{end:?}"),
+            Err(err) => format!("{err:#}"),
+        }
+    );
 
     // `tmux: false` never outlives its connection — an ungraceful
     // disconnect tears it down exactly like an explicit `Close` would,
     // since there's nothing worth persisting for a non-tmux profile (this
     // matches today's plain, non-tmux PTY behavior: closing the tab ends
     // the shell). `tmux: true` only ever gets torn down by an explicit
-    // `Close` (handled inside `read_loop` itself, which already calls
-    // `session.kill()` before returning in that case) — a plain dropped
-    // connection here leaves it in the registry for a later reconnect,
-    // indefinitely, exactly like today's existing HOLDER survival
-    // behavior.
-    if !registered.tmux {
+    // `Close` - which must also take the (dead) session out of the
+    // registry, or it stays there for as long as the daemon runs and a
+    // later connection with the same pane id would find a corpse - while a
+    // plain dropped connection leaves it in the registry for a later
+    // reconnect, indefinitely, exactly like today's existing HOLDER
+    // survival behavior.
+    if !registered.tmux || closed_for_good {
         remove_session(registry, &key);
     }
 
-    result
+    result.map(|_| ())
 }
 
 fn read_relay_message(connection: &PipeConnection) -> anyhow::Result<RelayInput> {
@@ -396,7 +407,15 @@ fn read_relay_message(connection: &PipeConnection) -> anyhow::Result<RelayInput>
     Ok(serde_json::from_slice(&message)?)
 }
 
-fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<()> {
+/// How a relay's connection ended, when it ended in an orderly way.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayEnd {
+    /// The relay asked for the session to be closed for good (`RelayInput::
+    /// Close`: the user closed the tab).
+    ClosedForGood,
+}
+
+fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<RelayEnd> {
     loop {
         let message = read_relay_message(connection)?;
         match message {
@@ -406,7 +425,7 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<(
             }
             RelayInput::Close => {
                 session.kill();
-                return Ok(());
+                return Ok(RelayEnd::ClosedForGood);
             }
             // Only ever expected once each, as the first/second messages
             // (handled in `handle_relay` before this loop starts) — a

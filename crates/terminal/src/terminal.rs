@@ -8498,10 +8498,7 @@ mod tests {
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         let (terminal, completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -8530,8 +8527,14 @@ mod tests {
             // drives the same `somsrv` subscription/`record_progress`
             // wiring `terminal_view::terminal_element::
             // paint_rich_content_placements` drives every real paint, so
-            // `rich_content_cache` actually gets populated below.
-            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+            // `rich_content_cache` actually gets populated below - and the
+            // same call every paint makes for pictures, which also asks the
+            // daemon for the start of a file the subscription began in the
+            // middle of.
+            terminal.update(cx, |term, _| {
+                term.poll_rich_content_srv_subscriptions();
+                term.rich_content_placements();
+            });
 
             let (_session_id, _file_id, bytes) = terminal.update(cx, |term, _| {
                 // Only one file is ever streamed in this test — grab
@@ -8623,10 +8626,7 @@ mod tests {
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -8710,10 +8710,7 @@ mod tests {
         let markdown_path = markdown_dir.join("test.md");
         std::fs::write(&markdown_path, "# Hello\n\nThis is a test.").unwrap();
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -8777,10 +8774,7 @@ mod tests {
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         // Unlike `build_test_terminal_with_arguments`'s default (10,000
         // lines of scrollback), this test needs `\x1b[2J` to ACTUALLY
@@ -9541,10 +9535,7 @@ mod tests {
         let tone_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac");
         assert!(tone_path.is_file(), "test_fixtures/tone.flac not found at {tone_path:?}");
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -9661,10 +9652,7 @@ mod tests {
             return;
         }
 
-        let test_exe = std::env::current_exe().expect("current_exe must resolve in a test binary");
-        let target_debug_dir = test_exe.parent().and_then(|p| p.parent()).expect("target/<profile>/deps/.. shape");
-        let somsrp_path = target_debug_dir.join(if cfg!(windows) { "somsrp.exe" } else { "somsrp" });
-        assert!(somsrp_path.is_file(), "somsrp bin target not found at {somsrp_path:?} — run `cargo build -p somsrp`");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -10212,28 +10200,16 @@ mod tests {
         );
     }
 
-    /// Finds `somsrv(.exe)` next to whichever `target/debug` this
-    /// test binary itself was built into — mirrors
-    /// `terminal_view::terminal_panel::somsrv_binary_path`'s own
-    /// resolution logic (that one looks next to `som.exe`; this one looks
-    /// next to `target/debug/deps/terminal-<hash>.exe`, one directory
-    /// shallower, since `cargo test` binaries live in `deps/` while
-    /// `cargo build`'s bin targets land directly in `target/debug/`).
-    /// Returns `None` (causing the test to skip, not fail) if the binary
-    /// hasn't been built yet — this test exercises the REAL somsrv
-    /// binary as an external process (deliberately, since the whole point is
-    /// testing the wire protocol between a real `Terminal`'s PTY and it),
-    /// not something `cargo test` builds automatically as a dependency.
-    fn find_somsrv_binary() -> Option<std::path::PathBuf> {
-        let test_exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-        let binary_name = if cfg!(target_os = "windows") { "somsrv.exe" } else { "somsrv" };
-        for candidate_dir in [test_exe_dir.clone(), test_exe_dir.parent()?.to_path_buf()] {
-            let candidate = candidate_dir.join(binary_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
+    /// Where the real `somsrv` processes (spawned by tests, not under the
+    /// test home fixture) write their logs: Som's logs directory
+    /// (`paths::logs_dir()`, `~/.local/state/som/logs` on Windows).
+    /// Computed from the real home on purpose - see the long comment in
+    /// `test_nul_byte_signals_tmux_relay_to_close_for_good`. It once
+    /// pointed at the old `~/.config/som/logs`, the test read an empty
+    /// file and failed forever without anyone noticing.
+    #[cfg(target_os = "windows")]
+    fn real_logs_dir() -> std::path::PathBuf {
+        dirs::home_dir().expect("failed to determine home directory").join(".local").join("state").join("som").join("logs")
     }
 
     /// Reproduces the exact mechanism `TerminalView::on_removed`
@@ -10257,10 +10233,7 @@ mod tests {
     async fn test_nul_byte_signals_tmux_relay_to_close_for_good(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        let Some(server_path) = find_somsrv_binary() else {
-            eprintln!("skipping: somsrv binary not built, run `cargo build -p somsrv` first");
-            return;
-        };
+        let server_path = somsrv::testing::debug_binary("somsrv");
 
         let pane_id = format!("test-nul-close-{}", std::process::id());
         let profile_name = "test-nul-close";
@@ -10287,7 +10260,23 @@ mod tests {
         // waiting on them requires actually blocking this thread — safe
         // here only because `cx.executor().allow_parking()` was called
         // above.
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // The daemon's own list of sessions says whether the tab's session
+        // exists - not its log, which this test used to scrape and which
+        // moved without anyone noticing. Polled with real sleeps, as above.
+        let holds_session = || {
+            somsrv::admin::list_sessions(None)
+                .map(|sessions| sessions.iter().any(|session| session.pane_id == pane_id))
+                .unwrap_or(false)
+        };
+        // First the session must exist at all: waiting for it to be gone
+        // while it never came would "pass" for nothing.
+        for _ in 0..100 {
+            if holds_session() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(holds_session(), "the tab's session was never registered with the daemon");
 
         terminal.update(cx, |terminal, _cx| {
             terminal.input(vec![0u8]);
@@ -10326,36 +10315,24 @@ mod tests {
         // old per-pane HOLDER process), so the assertion below also
         // checks the pane id appears in the matched line, in case some
         // other test's session close raced onto the same log first.
-        let real_home = dirs::home_dir().expect("failed to determine home directory");
-        let daemon_log_path = real_home.join(".config").join("som").join("logs").join("somsrv-daemon.log");
-        let expected = format!("session for pane {pane_id:?} closed for good");
-        let mut daemon_log = String::new();
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            daemon_log = std::fs::read_to_string(&daemon_log_path).unwrap_or_default();
-            if daemon_log.contains(&expected) {
+        for _ in 0..100 {
+            if !holds_session() {
                 break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let still_held = holds_session();
+        if still_held {
+            somsrv::admin::kill_session(None, pane_id.clone()).ok();
         }
         assert!(
-            daemon_log.contains(&expected),
-            "session should have been removed from the shared daemon's registry after the NUL byte \
-             was forwarded as RelayInput::Close — this is the exact bug this test guards against \
-             (a session outliving an explicitly closed tab). Expected {expected:?} in daemon log, got: {daemon_log:?}"
+            !still_held,
+            "session should have been removed from the shared daemon's registry after the NUL byte              was forwarded as RelayInput::Close - this is the exact bug this test guards against              (a session outliving an explicitly closed tab)"
         );
 
-        let log_path = real_home
-            .join(".config")
-            .join("som")
-            .join("logs")
-            .join(format!("somsrv-{profile_name}-{pane_id}-relay.log"));
-        let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            log_contents.contains("holder handshake"),
-            "sanity check: relay should have at least completed its handshake — got log: {log_contents:?}"
-        );
-
-        std::fs::remove_file(&log_path).ok();
+        // The relay's own log file is left behind by every run: removed
+        // (best effort - it is the relay's, which may still be exiting).
+        std::fs::remove_file(real_logs_dir().join(format!("somsrv-{profile_name}-{pane_id}-relay.log"))).ok();
     }
 
     /// Same mechanism as `test_nul_byte_signals_tmux_relay_to_close_for_good`,

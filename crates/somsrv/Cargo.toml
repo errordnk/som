@@ -41,6 +41,10 @@ name = "somsrvupd"
 path = "src/bin/somsrvupd.rs"
 doctest = false
 
+[features]
+# `somsrv::testing`: for the tests of other crates that run the real binaries.
+test-support = []
+
 [lints]
 workspace = true
 

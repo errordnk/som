@@ -907,7 +907,7 @@ impl TerminalPanel {
                         }
                         anyhow::Ok(item_id)
                     });
-                    tab_creations.push((db_index, tab.extra_splits, created));
+                    tab_creations.push((db_index, tab.extra_splits, tab.tmux_sessions.clone().unwrap_or_default(), created));
                     continue;
                 }
 
@@ -940,7 +940,7 @@ impl TerminalPanel {
                     let created = cx.background_spawn(async move {
                         created.await.map(|(item_id, _terminal)| item_id)
                     });
-                    tab_creations.push((db_index, tab.extra_splits, created));
+                    tab_creations.push((db_index, tab.extra_splits, tab.tmux_sessions.clone().unwrap_or_default(), created));
                 }
             }
 
@@ -953,12 +953,12 @@ impl TerminalPanel {
             // already correct the whole time, regardless of which tab's
             // (possibly slow, real SSH) connection happens to finish last.
             let mut tabs_in_db_order = Vec::with_capacity(tab_creations.len());
-            for (db_index, extra_splits, created) in tab_creations.into_iter() {
+            for (db_index, extra_splits, saved_pane_ids, created) in tab_creations.into_iter() {
                 if let Some(item_id) = created.await.log_err() {
-                    tabs_in_db_order.push((db_index, extra_splits, item_id));
+                    tabs_in_db_order.push((db_index, extra_splits, saved_pane_ids, item_id));
                 }
             }
-            tabs_in_db_order.sort_by_key(|(db_index, _, _)| *db_index);
+            tabs_in_db_order.sort_by_key(|(db_index, ..)| *db_index);
             // Move the tab db.json marked active to the end of the queue.
             // Phase 2 below activates each tab it splits (a real, visible
             // focus change — see the comment above that loop), so whichever
@@ -970,7 +970,7 @@ impl TerminalPanel {
             // restore where a non-active tab happens to have splits too.
             if let Some(active_pos) = tabs_in_db_order
                 .iter()
-                .position(|(db_index, _, _)| *db_index == db_state.active_tab)
+                .position(|(db_index, ..)| *db_index == db_state.active_tab)
             {
                 let active_entry = tabs_in_db_order.remove(active_pos);
                 tabs_in_db_order.push(active_entry);
@@ -1002,7 +1002,7 @@ impl TerminalPanel {
             // Phase 0, but this still looks each one up by `EntityId`
             // rather than assuming `position` holds, since splitting an
             // EARLIER tab in this same loop shifts later ones' indices.
-            for (_db_index, extra_splits, item_id) in tabs_in_db_order.into_iter() {
+            for (_db_index, extra_splits, saved_pane_ids, item_id) in tabs_in_db_order.into_iter() {
                 if extra_splits == 0 {
                     continue;
                 }
@@ -1073,7 +1073,12 @@ impl TerminalPanel {
                     continue;
                 }
 
-                for _ in 0..extra_splits {
+                // Each split reattaches to the HOLDER it had: the saved
+                // pane_ids are [main, split 1, split 2, ..], and the main
+                // one was used above. Without them every split got a fresh
+                // pane_id, started a brand-new session and left the old one
+                // (with whatever ran in it, an htop, say) orphaned.
+                make_restored_splits(&saved_pane_ids, extra_splits, async || {
                     let split_task = window_handle
                         .update(cx, |_, window, cx| {
                             workspace.update(cx, |workspace, cx| {
@@ -1085,7 +1090,8 @@ impl TerminalPanel {
                     if let Some(split_task) = split_task {
                         split_task.await;
                     }
-                }
+                })
+                .await;
             }
 
             // All tabs (and their splits) exist now — focus the tab db.json
@@ -1563,8 +1569,65 @@ fn wrap_remote_command_args(
 /// shape only needs updating in one place to keep this in sync (the reverse
 /// of maintaining a second, parallel encoding of the same information).
 pub fn rebuild_tmux_shell_with_fresh_pane_id(shell: &Shell) -> Option<(Shell, String)> {
+    rebuild_tmux_shell_with_pane_id(shell, uuid::Uuid::new_v4().to_string())
+}
+
+/// The pane_ids a restore has saved for the splits it is about to create,
+/// in order: the split made next takes the first (see
+/// [`rebuild_tmux_shell_for_split`]) and so reattaches to the HOLDER it had.
+static RESTORED_SPLIT_PANE_IDS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn queue_restored_split_pane_id(pane_id: String) {
+    RESTORED_SPLIT_PANE_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push_back(pane_id);
+}
+
+/// Before split number `split_index` (0 is the first split) of a restored
+/// tab is made: queues the pane_id the tab saved for it. `saved_pane_ids`
+/// is what `db.json` holds for the tab - the main pane's first, then each
+/// split's in the order they were made.
+fn queue_saved_split_pane_id(saved_pane_ids: &[String], split_index: usize) {
+    if let Some(saved) = saved_pane_ids.get(split_index + 1) {
+        queue_restored_split_pane_id(saved.clone());
+    }
+}
+
+/// Makes the `extra_splits` splits of a restored tab one after the other,
+/// each of them reattaching to the session the tab saved for it: before
+/// every split is made, its saved pane_id is queued for
+/// [`rebuild_tmux_shell_for_split`] to take. `make_split` makes one split
+/// (and returns when it exists); what it makes the split of is its own
+/// business, this is the part that must never be forgotten - it once was,
+/// and every split of every restored tab came back as a new, empty session.
+/// Shared by the restore and by the test that runs it against a real daemon.
+async fn make_restored_splits(saved_pane_ids: &[String], extra_splits: usize, mut make_split: impl AsyncFnMut()) {
+    clear_restored_split_pane_ids();
+    for split_index in 0..extra_splits {
+        queue_saved_split_pane_id(saved_pane_ids, split_index);
+        make_split().await;
+    }
+}
+
+fn clear_restored_split_pane_ids() {
+    RESTORED_SPLIT_PANE_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+}
+
+/// [`rebuild_tmux_shell_with_fresh_pane_id`] for a split being made: the
+/// pane_id is the one a restore saved for this split if it queued one, a
+/// fresh one otherwise (a split the user makes by hand).
+pub fn rebuild_tmux_shell_for_split(shell: &Shell) -> Option<(Shell, String)> {
+    let restored = RESTORED_SPLIT_PANE_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop_front();
+    match restored {
+        Some(pane_id) => rebuild_tmux_shell_with_pane_id(shell, pane_id),
+        None => rebuild_tmux_shell_with_fresh_pane_id(shell),
+    }
+}
+
+/// The shell rebuilt to connect to the session `pane_id` (the pane_id of a
+/// tmux-wrapped shell is the one thing that picks its HOLDER).
+pub fn rebuild_tmux_shell_with_pane_id(shell: &Shell, pane_id: String) -> Option<(Shell, String)> {
     let Shell::WithArguments { program, args, title_override } = shell else { return None };
-    let fresh_pane_id = uuid::Uuid::new_v4().to_string();
+    let fresh_pane_id = pane_id;
 
     match classify_remote(program) {
         RemoteKind::Local => {
@@ -2542,6 +2605,183 @@ mod tmux_shell_wrapping_tests {
         assert_ne!(args[4], "original-pane-id"); // pane_id replaced
         assert_eq!(args[4], fresh_pane_id); // and matches the returned pane_id
         assert_eq!(&args[5..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
+    }
+
+    /// A remote tmux-wrapped shell as a restored tab has it.
+    fn remote_tmux_shell() -> Shell {
+        let args = wrap_remote_command_args(
+            "deb",
+            "the-tabs-own-pane-id",
+            vec!["192.168.50.3".to_string()],
+            CursorShape::Block,
+            None,
+            RemoteKind::Ssh,
+        );
+        Shell::WithArguments { program: "ssh".to_string(), args, title_override: None }
+    }
+
+    fn pane_id_of(shell: &Shell) -> String {
+        let Shell::WithArguments { args, .. } = shell else { panic!("expected WithArguments") };
+        let server_pos = args.iter().position(|a| a.contains("somsrv")).expect("a somsrv argument");
+        args[server_pos + 2].clone()
+    }
+
+    #[test]
+    fn a_restored_split_reattaches_to_the_pane_id_its_tab_saved_for_it() {
+        // The global queue is shared by every test of this module that
+        // makes a split: this is the only one that fills it.
+        clear_restored_split_pane_ids();
+        queue_restored_split_pane_id("saved-for-split-1".to_string());
+        queue_restored_split_pane_id("saved-for-split-2".to_string());
+
+        let (first, first_id) = rebuild_tmux_shell_for_split(&remote_tmux_shell()).expect("tmux shell");
+        let (second, second_id) = rebuild_tmux_shell_for_split(&remote_tmux_shell()).expect("tmux shell");
+        assert_eq!((first_id.as_str(), pane_id_of(&first).as_str()), ("saved-for-split-1", "saved-for-split-1"));
+        assert_eq!((second_id.as_str(), pane_id_of(&second).as_str()), ("saved-for-split-2", "saved-for-split-2"));
+
+        // Nothing queued - a split made by hand: a fresh, new pane_id.
+        let (by_hand, by_hand_id) = rebuild_tmux_shell_for_split(&remote_tmux_shell()).expect("tmux shell");
+        assert_ne!(by_hand_id, "the-tabs-own-pane-id");
+        assert_eq!(pane_id_of(&by_hand), by_hand_id);
+    }
+
+    #[test]
+    fn rebuild_with_a_given_pane_id_uses_exactly_it_and_changes_nothing_else() {
+        let shell = remote_tmux_shell();
+        let (rebuilt, pane_id) = rebuild_tmux_shell_with_pane_id(&shell, "given".to_string()).expect("tmux shell");
+        assert_eq!(pane_id, "given");
+        let (Shell::WithArguments { args: before, .. }, Shell::WithArguments { args: after, .. }) = (&shell, &rebuilt) else {
+            panic!("expected WithArguments")
+        };
+        let server_pos = before.iter().position(|a| a.contains("somsrv")).expect("a somsrv argument");
+        for (index, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            if index == server_pos + 2 {
+                assert_eq!(b, "given");
+            } else {
+                assert_eq!(a, b, "argument {index} must not change");
+            }
+        }
+    }
+
+    // ---- the whole chain, with a real daemon -------------------------------
+
+    /// The relay a tmux tab's shell is, run the way Som runs it: stdin and
+    /// stdout stand in for Som's PTY.
+    fn start_relay(shell: &Shell) -> std::process::Child {
+        let Shell::WithArguments { program, args, .. } = shell else { panic!("a tmux-wrapped shell has arguments") };
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the relay starts");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        std::thread::spawn(move || {
+            std::io::copy(&mut stdout, &mut std::io::sink()).ok();
+        });
+        child
+    }
+
+    fn sessions_of_profile(profile: &str) -> Vec<String> {
+        let mut pane_ids: Vec<String> = somsrv::admin::list_sessions(None)
+            .map(|sessions| sessions.into_iter().filter(|session| session.profile_name == profile).map(|session| session.pane_id).collect())
+            .unwrap_or_default();
+        pane_ids.sort();
+        pane_ids
+    }
+
+    /// Takes the test's sessions out of the daemon and stops its relays, also when it failed.
+    struct Cleanup {
+        profile: String,
+        relays: Vec<std::process::Child>,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for relay in &mut self.relays {
+                relay.kill().ok();
+                relay.wait().ok();
+            }
+            for pane_id in sessions_of_profile(&self.profile) {
+                if let Err(err) = somsrv::admin::kill_session(None, pane_id.clone()) {
+                    eprintln!("could not clean up the session {pane_id}: {err:#}");
+                }
+            }
+        }
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(20) {
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("gave up waiting for: {what}");
+    }
+
+    /// THE regression test of tmux restore. A tab with a main pane and two
+    /// splits is made, Som quits, Som starts again and restores the tab the
+    /// way `restore_som_tabs` does (the main pane from the first saved
+    /// pane_id, the splits through `make_restored_splits` and
+    /// `rebuild_tmux_shell_for_split`, the same functions): every pane must
+    /// come back to the session it had - the daemon must still hold exactly
+    /// the three sessions it held, none made anew. Before the fix the
+    /// splits got fresh pane_ids, so the daemon grew two new sessions and
+    /// left what ran in the old ones (an htop, say) orphaned.
+    #[test]
+    fn a_restored_tab_reattaches_every_pane_to_the_session_it_had_before_the_restart() {
+        let somsrv = somsrv::testing::debug_binary("somsrv");
+        let profile = format!("restore-test-{}", std::process::id());
+        let program = if cfg!(windows) { "C:\\Windows\\System32\\cmd.exe" } else { "/bin/sh" };
+        let shell_for = |pane_id: &str| Shell::WithArguments {
+            program: somsrv.to_string_lossy().into_owned(),
+            args: wrap_command_args(&profile, pane_id, program.to_string(), vec![], CursorShape::Block, None, None),
+            title_override: None,
+        };
+        let mut cleanup = Cleanup { profile: profile.clone(), relays: Vec::new() };
+
+        // The tab while Som runs: a main pane and two splits made by hand
+        // (`clone_on_split`: a fresh pane_id each, recorded in the tab's list).
+        let main_id = format!("{profile}-main");
+        let main_shell = shell_for(&main_id);
+        clear_restored_split_pane_ids();
+        let (split1_shell, split1_id) = rebuild_tmux_shell_for_split(&main_shell).expect("a tmux shell");
+        let (split2_shell, split2_id) = rebuild_tmux_shell_for_split(&main_shell).expect("a tmux shell");
+        let saved_pane_ids = vec![main_id.clone(), split1_id, split2_id];
+        for shell in [&main_shell, &split1_shell, &split2_shell] {
+            cleanup.relays.push(start_relay(shell));
+        }
+        let mut expected = saved_pane_ids.clone();
+        expected.sort();
+        wait_for("the three sessions to exist", || sessions_of_profile(&profile) == expected);
+
+        // Som quits: the relays die, the sessions stay.
+        for relay in &mut cleanup.relays {
+            relay.kill().expect("the relay is killed");
+            relay.wait().expect("the relay is reaped");
+        }
+        cleanup.relays.clear();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert_eq!(sessions_of_profile(&profile), expected, "the sessions did not survive Som quitting");
+
+        // Som starts again and restores the tab from what it saved.
+        let restored_main = shell_for(&saved_pane_ids[0]);
+        let mut restored_shells = vec![restored_main.clone()];
+        futures::executor::block_on(make_restored_splits(&saved_pane_ids, 2, async || {
+            restored_shells.push(rebuild_tmux_shell_for_split(&restored_main).expect("a tmux shell").0);
+        }));
+        for shell in &restored_shells {
+            cleanup.relays.push(start_relay(shell));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            sessions_of_profile(&profile),
+            expected,
+            "the restore did not reattach every pane to its own session: a pane that got a pane_id of its own made a new session and left the old one behind"
+        );
     }
 
     #[test]

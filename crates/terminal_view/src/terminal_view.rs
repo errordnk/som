@@ -1368,7 +1368,7 @@ impl Item for TerminalView {
             // substitutes a fresh pane_id; anything else falls through to
             // the normal exact-copy clone.
             let source_shell = self.terminal().read(cx).shell();
-            match crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(source_shell) {
+            match crate::terminal_panel::rebuild_tmux_shell_for_split(source_shell) {
                 Some((fresh_shell, pane_id)) => {
                     fresh_pane_id = Some(pane_id);
                     project.clone_terminal_with_shell(self.terminal(), Some(fresh_shell), cx, cwd)

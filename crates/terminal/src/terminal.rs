@@ -63,7 +63,6 @@ use task::{HideStrategy, Shell, SpawnInTerminal};
 use terminal_hyperlinks::RegexSearches;
 use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
-use urlencoding;
 use util::{paths::PathStyle, truncate_and_trailoff};
 
 #[cfg(unix)]
@@ -264,23 +263,11 @@ pub enum Event {
     SpawnFailed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PathLikeTarget {
-    /// File system path, absolute or relative, existing or not.
-    /// Might have line and column number(s) attached as `file.rs:1:23`
-    pub maybe_path: String,
-    /// Current working directory of the terminal
-    pub terminal_dir: Option<PathBuf>,
-}
-
 /// A string inside terminal, potentially useful as a URI that can be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaybeNavigationTarget {
     /// HTTP, git, etc. string determined by the `URL_REGEX` regex.
     Url(String),
-    /// File system path, absolute or relative, existing or not.
-    /// Might have line and column number(s) attached as `file.rs:1:23`
-    PathLike(PathLikeTarget),
 }
 
 #[derive(Clone)]
@@ -293,7 +280,7 @@ enum InternalEvent {
     SetSelection(Option<(Selection, AlacPoint)>),
     UpdateSelection(Point<Pixels>),
     FindHyperlink(Point<Pixels>, bool),
-    ProcessHyperlink((String, bool, Match), bool),
+    ProcessHyperlink((String, Match), bool),
     // Whether keep selection when copy
     Copy(Option<bool>),
     // Vi mode events
@@ -538,8 +525,6 @@ impl TerminalBuilder {
                 cursor_shape,
                 alternate_scroll,
                 max_scroll_history_lines,
-                path_hyperlink_regexes: Vec::default(),
-                path_hyperlink_timeout_ms: 0,
                 window_id,
             },
             child_exited: None,
@@ -612,8 +597,6 @@ impl TerminalBuilder {
         cursor_shape: CursorShape,
         alternate_scroll: AlternateScroll,
         max_scroll_history_lines: Option<usize>,
-        path_hyperlink_regexes: Vec<String>,
-        path_hyperlink_timeout_ms: u64,
         is_remote_terminal: bool,
         window_id: u64,
         completion_tx: Option<Sender<Option<ExitStatus>>>,
@@ -863,10 +846,7 @@ impl TerminalBuilder {
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
-                hyperlink_regex_searches: RegexSearches::new(
-                    &path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
-                ),
+                hyperlink_regex_searches: RegexSearches::default(),
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 is_tmux_relay_shell,
@@ -884,8 +864,6 @@ impl TerminalBuilder {
                     cursor_shape,
                     alternate_scroll,
                     max_scroll_history_lines,
-                    path_hyperlink_regexes,
-                    path_hyperlink_timeout_ms,
                     window_id,
                 },
                 child_exited: None,
@@ -1331,7 +1309,7 @@ pub struct Terminal {
     is_tmux_relay_shell: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
-    mouse_down_hyperlink: Option<(String, bool, Match)>,
+    mouse_down_hyperlink: Option<(String, Match)>,
     /// Set by `mouse_down` when a click landed inside a rich-content
     /// widget's bounds (currently only audio play/pause/seek), so
     /// `mouse_drag`/`mouse_up` can skip terminal text-selection for the
@@ -1723,8 +1701,6 @@ struct CopyTemplate {
     cursor_shape: CursorShape,
     alternate_scroll: AlternateScroll,
     max_scroll_history_lines: Option<usize>,
-    path_hyperlink_regexes: Vec<String>,
-    path_hyperlink_timeout_ms: u64,
     window_id: u64,
 }
 
@@ -2352,7 +2328,6 @@ impl Terminal {
                     term,
                     point,
                     &mut self.hyperlink_regex_searches,
-                    self.path_style,
                 ) {
                     Some(hyperlink) => {
                         self.process_hyperlink(hyperlink, *open, cx);
@@ -2369,39 +2344,15 @@ impl Terminal {
         }
     }
 
-    fn process_hyperlink(
-        &mut self,
-        hyperlink: (String, bool, Match),
-        open: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let (maybe_url_or_path, is_url, url_match) = hyperlink;
+    fn process_hyperlink(&mut self, hyperlink: (String, Match), open: bool, cx: &mut Context<Self>) {
+        let (url, url_match) = hyperlink;
         let prev_hovered_word = self.last_content.last_hovered_word.take();
-
-        let target = if is_url {
-            if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
-                let decoded_path = urlencoding::decode(path)
-                    .map(|decoded| decoded.into_owned())
-                    .unwrap_or(path.to_owned());
-
-                MaybeNavigationTarget::PathLike(PathLikeTarget {
-                    maybe_path: decoded_path,
-                    terminal_dir: self.working_directory(),
-                })
-            } else {
-                MaybeNavigationTarget::Url(maybe_url_or_path.clone())
-            }
-        } else {
-            MaybeNavigationTarget::PathLike(PathLikeTarget {
-                maybe_path: maybe_url_or_path.clone(),
-                terminal_dir: self.working_directory(),
-            })
-        };
+        let target = MaybeNavigationTarget::Url(url.clone());
 
         if open {
             cx.emit(Event::Open(target));
         } else {
-            self.update_selected_word(prev_hovered_word, url_match, maybe_url_or_path, target, cx);
+            self.update_selected_word(prev_hovered_word, url_match, url, target, cx);
         }
     }
 
@@ -6388,7 +6339,6 @@ impl Terminal {
                 &term_lock,
                 point,
                 &mut self.hyperlink_regex_searches,
-                self.path_style,
             );
             drop(term_lock);
 
@@ -6490,7 +6440,6 @@ impl Terminal {
                         &term_lock,
                         point,
                         &mut self.hyperlink_regex_searches,
-                        self.path_style,
                     )
                 } {
                     if mouse_down_hyperlink == mouse_up_hyperlink {
@@ -6849,8 +6798,6 @@ impl Terminal {
             self.template.cursor_shape,
             self.template.alternate_scroll,
             self.template.max_scroll_history_lines,
-            self.template.path_hyperlink_regexes.clone(),
-            self.template.path_hyperlink_timeout_ms,
             self.is_remote_terminal,
             self.template.window_id,
             None,
@@ -7279,8 +7226,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     None,
-                    vec![],
-                    0,
                     false,
                     0,
                     Some(completion_tx),
@@ -7439,8 +7384,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     None,
-                    vec![],
-                    0,
                     false,
                     0,
                     Some(completion_tx),
@@ -7511,8 +7454,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     None,
-                    vec![],
-                    0,
                     false,
                     0,
                     None,
@@ -7577,8 +7518,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     None,
-                    Vec::new(),
-                    0,
                     false,
                     0,
                     Some(completion_tx),
@@ -8805,8 +8744,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     Some(0),
-                    vec![],
-                    0,
                     false,
                     0,
                     Some(completion_tx),
@@ -9816,8 +9753,6 @@ mod tests {
                     CursorShape::default(),
                     AlternateScroll::On,
                     None,
-                    vec![],
-                    0,
                     false,
                     0,
                     Some(completion_tx),
@@ -11114,8 +11049,6 @@ mod tests {
             let window = cx.add_empty_window();
             let builder = window
                 .update(|window, cx| {
-                    let settings = TerminalSettings::get_global(cx);
-                    let test_path_hyperlink_timeout_ms = 100;
                     TerminalBuilder::new(
                         None,
                         None,
@@ -11124,8 +11057,6 @@ mod tests {
                         CursorShape::default(),
                         AlternateScroll::On,
                         None,
-                        settings.path_hyperlink_regexes.clone(),
-                        test_path_hyperlink_timeout_ms,
                         false,
                         window.window_handle().window_id().as_u64(),
                         None,

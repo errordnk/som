@@ -8,3 +8,5 @@ pub mod daemon;
 pub mod pipe;
 pub mod protocol;
 pub mod service_link;
+#[cfg(feature = "test-support")]
+pub mod testing;

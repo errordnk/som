@@ -193,8 +193,6 @@ impl Project {
                         settings.cursor_shape,
                         settings.alternate_scroll,
                         settings.max_scroll_history_lines,
-                        settings.path_hyperlink_regexes,
-                        settings.path_hyperlink_timeout_ms,
                         false,
                         cx.entity_id().as_u64(),
                         None,

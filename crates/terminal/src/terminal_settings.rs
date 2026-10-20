@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub use settings::AlternateScroll;
 
 use settings::{
-    IntoGpui, PathHyperlinkRegex, RegisterSetting, ShowScrollbar, TerminalBell, TerminalBlink,
+    IntoGpui, RegisterSetting, ShowScrollbar, TerminalBell, TerminalBlink,
     TerminalDockPosition, TerminalLineHeight, VenvSettings, WorkingDirectory,
     merge_from::MergeFrom,
 };
@@ -49,8 +49,6 @@ pub struct TerminalSettings {
     pub toolbar: Toolbar,
     pub scrollbar: ScrollbarSettings,
     pub minimum_contrast: f32,
-    pub path_hyperlink_regexes: Vec<String>,
-    pub path_hyperlink_timeout_ms: u64,
     pub show_count_badge: bool,
     pub bell: TerminalBell,
 }
@@ -133,18 +131,6 @@ impl settings::Settings for TerminalSettings {
                 show: user_content.scrollbar.unwrap_or_default().show,
             },
             minimum_contrast: user_content.minimum_contrast.unwrap_or(1.0),
-            path_hyperlink_regexes: project_content
-                .path_hyperlink_regexes
-                .unwrap_or_default()
-                .into_iter()
-                .map(|regex| match regex {
-                    PathHyperlinkRegex::SingleLine(regex) => regex,
-                    PathHyperlinkRegex::MultiLine(regex) => regex.join("\n"),
-                })
-                .collect(),
-            path_hyperlink_timeout_ms: project_content
-                .path_hyperlink_timeout_ms
-                .unwrap_or(3000),
             show_count_badge: user_content.show_count_badge.unwrap_or(true),
             bell: user_content.bell.unwrap_or_default(),
         }

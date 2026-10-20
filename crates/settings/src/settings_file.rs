@@ -128,6 +128,17 @@ pub fn test_settings() -> String {
     let mut value =
         crate::parse_json_with_comments::<serde_json::Value>(crate::default_settings().as_ref())
             .unwrap();
+    // The examples the tests of the store's merging use: Som itself has no
+    // tab bar settings or language defaults, and these tests read them
+    // through `unwrap`.
+    util::merge_non_null_json_value_into(
+        serde_json::json!({
+            "tabs": { "close_position": "right", "git_status": false },
+            "tab_size": 4,
+            "preferred_line_length": 80,
+        }),
+        &mut value,
+    );
     #[cfg(not(target_os = "windows"))]
     util::merge_non_null_json_value_into(
         serde_json::json!({

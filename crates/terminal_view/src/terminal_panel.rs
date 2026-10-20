@@ -2770,6 +2770,23 @@ mod tmux_shell_wrapping_tests {
     /// new, empty shells, with the old ones, and what ran in them, left
     /// orphaned.
     #[test]
+    fn the_command_a_tmux_ssh_tab_runs_yields_a_bridge_command() {
+        // The bridge to a remote host is derived from the tab's own command;
+        // if that command's shape changes this must change with it, or rich
+        // content from remote hosts goes black again.
+        for kind in [RemoteKind::Ssh, RemoteKind::Wsl] {
+            let host_args = if matches!(kind, RemoteKind::Ssh) { vec!["me@host".to_string()] } else { vec!["-d".to_string(), "Ubuntu".to_string(), "--".to_string()] };
+            let args = wrap_remote_command_args("Profile", "pane-1", host_args, CursorShape::default(), None, kind);
+            let program = if matches!(kind, RemoteKind::Ssh) { "ssh" } else { "wsl.exe" };
+            let (bridge_program, bridge_args) = terminal::rich_content_srv_channel::bridge_command(program, &args)
+                .unwrap_or_else(|| panic!("no bridge command for {program} {args:?}"));
+            assert_eq!(bridge_program, program);
+            assert_eq!(&bridge_args[bridge_args.len() - 2..], ["~/.local/bin/somsrv", "--srv-bridge"]);
+            assert!(!bridge_args.iter().any(|arg| arg == "$SHELL" || arg == "pane-1"), "{bridge_args:?}");
+        }
+    }
+
+    #[test]
     fn a_restored_tab_gives_every_pane_back_its_own_running_shell() {
         let somsrv = somsrv::testing::debug_binary("somsrv");
         let profile = format!("restore-test-{}", std::process::id());

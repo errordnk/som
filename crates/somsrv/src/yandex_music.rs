@@ -171,8 +171,20 @@ pub fn account_from_settings(settings: &str) -> Account {
 }
 
 fn load_account() -> anyhow::Result<Account> {
-    let path = paths::settings_file();
-    let text = std::fs::read_to_string(path).map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
+    load_account_at(paths::settings_file())
+}
+
+/// The account out of the settings file at `path`. The file is that of the
+/// machine this `somsrv` runs on - for a remote host the settings.json
+/// there, not the one of the machine Som runs on - and the error says so:
+/// "No such file" alone sent the user looking in the wrong place.
+fn load_account_at(path: &std::path::Path) -> anyhow::Result<Account> {
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        anyhow::anyhow!(
+            "reading {}: {err} - Yandex Music's token (music.yandex.token) is read from the settings.json of the machine that somsrp runs on, put it there",
+            path.display()
+        )
+    })?;
     Ok(account_from_settings(&text))
 }
 
@@ -588,6 +600,15 @@ mod tests {
         assert_eq!(meta.year, Some(1973));
         assert_eq!(meta.duration_ms, 413000);
         assert_eq!(meta.cover_url.as_deref(), Some("https://avatars.yandex.net/get-music-content/1/abc/1000x1000"));
+    }
+
+    #[test]
+    fn a_missing_settings_file_says_where_the_token_has_to_be() {
+        let missing = std::path::Path::new("definitely/not/there/settings.json");
+        let message = format!("{:#}", load_account_at(missing).expect_err("no such file"));
+        assert!(message.contains("music.yandex.token"), "{message}");
+        assert!(message.contains("machine that somsrp runs on"), "{message}");
+        assert!(message.contains("definitely/not/there/settings.json"), "{message}");
     }
 
     #[test]

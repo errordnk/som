@@ -957,7 +957,7 @@ fn subscribe_for_terminal_events(
                                 cx.notify();
                             }
                         }
-                        Some((MaybeNavigationTarget::PathLike(_), _)) | None => {
+                        None => {
                             terminal_view.hover = None;
                             terminal_view.hover_tooltip_update = Task::ready(());
                             cx.notify();
@@ -967,7 +967,6 @@ fn subscribe_for_terminal_events(
 
                 Event::Open(maybe_navigation_target) => match maybe_navigation_target {
                     MaybeNavigationTarget::Url(url) => cx.open_url(url),
-                    MaybeNavigationTarget::PathLike(_) => {}
                 },
                 Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),

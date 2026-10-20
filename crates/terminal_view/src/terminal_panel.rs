@@ -2665,22 +2665,57 @@ mod tmux_shell_wrapping_tests {
 
     // ---- the whole chain, with a real daemon -------------------------------
 
-    /// The relay a tmux tab's shell is, run the way Som runs it: stdin and
-    /// stdout stand in for Som's PTY.
-    fn start_relay(shell: &Shell) -> std::process::Child {
-        let Shell::WithArguments { program, args, .. } = shell else { panic!("a tmux-wrapped shell has arguments") };
-        let mut child = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("the relay starts");
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        std::thread::spawn(move || {
-            std::io::copy(&mut stdout, &mut std::io::sink()).ok();
-        });
-        child
+    /// The relay a tmux tab's shell is, run the way Som runs it: its stdin
+    /// and stdout stand in for Som's PTY. What it paints is kept, so a test
+    /// can see what the user would see in the pane.
+    struct TestRelay {
+        child: std::process::Child,
+        painted: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl TestRelay {
+        fn start(shell: &Shell) -> TestRelay {
+            let Shell::WithArguments { program, args, .. } = shell else { panic!("a tmux-wrapped shell has arguments") };
+            let mut child = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the relay starts");
+            let painted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let sink = painted.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stdout.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend_from_slice(&chunk[..read]);
+                }
+            });
+            TestRelay { child, painted }
+        }
+
+        /// What the user types in the pane, followed by Enter.
+        fn type_line(&mut self, line: &str) {
+            use std::io::Write;
+            let stdin = self.child.stdin.as_mut().expect("piped stdin");
+            stdin.write_all(format!("{line}\r").as_bytes()).expect("the line reaches the relay");
+            stdin.flush().expect("the line is flushed");
+        }
+
+        fn shows(&self, text: &str) -> bool {
+            let painted = self.painted.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            String::from_utf8_lossy(&painted).contains(text)
+        }
+
+        fn quit(&mut self) {
+            self.child.kill().ok();
+            self.child.wait().ok();
+        }
     }
 
     fn sessions_of_profile(profile: &str) -> Vec<String> {
@@ -2691,17 +2726,16 @@ mod tmux_shell_wrapping_tests {
         pane_ids
     }
 
-    /// Takes the test's sessions out of the daemon and stops its relays, also when it failed.
+    /// Stops the test's relays and takes its sessions out of the daemon, also when it failed.
     struct Cleanup {
         profile: String,
-        relays: Vec<std::process::Child>,
+        relays: Vec<TestRelay>,
     }
 
     impl Drop for Cleanup {
         fn drop(&mut self) {
             for relay in &mut self.relays {
-                relay.kill().ok();
-                relay.wait().ok();
+                relay.quit();
             }
             for pane_id in sessions_of_profile(&self.profile) {
                 if let Err(err) = somsrv::admin::kill_session(None, pane_id.clone()) {
@@ -2722,17 +2756,21 @@ mod tmux_shell_wrapping_tests {
         panic!("gave up waiting for: {what}");
     }
 
-    /// THE regression test of tmux restore. A tab with a main pane and two
-    /// splits is made, Som quits, Som starts again and restores the tab the
-    /// way `restore_som_tabs` does (the main pane from the first saved
+    /// THE regression test of tmux restore, played the way a user plays it.
+    /// A tab with a main pane and two splits is made and each pane's shell
+    /// is given a state of its own (two variables, which a new shell would
+    /// not have); Som quits; Som starts again and restores the tab the way
+    /// `restore_som_tabs` does (the main pane from the first saved
     /// pane_id, the splits through `make_restored_splits` and
-    /// `rebuild_tmux_shell_for_split`, the same functions): every pane must
-    /// come back to the session it had - the daemon must still hold exactly
-    /// the three sessions it held, none made anew. Before the fix the
-    /// splits got fresh pane_ids, so the daemon grew two new sessions and
-    /// left what ran in the old ones (an htop, say) orphaned.
+    /// `rebuild_tmux_shell_for_split`, the same functions). What the user
+    /// would see must be what he left: in every pane the same shell, still
+    /// holding its state (`htop`, `mc` and `micro` running in it would be
+    /// running still) - and the daemon must hold exactly the sessions it
+    /// held, none made anew. Before the fix the splits got fresh pane_ids:
+    /// new, empty shells, with the old ones, and what ran in them, left
+    /// orphaned.
     #[test]
-    fn a_restored_tab_reattaches_every_pane_to_the_session_it_had_before_the_restart() {
+    fn a_restored_tab_gives_every_pane_back_its_own_running_shell() {
         let somsrv = somsrv::testing::debug_binary("somsrv");
         let profile = format!("restore-test-{}", std::process::id());
         let program = if cfg!(windows) { "C:\\Windows\\System32\\cmd.exe" } else { "/bin/sh" };
@@ -2741,6 +2779,16 @@ mod tmux_shell_wrapping_tests {
             args: wrap_command_args(&profile, pane_id, program.to_string(), vec![], CursorShape::Block, None, None),
             title_override: None,
         };
+        // What a pane's shell is told to remember, and what it says when
+        // asked: the answer is never in the text typed, so it is only seen
+        // if the shell really holds the state.
+        let (set_first, set_second, ask) = if cfg!(windows) {
+            ("set SOMA=", "set SOMB=", "echo %SOMA%%SOMB%")
+        } else {
+            ("SOMA=", "SOMB=", "echo $SOMA$SOMB")
+        };
+        let pid = std::process::id();
+        let answer_of = |pane: usize| format!("pane{pane}x{pid}");
         let mut cleanup = Cleanup { profile: profile.clone(), relays: Vec::new() };
 
         // The tab while Som runs: a main pane and two splits made by hand
@@ -2752,16 +2800,28 @@ mod tmux_shell_wrapping_tests {
         let (split2_shell, split2_id) = rebuild_tmux_shell_for_split(&main_shell).expect("a tmux shell");
         let saved_pane_ids = vec![main_id.clone(), split1_id, split2_id];
         for shell in [&main_shell, &split1_shell, &split2_shell] {
-            cleanup.relays.push(start_relay(shell));
+            cleanup.relays.push(TestRelay::start(shell));
         }
         let mut expected = saved_pane_ids.clone();
         expected.sort();
         wait_for("the three sessions to exist", || sessions_of_profile(&profile) == expected);
 
+        // The user works in each pane: it gets a state of its own.
+        for (pane, relay) in cleanup.relays.iter_mut().enumerate() {
+            let answer = answer_of(pane);
+            let (first, second) = answer.split_at(answer.len() / 2);
+            relay.type_line(&format!("{set_first}{first}"));
+            relay.type_line(&format!("{set_second}{second}"));
+            relay.type_line(ask);
+        }
+        for (pane, relay) in cleanup.relays.iter().enumerate() {
+            let answer = answer_of(pane);
+            wait_for("a pane's shell to answer", || relay.shows(&answer));
+        }
+
         // Som quits: the relays die, the sessions stay.
         for relay in &mut cleanup.relays {
-            relay.kill().expect("the relay is killed");
-            relay.wait().expect("the relay is reaped");
+            relay.quit();
         }
         cleanup.relays.clear();
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2774,13 +2834,24 @@ mod tmux_shell_wrapping_tests {
             restored_shells.push(rebuild_tmux_shell_for_split(&restored_main).expect("a tmux shell").0);
         }));
         for shell in &restored_shells {
-            cleanup.relays.push(start_relay(shell));
+            cleanup.relays.push(TestRelay::start(shell));
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Every pane asked what it remembers: its own answer, and no other pane's.
+        for relay in &mut cleanup.relays {
+            relay.type_line(ask);
+        }
+        for (pane, relay) in cleanup.relays.iter().enumerate() {
+            let answer = answer_of(pane);
+            wait_for(&format!("pane {pane} to answer with what it remembered (a new shell remembers nothing)"), || relay.shows(&answer));
+            for other in (0..3).filter(|other| *other != pane) {
+                assert!(!relay.shows(&answer_of(other)), "pane {pane} shows what pane {other} remembered: the panes got mixed up");
+            }
+        }
         assert_eq!(
             sessions_of_profile(&profile),
             expected,
-            "the restore did not reattach every pane to its own session: a pane that got a pane_id of its own made a new session and left the old one behind"
+            "the restore made new sessions: a pane that got a pane_id of its own left the old session behind"
         );
     }
 

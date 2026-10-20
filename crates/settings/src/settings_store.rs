@@ -1612,7 +1612,7 @@ mod tests {
     use std::{cell::RefCell, num::NonZeroU32};
 
     use crate::{
-        ClosePosition, ItemSettingsContent, default_settings,
+        ClosePosition, ItemSettingsContent,
         settings_content::LanguageSettingsContent, test_settings,
     };
 
@@ -1620,6 +1620,19 @@ mod tests {
     use fs::FakeFs;
     use unindent::Unindent;
     use util::rel_path::rel_path;
+
+    /// The defaults these tests of the store's merging run against: Som's own
+    /// plus the few settings the tests use as their examples. Som has no tab
+    /// bar settings or language defaults of its own any more, and the tests
+    /// read them through `unwrap`, so against Som's bare defaults they
+    /// failed for years without anyone noticing.
+    fn default_settings() -> String {
+        super::super::default_settings().replacen(
+            '{',
+            r#"{ "tabs": { "close_position": "right", "git_status": false }, "tab_size": 4, "preferred_line_length": 80,"#,
+            1,
+        )
+    }
 
     #[derive(Debug, PartialEq)]
     struct AutoUpdateSetting {

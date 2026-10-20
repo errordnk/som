@@ -606,11 +606,21 @@ impl SrvProgressState {
             return;
         }
         let buffer_len = self.buffer.lock().unwrap_or_else(|p| p.into_inner()).len() as u64;
-        if buffer_len > 0 {
+        // A picture is decoded from its first byte: a buffer that holds the
+        // file from the start needs nothing, one that is empty or begins
+        // later (Som subscribed while the file was already streaming, and
+        // the first chunk it saw became its starting point) needs the whole
+        // file from the daemon.
+        if buffer_len > 0 && self.buffer_start_offset.load(Ordering::Acquire) == 0 {
             return;
         }
         if self.whole_range_requested.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if buffer_len > 0 {
+            // The reply starts at 0, behind the buffer's own start: it is
+            // let in to re-anchor the buffer there (see `append_chunk`).
+            *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some(0);
         }
         let total_size = self.total_size().max(contiguous_len);
         request_byte_range(session_id, file_id, 0, total_size);
@@ -1060,6 +1070,22 @@ fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyh
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_buffer_that_began_mid_file_is_re_anchored_by_the_reply_for_the_whole_file() {
+        // Som subscribed late: the first chunk it saw was from the middle.
+        let state = SrvProgressState::default();
+        state.append_chunk(500, &[7u8; 100]);
+        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 500, "the first chunk seen anchors the buffer");
+
+        // The whole-file reply (offset 0) is let in only once asked for.
+        state.append_chunk(0, &[1u8; 600]);
+        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 500, "an unasked-for chunk behind the start is ignored");
+        *state.pending_seek_target.lock().unwrap() = Some(0);
+        state.append_chunk(0, &[1u8; 600]);
+        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 0, "the reply for the whole file re-anchors the buffer");
+        assert_eq!(state.buffer.lock().unwrap().len(), 600);
+    }
+
     use super::*;
 
     #[test]

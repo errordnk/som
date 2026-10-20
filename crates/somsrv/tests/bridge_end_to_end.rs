@@ -143,7 +143,8 @@ fn a_bridge_whose_process_is_gone_is_reported_down() {
 
 /// Against a real host over real ssh, the way Som starts the bridge:
 /// `SOM_BRIDGE_LIVE_HOST=deb cargo test -p somsrv --test bridge_end_to_end -- --ignored live`.
-/// The host needs a `somsrv` with `--srv-bridge` at `~/.local/bin/somsrv`.
+/// The host needs a `somsrv` with `--srv-bridge` at `~/.local/bin/somsrv`
+/// (or wherever `SOM_BRIDGE_LIVE_SOMSRV` points).
 #[test]
 #[ignore]
 fn live_bridge_over_ssh_reaches_the_daemon_of_the_remote_host() {
@@ -151,8 +152,9 @@ fn live_bridge_over_ssh_reaches_the_daemon_of_the_remote_host() {
         panic!("set SOM_BRIDGE_LIVE_HOST to an ssh host that has somsrv at ~/.local/bin/somsrv");
     };
     let ssh = if cfg!(windows) { r"C:\Windows\System32\OpenSSH\ssh.exe" } else { "ssh" };
+    let remote_somsrv = std::env::var("SOM_BRIDGE_LIVE_SOMSRV").unwrap_or_else(|_| "~/.local/bin/somsrv".to_string());
     let args: Vec<String> =
-        ["-T", "-o", "BatchMode=yes", host.as_str(), "~/.local/bin/somsrv", "--srv-bridge"].iter().map(|arg| arg.to_string()).collect();
+        ["-T", "-o", "BatchMode=yes", host.as_str(), remote_somsrv.as_str(), "--srv-bridge"].iter().map(|arg| arg.to_string()).collect();
     within(Duration::from_secs(60), move || {
         let bridge = RemoteBridge::spawn(ssh, &args).expect("starting ssh");
         let channel = handshake_over_bridge(&bridge);

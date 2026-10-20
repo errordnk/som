@@ -122,8 +122,9 @@ actually running on** — never to Som directly, never over the network
 itself. If Som is local, that's the same machine. If Som reached your
 client over SSH, `somsrv` is running on the remote end (deployed there
 the same way), and your client connects to the socket on THAT machine —
-`somsrv` itself bridges back to Som over the SSH connection Som
-already has open, entirely transparently to your client.
+Som reaches that remote daemon through a second SSH process it
+starts beside the tab (`ssh host ~/.local/bin/somsrv --srv-bridge`, no
+pty; see `somsrv::bridge`), entirely transparently to your client.
 
 If the daemon isn't running yet when your client tries to connect,
 spawn it yourself (detached, so it outlives your own process) and

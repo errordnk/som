@@ -273,6 +273,8 @@ This feature has no separate settings.json toggle beyond the per-profile `"tmux"
 
 Som implements its own binary protocol for streaming rich content (images/GIFs, audio, video and markdown) through the PTY — the `somsrp` tool bundled alongside Som is the reference client: `somsrp some.gif` streams a file and displays it inline. There's no settings.json toggle for this: it's always on.
 
+**Over SSH and WSL.** `somsrp` also works in an `ssh` or `wsl` tab that has `tmux`, `srp` or `lua` set: the files it shows, plays or streams are those of the remote machine (its disk, its network, its IP) and are drawn in your local Som. Som starts a second, pty-less `ssh host ~/.local/bin/somsrv --srv-bridge` beside the tab for that, so the login has to work without a password (a key or an agent); if it cannot, the pictures simply stay empty.
+
 **Markdown documents.** `somsrp doc.md` renders a markdown file, and `![alt](path-or-URL)` embeds media into it: images and GIFs, audio (the same "now playing" widget as for a track played directly - tags from the file, the cover looked up by artist and album), video, and other `.md` files (laid out inline, nesting allowed, cycles refused). A `{...}` block right after the link sets the placement: `left`/`center`/`right`, `top`/`middle`/`bottom`, `NN%` (width), a bare `NN` (height in rows), `float` (text wraps around it). Several embeds on one line form a **row** that shares one band - `![](cover.png){40%} ![](track.flac){60%}`: each takes its `NN%`, the ones without a width share what is left equally, and any text between them keeps them apart.
 
 ### Audio, internet radio and playlists

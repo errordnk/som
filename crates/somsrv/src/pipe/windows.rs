@@ -189,6 +189,15 @@ impl PipeConnection {
         Ok(buf)
     }
 
+    /// Cancels the I/O pending on this connection, so a thread blocked in
+    /// `read_message` gets an error instead of waiting for a peer that is
+    /// no longer wanted.
+    pub fn shutdown(&self) {
+        if let Err(err) = unsafe { windows::Win32::System::IO::CancelIoEx(self.handle, None) } {
+            log::debug!("cancelling the I/O of a connection: {err}");
+        }
+    }
+
     pub fn write_message(&self, payload: &[u8]) -> Result<()> {
         let len = (payload.len() as u32).to_le_bytes();
         self.write_all(&len)?;

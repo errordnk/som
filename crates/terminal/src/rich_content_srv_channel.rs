@@ -25,6 +25,7 @@
 //! to `RichContentCache::record_progress` the first time it's non-`None`.
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
+use somsrv::bridge::{BridgeChannel, RemoteBridge};
 use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -73,6 +74,10 @@ const LIVE_CONSUMED_RETENTION: u64 = 4 * 1024 * 1024;
 /// for the full reasoning.
 #[derive(Default)]
 pub struct SrvProgressState {
+    /// When the subscription thread ended with an error before anything
+    /// arrived (the remote host could not be reached through the bridge, the
+    /// daemon was restarting): the caller may try again after a pause.
+    subscription_failed_at: Mutex<Option<std::time::Instant>>,
     contiguous_len: AtomicU64,
     /// See `somsrv::protocol::SrvResponse::Progress::tail_available_from`'s
     /// own doc comment — defaults to 0 (not `total_size`) until the first
@@ -704,15 +709,147 @@ fn to_terminal_video_codec(codec: somsrv::protocol::VideoCodec) -> crate::rich_c
 /// stronger guarantee than "no more progress updates for this file" to
 /// offer to callers in that case (mirrors what a dropped `Query` on the
 /// OLD PTY path already tolerated).
-pub fn spawn_progress_listener(session_id: u32, file_id: u32) -> Arc<SrvProgressState> {
+///
+/// `bridge` is the remote host's daemon when the placement was announced on
+/// another machine (see [`bridge_for_shell`]); every later request about
+/// this key - seeks, clicks, unsubscribing - follows the same route.
+pub fn spawn_progress_listener(session_id: u32, file_id: u32, bridge: Option<Arc<RemoteBridge>>) -> Arc<SrvProgressState> {
+    {
+        let mut routes = ROUTES.lock().unwrap_or_else(|p| p.into_inner());
+        match bridge {
+            Some(bridge) => {
+                routes.insert((session_id, file_id), bridge);
+            },
+            None => {
+                routes.remove(&(session_id, file_id));
+            },
+        }
+    }
     let state = Arc::new(SrvProgressState::default());
     let thread_state = state.clone();
     std::thread::spawn(move || {
         if let Err(err) = run(session_id, file_id, &thread_state) {
             log::debug!("somsrv progress listener for {session_id:#x}:{file_id:#x} ended: {err:#}");
+            if thread_state.contiguous_len.load(Ordering::Acquire) == 0 {
+                *thread_state.subscription_failed_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+            }
         }
     });
     state
+}
+
+/// How long a subscription that failed before anything arrived is left alone
+/// before the next attempt.
+const SUBSCRIPTION_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SrvProgressState {
+    /// True when the subscription ended in failure with nothing received and
+    /// the pause before the next attempt has passed.
+    pub fn subscription_may_be_retried(&self) -> bool {
+        self.subscription_failed_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|failed_at| failed_at.elapsed() >= SUBSCRIPTION_RETRY_PAUSE)
+    }
+}
+
+/// Which daemon each placement key talks to: the entry's bridge, or the local
+/// daemon when there is none. Ids are minted per placement, so a key never
+/// belongs to two hosts at once.
+static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), Arc<RemoteBridge>>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Bridges already started, by their command line: every tab and split that
+/// talks to one host shares one ssh process.
+static BRIDGES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, BridgeSlot>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+struct BridgeSlot {
+    bridge: Arc<RemoteBridge>,
+    started: std::time::Instant,
+}
+
+/// How long a bridge that has died is not started again, so a host that
+/// cannot bridge (an older `somsrv`, a refused login) is not asked on every
+/// frame.
+const BRIDGE_RESTART_PAUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The path a tab's `ssh`/`wsl` command names the remote `somsrv` by; see
+/// `terminal_view::terminal_panel::wrap_remote_command_args`.
+const REMOTE_SOMSRV: &str = "~/.local/bin/somsrv";
+
+/// The command that runs the remote bridge for a tab whose shell is
+/// `program args...`, or `None` for a tab that runs on this machine.
+/// The tab's own command is `ssh [flags] host ~/.local/bin/somsrv <profile>
+/// <pane> $SHELL ...` (or `wsl [flags] -- ...`); the bridge is the same
+/// command up to the `somsrv` word, then `somsrv --srv-bridge`.
+pub fn bridge_command(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    let somsrv_at = args.iter().position(|arg| arg == REMOTE_SOMSRV)?;
+    let stem = std::path::Path::new(program).file_stem()?.to_string_lossy().to_lowercase();
+    let mut bridge_args = Vec::new();
+    match stem.as_str() {
+        "ssh" => {
+            // No pty (it would mangle binary frames), no password prompt
+            // (there is nobody to type it), and a dead link noticed.
+            bridge_args.extend(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15"].map(String::from));
+            bridge_args.extend(args[..somsrv_at].iter().filter(|arg| !matches!(arg.as_str(), "-t" | "-tt")).cloned());
+        },
+        "wsl" => bridge_args.extend(args[..somsrv_at].iter().cloned()),
+        _ => return None,
+    }
+    bridge_args.push(REMOTE_SOMSRV.to_string());
+    bridge_args.push("--srv-bridge".to_string());
+    Some((program.to_string(), bridge_args))
+}
+
+/// The bridge to the host a tab with this shell runs on; `None` for a local
+/// tab, or when the bridge cannot be started (the placement then stays
+/// empty, and the caller tries again later).
+pub fn bridge_for_shell(shell: &task::Shell) -> Option<Arc<RemoteBridge>> {
+    let task::Shell::WithArguments { program, args, .. } = shell else { return None };
+    let (program, args) = bridge_command(program, args)?;
+    let key = format!("{program}\0{}", args.join("\0"));
+    let mut bridges = BRIDGES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(slot) = bridges.get(&key) {
+        if slot.bridge.is_alive() {
+            return Some(slot.bridge.clone());
+        }
+        if slot.started.elapsed() < BRIDGE_RESTART_PAUSE {
+            return None;
+        }
+    }
+    match RemoteBridge::spawn(&program, &args) {
+        Ok(bridge) => {
+            bridges.insert(key, BridgeSlot { bridge: bridge.clone(), started: std::time::Instant::now() });
+            Some(bridge)
+        },
+        Err(err) => {
+            log::warn!("cannot start the bridge to the remote somsrv: {err:#}");
+            None
+        },
+    }
+}
+
+/// One connection to whichever daemon `(session_id, file_id)` belongs to.
+enum SrvConnection {
+    Local(somsrv::pipe::PipeConnection),
+    Bridged(BridgeChannel),
+}
+
+impl SrvConnection {
+    fn read_message(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Local(connection) => connection.read_message(),
+            Self::Bridged(channel) => channel.read_message(),
+        }
+    }
+
+    fn write_message(&self, payload: &[u8]) -> anyhow::Result<()> {
+        match self {
+            Self::Local(connection) => connection.write_message(payload),
+            Self::Bridged(channel) => channel.write_message(payload),
+        }
+    }
 }
 
 /// Sends `SrvRequest::RequestByteRange` on a FRESH, one-shot connection
@@ -756,7 +893,7 @@ pub fn request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) 
 }
 
 fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::RequestByteRange { session_id, file_id, offset, len })?;
     Ok(())
 }
@@ -767,7 +904,7 @@ fn try_request_byte_range(session_id: u32, file_id: u32, offset: u64, len: u64) 
 /// [`request_byte_range`] is.
 pub fn playlist_step(session_id: u32, file_id: u32, delta: i32) {
     std::thread::spawn(move || {
-        let result = connect_and_handshake()
+        let result = connect_and_handshake(session_id, file_id)
             .and_then(|connection| send(&connection, &SrvRequest::PlaylistStep { session_id, file_id, delta }));
         if let Err(err) = result {
             log::debug!("failed to send somsrv PlaylistStep for {session_id:#x}:{file_id:#x}: {err:#}");
@@ -780,7 +917,7 @@ pub fn playlist_step(session_id: u32, file_id: u32, delta: i32) {
 /// a background thread, for the same reason [`playlist_step`] is.
 pub fn radio_control(session_id: u32, file_id: u32, control: somsrv::protocol::RadioControl) {
     std::thread::spawn(move || {
-        let result = connect_and_handshake()
+        let result = connect_and_handshake(session_id, file_id)
             .and_then(|connection| send(&connection, &SrvRequest::RadioControl { session_id, file_id, control }));
         if let Err(err) = result {
             log::debug!("failed to send somsrv RadioControl for {session_id:#x}:{file_id:#x}: {err:#}");
@@ -808,7 +945,7 @@ pub fn end_playback(session_id: u32, file_id: u32) {
 }
 
 fn try_end_playback(session_id: u32, file_id: u32) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::EndPlayback { session_id, file_id })?;
     Ok(())
 }
@@ -832,7 +969,7 @@ pub fn request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u
 }
 
 fn try_request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows })?;
     Ok(())
 }
@@ -854,11 +991,12 @@ pub fn unsubscribe(session_id: u32, file_id: u32) {
         if let Err(err) = try_unsubscribe(session_id, file_id) {
             log::debug!("failed to send somsrv UnsubscribeProgress for {session_id:#x}:{file_id:#x}: {err:#}");
         }
+        ROUTES.lock().unwrap_or_else(|p| p.into_inner()).remove(&(session_id, file_id));
     });
 }
 
 fn try_unsubscribe(session_id: u32, file_id: u32) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::UnsubscribeProgress { session_id, file_id })?;
     Ok(())
 }
@@ -922,7 +1060,7 @@ pub fn request_fetch_resource(session_id: u32, file_id: u32, target: String, bas
 /// forget: without it the embed just shows no cover.
 pub fn announce_track(session_id: u32, file_id: u32, target: String, tags: somsrv::protocol::TrackTags) {
     std::thread::spawn(move || {
-        let result = connect_and_handshake().and_then(|connection| {
+        let result = connect_and_handshake(session_id, file_id).and_then(|connection| {
             send(
                 &connection,
                 &SrvRequest::AnnounceTrack {
@@ -944,13 +1082,13 @@ pub fn announce_track(session_id: u32, file_id: u32, target: String, tags: somsr
 }
 
 fn try_request_fetch_resource(session_id: u32, file_id: u32, target: &str, base_dir: Option<String>) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::FetchResource { session_id, file_id, target: target.to_string(), base_dir })?;
     Ok(())
 }
 
 fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Result<()> {
-    let connection = connect_and_handshake()?;
+    let connection = connect_and_handshake(session_id, file_id)?;
     send(&connection, &SrvRequest::SubscribeProgress { session_id, file_id })?;
 
     loop {
@@ -1044,16 +1182,24 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
     }
 }
 
-fn connect_and_handshake() -> anyhow::Result<somsrv::pipe::PipeConnection> {
-    // Same spawn-if-not-running convention every other `somsrv` client
-    // in this codebase uses (`somsrp::srv_channel::SrvChannel::connect`,
-    // `somsrv::relay`'s own RELAY-side connect) — the daemon binary is
-    // expected next to Som's own executable (see `somsrv::daemon::
-    // binary_path_next_to_current_exe`'s doc comment for why this one
-    // function is shared rather than three independent copies).
-    let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe()?;
-    let connection = somsrv::daemon::connect_or_spawn(&daemon_binary)?;
-    ConnectionKind::Srv.write_to(&connection)?;
+fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvConnection> {
+    let bridge = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).cloned();
+    let connection = match bridge {
+        // The key was announced on another machine: ask that machine's daemon.
+        Some(bridge) => SrvConnection::Bridged(bridge.open_channel()?),
+        None => {
+            // Same spawn-if-not-running convention every other `somsrv`
+            // client in this codebase uses (`somsrp::srv_channel::SrvChannel::
+            // connect`, `somsrv::relay`'s own RELAY-side connect) - the daemon
+            // binary is expected next to Som's own executable (see `somsrv::
+            // daemon::binary_path_next_to_current_exe`'s doc comment for why
+            // this one function is shared rather than three independent
+            // copies).
+            let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe()?;
+            SrvConnection::Local(somsrv::daemon::connect_or_spawn(&daemon_binary)?)
+        },
+    };
+    connection.write_message(&[ConnectionKind::Srv as u8])?;
     send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
     let message = connection.read_message()?;
     match serde_json::from_slice::<SrvResponse>(&message)? {
@@ -1062,7 +1208,7 @@ fn connect_and_handshake() -> anyhow::Result<somsrv::pipe::PipeConnection> {
     }
 }
 
-fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyhow::Result<()> {
+fn send(connection: &SrvConnection, message: &SrvRequest) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(message)?;
     connection.write_message(&payload)?;
     Ok(())
@@ -1070,6 +1216,98 @@ fn send(connection: &somsrv::pipe::PipeConnection, message: &SrvRequest) -> anyh
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_placement_announced_on_another_machine_is_followed_through_the_bridge() {
+        // `somsrv --srv-bridge` stands for the one ssh runs on the remote
+        // host; the direct connection to the daemon is that host's `somsrp`.
+        let somsrv_binary = somsrv::testing::debug_binary("somsrv");
+        let bridge = RemoteBridge::spawn(somsrv_binary.to_str().unwrap(), &["--srv-bridge".to_string()]).unwrap();
+        let (session_id, file_id) = mint_som_ids();
+        let state = spawn_progress_listener(session_id, file_id, Some(bridge));
+
+        let player = somsrv::daemon::connect_or_spawn(&somsrv_binary).unwrap();
+        player.write_message(&[ConnectionKind::Srv as u8]).unwrap();
+        player.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();
+        player.read_message().unwrap();
+
+        let text = b"# a document that lives on the other machine\n";
+        let put = serde_json::to_vec(&SrvRequest::PutChunk {
+            session_id,
+            file_id,
+            offset: 0,
+            data: text.to_vec(),
+            total_size: text.len() as u64,
+            content_type: somsrv::protocol::ContentType::Markdown,
+            metadata: somsrv::protocol::ContentMetadata::Markdown { base_dir: String::new() },
+        })
+        .unwrap();
+        // The subscription is not acknowledged, so the announcement may come
+        // before or after it is registered: either way the watermark arrives
+        // (a late subscriber is given no bytes, only the watermark).
+        player.write_message(&put).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.contiguous_len() < text.len() as u64 {
+            assert!(std::time::Instant::now() < deadline, "the announced document never reached the subscriber behind the bridge");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // The way back: a request about the same key reaches the player on
+        // the other machine, and the player's answer arrives as bytes.
+        request_byte_range(session_id, file_id, 0, text.len() as u64);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the request never reached the player on the other machine");
+            let message = player.read_message().unwrap();
+            if let Ok(SrvRequest::RequestByteRange { session_id: s, file_id: f, offset, len }) = serde_json::from_slice::<SrvRequest>(&message)
+                && (s, f) == (session_id, file_id)
+            {
+                assert_eq!((offset, len), (0, text.len() as u64));
+                if state.bytes_received_so_far().is_empty() {
+                    player.write_message(&put).unwrap();
+                }
+                break;
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.bytes_received_so_far() != text {
+            assert!(std::time::Instant::now() < deadline, "the bytes the player answered with never arrived: {:?}", state.bytes_received_so_far());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_subscription_that_could_not_be_made_may_be_made_again_after_a_pause() {
+        let state = SrvProgressState::default();
+        assert!(!state.subscription_may_be_retried(), "nothing failed yet");
+        *state.subscription_failed_at.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(!state.subscription_may_be_retried(), "not at once");
+        *state.subscription_failed_at.lock().unwrap() = Some(std::time::Instant::now() - SUBSCRIPTION_RETRY_PAUSE);
+        assert!(state.subscription_may_be_retried());
+    }
+
+    #[test]
+    fn the_bridge_command_is_the_tabs_own_ssh_up_to_the_remote_somsrv() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let (program, bridge_args) = bridge_command(
+            "ssh",
+            &args(&["-tt", "-p", "2222", "me@host", "~/.local/bin/somsrv", "Profile", "pane-1", "$SHELL", "--cursor-shape", "block", "--", "-l"]),
+        )
+        .unwrap();
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            bridge_args,
+            args(&["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-p", "2222", "me@host", "~/.local/bin/somsrv", "--srv-bridge"]),
+            "no pty (it would mangle the frames), the host as the tab has it, the bridge instead of the shell"
+        );
+
+        let (program, bridge_args) = bridge_command("wsl.exe", &args(&["-d", "Ubuntu", "--", "~/.local/bin/somsrv", "P", "pane-2", "$SHELL"])).unwrap();
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(bridge_args, args(&["-d", "Ubuntu", "--", "~/.local/bin/somsrv", "--srv-bridge"]));
+
+        assert_eq!(bridge_command("ssh", &args(&["me@host"])), None, "a plain ssh tab has no somsrv to bridge to");
+        assert_eq!(bridge_command("C:\\bin\\somsrv.exe", &args(&["P", "pane", "cmd.exe"])), None, "a local tab uses the local daemon");
+    }
+
     #[test]
     fn a_buffer_that_began_mid_file_is_re_anchored_by_the_reply_for_the_whole_file() {
         // Som subscribed late: the first chunk it saw was from the middle.

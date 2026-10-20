@@ -296,7 +296,7 @@ impl AudioCover {
     /// requesting, the order `request_fetch_resource` requires.
     pub fn start(url: &str) -> Self {
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
-        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id);
+        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, None);
         rich_content_srv_channel::request_fetch_resource(session_id, file_id, url.to_string(), None);
         Self { started: std::time::Instant::now(), url: url.to_string(), session_id, file_id, state, content_type: None, player: None }
     }

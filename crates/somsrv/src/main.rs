@@ -101,6 +101,18 @@ fn parse_args() -> Args {
                 println!("{}", serde_json::to_string(&somsrv::protocol::HandshakeInfo::current()).unwrap());
                 std::process::exit(0);
             }
+            // Serves Som's rich-content channel to this machine's daemon over
+            // stdin/stdout (see `somsrv::bridge`). Deliberately before any
+            // logging setup: stdout carries binary frames.
+            "--srv-bridge" => {
+                match somsrv::bridge::run_stdio_bridge() {
+                    Ok(()) => std::process::exit(0),
+                    Err(err) => {
+                        eprintln!("srv bridge ended: {err:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             // Self-contained admin subcommands — connect to the daemon
             // ALREADY running on this same machine (see `somsrv::admin`),
             // print a JSON result, exit. These are what `terminal_panel.

@@ -4,6 +4,7 @@
 //! private to the binary; Som only ever talks to a running server over the
 //! pipe protocol, it never links against session/PTY internals directly.
 pub mod admin;
+pub mod bridge;
 pub mod daemon;
 pub mod pipe;
 pub mod protocol;

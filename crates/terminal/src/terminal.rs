@@ -2588,11 +2588,20 @@ impl Terminal {
     /// to do that.
     pub fn ensure_rich_content_srv_subscription(&mut self, session_id: u32, file_id: u32) {
         let key = (session_id, file_id);
+        // A subscription that could not be made (the bridge to a remote host
+        // was down, the daemon restarting) and has heard nothing since is
+        // made again after a pause, rather than leaving the placement
+        // black for good.
+        let retry = self.rich_content_srv_progress.borrow().get(&key).is_some_and(|state| state.subscription_may_be_retried());
+        if retry {
+            self.rich_content_srv_progress.borrow_mut().remove(&key);
+        }
+        let bridge = if self.rich_content_srv_progress.borrow().contains_key(&key) { None } else { self.srv_bridge() };
         let state = self
             .rich_content_srv_progress
             .borrow_mut()
             .entry(key)
-            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id))
+            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id, bridge))
             .clone();
 
         // `record_progress` only reads `content_type`/`metadata` the
@@ -3101,7 +3110,7 @@ impl Terminal {
             return;
         }
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
-        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id);
+        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_bridge());
         // `markdown_base_dirs` only ever holds an entry for a TOP-LEVEL
         // placement's own id (populated from the grid-scanned placement,
         // see that map's own doc comment) — a `host` that is itself an
@@ -6780,6 +6789,15 @@ impl Terminal {
     /// split from.
     pub fn shell(&self) -> &Shell {
         &self.template.shell
+    }
+
+    /// The bridge to the `somsrv` daemon of the machine this terminal runs
+    /// on, when that is another machine (an ssh or wsl tab); `None` for a
+    /// local terminal, whose placements are served by the local daemon.
+    /// What a remote `somsrp` announces lives in that remote daemon, so the
+    /// subscription to it has to go there.
+    pub fn srv_bridge(&self) -> Option<std::sync::Arc<somsrv::bridge::RemoteBridge>> {
+        rich_content_srv_channel::bridge_for_shell(self.shell())
     }
 
     /// Like `clone_builder`, but lets the caller substitute a different

@@ -80,6 +80,16 @@ impl PipeConnection {
         Ok(buf)
     }
 
+    /// Ends the connection for everyone using it, including a thread that is
+    /// blocked in `read_message` (it gets an error), which just dropping one
+    /// owner of a shared connection would not do.
+    pub fn shutdown(&self) {
+        let write_half = self.write_half.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(err) = write_half.shutdown(std::net::Shutdown::Both) {
+            log::debug!("shutting a connection down: {err}");
+        }
+    }
+
     pub fn write_message(&self, payload: &[u8]) -> Result<()> {
         let len = (payload.len() as u32).to_le_bytes();
         let mut write_half = self.write_half.lock().unwrap();

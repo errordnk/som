@@ -116,8 +116,6 @@ impl TerminalPanel {
             let placeholder = cx.new(|cx| PendingTerminalTab::new(tab_name.clone(), tab_icon.clone(), cx));
             let placeholder_item_id = placeholder.entity_id();
             workspace.add_item_to_main_pane(Box::new(placeholder), profile_index, window, cx);
-            let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
-            let remote_kind = classify_remote(&remote_program);
             let terminal_settings = TerminalSettings::get_global(cx);
             let cursor_shape = terminal_settings.cursor_shape;
             let scrollback = terminal_settings.max_scroll_history_lines;
@@ -154,59 +152,6 @@ impl TerminalPanel {
                         })?;
                     }
 
-                    // Background mtime-based deploy/redeploy check — runs
-                    // strictly AFTER the tab has already opened (SRP or
-                    // fallback plain SSH, either way), never blocking it.
-                    // Fire-and-forget: the spawned task still awaits its
-                    // own background_spawn'd blocking work and surfaces a
-                    // toast either way (see `show_somsrv_toast`'s doc
-                    // comment).
-                    if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
-                        let host_args = host_args.clone();
-                        let profile_name = profile.name.clone();
-                        let profile_os = profile.os;
-                        cx.spawn({
-                            let workspace = workspace.clone();
-                            async move |cx| {
-                                let deploy_result = cx
-                                    .background_spawn({
-                                        let host_args = host_args.clone();
-                                        async move { ensure_remote_binary_deployed(&host_args, remote_kind, profile_os) }
-                                    })
-                                    .await;
-                                match deploy_result {
-                                    Ok(true) => {
-                                        let message = format!(
-                                            "Redeployed somsrv on the \"{profile_name}\" server — restart this tab to use it, or keep working as-is."
-                                        );
-                                        workspace
-                                            .update(cx, |workspace, cx| {
-                                                show_somsrv_toast(
-                                                    workspace,
-                                                    placeholder_item_id,
-                                                    "redeployed",
-                                                    workspace::notifications::NotificationSeverity::Info,
-                                                    message,
-                                                    cx,
-                                                );
-                                            })
-                                            .ok();
-                                    }
-                                    Ok(false) => {}
-                                    Err(err) => {
-                                        log::warn!("background somsrv deploy check failed for {host_args:?}: {err:#}");
-                                        let message = human_readable_deploy_error(&profile_name, &err);
-                                        workspace
-                                            .update(cx, |workspace, cx| {
-                                                show_somsrv_error(workspace, placeholder_item_id, message, cx);
-                                            })
-                                            .ok();
-                                    }
-                                }
-                            }
-                        })
-                        .detach();
-                    }
                     anyhow::Ok(())
                 }
                 .await;
@@ -523,6 +468,45 @@ impl TerminalPanel {
         tab_icon: Option<String>,
         profile_index: Option<usize>,
     ) -> anyhow::Result<(gpui::EntityId, Option<String>)> {
+        // The somsrv on the host first: the relay this tab starts must be the build
+        // embedded in this Som, and an older one is replaced before it is used.
+        let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+        let remote_kind = classify_remote(&remote_program);
+        if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
+            let profile_os = profile.os;
+            let deploy_result = cx
+                .background_spawn({
+                    let host_args = host_args.clone();
+                    async move { ensure_remote_binary_deployed(&host_args, remote_kind, profile_os) }
+                })
+                .await;
+            match deploy_result {
+                Ok(true) => {
+                    let message = format!("Updated somsrv on the \"{}\" server.", profile.name);
+                    window_handle
+                        .update(cx, |_, _, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                show_somsrv_toast(workspace, placeholder_item_id, "redeployed", workspace::notifications::NotificationSeverity::Info, message, cx);
+                            })
+                        })
+                        .log_err();
+                },
+                Ok(false) => {},
+                Err(err) => {
+                    // The tab still opens: SRP is tried and falls back to plain ssh.
+                    log::warn!("somsrv deploy check failed for {host_args:?}: {err:#}");
+                    let message = human_readable_deploy_error(&profile.name, &err);
+                    window_handle
+                        .update(cx, |_, _, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                show_somsrv_error(workspace, placeholder_item_id, message, cx);
+                            })
+                        })
+                        .log_err();
+                },
+            }
+        }
+
         let (program, args) = tmux_wrapped_shell(&profile, &pane_id, cursor_shape, scrollback, cell_pixel_size)?;
 
         let project = window_handle.update(cx, |_, _, cx| {
@@ -845,65 +829,12 @@ impl TerminalPanel {
                             })??;
                         }
 
-                        // Background mtime-based deploy/redeploy check +
-                        // orphan cleanup — both run in the background,
-                        // detached, strictly AFTER this tab has already
-                        // opened (SRP or fallback plain SSH). Neither
-                        // blocks this tab's own open.
+                        // Orphan cleanup runs in the background, detached, strictly
+                        // AFTER this tab has opened (SRP or fallback plain SSH).
                         if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
                             let host_args = host_args.clone();
                             let live_pane_ids = live_pane_ids.clone();
-                            let profile_name = profile.name.clone();
-                            let profile_os = profile.os;
-                            cx.spawn({
-                                let workspace = workspace.clone();
-                                async move |cx| {
-                                    let deploy_result = cx
-                                        .background_spawn({
-                                            let host_args = host_args.clone();
-                                            async move {
-                                                let deploy_result = ensure_remote_binary_deployed(&host_args, remote_kind, profile_os);
-                                                kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids);
-                                                deploy_result
-                                            }
-                                        })
-                                        .await;
-                                    match deploy_result {
-                                        Ok(true) => {
-                                            let message = format!(
-                                                "Redeployed somsrv on the \"{profile_name}\" server — restart this tab to use it, or keep working as-is."
-                                            );
-                                            window_handle
-                                                .update(cx, |_, _, cx| {
-                                                    workspace.update(cx, |workspace, cx| {
-                                                        show_somsrv_toast(
-                                                            workspace,
-                                                            placeholder_item_id,
-                                                            "redeployed",
-                                                            workspace::notifications::NotificationSeverity::Info,
-                                                            message,
-                                                            cx,
-                                                        );
-                                                    })
-                                                })
-                                                .ok();
-                                        }
-                                        Ok(false) => {}
-                                        Err(err) => {
-                                            log::warn!("background somsrv deploy check failed for {host_args:?}: {err:#}");
-                                            let message = human_readable_deploy_error(&profile_name, &err);
-                                            window_handle
-                                                .update(cx, |_, _, cx| {
-                                                    workspace.update(cx, |workspace, cx| {
-                                                        show_somsrv_error(workspace, placeholder_item_id, message, cx);
-                                                    })
-                                                })
-                                                .ok();
-                                        }
-                                    }
-                                }
-                            })
-                            .detach();
+                            cx.background_spawn(async move { kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids) }).detach();
                         }
                         anyhow::Ok(item_id)
                     });
@@ -1889,70 +1820,10 @@ fn show_somsrv_toast(
     });
 }
 
-/// Ensures `~/.local/bin/somsrv` on the far side of an `ssh`/`wsl`
-/// tmux profile is present and matches THIS Som build's version — see
-/// `project_som_tmux` memory for the full policy this implements. Runs
-/// entirely on a background thread (blocking `ssh`/`wsl`/`scp` child
-/// processes) — callers must not call this from GPUI's main thread.
-///
-/// Deploy mechanism is `scp` of a PRE-BUILT binary from `~/.config/som/
-/// srv/{platform}/somsrv` (see `somsrv::protocol::platform_binaries_
-/// dir`) — NOT `git pull && cargo build` on the remote machine, which is
-/// what this used to do. That approach needed a full clone of this
-/// repository AND a working Rust toolchain already present on every single
-/// remote host, and cost a real (sometimes multi-minute) compile on every
-/// version bump; `scp` of an already-built file costs a few hundred
-/// milliseconds regardless of host. The pre-built binaries themselves come
-/// from Som's own installer for each platform (packaged once at release
-/// time, not built here) — WSL keeps the OLD git-pull-and-build path since
-/// it isn't really a separate "remote platform" needing its own packaged
-/// binary (same machine, same architecture Som itself just built for).
-///
-/// UNLIKE the old approach, this never overwrites the LIVE `somsrv`
-/// binary in place — `cp`/`scp`'s destination-truncate semantics fail
-/// outright against a running executable (`ETXTBSY`, confirmed by direct
-/// reproduction — ordinary Unix "safe to replace a running executable"
-/// semantics only hold for an atomic rename onto a NEW inode, not an
-/// in-place truncate-and-rewrite). Redesigned (2026-09-15) so Som's side
-/// does no killing of any process at all: this function only `scp`s the
-/// new binary to a SEPARATE path (`~/.local/bin/somsrv.new`) and drops a
-/// marker file once it's fully in place — `somsrv` itself notices that
-/// marker on its NEXT client connection and handles the entire cutover
-/// (closing every live connection, renaming `.new` over its own running
-/// binary — which Unix allows even while it's executing, since a
-/// filename is just a directory entry pointing at an inode, not the
-/// inode itself — deleting the marker, and restarting itself) — see
-/// `crate::server::check_and_apply_pending_redeploy` on the `somsrv`
-/// side for that half. Every live pane on every client currently
-/// attached to that host (this account's own tabs AND, if sharing an
-/// account across machines, any other client's) loses its connection and
-/// reconnects to a brand new daemon on next use — an accepted, explicit
-/// tradeoff (long-running remote sessions are exactly what tmux:true
-/// exists to preserve across a LOCAL Som restart, but a version bump is
-/// disruptive by nature here). An earlier version of this had Som itself
-/// `kill -9` every `somsrv` process on the host before `scp`ing over the
-/// live binary path directly — reverted the same day in favor of this
-/// design specifically so Som's side never needs to decide when it's
-/// "safe" to kill anything; `somsrv` alone knows when it's actually
-/// between requests and safe to tear itself down.
 /// Per-host mutexes so two tabs pointed at the SAME remote host never run
-/// `ensure_remote_binary_deployed` concurrently — each entry is keyed on
-/// `host_args.join(" ")` (the exact `ssh`/`wsl` argv, e.g. `"usa"`), so
-/// different hosts still deploy fully in parallel. Without this, two tabs
-/// restored from `db.json` for the same host (or a new tab opened while
-/// another to the same host is still connecting) both independently see
-/// "version mismatch", both kill the remote's `somsrv` processes, and
-/// both `scp` the new binary to the SAME destination path AT THE SAME
-/// TIME — `scp` is not atomic against a concurrent second `scp` to the
-/// same destination, so this could in principle corrupt the resulting
-/// file, and even when it doesn't, it needlessly doubles the wall-clock
-/// cost of every affected tab's open (confirmed live: two `usa` tabs
-/// open together both logged their own "redeploying" and "killing N
-/// somsrv process(es)" lines seconds apart, race-restarting each
-/// other's redeploy). A plain `Mutex` (not `RwLock`) is correct here —
-/// every caller needs EXCLUSIVE access for the whole deploy-check-then-
-/// maybe-redeploy sequence, there's no read-only variant of this
-/// function to share.
+/// `ensure_remote_binary_deployed` concurrently (keyed on `host_args.join(" ")`,
+/// the exact `ssh`/`wsl` argv): two tabs restored from `db.json` for one host
+/// would otherwise both find the old build and both upload to the same path.
 static DEPLOY_LOCKS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
     std::sync::Mutex::new(None);
 
@@ -1966,131 +1837,83 @@ fn deploy_lock_for_host(host_args: &[String]) -> std::sync::Arc<std::sync::Mutex
         .clone()
 }
 
-/// Fast, single-round-trip check of whether `~/.local/bin/somsrv` exists
-/// (and is executable) on the far side of an SSH/WSL `tmux: true` profile
-/// — deliberately NOT a version check against the CURRENT build (that's
-/// Returns `Ok(true)` when a redeploy actually happened (so callers can
-/// surface a "redeployed, restart the tab to use it" toast), `Ok(false)`
-/// when the remote was already current and nothing was done.
+/// Hosts whose `somsrv` this run of Som has already found current (or brought up
+/// to date): the next tab to such a host does not ask again.
+static CURRENT_HOSTS: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Whether the `somsrv` on a host has to be replaced: it is, when it is older
+/// than the build embedded in this Som - or when it is not there, or is a build
+/// from before builds carried an id. Builds are compared by the time they were
+/// made (`somsrv::protocol::BUILD_ID`), nothing else: no file times, so no
+/// clocks of two machines to disagree.
+fn somsrv_needs_update(installed_build_id: Option<u64>, embedded_build_id: u64) -> bool {
+    installed_build_id.is_none_or(|installed| installed < embedded_build_id)
+}
+
+/// What the `somsrv` installed on the far side reports about itself
+/// (`somsrv --version`: the same `HandshakeInfo` the daemon answers a handshake
+/// with), or `None` when there is none, or it cannot be run.
+fn installed_somsrv_info(host_args: &[String], remote_kind: RemoteKind) -> Option<somsrv::protocol::HandshakeInfo> {
+    let probe = wrap_remote_probe_args(host_args, "~/.local/bin/somsrv", &["--version"]);
+    let output = run_remote_command(remote_kind, &probe).ok()?;
+    // A login shell may print its own lines first.
+    output.lines().filter(|line| line.trim_start().starts_with('{')).find_map(|line| serde_json::from_str(line.trim()).ok())
+}
+
+/// Makes the `somsrv` on the far side of an `ssh`/`wsl` profile the one embedded
+/// in this Som, when that is newer: the new file is uploaded and put in place
+/// at `~/.local/bin/somsrv` at once. Called before a tab to that host opens, so
+/// the relay the tab starts is already the new build - and a relay of a newer
+/// build than the daemon running there replaces the daemon on connecting
+/// (`somsrv::daemon::replace_if_stale`): the old daemon is stopped, whoever is
+/// connected to it and whatever sessions it holds, and a new one is started.
+/// Nothing is staged and nothing waits: no `.new`, no marker.
 ///
-/// 2026-09-15 redesign: no `--version` handshake anywhere in this
-/// function anymore, and no `uname` probing either — this is deliberately
-/// as dumb as possible now, per explicit user direction. `os` comes
-/// straight from the profile's own explicit `settings.json` field
-/// (`workspace::RemoteOs` — no heuristics, no asking the remote what it
-/// is), and "does this need deploying" is answered purely by comparing
-/// file mtimes: the remote `~/.local/bin/somsrv`'s mtime (via a `stat`
-/// probe, `None` if the file doesn't exist or the probe fails for any
-/// reason) against the LOCAL embedded/cached copy's own mtime. If the
-/// local copy is newer, copy it over; otherwise do nothing. This function
-/// runs strictly in the background, AFTER a tab has already opened
-/// (successfully via SRP or falled back to plain SSH) — see
-/// `open_srp_or_plain_ssh`'s doc comment — so it never blocks anything a
-/// user is looking at.
+/// The replacement is a rename onto the live file, which is allowed while the
+/// old build runs (the old process keeps its inode).
+///
+/// Returns `Ok(true)` when it uploaded, `Ok(false)` when the host was current.
+/// Runs on a background thread (blocking ssh/wsl/scp children), never on GPUI's
+/// main thread.
 fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, os: workspace::RemoteOs) -> anyhow::Result<bool> {
-    // Held for this entire function's body (see `deploy_lock_for_host`'s
-    // doc comment) — a second concurrent call for the SAME host blocks
-    // here until the first one finishes, then re-runs its OWN mtime probe
-    // and almost certainly finds the first call already brought the host
-    // up to date, so it returns immediately via the early `Ok(false)`
-    // below instead of redeploying a second time.
+    // Held for the whole body: a second tab to the same host waits here, then
+    // finds the host current and returns at once.
     let host_lock = deploy_lock_for_host(host_args);
     let _guard = host_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let host_key = host_args.join(" ");
+    if CURRENT_HOSTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(Default::default).contains(&host_key) {
+        return Ok(false);
+    }
 
     let (os, arch) = remote_os_to_platform(os);
-
-    // "Local mtime" is THIS running `som.exe`'s own file mtime — not some
-    // separately-cached extracted copy. There is no on-disk cache of the
-    // embedded `somsrv` at all anymore (2026-09-15 simplification): the
-    // embedded bytes are read directly from `assets::Assets` (already
-    // resident in this process's own memory, part of `som.exe` itself)
-    // and written straight to a throwaway temp file only when an actual
-    // upload is about to happen, deleted right after — see `embedded_
-    // somsrv_bytes`'s own doc comment. Som's own build/release process
-    // already keeps `assets/srv/{platform}/somsrv` in lockstep with
-    // Som's own version (`scripts/update_somsrv_binaries.sh`), so `som.exe`'s
-    // own mtime is a faithful proxy for "how new is the somsrv build
-    // embedded inside me" without needing a separate cached file's mtime
-    // at all.
-    let local_mtime = std::env::current_exe()
-        .and_then(|exe| std::fs::metadata(exe))
-        .and_then(|metadata| metadata.modified())
-        .context("failed to read this running som.exe's own mtime")?;
-
-    let remote_mtime = remote_binary_mtime(host_args, remote_kind, os);
-    log::debug!("deploy-check: {host_args:?} local_mtime={local_mtime:?} remote_mtime={remote_mtime:?}");
-
-    let needs_deploy = match remote_mtime {
-        Some(remote_mtime) => local_mtime > remote_mtime,
-        None => true, // nothing there (or unreadable) — always deploy
-    };
-    if !needs_deploy {
-        log::debug!("deploy-check: {host_args:?} remote somsrv is already at least as new as the local copy, skipping");
+    let embedded = embedded_somsrv_bytes(os, arch)?;
+    let embedded_build_id = somsrv::protocol::build_id_in(&embedded).context("the somsrv embedded in this Som carries no build id")?;
+    let installed = installed_somsrv_info(host_args, remote_kind);
+    log::debug!("deploy-check: {host_args:?} installed build {:?}, embedded build {embedded_build_id}", installed.as_ref().map(|info| info.build_id));
+    if !somsrv_needs_update(installed.map(|info| info.build_id), embedded_build_id) {
+        CURRENT_HOSTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(Default::default).insert(host_key);
         return Ok(false);
     }
 
     let staged_binary = stage_embedded_somsrv_to_temp_file(os, arch)?;
-
-    // `remote_mtime.is_none()` means nothing usable is at `~/.local/bin/
-    // somsrv` at all (missing, or the `stat` probe itself failed) — there
-    // is no running daemon to hand a careful cutover to, so the `.new` +
-    // marker + takeover dance below would never get applied (the daemon
-    // applies it, and there is no daemon). Write directly to the final path instead — safe precisely
-    // because there is no running process that could be executing it out
-    // from under this write.
-    if remote_mtime.is_none() {
-        let result = (|| -> anyhow::Result<()> {
-            // A genuinely fresh host has no `~/.local/bin` at all yet —
-            // `scp` doesn't create intermediate directories on its own,
-            // so without this the very first-ever deploy to a brand new
-            // host fails outright.
-            let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "~/.local/bin"]);
-            run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create ~/.local/bin on {host_args:?}"))?;
-            upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv")
-                .with_context(|| format!("failed to upload somsrv to {host_args:?}"))?;
-            let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv"]);
-            run_remote_command(remote_kind, &chmod_probe).with_context(|| format!("failed to chmod somsrv on {host_args:?}"))?;
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&staged_binary);
-        result?;
-        log::debug!("deploy-check: {host_args:?} first-ever deploy completed directly (no running daemon to hand off from)");
-        return Ok(true);
-    }
-
-    // Uploads to `~/.local/bin/somsrv.new` — a BRAND NEW path, never the
-    // live `somsrv` binary itself — so this never touches (and can never
-    // hit `ETXTBSY` against) whatever's currently executing on the
-    // remote host. No kill of any kind happens on Som's side: the actual
-    // cutover — closing every live connection, replacing the running
-    // binary with `.new`, and restarting itself — is entirely `somsrv`'s
-    // OWN responsibility, triggered the next time ANY client connects and
-    // finds the marker file below. See `crate::server`'s `check_and_
-    // apply_pending_redeploy` for that side.
     let result = (|| -> anyhow::Result<()> {
-        upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv.new")
-            .with_context(|| format!("failed to upload somsrv.new to {host_args:?}"))?;
-
-        let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv.new"]);
-        run_remote_command(remote_kind, &chmod_probe).with_context(|| format!("failed to chmod somsrv.new on {host_args:?}"))?;
-
-        // The marker file itself — `somsrv`'s connection-accept loop
-        // checks for exactly this path (`server::REDEPLOY_MARKER_NAME`)
-        // before handling each new connection. Written LAST, only after
-        // `.new` is fully in place and executable, so `somsrv` never
-        // observes "marker present, but `.new` still mid-transfer or not
-        // yet +x" — the marker being there is the one-and-only signal
-        // that a complete, ready-to-apply redeploy is waiting.
-        let touch_marker_script = "touch ~/.local/bin/somsrv.redeploy-pending";
-        let quoted_touch_script = shell_quote(touch_marker_script);
-        let touch_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_touch_script]);
-        run_remote_command(remote_kind, &touch_probe).with_context(|| format!("failed to write the redeploy marker on {host_args:?}"))?;
+        // A fresh host has no `~/.local/bin`; scp does not create directories.
+        let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "~/.local/bin"]);
+        run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create ~/.local/bin on {host_args:?}"))?;
+        upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv.upload")
+            .with_context(|| format!("failed to upload somsrv to {host_args:?}"))?;
+        // Executable first, then renamed onto the live file in one step: nothing ever
+        // sees a half-written or non-executable `somsrv`.
+        let put_in_place = shell_quote("chmod +x ~/.local/bin/somsrv.upload && mv -f ~/.local/bin/somsrv.upload ~/.local/bin/somsrv");
+        let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &put_in_place]);
+        run_remote_command(remote_kind, &probe).with_context(|| format!("failed to put somsrv in place on {host_args:?}"))?;
         Ok(())
     })();
-    let _ = std::fs::remove_file(&staged_binary);
+    std::fs::remove_file(&staged_binary).log_err();
     result?;
 
-    log::debug!("deploy-check: {host_args:?} deploy staged successfully (somsrv will apply it on next connection)");
+    CURRENT_HOSTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(Default::default).insert(host_key);
+    log::debug!("deploy-check: {host_args:?} somsrv build {embedded_build_id} is in place");
     Ok(true)
 }
 
@@ -2107,14 +1930,19 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
 /// needs to upload writes a fresh temp copy and the caller deletes it
 /// right after). Callers are responsible for deleting the returned path
 /// once the upload attempt (success or failure) is done.
-fn stage_embedded_somsrv_to_temp_file(os: somsrv::protocol::Os, arch: somsrv::protocol::Arch) -> anyhow::Result<std::path::PathBuf> {
+fn embedded_somsrv_bytes(os: somsrv::protocol::Os, arch: somsrv::protocol::Arch) -> anyhow::Result<std::borrow::Cow<'static, [u8]>> {
     let exe_suffix = if let somsrv::protocol::Os::Windows = os { ".exe" } else { "" };
     let asset_path = format!("srv/{}/somsrv{exe_suffix}", somsrv::protocol::platform_dir_name(os, arch));
-    let bytes = assets::Assets
+    assets::Assets
         .load(&asset_path)
         .ok()
         .flatten()
-        .ok_or_else(|| anyhow::anyhow!("no embedded somsrv binary for {os:?}/{arch:?} at {asset_path:?} — unsupported platform"))?;
+        .ok_or_else(|| anyhow::anyhow!("no embedded somsrv binary for {os:?}/{arch:?} at {asset_path:?} — unsupported platform"))
+}
+
+fn stage_embedded_somsrv_to_temp_file(os: somsrv::protocol::Os, arch: somsrv::protocol::Arch) -> anyhow::Result<std::path::PathBuf> {
+    let exe_suffix = if let somsrv::protocol::Os::Windows = os { ".exe" } else { "" };
+    let bytes = embedded_somsrv_bytes(os, arch)?;
 
     let temp_path = std::env::temp_dir().join(format!("somsrv-deploy-{}{exe_suffix}", std::process::id()));
     std::fs::write(&temp_path, bytes.as_ref()).with_context(|| format!("failed to write embedded somsrv to {temp_path:?}"))?;
@@ -2138,29 +1966,6 @@ fn remote_os_to_platform(os: workspace::RemoteOs) -> (somsrv::protocol::Os, soms
         workspace::RemoteOs::Mac => (somsrv::protocol::Os::Darwin, somsrv::protocol::Arch::Arm64),
         workspace::RemoteOs::Lnx => (somsrv::protocol::Os::Linux, somsrv::protocol::Arch::Amd64),
     }
-}
-
-/// Probes the remote `~/.local/bin/somsrv`'s mtime as Unix epoch seconds
-/// via `stat` — `None` if the file doesn't exist or the probe fails for
-/// any other reason (treated identically to "nothing deployed yet" by
-/// `ensure_remote_binary_deployed`). `stat`'s flags for "mtime as epoch
-/// seconds" differ between GNU/Linux (`-c %Y`) and BSD/macOS (`-f %m`) —
-/// picked from `os` (the profile's own explicit setting, not a guess).
-/// Prefixed with a marker line (same technique `read_this_client_id`
-/// uses) since a login shell can print unrelated profile-script noise
-/// ahead of the real output.
-fn remote_binary_mtime(host_args: &[String], remote_kind: RemoteKind, os: somsrv::protocol::Os) -> Option<std::time::SystemTime> {
-    let stat_flag = match os {
-        somsrv::protocol::Os::Darwin => "-f %m",
-        somsrv::protocol::Os::Windows | somsrv::protocol::Os::Linux => "-c %Y",
-    };
-    let script = format!(r#"echo "SOM_MTIME:$(stat {stat_flag} ~/.local/bin/somsrv 2>/dev/null)""#);
-    let quoted_script = shell_quote(&script);
-    let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
-    let output = run_remote_command(remote_kind, &probe).ok()?;
-    let marker_line = output.lines().find_map(|line| line.strip_prefix("SOM_MTIME:"))?;
-    let epoch_seconds: u64 = marker_line.trim().parse().ok()?;
-    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_seconds))
 }
 
 /// Reproduces the EXACT `<user>@<ip>` shape `somsrv::protocol::
@@ -2822,6 +2627,15 @@ mod tmux_shell_wrapping_tests {
     }
 
     #[test]
+    fn a_host_is_updated_only_when_its_somsrv_is_older_than_the_embedded_one() {
+        assert!(somsrv_needs_update(None, 1_700_000_000), "nothing installed");
+        assert!(somsrv_needs_update(Some(0), 1_700_000_000), "a build from before builds had ids");
+        assert!(somsrv_needs_update(Some(1_699_999_999), 1_700_000_000), "older");
+        assert!(!somsrv_needs_update(Some(1_700_000_000), 1_700_000_000), "the same build");
+        assert!(!somsrv_needs_update(Some(1_800_000_000), 1_700_000_000), "a newer one is never replaced by an older Som's");
+    }
+
+    #[test]
     fn a_restored_tab_gives_every_pane_back_its_own_running_shell() {
         let somsrv = somsrv::testing::debug_binary("somsrv");
         let profile = format!("restore-test-{}", std::process::id());
@@ -2927,47 +2741,6 @@ mod tmux_shell_wrapping_tests {
         vec![std::env::var("SOM_TEST_SSH_HOST").unwrap_or_else(|_| "localhost".to_string())]
     }
 
-    /// Real SSH round-trip against `integration_test_ssh_host()` — confirms
-    /// `ensure_remote_binary_deployed` correctly STAGES a redeploy (2026-
-    /// 09-15 redesign: Som's side no longer kills anything or applies the
-    /// deploy directly — it only `scp`s the new binary to `somsrv.new`
-    /// and drops a marker file; `somsrv` itself applies the actual cutover
-    /// (`somsrv --takeover`) once no client is connected any more — see
-    /// `somsrv::daemon::check_and_apply_pending_redeploy`'s own doc
-    /// comment for that half). This test therefore only checks
-    /// the STAGING half: `somsrv.new` exists, is executable, and reports
-    /// the current version when run directly (NOT via `~/.local/bin/
-    /// somsrv`, which is deliberately untouched by this call) — and the
-    /// marker file is present. Applying the staged redeploy end-to-end
-    /// (actually cutting over `~/.local/bin/somsrv` itself) needs a real
-    /// `somsrv` daemon connection cycle, covered separately, not by this
-    /// test.
-    ///
-    /// Requires a LIVE, responding `somsrv` daemon on the host already
-    /// (started here via `spawn_test_relay`, same as `test_redeploy_
-    /// applies_end_to_end_via_takeover` below) — `ensure_remote_binary_
-    /// deployed` only takes the `.new` + marker staging path at all when
-    /// `remote_info.is_some()` (see that function's own doc comment,
-    /// 2026-09-15: with nothing live to hand a cutover to, staging would
-    /// be a dead end no connection could ever apply, so it writes
-    /// directly to the final path instead in that case — a DIFFERENT
-    /// code path than the one this test exists to verify).
-    ///
-    /// KNOWN LIMITATION on a real dev machine: this manufactures a
-    /// missing-binary case by deleting whatever's at `somsrv.new` before
-    /// the call, which forces `ensure_remote_binary_deployed` down its
-    /// `ensure_embedded_binary_available` -> `somsrv::protocol::
-    /// ensure_embedded_binary_extracted` lookup — under `cfg!(test)`,
-    /// `paths::config_dir()` resolves against a FAKE home directory
-    /// (`C:\Users\zed\...`/`/home/zed\...`, see `util::paths::home_dir`'s
-    /// own `cfg!(test)` branch) this process typically has no permission
-    /// to create on a real Windows machine (confirmed: `New-Item -Path
-    /// C:\Users\zed` → access denied, even from an otherwise fully-
-    /// privileged dev account — creating an arbitrary top-level
-    /// `C:\Users\<name>` directory needs real admin rights this test
-    /// deliberately does NOT attempt to acquire). Skip this one unless
-    /// that fake config dir is writable in this test environment.
-    ///
     /// Regression test for the missing `mkdir -p ~/.local/bin` bug: a
     /// genuinely fresh host (no `~/.local/bin` at all, no `somsrv`
     /// process running) must still succeed on its FIRST-EVER deploy —
@@ -2991,125 +2764,6 @@ mod tmux_shell_wrapping_tests {
         let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
         assert_eq!(info.version, somsrv::protocol::HandshakeInfo::current().version);
-    }
-
-    /// `#[ignore]`d by default: needs a real reachable SSH host with a
-    /// clone of this repo at `~/som` (so `git pull` succeeds, in the WSL
-    /// branch of `ensure_remote_binary_deployed`). Run explicitly with:
-    /// `cargo test -p terminal_view test_deploy_stages_a_redeploy -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn test_deploy_stages_a_redeploy() {
-        let host_args = integration_test_ssh_host();
-
-        // Clean slate: remove whatever might already be staged from a
-        // previous test run, so a successful `scp` below is unambiguous.
-        let cleanup_probe = wrap_remote_probe_args(
-            &host_args,
-            "rm",
-            &["-f", "~/.local/bin/somsrv.new", "~/.local/bin/somsrv.redeploy-pending"],
-        );
-        run_remote_command(RemoteKind::Ssh, &cleanup_probe).expect("failed to clear out any stale staged files for this test");
-
-        // Ensures a live, responding daemon exists on the host first —
-        // see this test's own doc comment above for why the staging path
-        // this test verifies is only reachable when one is.
-        let warm_up_pane_id = format!("test-deploy-stages-warmup-{}", std::process::id());
-        spawn_test_relay(&host_args, &warm_up_pane_id);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let staged = ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("staging the deploy should succeed against a real reachable host");
-        if !staged {
-            eprintln!("remote host is already at the current version — nothing to stage, test has nothing to verify");
-            return;
-        }
-
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv.new", &["--version"]);
-        let output = run_remote_command(RemoteKind::Ssh, &version_probe).expect("the freshly-staged somsrv.new should be executable and runnable");
-        let info: somsrv::protocol::HandshakeInfo =
-            serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
-        assert_eq!(info.version, somsrv::protocol::HandshakeInfo::current().version);
-
-        let marker_probe = wrap_remote_probe_args(&host_args, "test", &["-f", "~/.local/bin/somsrv.redeploy-pending"]);
-        run_remote_command(RemoteKind::Ssh, &marker_probe).expect("the redeploy marker file should have been written");
-
-        // Cleanup: leave no staged redeploy behind for whatever real
-        // daemon might be running on this test host.
-        run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
-    }
-
-    /// Real SSH round-trip covering the FULL redeploy cycle end to end —
-    /// staging (`ensure_remote_binary_deployed`) AND application (the
-    /// daemon noticing the marker while no client is connected via
-    /// `somsrv::daemon::check_and_apply_pending_redeploy`, and starting a
-    /// `somsrv --takeover` copy of itself, which waits for the old daemon
-    /// to exit, renames `.new` into place, and starts a fresh one).
-    /// Deliberately verifies every step through the SAME `--version`
-    /// protocol probe `ensure_remote_binary_deployed` itself already
-    /// uses (`~/.local/bin/somsrv --version`) rather than any raw shell
-    /// inspection (`ps`/`ls`/etc) of the remote host — if that protocol
-    /// round-trip fails or reports the wrong version, that IS the
-    /// failure this test needs to catch, and probing it any other way
-    /// would risk passing on a state the real deploy-check code path
-    /// wouldn't actually trust either.
-    ///
-    /// Sequence:
-    /// 1. Ensure SOME `somsrv` is already running as a daemon on the
-    ///    test host (via `spawn_test_relay`, the same real-RELAY-
-    ///    invocation helper other tests already use — this transitively
-    ///    spawns the daemon if nothing was listening yet).
-    /// 2. Stage a redeploy (`ensure_remote_binary_deployed`) — this
-    ///    process's OWN current build is what gets staged, so if the
-    ///    remote already happens to be at this exact version, staging
-    ///    is skipped entirely and this test has nothing left to verify;
-    ///    see the `Ok(false)`-early-return guard below.
-    /// 3. Connect a SECOND real RELAY, which then ends: the daemon applies
-    ///    a staged redeploy after 5 seconds with no client connected.
-    /// 4. Poll `~/.local/bin/somsrv --version` (the ordinary path, NOT
-    ///    `.new`) until it reports the just-staged version — the
-    ///    takeover (wait for the old daemon, rename, spawn the new one)
-    ///    is asynchronous relative to this test process, so this can't be
-    ///    a single immediate assertion.
-    ///
-    /// `#[ignore]`d by default: needs a real reachable SSH host with a
-    /// clone of this repo at `~/som`. Run explicitly with:
-    /// `cargo test -p terminal_view test_redeploy_applies_end_to_end_via_takeover -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn test_redeploy_applies_end_to_end_via_takeover() {
-        let host_args = integration_test_ssh_host();
-        let warm_up_pane_id = format!("test-redeploy-warmup-{}", std::process::id());
-        spawn_test_relay(&host_args, &warm_up_pane_id);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let staged = ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("staging the deploy should succeed against a real reachable host");
-        if !staged {
-            eprintln!("remote host is already at the current version — nothing to redeploy, test has nothing to verify");
-            return;
-        }
-
-        // A fresh RELAY connects and ends; once the daemon has had no client
-        // for a few seconds it notices the marker this call just staged.
-        let trigger_pane_id = format!("test-redeploy-trigger-{}", std::process::id());
-        spawn_test_relay(&host_args, &trigger_pane_id);
-
-        let expected_version = somsrv::protocol::HandshakeInfo::current().version;
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-        loop {
-            if let Ok(output) = run_remote_command(RemoteKind::Ssh, &version_probe) {
-                if let Ok(info) = serde_json::from_str::<somsrv::protocol::HandshakeInfo>(output.trim()) {
-                    if info.version == expected_version {
-                        break; // redeploy applied successfully
-                    }
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "~/.local/bin/somsrv never reported version {expected_version:?} within the timeout — the takeover did not complete"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
     }
 
     /// Real SSH round-trip: confirms `ensure_remote_binary_deployed` is a
@@ -3152,10 +2806,9 @@ mod tmux_shell_wrapping_tests {
             .expect("remote must already have SOME somsrv at ~/.local/bin/somsrv for this test's precondition");
         let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
-        assert_eq!(
-            info.version,
-            somsrv::protocol::HandshakeInfo::current().version,
-            "test precondition not met: deploy the current build to the test host manually first (see doc comment)"
+        assert!(
+            info.build_id > 0,
+            "test precondition not met: deploy a build that carries an id to the test host first (see doc comment)"
         );
 
         let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "~/.local/bin/somsrv"]);

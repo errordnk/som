@@ -76,6 +76,10 @@ impl SrvChannel {
                  check `~/.local/bin/somsrv` exists and is executable)"
             )
         })?;
+        // A daemon older than the somsrv next to this somsrp is replaced first.
+        if let Err(err) = somsrv::daemon::replace_if_stale(&daemon_binary) {
+            eprintln!("somsrp: could not check whether the running somsrv is current: {err:#}");
+        }
         let connection = somsrv::daemon::connect_or_spawn(&daemon_binary).map_err(|err| {
             format!("failed to connect to the somsrv daemon at {:?}: {err:#}", daemon_socket_path())
         })?;

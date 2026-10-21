@@ -16,8 +16,9 @@ fn identical_chunks_in_quick_succession_all_reach_the_relays_output() {
     std::thread::spawn(move || {
         const ECHOES: usize = 150;
         // The "shell": writes the erase echo of a backspace again and again, a few
-        // milliseconds apart, so each lands in a read of its own.
-        let script = format!(r#"i=0; while [ $i -lt {ECHOES} ]; do printf '\b\033[K'; sleep 0.004; i=$((i+1)); done; sleep 30"#);
+        // milliseconds apart, so each lands in a read of its own. It waits first: what it
+        // prints before the relay is attached is not the relay's to receive.
+        let script = format!(r#"sleep 2; i=0; while [ $i -lt {ECHOES} ]; do printf '\b\033[K'; sleep 0.004; i=$((i+1)); done; sleep 30"#);
         let pane_id = format!("echo-burst-{}", std::process::id());
         let mut relay = std::process::Command::new(env!("CARGO_BIN_EXE_somsrv"))
             .args(["echo-burst", pane_id.as_str(), "sh", "-c", script.as_str()])

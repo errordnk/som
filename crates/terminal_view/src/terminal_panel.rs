@@ -1997,22 +1997,6 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
     let host_lock = deploy_lock_for_host(host_args);
     let _guard = host_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // WSL is the same machine/architecture Som itself was just built for —
-    // no separate pre-built platform binary to `scp` in, so it keeps the
-    // original remote-build path (still cheap: WSL's own repo clone,
-    // usually already warm from Som's own dev use, and no network hop).
-    // Always rebuilds unconditionally when it runs — it never depended on
-    // a version/mtime comparison to decide whether to run in the first
-    // place, before or after this redesign.
-    if let RemoteKind::Wsl = remote_kind {
-        let deploy_script =
-            "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv) && mkdir -p ~/.local/bin && cp target/release/somsrv ~/.local/bin/somsrv";
-        let quoted_deploy_script = shell_quote(deploy_script);
-        let deploy_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_deploy_script]);
-        run_remote_command(remote_kind, &deploy_probe)?;
-        return Ok(true);
-    }
-
     let (os, arch) = remote_os_to_platform(os);
 
     // "Local mtime" is THIS running `som.exe`'s own file mtime — not some
@@ -2063,7 +2047,7 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
             // host fails outright.
             let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "~/.local/bin"]);
             run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create ~/.local/bin on {host_args:?}"))?;
-            scp_to_remote(host_args, &staged_binary, "~/.local/bin/somsrv")
+            upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv")
                 .with_context(|| format!("failed to upload somsrv to {host_args:?}"))?;
             let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv"]);
             run_remote_command(remote_kind, &chmod_probe).with_context(|| format!("failed to chmod somsrv on {host_args:?}"))?;
@@ -2085,7 +2069,7 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
     // finds the marker file below. See `crate::server`'s `check_and_
     // apply_pending_redeploy` for that side.
     let result = (|| -> anyhow::Result<()> {
-        scp_to_remote(host_args, &staged_binary, "~/.local/bin/somsrv.new")
+        upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv.new")
             .with_context(|| format!("failed to upload somsrv.new to {host_args:?}"))?;
 
         let chmod_probe = wrap_remote_probe_args(host_args, "chmod", &["+x", "~/.local/bin/somsrv.new"]);
@@ -2264,6 +2248,23 @@ fn windows_openssh_binary(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
+/// Puts `local_path` at `remote_path` on the far side of an ssh or wsl
+/// profile: `scp` for ssh; for WSL (where Windows' own files are visible under
+/// `/mnt`) a `cp` from the path `wslpath` makes of it.
+fn upload_to_remote(remote_kind: RemoteKind, host_args: &[String], local_path: &std::path::Path, remote_path: &str) -> anyhow::Result<()> {
+    match remote_kind {
+        RemoteKind::Wsl => {
+            let script = format!(r#"cp "$(wslpath -u {})" {remote_path}"#, shell_quote(&local_path.to_string_lossy()));
+            let quoted_script = shell_quote(&script);
+            let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_script]);
+            run_remote_command(remote_kind, &probe).with_context(|| format!("failed to copy {local_path:?} into WSL at {remote_path}"))?;
+            Ok(())
+        },
+        RemoteKind::Ssh => scp_to_remote(host_args, local_path, remote_path),
+        RemoteKind::Local => anyhow::bail!("upload_to_remote called with RemoteKind::Local"),
+    }
+}
+
 fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path: &str) -> anyhow::Result<()> {
     let Some(host) = host_args.last() else {
         anyhow::bail!("scp_to_remote called with empty host_args");
@@ -2286,6 +2287,17 @@ fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path
         anyhow::bail!("scp exited with {:?}: {}", output.status.code(), String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
+}
+
+/// The script arguments of the remote probes are single-quoted (`shell_quote`)
+/// because ssh joins its arguments into one command line for the far shell.
+/// `wsl.exe` does not: it hands the arguments on as they are, so the quotes
+/// would reach the shell as part of the word. Takes them off again.
+fn unquote_for_wsl(arg: &str) -> String {
+    match arg.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+        Some(inner) => inner.replace(r#"'\''"#, "'"),
+        None => arg.to_string(),
+    }
 }
 
 /// Runs one blocking `ssh`/`wsl` invocation to completion and returns its
@@ -2316,7 +2328,10 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     // deploy check's every-tab-open version probe is what's actually
     // spawning it).
     let output = util::command::new_std_command(&program)
-        .args(args)
+        .args(args.iter().map(|arg| match remote_kind {
+            RemoteKind::Wsl => unquote_for_wsl(arg),
+            _ => arg.clone(),
+        }))
         .output()
         .with_context(|| format!("failed to spawn {program:?} for remote deploy check"))?;
     if !output.status.success() {
@@ -2797,6 +2812,14 @@ mod tmux_shell_wrapping_tests {
         let local = Shell::WithArguments { program: local_program, args: local_args, title_override: None };
         assert!(!terminal::rich_content_srv_channel::shell_is_remote_srp(&local), "a local tab uses the local daemon");
         assert!(!terminal::rich_content_srv_channel::shell_is_remote_srp(&Shell::Program("cmd.exe".to_string())));
+    }
+
+    #[test]
+    fn the_quotes_meant_for_ssh_come_off_for_wsl_and_only_those() {
+        assert_eq!(unquote_for_wsl(&shell_quote("echo \"hi there\"; stat ~/x")), "echo \"hi there\"; stat ~/x");
+        assert_eq!(unquote_for_wsl(&shell_quote("it's")), "it's", "a quote inside the script survives the round trip");
+        assert_eq!(unquote_for_wsl("-lc"), "-lc");
+        assert_eq!(unquote_for_wsl("'"), "'", "one quote is not a quoted word");
     }
 
     #[test]

@@ -16,7 +16,7 @@
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::term::{Config, Term};
 use anyhow::Context as _;
-use somsrv::link::{Extractor, LinkHub, PtyOutput};
+use somsrv::link::{Extractor, Framing, LinkHub, PtyOutput};
 use somsrv::pipe::PipeConnection;
 use somsrv::protocol::{ConnectionKind, HandshakeInfo, HolderOutput, RelayInput};
 use std::io::Read;
@@ -50,10 +50,6 @@ const SETTLE_MAX_ATTEMPTS: u32 = 150;
 /// used to make `settled_initial_size` treat the placeholder itself as
 /// "stable" and confidently report the wrong size.
 const PLACEHOLDER_SIZE: (u16, u16) = (100, 6);
-
-/// How long the relay waits for more input before it takes what it holds back as
-/// a possible start of a link frame (an ESC) to be the user's Escape key.
-const HELD_INPUT_PATIENCE: Duration = Duration::from_millis(30);
 
 /// Polls `term_size::current_size()` repeatedly until two consecutive reads
 /// agree on something other than `PLACEHOLDER_SIZE` (or `SETTLE_MAX_WAIT`
@@ -407,38 +403,19 @@ pub fn run(
     let mut last_byte_was_cr = false;
     // What Som writes into this pty is its keystrokes and, between them, the
     // frames of the link: the frames go to the hub, the rest on to the shell.
-    let mut extractor = Extractor::default();
+    let mut extractor = Extractor::new(Framing::Input);
     let mut typed = Vec::new();
     let mut frames = Vec::new();
-    // Read on a thread of its own, so that a pause in the input can be noticed:
-    // an ESC the extractor holds back (it might begin a frame) is, after a
-    // pause, just the Escape key.
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match std::io::stdin().read(&mut buf) {
-                Ok(0) | Err(_) => return, // EOF — Som closed its side
-                Ok(n) => {
-                    if input_tx.send(buf[..n].to_vec()).is_err() {
-                        return;
-                    }
-                },
-            }
-        }
-    });
+    let mut buf = [0u8; 4096];
     loop {
+        let read = match std::io::stdin().read(&mut buf) {
+            Ok(0) => break, // EOF — Som closed its side
+            Ok(n) => n,
+            Err(_) => break,
+        };
         typed.clear();
         frames.clear();
-        match input_rx.recv_timeout(HELD_INPUT_PATIENCE) {
-            Ok(chunk) => extractor.feed(&chunk, &mut typed, &mut frames),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !extractor.take_held(&mut typed) {
-                    continue;
-                }
-            },
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+        extractor.feed(&buf[..read], &mut typed, &mut frames);
         for body in &frames {
             hub.on_frame(body);
         }

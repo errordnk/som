@@ -25,9 +25,10 @@
 //! to `RichContentCache::record_progress` the first time it's non-`None`.
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
-use somsrv::bridge::{BridgeChannel, RemoteBridge};
+use somsrv::tcp::TcpConnection;
 use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -710,15 +711,16 @@ fn to_terminal_video_codec(codec: somsrv::protocol::VideoCodec) -> crate::rich_c
 /// offer to callers in that case (mirrors what a dropped `Query` on the
 /// OLD PTY path already tolerated).
 ///
-/// `bridge` is the remote host's daemon when the placement was announced on
-/// another machine (see [`bridge_for_shell`]); every later request about
-/// this key - seeks, clicks, unsubscribing - follows the same route.
-pub fn spawn_progress_listener(session_id: u32, file_id: u32, bridge: Option<Arc<RemoteBridge>>) -> Arc<SrvProgressState> {
+/// `tunnel` is the local end of the forward to a remote host's daemon when
+/// the placement was announced on another machine (see [`tunnel_for_shell`]);
+/// every later request about this key - seeks, clicks, unsubscribing -
+/// follows the same route.
+pub fn spawn_progress_listener(session_id: u32, file_id: u32, tunnel: Option<SocketAddr>) -> Arc<SrvProgressState> {
     {
         let mut routes = ROUTES.lock().unwrap_or_else(|p| p.into_inner());
-        match bridge {
-            Some(bridge) => {
-                routes.insert((session_id, file_id), bridge);
+        match tunnel {
+            Some(address) => {
+                routes.insert((session_id, file_id), address);
             },
             None => {
                 routes.remove(&(session_id, file_id));
@@ -753,104 +755,50 @@ impl SrvProgressState {
     }
 }
 
-/// Which daemon each placement key talks to: the entry's bridge, or the local
-/// daemon when there is none. Ids are minted per placement, so a key never
-/// belongs to two hosts at once.
-static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), Arc<RemoteBridge>>>> =
+/// Which daemon each placement key talks to: the local end of the forward to
+/// the remote host's daemon, or the local daemon when there is no entry. Ids
+/// are minted per placement, so a key never belongs to two hosts at once.
+static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), SocketAddr>>> =
     std::sync::LazyLock::new(Mutex::default);
 
-/// Bridges already started, by their command line: every tab and split that
-/// talks to one host shares one ssh process.
-static BRIDGES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, BridgeSlot>>> =
-    std::sync::LazyLock::new(Mutex::default);
-
-struct BridgeSlot {
-    bridge: Arc<RemoteBridge>,
-    started: std::time::Instant,
-}
-
-/// How long a bridge that has died is not started again, so a host that
-/// cannot bridge (an older `somsrv`, a refused login) is not asked on every
-/// frame.
-const BRIDGE_RESTART_PAUSE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The path a tab's `ssh`/`wsl` command names the remote `somsrv` by; see
-/// `terminal_view::terminal_panel::wrap_remote_command_args`.
-const REMOTE_SOMSRV: &str = "~/.local/bin/somsrv";
-
-/// The command that runs the remote bridge for a tab whose shell is
-/// `program args...`, or `None` for a tab that runs on this machine.
-/// The tab's own command is `ssh [flags] host ~/.local/bin/somsrv <profile>
-/// <pane> $SHELL ...` (or `wsl [flags] -- ...`); the bridge is the same
-/// command up to the `somsrv` word, then `somsrv --srv-bridge`.
-pub fn bridge_command(program: &str, args: &[String]) -> Option<(String, Vec<String>)> {
-    let somsrv_at = args.iter().position(|arg| arg == REMOTE_SOMSRV)?;
-    let stem = std::path::Path::new(program).file_stem()?.to_string_lossy().to_lowercase();
-    let mut bridge_args = Vec::new();
-    match stem.as_str() {
-        "ssh" => {
-            // No pty (it would mangle binary frames), no password prompt
-            // (there is nobody to type it), and a dead link noticed.
-            bridge_args.extend(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15"].map(String::from));
-            bridge_args.extend(args[..somsrv_at].iter().filter(|arg| !matches!(arg.as_str(), "-t" | "-tt")).cloned());
-        },
-        "wsl" => bridge_args.extend(args[..somsrv_at].iter().cloned()),
-        _ => return None,
-    }
-    bridge_args.push(REMOTE_SOMSRV.to_string());
-    bridge_args.push("--srv-bridge".to_string());
-    Some((program.to_string(), bridge_args))
-}
-
-/// The bridge to the host a tab with this shell runs on; `None` for a local
-/// tab, or when the bridge cannot be started (the placement then stays
-/// empty, and the caller tries again later).
-pub fn bridge_for_shell(shell: &task::Shell) -> Option<Arc<RemoteBridge>> {
-    let task::Shell::WithArguments { program, args, .. } = shell else { return None };
-    let (program, args) = bridge_command(program, args)?;
-    let key = format!("{program}\0{}", args.join("\0"));
-    let mut bridges = BRIDGES.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(slot) = bridges.get(&key) {
-        if slot.bridge.is_alive() {
-            return Some(slot.bridge.clone());
-        }
-        if slot.started.elapsed() < BRIDGE_RESTART_PAUSE {
-            return None;
-        }
-    }
-    match RemoteBridge::spawn(&program, &args) {
-        Ok(bridge) => {
-            bridges.insert(key, BridgeSlot { bridge: bridge.clone(), started: std::time::Instant::now() });
-            Some(bridge)
-        },
-        Err(err) => {
-            log::warn!("cannot start the bridge to the remote somsrv: {err:#}");
-            None
-        },
-    }
+/// The local end of the forward to the daemon of the host a tab runs on: the
+/// tab's own `ssh` command carries `-L 127.0.0.1:<port>:<daemon socket>`
+/// (`terminal_view`'s `wrap_remote_command_args`), so the same ssh connection
+/// that carries the terminal carries this. `None` for a tab on this machine.
+pub fn tunnel_for_shell(shell: &task::Shell) -> Option<SocketAddr> {
+    let task::Shell::WithArguments { args, .. } = shell else { return None };
+    let port = args
+        .windows(2)
+        .find_map(|pair| if pair[0] == "-L" { somsrv::protocol::ssh_forward_port(&pair[1]) } else { None })?;
+    Some(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 /// One connection to whichever daemon `(session_id, file_id)` belongs to.
 enum SrvConnection {
     Local(somsrv::pipe::PipeConnection),
-    Bridged(BridgeChannel),
+    Tunnel(TcpConnection),
 }
 
 impl SrvConnection {
     fn read_message(&self) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Local(connection) => connection.read_message(),
-            Self::Bridged(channel) => channel.read_message(),
+            Self::Tunnel(connection) => connection.read_message(),
         }
     }
 
     fn write_message(&self, payload: &[u8]) -> anyhow::Result<()> {
         match self {
             Self::Local(connection) => connection.write_message(payload),
-            Self::Bridged(channel) => channel.write_message(payload),
+            Self::Tunnel(connection) => connection.write_message(payload),
         }
     }
 }
+
+/// How long the forward may take to accept a connection, and the remote
+/// daemon to answer the handshake. The forward accepts as soon as ssh listens
+/// and only then finds out whether anything is behind it.
+const TUNNEL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Sends `SrvRequest::RequestByteRange` on a FRESH, one-shot connection
 /// to `somsrv` — deliberately not reusing `spawn_progress_listener`'s
@@ -1183,10 +1131,10 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
 }
 
 fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvConnection> {
-    let bridge = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).cloned();
-    let connection = match bridge {
+    let tunnel = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).copied();
+    let connection = match tunnel {
         // The key was announced on another machine: ask that machine's daemon.
-        Some(bridge) => SrvConnection::Bridged(bridge.open_channel()?),
+        Some(address) => SrvConnection::Tunnel(TcpConnection::connect(address, TUNNEL_PATIENCE)?),
         None => {
             // Same spawn-if-not-running convention every other `somsrv`
             // client in this codebase uses (`somsrp::srv_channel::SrvChannel::
@@ -1201,7 +1149,13 @@ fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvCon
     };
     connection.write_message(&[ConnectionKind::Srv as u8])?;
     send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
+    if let SrvConnection::Tunnel(tunnel) = &connection {
+        tunnel.set_read_timeout(Some(TUNNEL_PATIENCE))?;
+    }
     let message = connection.read_message()?;
+    if let SrvConnection::Tunnel(tunnel) = &connection {
+        tunnel.set_read_timeout(None)?;
+    }
     match serde_json::from_slice::<SrvResponse>(&message)? {
         SrvResponse::Handshake(_) => Ok(connection),
         other => anyhow::bail!("expected Handshake as somsrv's first reply, got {other:?}"),
@@ -1217,13 +1171,14 @@ fn send(connection: &SrvConnection, message: &SrvRequest) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_placement_announced_on_another_machine_is_followed_through_the_bridge() {
-        // `somsrv --srv-bridge` stands for the one ssh runs on the remote
-        // host; the direct connection to the daemon is that host's `somsrp`.
+    fn a_placement_announced_on_another_machine_is_followed_through_the_forward() {
+        // The forward stands for the one the tab's ssh connection carries to
+        // the remote host's daemon; the direct connection to the daemon is
+        // that host's `somsrp`.
         let somsrv_binary = somsrv::testing::debug_binary("somsrv");
-        let bridge = RemoteBridge::spawn(somsrv_binary.to_str().unwrap(), &["--srv-bridge".to_string()]).unwrap();
+        let forward = somsrv::testing::spawn_tcp_forward_to_local_daemon(&somsrv_binary);
         let (session_id, file_id) = mint_som_ids();
-        let state = spawn_progress_listener(session_id, file_id, Some(bridge));
+        let state = spawn_progress_listener(session_id, file_id, Some(forward.address));
 
         let player = somsrv::daemon::connect_or_spawn(&somsrv_binary).unwrap();
         player.write_message(&[ConnectionKind::Srv as u8]).unwrap();
@@ -1247,7 +1202,7 @@ mod tests {
         player.write_message(&put).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while state.contiguous_len() < text.len() as u64 {
-            assert!(std::time::Instant::now() < deadline, "the announced document never reached the subscriber behind the bridge");
+            assert!(std::time::Instant::now() < deadline, "the announced document never reached the subscriber behind the forward");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
@@ -1273,6 +1228,12 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the bytes the player answered with never arrived: {:?}", state.bytes_received_so_far());
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // The subscription and the request each had a connection of their
+        // own, and both went through the forward - not around it.
+        assert!(
+            forward.connections.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "the traffic did not go through the forward"
+        );
     }
 
     #[test]
@@ -1286,26 +1247,19 @@ mod tests {
     }
 
     #[test]
-    fn the_bridge_command_is_the_tabs_own_ssh_up_to_the_remote_somsrv() {
+    fn the_forward_of_a_tab_is_found_in_its_ssh_arguments() {
+        let shell = |args: Vec<String>| task::Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
         let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-        let (program, bridge_args) = bridge_command(
-            "ssh",
-            &args(&["-tt", "-p", "2222", "me@host", "~/.local/bin/somsrv", "Profile", "pane-1", "$SHELL", "--cursor-shape", "block", "--", "-l"]),
-        )
-        .unwrap();
-        assert_eq!(program, "ssh");
-        assert_eq!(
-            bridge_args,
-            args(&["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-p", "2222", "me@host", "~/.local/bin/somsrv", "--srv-bridge"]),
-            "no pty (it would mangle the frames), the host as the tab has it, the bridge instead of the shell"
-        );
+        let spec = somsrv::protocol::ssh_forward_spec(51234);
 
-        let (program, bridge_args) = bridge_command("wsl.exe", &args(&["-d", "Ubuntu", "--", "~/.local/bin/somsrv", "P", "pane-2", "$SHELL"])).unwrap();
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(bridge_args, args(&["-d", "Ubuntu", "--", "~/.local/bin/somsrv", "--srv-bridge"]));
+        let mut tab = args(&["-tt", "-L"]);
+        tab.push(spec.clone());
+        tab.extend(args(&["me@host", "~/.local/bin/somsrv", "Profile", "pane-1"]));
+        assert_eq!(tunnel_for_shell(&shell(tab)), Some(SocketAddr::from(([127, 0, 0, 1], 51234))));
 
-        assert_eq!(bridge_command("ssh", &args(&["me@host"])), None, "a plain ssh tab has no somsrv to bridge to");
-        assert_eq!(bridge_command("C:\\bin\\somsrv.exe", &args(&["P", "pane", "cmd.exe"])), None, "a local tab uses the local daemon");
+        assert_eq!(tunnel_for_shell(&shell(args(&["me@host"]))), None, "a plain ssh tab has no daemon to reach");
+        assert_eq!(tunnel_for_shell(&shell(args(&["-L", "8080:localhost:80", "me@host"]))), None, "the user's own forwards are not ours");
+        assert_eq!(tunnel_for_shell(&task::Shell::Program("cmd.exe".to_string())), None, "a local tab uses the local daemon");
     }
 
     #[test]

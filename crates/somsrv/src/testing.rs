@@ -59,3 +59,53 @@ pub fn debug_binary(name: &str) -> PathBuf {
     assert!(path.is_file(), "{path:?} was not produced by the build");
     path
 }
+
+/// What `ssh -L 127.0.0.1:<port>:<daemon socket>` is to the tab: a loopback
+/// address whose connections are carried to the daemon of this machine, one
+/// daemon connection per accepted one. Returns the address to connect to.
+/// (The real thing is a byte pump; this one moves whole messages, which for
+/// the length-prefixed protocol comes to the same.)
+///
+/// The forward counts the connections it carried, so a test can tell that its
+/// traffic went through it and not around it.
+pub struct LocalForward {
+    pub address: std::net::SocketAddr,
+    pub connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub fn spawn_tcp_forward_to_local_daemon(daemon_binary: &Path) -> LocalForward {
+    use crate::tcp::TcpConnection;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port for the forward");
+    let address = listener.local_addr().expect("the forward's address");
+    let daemon_binary = daemon_binary.to_path_buf();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            counted.fetch_add(1, Ordering::Relaxed);
+            let daemon_binary = daemon_binary.clone();
+            std::thread::spawn(move || {
+                let Ok(from_client) = TcpConnection::from_stream(stream).map(Arc::new) else { return };
+                let Ok(to_daemon) = crate::daemon::connect_or_spawn(&daemon_binary).map(Arc::new) else { return };
+                let (client, daemon) = (from_client.clone(), to_daemon.clone());
+                std::thread::spawn(move || {
+                    while let Ok(message) = daemon.read_message() {
+                        if client.write_message(&message).is_err() {
+                            return;
+                        }
+                    }
+                });
+                while let Ok(message) = from_client.read_message() {
+                    if to_daemon.write_message(&message).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    LocalForward { address, connections }
+}

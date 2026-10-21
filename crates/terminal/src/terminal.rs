@@ -7297,9 +7297,8 @@ mod tests {
         // The stand-in for ssh (named `ssh`, as the tab's command is): it drops
         // `-tt <host> ~/.local/bin/somsrv` and runs the relay with the rest.
         let somsrv_binary = somsrv::testing::debug_binary("somsrv");
-        let dir = std::env::temp_dir().join(format!("som-fake-ssh-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake_ssh = dir.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
+        let scratch = tempfile::tempdir().unwrap();
+        let fake_ssh = scratch.path().join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
         std::fs::copy(somsrv::testing::debug_binary("fakessh"), &fake_ssh).unwrap();
         // SAFETY: set before any thread of this test reads it, for the child to inherit.
         unsafe { std::env::set_var("FAKESSH_SOMSRV", &somsrv_binary) };
@@ -7410,7 +7409,6 @@ mod tests {
 
         drop(terminal);
         somsrv::admin::kill_session(None, pane_id).ok();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `somsrp` run from a directory of its own, with no FFmpeg DLLs beside it
@@ -7430,8 +7428,8 @@ mod tests {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
         }
-        let dir = std::env::temp_dir().join(format!("somsrp-alone-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().to_path_buf();
         let somsrp = dir.join("somsrp.exe");
         std::fs::copy(somsrv::testing::debug_binary("somsrp"), &somsrp).unwrap();
         // somsrp starts the daemon from the binary next to it.
@@ -7462,7 +7460,6 @@ mod tests {
             .filter(|name| name.to_ascii_lowercase().ends_with(".dll"))
             .collect();
         drop(terminal);
-        std::fs::remove_dir_all(&dir).ok();
         assert!(saw_video, "somsrp run alone in a directory never showed the video: FFmpeg was not found");
         assert!(leftovers.is_empty(), "somsrp left DLLs next to itself: {leftovers:?}");
     }
@@ -8871,8 +8868,8 @@ mod tests {
             }
         }
 
-        let markdown_dir = std::env::temp_dir().join(format!("som_markdown_paint_path_test_{}", std::process::id()));
-        std::fs::create_dir_all(&markdown_dir).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let markdown_dir = scratch.path().to_path_buf();
         let markdown_path = markdown_dir.join("test.md");
         std::fs::write(&markdown_path, "# Hello\n\nThis is a test.").unwrap();
 
@@ -8903,7 +8900,6 @@ mod tests {
         let rendered_text = rendered_text.expect("rich_content_markdown_placements() never returned a placement within the poll budget");
         assert_eq!(rendered_text, "# Hello\n\nThis is a test.", "Phase 1's identity render() must pass the source through unchanged");
 
-        let _ = std::fs::remove_dir_all(&markdown_dir);
     }
 
     #[gpui::test]
@@ -9949,8 +9945,8 @@ mod tests {
         // yazi previews whatever file is under its cursor on startup —
         // an isolated directory containing exactly this one file means
         // that's always the fixture, no keystrokes needed to select it.
-        let preview_dir = std::env::temp_dir().join("som_yazi_srp_audio_preview_test");
-        std::fs::create_dir_all(&preview_dir).expect("must be able to create the isolated preview directory");
+        let scratch = tempfile::tempdir().expect("must be able to create the isolated preview directory");
+        let preview_dir = scratch.path().to_path_buf();
         let fixture_copy = preview_dir.join("tone.flac");
         std::fs::copy(&tone_path, &fixture_copy).expect("must be able to copy the fixture into the preview dir");
 

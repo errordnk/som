@@ -317,10 +317,12 @@ mod tests {
     use somsrv::protocol::SrvResponse;
     use std::sync::{Arc, Mutex};
 
-    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("somsrv_http_fetch_test_{}_{name}", std::process::id()));
+    /// A file of its own in a directory that goes away with the returned guard.
+    fn temp_file(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
-        path
+        (dir, path)
     }
 
     /// Subscribes a fresh `SrvCache` to `(1, 2)` and returns the observed
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn local_path_streams_file_bytes_with_correct_content_type() {
-        let path = temp_file("image.png", b"fake png bytes");
+        let (_scratch, path) = temp_file("image.png", b"fake png bytes");
         let cache = SrvCache::new();
         let observed = subscribe_and_collect(&cache);
 
@@ -356,13 +358,12 @@ mod tests {
         }
         assert_eq!(chunk_data, b"fake png bytes");
 
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn local_path_relative_to_base_dir_resolves_correctly() {
-        let dir = std::env::temp_dir().join(format!("somsrv_http_fetch_test_dir_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path();
         let file_path = dir.join("notes.md");
         std::fs::write(&file_path, b"# hello").unwrap();
 
@@ -380,8 +381,6 @@ mod tests {
             }
         }
         assert_eq!(chunk_data, b"# hello");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -440,13 +439,12 @@ mod tests {
 
     #[test]
     fn unrecognized_local_extension_is_an_error() {
-        let path = temp_file("mystery.xyz", b"whatever");
+        let (_scratch, path) = temp_file("mystery.xyz", b"whatever");
         let cache = SrvCache::new();
 
         let result = fetch_and_stream(&cache, 1, 2, path.to_str().unwrap(), None);
         assert!(result.is_err());
 
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]

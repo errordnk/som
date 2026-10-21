@@ -31,6 +31,12 @@ pub fn debug_binary(name: &str) -> PathBuf {
     static ONE_BUILD_AT_A_TIME: Mutex<()> = Mutex::new(());
     let _guard = ONE_BUILD_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
+    // The tests run in parallel against one daemon, started by whichever build a
+    // test happens to use: a client of a newer build must not stop the daemon of
+    // an older one that the other tests are using. Children inherit this.
+    // SAFETY: set under the lock above, before any child of this call exists.
+    unsafe { std::env::set_var(crate::daemon::KEEP_RUNNING_DAEMON_ENV, "1") };
+
     // The crate is `<root>/crates/somsrv`. No `..` in the path: ConPTY
     // refuses to start a process from one.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).expect("the crate is two levels below the workspace root");

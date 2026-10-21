@@ -41,6 +41,13 @@ name = "somsrvupd"
 path = "src/bin/somsrvupd.rs"
 doctest = false
 
+# The stand-in for `ssh` of the tests of remote tabs (`somsrv::testing`).
+[[bin]]
+name = "fakessh"
+path = "src/bin/fakessh.rs"
+doctest = false
+required-features = ["test-support"]
+
 [features]
 # `somsrv::testing`: for the tests of other crates that run the real binaries.
 test-support = []
@@ -72,6 +79,7 @@ smol.workspace = true
 sysinfo.workspace = true
 ureq = { workspace = true, features = ["socks-proxy"] }
 uuid.workspace = true
+zstd.workspace = true
 zlog.workspace = true
 
 [target.'cfg(windows)'.dependencies]

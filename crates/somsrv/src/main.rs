@@ -72,9 +72,6 @@ struct Args {
     /// contention, at the cost of never updating if the font/DPI changes
     /// mid-session (rare enough to accept).
     cell_pixel_size: Option<(u16, u16)>,
-    /// The loopback port the daemon is to listen on for Som (WSL tabs; see
-    /// `RelayInput::ListenTcp`).
-    srv_tcp_port: Option<u16>,
 }
 
 fn parse_args() -> Args {
@@ -87,7 +84,6 @@ fn parse_args() -> Args {
     let mut cursor_shape = None;
     let mut scrollback = None;
     let mut cell_pixel_size = None;
-    let mut srv_tcp_port = None;
     let mut extra_args = Vec::new();
 
     let mut iter = std::env::args().skip(1).peekable();
@@ -147,7 +143,6 @@ fn parse_args() -> Args {
             "--client-id" => client_id = iter.next(),
             "--cursor-shape" => cursor_shape = iter.next(),
             "--scrollback" => scrollback = iter.next().and_then(|s| s.parse().ok()),
-            "--srv-tcp-port" => srv_tcp_port = iter.next().and_then(|s| s.parse().ok()),
             "--cell-pixel-size" => {
                 cell_pixel_size = iter.next().and_then(|s| {
                     let (w, h) = s.split_once(';')?;
@@ -202,7 +197,6 @@ fn parse_args() -> Args {
             cursor_shape: None,
             scrollback: None,
             cell_pixel_size: None,
-            srv_tcp_port: None,
         };
     }
 
@@ -210,7 +204,7 @@ fn parse_args() -> Args {
     let Some(pane_id) = pane_id.filter(|s| !s.trim().is_empty()) else { usage() };
     let Some(program) = program.filter(|s| !s.trim().is_empty()) else { usage() };
 
-    Args { daemon, profile, pane_id, program, args: extra_args, cwd, client_id, cursor_shape, scrollback, cell_pixel_size, srv_tcp_port }
+    Args { daemon, profile, pane_id, program, args: extra_args, cwd, client_id, cursor_shape, scrollback, cell_pixel_size }
 }
 
 fn main() {
@@ -261,7 +255,6 @@ fn main() {
             args.cursor_shape,
             args.scrollback,
             args.cell_pixel_size,
-            args.srv_tcp_port,
         )
     };
 

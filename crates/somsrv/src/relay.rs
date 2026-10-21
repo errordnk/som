@@ -16,9 +16,10 @@
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::term::{Config, Term};
 use anyhow::Context as _;
+use somsrv::link::{Extractor, LinkHub, PtyOutput};
 use somsrv::pipe::PipeConnection;
 use somsrv::protocol::{ConnectionKind, HandshakeInfo, HolderOutput, RelayInput};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -132,7 +133,6 @@ pub fn run(
     cursor_shape: Option<String>,
     scrollback: Option<usize>,
     pixel_cell_size: Option<(u16, u16)>,
-    srv_tcp_port: Option<u16>,
 ) -> anyhow::Result<()> {
     // This RELAY only exists at all for a `tmux: true` profile — a `tmux:
     // false` SSH/local profile never runs `somsrv` as a shell wrapper in
@@ -251,10 +251,19 @@ pub fn run(
         },
     )?;
 
-    // Som reaches this daemon through a loopback port when there is no socket
-    // path it can use (WSL): ask for the port Som picked for this tab.
-    if let Some(port) = srv_tcp_port {
-        send(&connection, &writer, &RelayInput::ListenTcp { port })?;
+    // Everything this relay writes to its pty goes through one place, so the
+    // link's frames (Som's rich-content channel to this machine's daemon,
+    // carried in the same pty) never land inside an escape sequence of the
+    // shell's own output.
+    let output = Arc::new(PtyOutput::new(std::io::stdout()));
+    let daemon_binary = std::env::current_exe().context("cannot tell where this somsrv is")?;
+    let link_output = output.clone();
+    let hub = LinkHub::new(
+        Box::new(move |frame| link_output.write_frame(frame)),
+        Box::new(move || somsrv::daemon::connect_or_spawn(&daemon_binary)),
+    );
+    if let Err(err) = hub.announce() {
+        log::warn!("cannot announce the link to Som: {err:#}");
     }
 
     let reader_connection = connection.clone();
@@ -276,6 +285,7 @@ pub fn run(
         default_cursor_style: crate::session::parse_cursor_shape(cursor_shape.as_deref()),
         ..Config::default()
     };
+    let shell_output = output.clone();
     let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         loop {
             let message = read_holder_message(&reader_connection)?;
@@ -309,8 +319,7 @@ pub fn run(
                     let mut redrawer = crate::redraw::Redrawer::new();
                     let mut bytes = Vec::new();
                     redrawer.redraw(&term, &mut bytes)?;
-                    std::io::stdout().write_all(&bytes)?;
-                    std::io::stdout().flush()?;
+                    shell_output.write_shell(&bytes)?;
                 }
                 // The ongoing stream, post-snapshot: raw bytes straight
                 // from the real shell's PTY (see `Session::subscribe_raw_
@@ -318,8 +327,7 @@ pub fn run(
                 // written through unmodified, exactly like a plain
                 // (non-tmux) Som terminal's own PTY output already is.
                 HolderOutput::Bytes(bytes) => {
-                    std::io::stdout().write_all(&bytes)?;
-                    std::io::stdout().flush()?;
+                    shell_output.write_shell(&bytes)?;
                 }
                 HolderOutput::ShellExited => return Ok(()),
                 // Only expected once, handled above before this loop
@@ -394,12 +402,26 @@ pub fn run(
     let mut buf = [0u8; 4096];
     #[cfg(windows)]
     let mut last_byte_was_cr = false;
+    // What Som writes into this pty is its keystrokes and, between them, the
+    // frames of the link: the frames go to the hub, the rest on to the shell.
+    let mut extractor = Extractor::default();
+    let mut typed = Vec::new();
+    let mut frames = Vec::new();
     loop {
         let read = match std::io::stdin().read(&mut buf) {
             Ok(0) => break, // EOF — Som closed its side
             Ok(n) => n,
             Err(_) => break,
         };
+        typed.clear();
+        frames.clear();
+        extractor.feed(&buf[..read], &mut typed, &mut frames);
+        for body in &frames {
+            hub.on_frame(body);
+        }
+        if typed.is_empty() {
+            continue;
+        }
         // A lone NUL byte is `TerminalView::on_removed`'s explicit "the user
         // closed this tab, kill the real shell for good" signal — see that
         // function's doc comment for why this can't just be Som killing the
@@ -409,7 +431,7 @@ pub fn run(
         // produces a bare `\0` on its own, so this is unambiguous — checked
         // BEFORE the CRLF filter/forwarding below since it's a control
         // signal, not shell input to relay.
-        if buf[..read].contains(&0u8) {
+        if typed.contains(&0u8) {
             send(&connection, &writer, &RelayInput::Close).ok();
             break;
         }
@@ -422,9 +444,9 @@ pub fn run(
         // onto the command that was just typed). Only apply it on the one
         // platform it's actually needed for.
         #[cfg(windows)]
-        let filtered = strip_cr_induced_lf(&buf[..read], &mut last_byte_was_cr);
+        let filtered = strip_cr_induced_lf(&typed, &mut last_byte_was_cr);
         #[cfg(not(windows))]
-        let filtered = buf[..read].to_vec();
+        let filtered = typed.clone();
         if filtered.is_empty() {
             continue;
         }

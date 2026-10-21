@@ -511,6 +511,7 @@ impl TerminalBuilder {
             vi_mode_enabled: false,
             is_remote_terminal: false,
             is_tmux_relay_shell: false,
+            srv_link: None,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -793,6 +794,22 @@ impl TerminalBuilder {
                     || params.args.as_ref().is_some_and(|args| args.iter().any(|arg| arg.contains("somsrv")))
             });
 
+            // A tab on another machine (ssh, wsl) has the daemon that holds what
+            // a `somsrp` there announces on that machine. Its relay carries
+            // Som's channel to that daemon inside the tab's own pty stream:
+            // frames in the output are taken out here before the parser sees
+            // them, and the link writes its requests into the pty input.
+            let pty_input: Arc<std::sync::OnceLock<alacritty_terminal::event_loop::EventLoopSender>> = Arc::default();
+            let srv_link = rich_content_srv_channel::shell_is_remote_srp(&shell).then(|| {
+                let input = pty_input.clone();
+                somsrv::link::SrvLink::new(Box::new(move |bytes| {
+                    let Some(sender) = input.get() else {
+                        return Err(std::io::Error::other("the pty is not running yet"));
+                    };
+                    sender.send(Msg::Input(std::borrow::Cow::Owned(bytes.to_vec()))).map_err(|err| std::io::Error::other(err.to_string()))
+                }))
+            });
+
             //And connect them together
             let mut event_loop = EventLoop::new(
                 term.clone(),
@@ -821,7 +838,12 @@ impl TerminalBuilder {
                 }
             }
 
+            if let Some(link) = &srv_link {
+                event_loop = event_loop.with_stream_filter(Box::new(rich_content_srv_channel::LinkFilter::new(link.clone())));
+            }
+
             let pty_tx = event_loop.channel();
+            pty_input.set(pty_tx.clone()).ok();
             let _io_thread = event_loop.spawn(); // DANGER
 
             let no_task = task.is_none();
@@ -850,6 +872,7 @@ impl TerminalBuilder {
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 is_tmux_relay_shell,
+                srv_link,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -1307,6 +1330,11 @@ pub struct Terminal {
     /// whatever the real client program (e.g. `yazi`) is currently
     /// rendering.
     is_tmux_relay_shell: bool,
+    /// The way to the `somsrv` daemon of the machine this terminal runs on,
+    /// when that is another machine (an ssh or wsl tab running a `somsrv`
+    /// relay): carried in the tab's own pty stream. `None` for a local tab,
+    /// whose placements are served by the local daemon.
+    srv_link: Option<Arc<somsrv::link::SrvLink>>,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
     mouse_down_hyperlink: Option<(String, Match)>,
@@ -2588,20 +2616,19 @@ impl Terminal {
     /// to do that.
     pub fn ensure_rich_content_srv_subscription(&mut self, session_id: u32, file_id: u32) {
         let key = (session_id, file_id);
-        // A subscription that could not be made (the bridge to a remote host
-        // was down, the daemon restarting) and has heard nothing since is
-        // made again after a pause, rather than leaving the placement
-        // black for good.
+        // A subscription that could not be made (the relay of a remote tab
+        // had not said hello yet, the daemon was restarting) and has heard
+        // nothing since is made again after a pause, rather than leaving the
+        // placement black for good.
         let retry = self.rich_content_srv_progress.borrow().get(&key).is_some_and(|state| state.subscription_may_be_retried());
         if retry {
             self.rich_content_srv_progress.borrow_mut().remove(&key);
         }
-        let tunnel = if self.rich_content_srv_progress.borrow().contains_key(&key) { None } else { self.srv_tunnel() };
         let state = self
             .rich_content_srv_progress
             .borrow_mut()
             .entry(key)
-            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id, tunnel))
+            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_link.clone()))
             .clone();
 
         // `record_progress` only reads `content_type`/`metadata` the
@@ -3110,7 +3137,7 @@ impl Terminal {
             return;
         }
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
-        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_tunnel());
+        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_link.clone());
         // `markdown_base_dirs` only ever holds an entry for a TOP-LEVEL
         // placement's own id (populated from the grid-scanned placement,
         // see that map's own doc comment) — a `host` that is itself an
@@ -6791,15 +6818,6 @@ impl Terminal {
         &self.template.shell
     }
 
-    /// The local end of the forward to the `somsrv` daemon of the machine this
-    /// terminal runs on, when that is another machine (an ssh tab); `None` for
-    /// a local terminal, whose placements are served by the local daemon.
-    /// What a remote `somsrp` announces lives in that remote daemon, so the
-    /// subscription to it has to go there.
-    pub fn srv_tunnel(&self) -> Option<std::net::SocketAddr> {
-        rich_content_srv_channel::tunnel_for_shell(self.shell())
-    }
-
     /// Like `clone_builder`, but lets the caller substitute a different
     /// `Shell` than the one this terminal was actually spawned with — used
     /// by `terminal_view`'s `clone_on_split` for tmux-wrapped shells (see
@@ -7256,6 +7274,143 @@ mod tests {
             .unwrap();
         let terminal = cx.new(|cx| builder.subscribe(cx));
         (terminal, completion_rx)
+    }
+
+    /// A remote tab with a real `Terminal`, a real relay behind a stand-in for
+    /// `ssh`, and a real daemon: what a `somsrp` on "the remote machine" announces
+    /// reaches the Terminal through the tab's own pty stream, and none of the link
+    /// reaches the screen.
+    #[gpui::test]
+    async fn a_remote_tab_reaches_the_daemon_of_its_host_through_its_own_pty(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        // The patched ConPTY the real Som ships, as the other real-process tests use.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        // The stand-in for ssh (named `ssh`, as the tab's command is): it drops
+        // `-tt <host> ~/.local/bin/somsrv` and runs the relay with the rest.
+        let somsrv_binary = somsrv::testing::debug_binary("somsrv");
+        let dir = std::env::temp_dir().join(format!("som-fake-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_ssh = dir.join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
+        std::fs::copy(somsrv::testing::debug_binary("fakessh"), &fake_ssh).unwrap();
+        // SAFETY: set before any thread of this test reads it, for the child to inherit.
+        unsafe { std::env::set_var("FAKESSH_SOMSRV", &somsrv_binary) };
+
+        let pane_id = format!("remote-tab-test-{}", std::process::id());
+        let shell = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        let (terminal, _completion) = build_test_terminal_with_arguments(
+            cx,
+            fake_ssh.to_string_lossy().into_owned(),
+            ["-tt", "me@host", "~/.local/bin/somsrv", "Profile", pane_id.as_str(), shell].map(String::from).to_vec(),
+        )
+        .await;
+
+        // The relay says hello through the pty.
+        let mut ready = false;
+        for _ in 0..600 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            ready = terminal.update(cx, |term, _| term.srv_link.as_ref().is_some_and(|link| link.is_ready()));
+            if ready {
+                break;
+            }
+        }
+        let mut diagnosis = || {
+            let screen = terminal.update(cx, |term, _| term.get_content());
+            format!("screen: {screen:?}, process: {:?}, link: {}", _completion.try_recv(), terminal.update(cx, |term, _| term.srv_link.is_some()))
+        };
+        assert!(ready, "the relay never said hello through the pty (the link did not survive the pty, or the relay did not start) - {}", diagnosis());
+
+        // The remote `somsrp`: announces a file to the daemon, answers requests for
+        // bytes of it.
+        let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
+        let mut data: Vec<u8> = Vec::new();
+        let mut state = 0x9e37_79b9u32;
+        for _ in 0..(300 * 1024) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push(state as u8);
+        }
+        data.extend(std::iter::repeat_n(0u8, 200_000));
+        data.extend_from_slice("# a document of the other machine\n".repeat(500).as_bytes());
+        let player = std::sync::Arc::new(somsrv::daemon::connect_or_spawn(&somsrv_binary).unwrap());
+        somsrv::protocol::ConnectionKind::Srv.write_to(&player).unwrap();
+        player.write_message(&serde_json::to_vec(&somsrv::protocol::SrvRequest::Handshake(somsrv::protocol::HandshakeInfo::current())).unwrap()).unwrap();
+        player.read_message().unwrap();
+        let announce = {
+            let (player, data) = (player.clone(), data.clone());
+            move || {
+                for (index, piece) in data.chunks(128 * 1024).enumerate() {
+                    let put = somsrv::protocol::SrvRequest::PutChunk {
+                        session_id,
+                        file_id,
+                        offset: (index * 128 * 1024) as u64,
+                        data: piece.to_vec(),
+                        total_size: data.len() as u64,
+                        content_type: somsrv::protocol::ContentType::Markdown,
+                        metadata: somsrv::protocol::ContentMetadata::Markdown { base_dir: String::new() },
+                    };
+                    player.write_message(&serde_json::to_vec(&put).unwrap()).unwrap();
+                }
+            }
+        };
+        {
+            let (player, announce) = (player.clone(), announce.clone());
+            std::thread::spawn(move || {
+                while let Ok(message) = player.read_message() {
+                    if let Ok(somsrv::protocol::SrvRequest::RequestByteRange { session_id: s, file_id: f, .. }) =
+                        serde_json::from_slice::<somsrv::protocol::SrvRequest>(&message)
+                        && (s, f) == (session_id, file_id)
+                    {
+                        announce();
+                    }
+                }
+            });
+        }
+
+        terminal.update(cx, |term, _| term.ensure_rich_content_srv_subscription(session_id, file_id));
+        std::thread::sleep(std::time::Duration::from_secs(1)); // the subscription is not acknowledged
+        announce();
+
+        let mut received = Vec::new();
+        for _ in 0..600 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            received = terminal.update(cx, |term, _| {
+                term.ensure_rich_content_srv_subscription(session_id, file_id);
+                let progress = term.rich_content_srv_progress.borrow().get(&(session_id, file_id)).cloned();
+                match progress {
+                    Some(progress) => {
+                        // A subscription that began after the announcement is
+                        // given no bytes, only the watermark: ask for them, as every paint does.
+                        progress.request_whole_range_once_if_needed(session_id, file_id);
+                        progress.bytes_received_so_far()
+                    },
+                    None => Vec::new(),
+                }
+            });
+            if received.len() >= data.len() {
+                break;
+            }
+        }
+        assert!(received == data, "{} of {} bytes arrived, equal: {}", received.len(), data.len(), received == data);
+
+        // None of the link reached the terminal's screen.
+        let screen = terminal.update(cx, |term, _| term.get_content());
+        assert!(!screen.contains("SRV;") && !screen.contains('\u{1b}'), "a frame of the link reached the screen: {screen:?}");
+
+        drop(terminal);
+        somsrv::admin::kill_session(None, pane_id).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn init_ctrl_click_hyperlink_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {

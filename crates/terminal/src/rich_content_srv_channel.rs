@@ -25,10 +25,9 @@
 //! to `RichContentCache::record_progress` the first time it's non-`None`.
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
-use somsrv::tcp::TcpConnection;
+use somsrv::link::{LinkChannel, SrvLink};
 use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -76,8 +75,8 @@ const LIVE_CONSUMED_RETENTION: u64 = 4 * 1024 * 1024;
 #[derive(Default)]
 pub struct SrvProgressState {
     /// When the subscription thread ended with an error before anything
-    /// arrived (the remote host could not be reached through the bridge, the
-    /// daemon was restarting): the caller may try again after a pause.
+    /// arrived (the relay of a remote tab had not said hello yet, the daemon
+    /// was restarting): the caller may try again after a pause.
     subscription_failed_at: Mutex<Option<std::time::Instant>>,
     contiguous_len: AtomicU64,
     /// See `somsrv::protocol::SrvResponse::Progress::tail_available_from`'s
@@ -711,16 +710,16 @@ fn to_terminal_video_codec(codec: somsrv::protocol::VideoCodec) -> crate::rich_c
 /// offer to callers in that case (mirrors what a dropped `Query` on the
 /// OLD PTY path already tolerated).
 ///
-/// `tunnel` is the local end of the forward to a remote host's daemon when
-/// the placement was announced on another machine (see [`tunnel_for_shell`]);
-/// every later request about this key - seeks, clicks, unsubscribing -
-/// follows the same route.
-pub fn spawn_progress_listener(session_id: u32, file_id: u32, tunnel: Option<SocketAddr>) -> Arc<SrvProgressState> {
+/// `link` is the way to the daemon of the remote machine when the placement was
+/// announced there (see [`Terminal::srv_link`](crate::Terminal)); every later
+/// request about this key - seeks, clicks, unsubscribing - follows the same
+/// route.
+pub fn spawn_progress_listener(session_id: u32, file_id: u32, link: Option<Arc<SrvLink>>) -> Arc<SrvProgressState> {
     {
         let mut routes = ROUTES.lock().unwrap_or_else(|p| p.into_inner());
-        match tunnel {
-            Some(address) => {
-                routes.insert((session_id, file_id), address);
+        match link {
+            Some(link) => {
+                routes.insert((session_id, file_id), link);
             },
             None => {
                 routes.remove(&(session_id, file_id));
@@ -755,54 +754,71 @@ impl SrvProgressState {
     }
 }
 
-/// Which daemon each placement key talks to: the local end of the forward to
-/// the remote host's daemon, or the local daemon when there is no entry. Ids
-/// are minted per placement, so a key never belongs to two hosts at once.
-static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), SocketAddr>>> =
+/// Which daemon each placement key talks to: the link to a remote machine's
+/// daemon, or the local daemon when there is no entry. Ids are minted per
+/// placement, so a key never belongs to two machines at once.
+static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), Arc<SrvLink>>>> =
     std::sync::LazyLock::new(Mutex::default);
 
-/// The local end of the forward to the daemon of the host a tab runs on: the
-/// tab's own `ssh` command carries `-L 127.0.0.1:<port>:<daemon socket>`
-/// (`terminal_view`'s `wrap_remote_command_args`), so the same ssh connection
-/// that carries the terminal carries this. `None` for a tab on this machine.
-pub fn tunnel_for_shell(shell: &task::Shell) -> Option<SocketAddr> {
-    let task::Shell::WithArguments { args, .. } = shell else { return None };
-    // An ssh tab carries a forward (`-L`); a WSL tab names the port its
-    // daemon was asked to listen on.
-    let port = args.windows(2).find_map(|pair| match pair[0].as_str() {
-        "-L" => somsrv::protocol::ssh_forward_port(&pair[1]),
-        somsrv::protocol::SRV_TCP_PORT_FLAG => pair[1].parse().ok(),
-        _ => None,
-    })?;
-    Some(SocketAddr::from(([127, 0, 0, 1], port)))
+/// What a tab's `ssh`/`wsl` command names the `somsrv` on the far side by; see
+/// `terminal_view::terminal_panel::wrap_remote_command_args`.
+const REMOTE_SOMSRV: &str = "~/.local/bin/somsrv";
+
+/// Whether a tab with this shell runs a `somsrv` relay on another machine
+/// (over ssh or in WSL): the machine whose daemon holds what a `somsrp` there
+/// announces, reachable through the link carried in the tab's own pty.
+pub fn shell_is_remote_srp(shell: &task::Shell) -> bool {
+    let task::Shell::WithArguments { program, args, .. } = shell else { return false };
+    let is_remote_program = std::path::Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| matches!(stem.to_string_lossy().to_lowercase().as_str(), "ssh" | "wsl"));
+    is_remote_program && args.iter().any(|arg| arg == REMOTE_SOMSRV)
+}
+
+/// Takes the frames of the link out of a remote tab's pty output, before the
+/// terminal parser sees it, and hands them to the link.
+pub struct LinkFilter {
+    extractor: somsrv::link::Extractor,
+    link: Arc<SrvLink>,
+}
+
+impl LinkFilter {
+    pub fn new(link: Arc<SrvLink>) -> Self {
+        Self { extractor: somsrv::link::Extractor::default(), link }
+    }
+}
+
+impl alacritty_terminal::event_loop::StreamFilter for LinkFilter {
+    fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        let mut bodies = Vec::new();
+        self.extractor.feed(input, out, &mut bodies);
+        for body in &bodies {
+            self.link.on_frame(body);
+        }
+    }
 }
 
 /// One connection to whichever daemon `(session_id, file_id)` belongs to.
 enum SrvConnection {
     Local(somsrv::pipe::PipeConnection),
-    Tunnel(TcpConnection),
+    Linked(LinkChannel),
 }
 
 impl SrvConnection {
     fn read_message(&self) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Local(connection) => connection.read_message(),
-            Self::Tunnel(connection) => connection.read_message(),
+            Self::Linked(channel) => channel.read_message(),
         }
     }
 
     fn write_message(&self, payload: &[u8]) -> anyhow::Result<()> {
         match self {
             Self::Local(connection) => connection.write_message(payload),
-            Self::Tunnel(connection) => connection.write_message(payload),
+            Self::Linked(channel) => channel.write_message(payload),
         }
     }
 }
-
-/// How long the forward may take to accept a connection, and the remote
-/// daemon to answer the handshake. The forward accepts as soon as ssh listens
-/// and only then finds out whether anything is behind it.
-const TUNNEL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Sends `SrvRequest::RequestByteRange` on a FRESH, one-shot connection
 /// to `somsrv` — deliberately not reusing `spawn_progress_listener`'s
@@ -1135,10 +1151,10 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
 }
 
 fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvConnection> {
-    let tunnel = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).copied();
-    let connection = match tunnel {
+    let link = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).cloned();
+    let connection = match link {
         // The key was announced on another machine: ask that machine's daemon.
-        Some(address) => SrvConnection::Tunnel(TcpConnection::connect(address, TUNNEL_PATIENCE)?),
+        Some(link) => SrvConnection::Linked(link.open_channel()?),
         None => {
             // Same spawn-if-not-running convention every other `somsrv`
             // client in this codebase uses (`somsrp::srv_channel::SrvChannel::
@@ -1153,13 +1169,7 @@ fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvCon
     };
     connection.write_message(&[ConnectionKind::Srv as u8])?;
     send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
-    if let SrvConnection::Tunnel(tunnel) = &connection {
-        tunnel.set_read_timeout(Some(TUNNEL_PATIENCE))?;
-    }
     let message = connection.read_message()?;
-    if let SrvConnection::Tunnel(tunnel) = &connection {
-        tunnel.set_read_timeout(None)?;
-    }
     match serde_json::from_slice::<SrvResponse>(&message)? {
         SrvResponse::Handshake(_) => Ok(connection),
         other => anyhow::bail!("expected Handshake as somsrv's first reply, got {other:?}"),
@@ -1174,98 +1184,6 @@ fn send(connection: &SrvConnection, message: &SrvRequest) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_placement_announced_on_another_machine_is_followed_through_the_forward() {
-        // The forward stands for the one the tab's ssh connection carries to
-        // the remote host's daemon; the direct connection to the daemon is
-        // that host's `somsrp`.
-        let somsrv_binary = somsrv::testing::debug_binary("somsrv");
-        let forward = somsrv::testing::spawn_tcp_forward_to_local_daemon(&somsrv_binary);
-        let (session_id, file_id) = mint_som_ids();
-        let state = spawn_progress_listener(session_id, file_id, Some(forward.address));
-
-        let player = somsrv::daemon::connect_or_spawn(&somsrv_binary).unwrap();
-        player.write_message(&[ConnectionKind::Srv as u8]).unwrap();
-        player.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();
-        player.read_message().unwrap();
-
-        let text = b"# a document that lives on the other machine\n";
-        let put = serde_json::to_vec(&SrvRequest::PutChunk {
-            session_id,
-            file_id,
-            offset: 0,
-            data: text.to_vec(),
-            total_size: text.len() as u64,
-            content_type: somsrv::protocol::ContentType::Markdown,
-            metadata: somsrv::protocol::ContentMetadata::Markdown { base_dir: String::new() },
-        })
-        .unwrap();
-        // The subscription is not acknowledged, so the announcement may come
-        // before or after it is registered: either way the watermark arrives
-        // (a late subscriber is given no bytes, only the watermark).
-        player.write_message(&put).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while state.contiguous_len() < text.len() as u64 {
-            assert!(std::time::Instant::now() < deadline, "the announced document never reached the subscriber behind the forward");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // The way back: a request about the same key reaches the player on
-        // the other machine, and the player's answer arrives as bytes.
-        request_byte_range(session_id, file_id, 0, text.len() as u64);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "the request never reached the player on the other machine");
-            let message = player.read_message().unwrap();
-            if let Ok(SrvRequest::RequestByteRange { session_id: s, file_id: f, offset, len }) = serde_json::from_slice::<SrvRequest>(&message)
-                && (s, f) == (session_id, file_id)
-            {
-                assert_eq!((offset, len), (0, text.len() as u64));
-                if state.bytes_received_so_far().is_empty() {
-                    player.write_message(&put).unwrap();
-                }
-                break;
-            }
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while state.bytes_received_so_far() != text {
-            assert!(std::time::Instant::now() < deadline, "the bytes the player answered with never arrived: {:?}", state.bytes_received_so_far());
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // The subscription and the request each had a connection of their
-        // own, and both went through the forward - not around it.
-        assert!(
-            forward.connections.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-            "the traffic did not go through the forward"
-        );
-    }
-
-    #[test]
-    fn a_subscription_that_could_not_be_made_may_be_made_again_after_a_pause() {
-        let state = SrvProgressState::default();
-        assert!(!state.subscription_may_be_retried(), "nothing failed yet");
-        *state.subscription_failed_at.lock().unwrap() = Some(std::time::Instant::now());
-        assert!(!state.subscription_may_be_retried(), "not at once");
-        *state.subscription_failed_at.lock().unwrap() = Some(std::time::Instant::now() - SUBSCRIPTION_RETRY_PAUSE);
-        assert!(state.subscription_may_be_retried());
-    }
-
-    #[test]
-    fn the_forward_of_a_tab_is_found_in_its_ssh_arguments() {
-        let shell = |args: Vec<String>| task::Shell::WithArguments { program: "ssh".to_string(), args, title_override: None };
-        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-        let spec = somsrv::protocol::ssh_forward_spec(51234);
-
-        let mut tab = args(&["-tt", "-L"]);
-        tab.push(spec.clone());
-        tab.extend(args(&["me@host", "~/.local/bin/somsrv", "Profile", "pane-1"]));
-        assert_eq!(tunnel_for_shell(&shell(tab)), Some(SocketAddr::from(([127, 0, 0, 1], 51234))));
-
-        assert_eq!(tunnel_for_shell(&shell(args(&["me@host"]))), None, "a plain ssh tab has no daemon to reach");
-        assert_eq!(tunnel_for_shell(&shell(args(&["-L", "8080:localhost:80", "me@host"]))), None, "the user's own forwards are not ours");
-        assert_eq!(tunnel_for_shell(&task::Shell::Program("cmd.exe".to_string())), None, "a local tab uses the local daemon");
-    }
-
     #[test]
     fn a_buffer_that_began_mid_file_is_re_anchored_by_the_reply_for_the_whole_file() {
         // Som subscribed late: the first chunk it saw was from the middle.

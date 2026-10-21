@@ -767,9 +767,13 @@ static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), S
 /// that carries the terminal carries this. `None` for a tab on this machine.
 pub fn tunnel_for_shell(shell: &task::Shell) -> Option<SocketAddr> {
     let task::Shell::WithArguments { args, .. } = shell else { return None };
-    let port = args
-        .windows(2)
-        .find_map(|pair| if pair[0] == "-L" { somsrv::protocol::ssh_forward_port(&pair[1]) } else { None })?;
+    // An ssh tab carries a forward (`-L`); a WSL tab names the port its
+    // daemon was asked to listen on.
+    let port = args.windows(2).find_map(|pair| match pair[0].as_str() {
+        "-L" => somsrv::protocol::ssh_forward_port(&pair[1]),
+        somsrv::protocol::SRV_TCP_PORT_FLAG => pair[1].parse().ok(),
+        _ => None,
+    })?;
     Some(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 

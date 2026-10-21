@@ -2596,12 +2596,12 @@ impl Terminal {
         if retry {
             self.rich_content_srv_progress.borrow_mut().remove(&key);
         }
-        let bridge = if self.rich_content_srv_progress.borrow().contains_key(&key) { None } else { self.srv_bridge() };
+        let tunnel = if self.rich_content_srv_progress.borrow().contains_key(&key) { None } else { self.srv_tunnel() };
         let state = self
             .rich_content_srv_progress
             .borrow_mut()
             .entry(key)
-            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id, bridge))
+            .or_insert_with(|| rich_content_srv_channel::spawn_progress_listener(session_id, file_id, tunnel))
             .clone();
 
         // `record_progress` only reads `content_type`/`metadata` the
@@ -3110,7 +3110,7 @@ impl Terminal {
             return;
         }
         let (session_id, file_id) = rich_content_srv_channel::mint_som_ids();
-        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_bridge());
+        let state = rich_content_srv_channel::spawn_progress_listener(session_id, file_id, self.srv_tunnel());
         // `markdown_base_dirs` only ever holds an entry for a TOP-LEVEL
         // placement's own id (populated from the grid-scanned placement,
         // see that map's own doc comment) — a `host` that is itself an
@@ -6791,13 +6791,13 @@ impl Terminal {
         &self.template.shell
     }
 
-    /// The bridge to the `somsrv` daemon of the machine this terminal runs
-    /// on, when that is another machine (an ssh or wsl tab); `None` for a
-    /// local terminal, whose placements are served by the local daemon.
+    /// The local end of the forward to the `somsrv` daemon of the machine this
+    /// terminal runs on, when that is another machine (an ssh tab); `None` for
+    /// a local terminal, whose placements are served by the local daemon.
     /// What a remote `somsrp` announces lives in that remote daemon, so the
     /// subscription to it has to go there.
-    pub fn srv_bridge(&self) -> Option<std::sync::Arc<somsrv::bridge::RemoteBridge>> {
-        rich_content_srv_channel::bridge_for_shell(self.shell())
+    pub fn srv_tunnel(&self) -> Option<std::net::SocketAddr> {
+        rich_content_srv_channel::tunnel_for_shell(self.shell())
     }
 
     /// Like `clone_builder`, but lets the caller substitute a different

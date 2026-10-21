@@ -1486,6 +1486,28 @@ fn wrap_command_args(
 /// Windows-side command-line builder could usefully pass down instead (it
 /// has no reliable view of what source IP sshd will see this connection
 /// arrive from).
+/// What the tab's ssh command names the remote `somsrv` by.
+const REMOTE_SOMSRV: &str = "~/.local/bin/somsrv";
+
+/// A loopback port nothing listens on right now.
+fn free_loopback_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).log_err()?;
+    Some(listener.local_addr().log_err()?.port())
+}
+
+/// `args` with the port of its daemon forward (if it has one) replaced by a
+/// free one: a tab made from another tab's command (a split, a restore) must
+/// not bind the port the first one holds.
+fn with_fresh_forward_port(args: &mut [String]) {
+    let Some(at) = args.windows(2).position(|pair| pair[0] == "-L" && somsrv::protocol::ssh_forward_port(&pair[1]).is_some()) else {
+        return;
+    };
+    match free_loopback_port() {
+        Some(port) => args[at + 1] = somsrv::protocol::ssh_forward_spec(port),
+        None => log::warn!("no free loopback port for the daemon forward of a split"),
+    }
+}
+
 fn wrap_remote_command_args(
     profile_name: &str,
     pane_id: &str,
@@ -1512,8 +1534,21 @@ fn wrap_remote_command_args(
     // handling, so this is SSH-only.
     if let RemoteKind::Ssh = remote_kind {
         wrapped_args.insert(0, "-tt".to_string());
+        // The rich content of this tab (what a `somsrp` over there shows or
+        // plays) lives in the daemon of that host. Forwarding a loopback port
+        // to the daemon's socket over THIS connection is how Som reaches it:
+        // one ssh connection, nothing else started. Each tab gets a port of
+        // its own - a second ssh that cannot bind the same one only prints a
+        // warning into the terminal.
+        match free_loopback_port() {
+            Some(port) => {
+                wrapped_args.insert(1, "-L".to_string());
+                wrapped_args.insert(2, somsrv::protocol::ssh_forward_spec(port));
+            },
+            None => log::warn!("no free loopback port for the daemon forward: rich content of this tab will not show"),
+        }
     }
-    wrapped_args.push("~/.local/bin/somsrv".to_string());
+    wrapped_args.push(REMOTE_SOMSRV.to_string());
     wrapped_args.push(profile_name.to_string());
     wrapped_args.push(pane_id.to_string());
     wrapped_args.push("$SHELL".to_string());
@@ -1644,13 +1679,14 @@ pub fn rebuild_tmux_shell_with_pane_id(shell: &Shell, pane_id: String) -> Option
         }
         RemoteKind::Ssh | RemoteKind::Wsl => {
             // wrap_remote_command_args: [...host_args, "~/.local/bin/somsrv", profile, pane_id, "$SHELL", ...]
-            let server_pos = args.iter().position(|a| a.contains("somsrv"))?;
+            let server_pos = args.iter().position(|a| a == REMOTE_SOMSRV)?;
             let pane_id_pos = server_pos + 2;
             if pane_id_pos >= args.len() {
                 return None;
             }
             let mut new_args = args.clone();
             new_args[pane_id_pos] = fresh_pane_id.clone();
+            with_fresh_forward_port(&mut new_args);
             Some((
                 Shell::WithArguments { program: program.clone(), args: new_args, title_override: title_override.clone() },
                 fresh_pane_id,
@@ -2449,12 +2485,13 @@ mod tmux_shell_wrapping_tests {
         // own flags/host to a shell on the far end.
         let args =
             wrap_remote_command_args("pi5", "pane-uuid-4", vec!["192.168.50.5".to_string()], CursorShape::Block, None, RemoteKind::Ssh);
+        // The tab's own ssh connection also forwards a loopback port to the
+        // host's daemon (a port of its own, so only its shape is fixed here).
+        assert_eq!(&args[..2], ["-tt", "-L"]);
+        assert!(somsrv::protocol::ssh_forward_port(&args[2]).is_some(), "{:?}", args[2]);
         assert_eq!(
-            args,
-            vec![
-                "-tt", "192.168.50.5", "~/.local/bin/somsrv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
-                "--", "-l"
-            ]
+            &args[3..],
+            ["192.168.50.5", "~/.local/bin/somsrv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block", "--", "-l"]
         );
     }
 
@@ -2599,12 +2636,14 @@ mod tmux_shell_wrapping_tests {
         let Shell::WithArguments { program, args, .. } = &rebuilt else { panic!("expected WithArguments") };
         assert_eq!(program, "ssh");
         assert_eq!(args[0], "-tt");
-        assert_eq!(args[1], "192.168.50.5");
-        assert_eq!(args[2], "~/.local/bin/somsrv");
-        assert_eq!(args[3], "pi5"); // profile unchanged
-        assert_ne!(args[4], "original-pane-id"); // pane_id replaced
-        assert_eq!(args[4], fresh_pane_id); // and matches the returned pane_id
-        assert_eq!(&args[5..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
+        assert_eq!(args[1], "-L");
+        assert!(somsrv::protocol::ssh_forward_port(&args[2]).is_some());
+        assert_eq!(args[3], "192.168.50.5");
+        assert_eq!(args[4], "~/.local/bin/somsrv");
+        assert_eq!(args[5], "pi5"); // profile unchanged
+        assert_ne!(args[6], "original-pane-id"); // pane_id replaced
+        assert_eq!(args[6], fresh_pane_id); // and matches the returned pane_id
+        assert_eq!(&args[7..], &["$SHELL", "--cursor-shape", "block", "--", "-l"]);
     }
 
     /// A remote tmux-wrapped shell as a restored tab has it.
@@ -2622,7 +2661,7 @@ mod tmux_shell_wrapping_tests {
 
     fn pane_id_of(shell: &Shell) -> String {
         let Shell::WithArguments { args, .. } = shell else { panic!("expected WithArguments") };
-        let server_pos = args.iter().position(|a| a.contains("somsrv")).expect("a somsrv argument");
+        let server_pos = args.iter().position(|a| a == REMOTE_SOMSRV).expect("a somsrv argument");
         args[server_pos + 2].clone()
     }
 
@@ -2653,10 +2692,15 @@ mod tmux_shell_wrapping_tests {
         let (Shell::WithArguments { args: before, .. }, Shell::WithArguments { args: after, .. }) = (&shell, &rebuilt) else {
             panic!("expected WithArguments")
         };
-        let server_pos = before.iter().position(|a| a.contains("somsrv")).expect("a somsrv argument");
+        let server_pos = before.iter().position(|a| a == REMOTE_SOMSRV).expect("a somsrv argument");
+        let forward_at = before.iter().position(|a| a == "-L").expect("the daemon forward") + 1;
         for (index, (a, b)) in before.iter().zip(after.iter()).enumerate() {
             if index == server_pos + 2 {
                 assert_eq!(b, "given");
+            } else if index == forward_at {
+                // The one other thing that differs: the split listens on a port of its own.
+                assert_ne!(a, b, "a split must not reuse its tab's forward port");
+                assert!(somsrv::protocol::ssh_forward_port(b).is_some());
             } else {
                 assert_eq!(a, b, "argument {index} must not change");
             }
@@ -2770,20 +2814,25 @@ mod tmux_shell_wrapping_tests {
     /// new, empty shells, with the old ones, and what ran in them, left
     /// orphaned.
     #[test]
-    fn the_command_a_tmux_ssh_tab_runs_yields_a_bridge_command() {
-        // The bridge to a remote host is derived from the tab's own command;
-        // if that command's shape changes this must change with it, or rich
-        // content from remote hosts goes black again.
-        for kind in [RemoteKind::Ssh, RemoteKind::Wsl] {
-            let host_args = if matches!(kind, RemoteKind::Ssh) { vec!["me@host".to_string()] } else { vec!["-d".to_string(), "Ubuntu".to_string(), "--".to_string()] };
-            let args = wrap_remote_command_args("Profile", "pane-1", host_args, CursorShape::default(), None, kind);
-            let program = if matches!(kind, RemoteKind::Ssh) { "ssh" } else { "wsl.exe" };
-            let (bridge_program, bridge_args) = terminal::rich_content_srv_channel::bridge_command(program, &args)
-                .unwrap_or_else(|| panic!("no bridge command for {program} {args:?}"));
-            assert_eq!(bridge_program, program);
-            assert_eq!(&bridge_args[bridge_args.len() - 2..], ["~/.local/bin/somsrv", "--srv-bridge"]);
-            assert!(!bridge_args.iter().any(|arg| arg == "$SHELL" || arg == "pane-1"), "{bridge_args:?}");
-        }
+    fn an_ssh_tab_carries_the_forward_to_its_hosts_daemon_and_a_split_gets_its_own() {
+        // Rich content of a remote host reaches Som through this forward, on
+        // the tab's own ssh connection. If the shape of the command changes
+        // and the forward is lost, such content goes black again.
+        let args = wrap_remote_command_args("Profile", "pane-1", vec!["me@host".to_string()], CursorShape::default(), None, RemoteKind::Ssh);
+        let shell = Shell::WithArguments { program: "ssh".to_string(), args: args.clone(), title_override: None };
+        let tab_address = terminal::rich_content_srv_channel::tunnel_for_shell(&shell).expect("the tab's command carries the daemon forward");
+        assert_eq!(tab_address.ip().to_string(), "127.0.0.1");
+        let host_at = args.iter().position(|arg| arg == "me@host").unwrap();
+        let forward_at = args.iter().position(|arg| arg == "-L").unwrap();
+        assert!(forward_at < host_at, "options go before the host, or ssh takes them for the remote command: {args:?}");
+
+        let (split, _) = rebuild_tmux_shell_with_fresh_pane_id(&shell).expect("a tmux ssh shell can be rebuilt");
+        let split_address = terminal::rich_content_srv_channel::tunnel_for_shell(&split).expect("the split carries a forward too");
+        assert_ne!(split_address, tab_address, "two ssh connections cannot both listen on one port");
+
+        // A tab for WSL has no ssh connection to carry one.
+        let wsl_args = wrap_remote_command_args("Profile", "pane-1", vec!["-d".to_string(), "Ubuntu".to_string(), "--".to_string()], CursorShape::default(), None, RemoteKind::Wsl);
+        assert!(!wsl_args.iter().any(|arg| arg == "-L"));
     }
 
     #[test]

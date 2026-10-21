@@ -20,6 +20,37 @@ use serde::{Deserialize, Serialize};
 /// hardcodes `/tmp` rather than trusting `$TMPDIR` — see the historical
 /// `SUN_LEN` overflow this avoided, `project_som_tmux` memory,
 /// "Обновление 30").
+/// The address of the daemon's socket as `ssh -L` names it on the remote side:
+/// `%r` is ssh's token for the remote user name, which Som knows from nothing
+/// but ssh itself (the uid in [`daemon_socket_path`] it does not). The daemon
+/// publishes a link of this name to its socket, see [`daemon_socket_alias_path`].
+pub const SSH_FORWARD_REMOTE_SOCKET: &str = "/tmp/somsrv-%r.sock";
+
+/// The `-L` argument that forwards `127.0.0.1:<port>` of this machine to the
+/// daemon of the remote host, over the ssh connection that carries the tab.
+pub fn ssh_forward_spec(port: u16) -> String {
+    format!("127.0.0.1:{port}:{SSH_FORWARD_REMOTE_SOCKET}")
+}
+
+/// The port of an `-L` argument built by [`ssh_forward_spec`], or `None` for
+/// any other argument.
+pub fn ssh_forward_port(arg: &str) -> Option<u16> {
+    let rest = arg.strip_prefix("127.0.0.1:")?;
+    let (port, remote) = rest.split_once(':')?;
+    if remote != SSH_FORWARD_REMOTE_SOCKET {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// The link the daemon keeps to its socket under the name the ssh forward
+/// uses (`SSH_FORWARD_REMOTE_SOCKET` with this account's name); `None` when
+/// the account's name cannot be found.
+#[cfg(unix)]
+pub fn daemon_socket_alias_path() -> Option<String> {
+    Some(SSH_FORWARD_REMOTE_SOCKET.replace("%r", &whoami_unix()?))
+}
+
 #[cfg(windows)]
 pub fn daemon_socket_path() -> String {
     r"\\.\pipe\somsrv".to_string()
@@ -1181,6 +1212,24 @@ mod tests {
             "daemon_socket_path produced a {}-byte path (>= the {MACOS_SUN_LEN}-byte SUN_LEN limit): {path:?}",
             path.len()
         );
+    }
+
+    #[test]
+    fn the_ssh_forward_spec_and_its_port_round_trip_and_nothing_else_matches() {
+        let spec = ssh_forward_spec(51234);
+        assert_eq!(spec, "127.0.0.1:51234:/tmp/somsrv-%r.sock");
+        assert_eq!(ssh_forward_port(&spec), Some(51234));
+        assert_eq!(ssh_forward_port("8080:localhost:80"), None, "the user's own forwards are not ours");
+        assert_eq!(ssh_forward_port("127.0.0.1:8080:/tmp/other.sock"), None);
+        assert_eq!(ssh_forward_port("127.0.0.1:notaport:/tmp/somsrv-%r.sock"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_alias_is_the_forward_socket_with_this_accounts_name() {
+        let alias = daemon_socket_alias_path().expect("the account has a name");
+        assert!(alias.starts_with("/tmp/somsrv-") && alias.ends_with(".sock") && !alias.contains('%'), "{alias}");
+        assert!(alias.len() < 104, "must fit a socket path");
     }
 
     #[test]

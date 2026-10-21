@@ -1,54 +1,29 @@
-//! `somsrvupd` — a tiny, standalone updater that performs the entire
-//! `somsrv` redeploy cutover, so `somsrv` itself never has to touch its
-//! own running executable file (impossible to do safely on Windows, and
-//! only safe on Unix via a specific rename-not-truncate pattern that's
-//! still cleaner to keep entirely out of the long-lived daemon's own
-//! code). See `somsrv::daemon::check_and_apply_pending_redeploy`'s doc
-//! comment for the full protocol this is one half of:
+//! The cutover of a redeploy: `somsrv --takeover <old-pid> <staged> <final>
+//! <marker>`.
 //!
-//! 1. Som's `terminal_panel::ensure_remote_binary_deployed` `scp`s a new
-//!    build to `somsrv.new` (never overwriting the live binary) and
-//!    drops a marker file once it's fully in place.
-//! 2. The currently-running `somsrv` daemon notices the marker on its
-//!    next client connection, extracts ITS OWN embedded copy of this
-//!    `somsrvupd` binary to disk (fresh every time — see `daemon.rs`'s own
-//!    doc comment on why: this guarantees whatever's running is always
-//!    the updater bundled with the CURRENTLY installed `somsrv`, never
-//!    a stale leftover from some earlier version), and spawns it with
-//!    this process's own pid — then simply keeps running normally.
-//! 3. THIS process (`somsrvupd`) waits for that pid to actually exit
-//!    (nudging it along with a graceful signal first, then a forceful
-//!    one if it doesn't exit promptly), renames `somsrv.new` onto the
-//!    live `somsrv(.exe)` path (safe now — nothing is executing that
-//!    file anymore), deletes the marker, spawns a fresh `somsrv --daemon`
-//!    from the now-current binary, and exits.
+//! Som stages a new build as `somsrv.new` next to the live `somsrv` and drops a
+//! marker file once it is complete. The running daemon notices the marker when
+//! no client is connected (see `server`'s idle watcher) and starts a copy of
+//! itself in this mode - a separate process, because a daemon cannot replace its
+//! own executable (impossible on Windows, and cleaner kept out of the
+//! long-lived process on Unix). This process:
 //!
-//! Every live connection the old daemon was holding drops the instant it
-//! exits — the OS closes every handle/socket for a dead process
-//! unconditionally, so there is no separate "close every connection"
-//! step to write here; killing the process IS closing its connections.
+//! 1. waits for the old daemon to exit (nudging it with SIGTERM first on Unix,
+//!    forcing it after a few seconds),
+//! 2. renames `somsrv.new` onto the live `somsrv` (safe now: nothing runs it),
+//! 3. removes the marker and starts a fresh `somsrv --daemon` from the new file.
+//!
+//! Every connection the old daemon held drops when it exits: the OS closes a
+//! dead process's sockets, there is no separate step for it.
+//!
+//! It used to be a second binary, `somsrvupd`, embedded into `somsrv` from a
+//! directory a manual script filled. Nobody ran the script for Linux or macOS,
+//! so on those hosts the daemon found nothing to start and no update was ever
+//! applied. A copy of the running binary needs nothing to be built or embedded.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let usage = || -> ! {
-        eprintln!("usage: somsrvupd <old-pid> <staged-binary-path> <final-binary-path> <marker-path>");
-        std::process::exit(2);
-    };
-    let Some(old_pid) = args.next().and_then(|s| s.parse::<u32>().ok()) else { usage() };
-    let Some(staged_path) = args.next().map(PathBuf::from) else { usage() };
-    let Some(final_path) = args.next().map(PathBuf::from) else { usage() };
-    let Some(marker_path) = args.next().map(PathBuf::from) else { usage() };
-
-    if let Err(err) = run(old_pid, &staged_path, &final_path, &marker_path) {
-        eprintln!("somsrvupd failed: {err:#}");
-        std::process::exit(1);
-    }
-}
-
-fn run(old_pid: u32, staged_path: &std::path::Path, final_path: &std::path::Path, marker_path: &std::path::Path) -> anyhow::Result<()> {
+pub fn run(old_pid: u32, staged_path: &std::path::Path, final_path: &std::path::Path, marker_path: &std::path::Path) -> anyhow::Result<()> {
     request_graceful_exit(old_pid);
     wait_for_pid_to_exit(old_pid, Duration::from_secs(5), Duration::from_secs(10));
 

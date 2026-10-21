@@ -101,6 +101,32 @@ fn parse_args() -> Args {
                 println!("{}", serde_json::to_string(&somsrv::protocol::HandshakeInfo::current()).unwrap());
                 std::process::exit(0);
             }
+            // The cutover of a redeploy, run by a copy of the old daemon (see
+            // `somsrv::takeover`). No logging: nothing is listening to it.
+            "--takeover" => {
+                let (Some(old_pid), Some(staged), Some(final_path), Some(marker)) =
+                    (iter.next().and_then(|s| s.parse::<u32>().ok()), iter.next(), iter.next(), iter.next())
+                else {
+                    eprintln!("usage: somsrv --takeover <old-pid> <staged-binary> <final-binary> <marker>");
+                    std::process::exit(2);
+                };
+                let result = somsrv::takeover::run(old_pid, std::path::Path::new(&staged), std::path::Path::new(&final_path), std::path::Path::new(&marker));
+                // This process is a temporary copy of the old binary; a running
+                // executable cannot be deleted on Windows, the next takeover
+                // removes what is left there.
+                if let Ok(this_copy) = std::env::current_exe()
+                    && this_copy.file_name().is_some_and(|name| name.to_string_lossy().starts_with("somsrv-takeover-"))
+                {
+                    std::fs::remove_file(this_copy).ok();
+                }
+                match result {
+                    Ok(()) => std::process::exit(0),
+                    Err(err) => {
+                        eprintln!("takeover failed: {err:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             // Self-contained admin subcommands — connect to the daemon
             // ALREADY running on this same machine (see `somsrv::admin`),
             // print a JSON result, exit. These are what `terminal_panel.

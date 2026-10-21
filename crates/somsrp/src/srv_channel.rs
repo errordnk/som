@@ -249,8 +249,10 @@ impl SrvChannel {
         target: String,
         tags: Option<somsrv::protocol::TrackTags>,
         looping: bool,
+        current: Option<somsrv::protocol::NextTrack>,
+        next: Option<somsrv::protocol::NextTrack>,
     ) -> Result<(), String> {
-        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping })
+        send(&self.connection, &SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping, current, next })
     }
 
     /// Tells `somsrv` the track list of the CUE sheet `(session_id,

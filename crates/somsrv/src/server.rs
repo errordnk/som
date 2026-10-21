@@ -546,11 +546,30 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::Handshake(_) => {
                 log::warn!("received an unexpected second Handshake mid-connection, ignoring it");
             }
-            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping } => {
+            SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping, current, next } => {
                 let lookup_pending = crate::now_playing::station_for_url(&target).is_some();
                 cache.set_playlist(session_id, file_id, title, index, len, looping, lookup_pending);
+                cache.set_announced_next(session_id, file_id, next.clone());
                 if let Some(tags) = tags {
                     crate::now_playing::announce_file_tags(cache.clone(), session_id, file_id, tags);
+                }
+                // The tags and the cover of a track the player already knows
+                // (a radio batch): shown now, with the next track's cover let
+                // go for, rather than after the stream has been opened.
+                if let Some(current) = current {
+                    cache.set_now_playing(somsrv::protocol::NowPlayingInfo {
+                        session_id,
+                        file_id,
+                        artist: current.artist,
+                        title: current.title,
+                        album: current.album,
+                        year: current.year,
+                        duration_ms: current.duration_ms,
+                        remaining_ms: current.duration_ms,
+                        cover_url: current.cover_url,
+                        cover_lookup_pending: false,
+                        next,
+                    });
                 }
             }
             SrvRequest::AnnounceCue { session_id, file_id, sheet } => {

@@ -83,6 +83,12 @@ pub fn parse_track_meta(json: &str) -> anyhow::Result<TrackInfo> {
     let track = value
         .pointer("/result/0")
         .ok_or_else(|| anyhow::anyhow!("no track in the reply: {}", api_error(&value)))?;
+    Ok(track_info(track))
+}
+
+/// What the service says about a track object (the reply of a track lookup and
+/// the tracks of a radio batch have the same shape).
+fn track_info(track: &serde_json::Value) -> TrackInfo {
     let text = |pointer: &str| track.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut title = text("/title");
     let version = text("/version");
@@ -95,14 +101,14 @@ pub fn parse_track_meta(json: &str) -> anyhow::Result<TrackInfo> {
         .map(|artists| artists.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str())).collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
     let cover = track.get("coverUri").and_then(|v| v.as_str()).or_else(|| track.pointer("/albums/0/coverUri").and_then(|v| v.as_str()));
-    Ok(TrackInfo {
+    TrackInfo {
         title,
         artist,
         album: text("/albums/0/title"),
         year: track.pointer("/albums/0/year").and_then(|v| v.as_u64()).map(|year| year as u32),
         duration_ms: track.get("durationMs").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         cover_url: cover.map(cover_link),
-    })
+    }
 }
 
 /// A catalogue cover is `host/path/%%`; `%%` stands for the size.
@@ -255,10 +261,9 @@ fn file_info(agent: &ureq::Agent, token: &str, track: &TrackRef) -> anyhow::Resu
     parse_file_info(&api_get(agent, token, "file info", &format!("{API_BASE}/get-file-info?{query}"))?)
 }
 
-/// One track of a radio batch: its id, the "artist - title" to show, the
-/// link that plays it and its album's year. `None` for a track the service
-/// marks unavailable.
-fn batch_track(track: &serde_json::Value) -> Option<(String, String, String, Option<u32>)> {
+/// One track of a radio batch, with everything the batch says about it. `None`
+/// for a track the service marks unavailable.
+fn batch_track(track: &serde_json::Value) -> Option<RadioTrack> {
     if track.get("available").and_then(|v| v.as_bool()) == Some(false) {
         return None;
     }
@@ -266,12 +271,7 @@ fn batch_track(track: &serde_json::Value) -> Option<(String, String, String, Opt
         serde_json::Value::String(id) => id.clone(),
         other => other.as_u64()?.to_string(),
     };
-    let title = track.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let artist = track
-        .get("artists")
-        .and_then(|v| v.as_array())
-        .map(|artists| artists.iter().filter_map(|a| a.get("name").and_then(|n| n.as_str())).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
+    let info = track_info(track);
     let album_id = track
         .pointer("/albums/0/id")
         .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)));
@@ -279,9 +279,19 @@ fn batch_track(track: &serde_json::Value) -> Option<(String, String, String, Opt
         Some(album) => format!("https://music.yandex.ru/album/{album}/track/{id}"),
         None => format!("https://music.yandex.ru/track/{id}"),
     };
-    let title = if artist.is_empty() { title } else { format!("{artist} - {title}") };
-    let year = track.pointer("/albums/0/year").and_then(|v| v.as_u64()).and_then(|year| u32::try_from(year).ok());
-    Some((id, title, target, year))
+    let title = if info.artist.is_empty() { info.title.clone() } else { format!("{} - {}", info.artist, info.title) };
+    Some(RadioTrack {
+        id,
+        title,
+        target,
+        liked: false,
+        year: info.year,
+        artist: info.artist,
+        name: info.title,
+        album: info.album,
+        duration_ms: info.duration_ms,
+        cover_url: info.cover_url,
+    })
 }
 
 /// A station is `<type>:<tag>` (`user:onyourwave`, `track:38526`); nothing
@@ -305,8 +315,8 @@ pub fn parse_radio(json: &str) -> anyhow::Result<(String, Vec<RadioTrack>)> {
         .into_iter()
         .flatten()
         .filter_map(|item| {
-            let (id, title, target, year) = batch_track(item.get("track")?)?;
-            Some(RadioTrack { id, title, target, liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false), year })
+            let track = batch_track(item.get("track")?)?;
+            Some(RadioTrack { liked: item.get("liked").and_then(|v| v.as_bool()).unwrap_or(false), ..track })
         })
         .collect::<Vec<_>>();
     if tracks.is_empty() {
@@ -523,7 +533,7 @@ mod tests {
     #[test]
     fn a_radio_batch_is_parsed() {
         let json = r#"{"result":{"batchId":"1792-362","sequence":[
-            {"type":"track","liked":true,"track":{"id":"38526","title":"Roads","artists":[{"name":"Portishead"}],"albums":[{"id":3193,"year":1994}]}},
+            {"type":"track","liked":true,"track":{"id":"38526","title":"Roads","artists":[{"name":"Portishead"}],"durationMs":300000,"coverUri":"avatars.yandex.net/get-music-content/1/abc/%%","albums":[{"id":3193,"year":1994,"title":"Dummy"}]}},
             {"type":"track","liked":false,"track":{"id":80041888,"title":"Take Me Away","artists":[{"name":"Monolink"}],"albums":[{"id":14617746}]}},
             {"type":"track","track":{"id":"9","title":"Gone","available":false}}]}}"#;
         let (batch, tracks) = parse_radio(json).expect("batch");
@@ -537,6 +547,11 @@ mod tests {
                 target: "https://music.yandex.ru/album/3193/track/38526".into(),
                 liked: true,
                 year: Some(1994),
+                artist: "Portishead".into(),
+                name: "Roads".into(),
+                album: "Dummy".into(),
+                duration_ms: 300_000,
+                cover_url: Some("https://avatars.yandex.net/get-music-content/1/abc/1000x1000".into()),
             }
         );
         assert_eq!(tracks[1].id, "80041888");

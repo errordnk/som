@@ -1052,6 +1052,8 @@ pub fn announce_track(session_id: u32, file_id: u32, target: String, tags: somsr
                     target,
                     tags: Some(tags),
                     looping: true,
+                    current: None,
+                    next: None,
                 },
             )
         });

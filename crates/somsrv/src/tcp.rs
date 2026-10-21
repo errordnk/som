@@ -62,6 +62,86 @@ impl TcpConnection {
     }
 }
 
+/// Carries messages both ways between a TCP client and a daemon connection
+/// until either side hangs up.
+pub fn pump(client: std::sync::Arc<TcpConnection>, daemon: std::sync::Arc<crate::pipe::PipeConnection>) {
+    let (to_client, from_daemon) = (client.clone(), daemon.clone());
+    std::thread::spawn(move || {
+        while let Ok(message) = from_daemon.read_message() {
+            if to_client.write_message(&message).is_err() {
+                return;
+            }
+        }
+    });
+    while let Ok(message) = client.read_message() {
+        if daemon.write_message(&message).is_err() {
+            break;
+        }
+    }
+    // The client is gone: end the daemon's side too, or its handler (and the
+    // thread above) would wait on a connection nobody uses any more.
+    daemon.shutdown();
+}
+
+/// A loopback TCP listener that hands each connection on to the daemon of
+/// this machine: the way Som reaches a daemon it has no socket path to (in
+/// WSL). Stops listening when dropped.
+pub struct LoopbackListener {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LoopbackListener {
+    /// Listens on `127.0.0.1:port` and serves `Srv` connections through to
+    /// the daemon socket at `daemon_socket`. Anything whose first message is
+    /// not the `Srv` connection kind is dropped unanswered.
+    pub fn start(port: u16, daemon_socket: String) -> Result<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
+        listener.set_nonblocking(true).context("cannot make the listener non-blocking")?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let daemon_socket = daemon_socket.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) = serve_srv_connection(stream, &daemon_socket) {
+                                log::debug!("a connection on the loopback listener ended: {err:#}");
+                            }
+                        });
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(50)),
+                    Err(err) => {
+                        log::warn!("the loopback listener failed: {err}");
+                        return;
+                    },
+                }
+            }
+        });
+        Ok(Self { stop })
+    }
+}
+
+impl Drop for LoopbackListener {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn serve_srv_connection(stream: TcpStream, daemon_socket: &str) -> Result<()> {
+    // An accepted stream may inherit the listener's non-blocking mode.
+    stream.set_nonblocking(false).context("cannot make the connection blocking")?;
+    let client = std::sync::Arc::new(TcpConnection::from_stream(stream)?);
+    client.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let first = client.read_message()?;
+    anyhow::ensure!(first == [crate::protocol::ConnectionKind::Srv as u8], "the first message is not the Srv connection kind");
+    client.set_read_timeout(None)?;
+    let daemon = std::sync::Arc::new(crate::pipe::PipeConnection::connect(daemon_socket)?);
+    daemon.write_message(&first)?;
+    pump(client, daemon);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -347,7 +347,18 @@ pub enum RelayInput {
     /// see `Register::tmux`'s doc comment). Mirrors the detach-vs-kill
     /// semantics from the old protocol's `CloseSession`.
     Close,
+    /// Asks the daemon to also accept `Srv` connections on this loopback TCP
+    /// port, for as long as this relay stays connected. How Som reaches the
+    /// daemon inside WSL: the port is the relay's `--srv-tcp-port` (Som picks
+    /// it), WSL2 carries a port listened on in WSL to the same port of
+    /// Windows' loopback. Only `Srv` connections are taken on it - a
+    /// `Relay` one would let whoever reaches the port start a shell.
+    ListenTcp { port: u16 },
 }
+
+/// The relay flag that names the loopback port its daemon is to listen on
+/// for Som (see `RelayInput::ListenTcp`).
+pub const SRV_TCP_PORT_FLAG: &str = "--srv-tcp-port";
 
 /// HOLDER -> RELAY: the HOLDER owns a headless `alacritty_terminal::Term`
 /// that mirrors the real shell's actual terminal state (fed by the real

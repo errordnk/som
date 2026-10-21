@@ -91,19 +91,7 @@ pub fn spawn_tcp_forward_to_local_daemon(daemon_binary: &Path) -> LocalForward {
             std::thread::spawn(move || {
                 let Ok(from_client) = TcpConnection::from_stream(stream).map(Arc::new) else { return };
                 let Ok(to_daemon) = crate::daemon::connect_or_spawn(&daemon_binary).map(Arc::new) else { return };
-                let (client, daemon) = (from_client.clone(), to_daemon.clone());
-                std::thread::spawn(move || {
-                    while let Ok(message) = daemon.read_message() {
-                        if client.write_message(&message).is_err() {
-                            return;
-                        }
-                    }
-                });
-                while let Ok(message) = from_client.read_message() {
-                    if to_daemon.write_message(&message).is_err() {
-                        return;
-                    }
-                }
+                crate::tcp::pump(from_client, to_daemon);
             });
         }
     });

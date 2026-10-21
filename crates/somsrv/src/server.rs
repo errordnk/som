@@ -433,7 +433,11 @@ fn handle_relay(connection: PipeConnection, registry: &SessionRegistry) -> anyho
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_forwarder(connection.clone(), writer.clone(), session.clone(), raw_bytes_rx, stop.clone());
 
-    let result = read_loop(&connection, session);
+    // Held for as long as this relay is connected: when it goes, so does the
+    // port Som was given for this tab.
+    let mut tcp_listener = None;
+    let result = read_loop(&connection, session, &mut tcp_listener);
+    drop(tcp_listener);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let closed_for_good = matches!(result, Ok(RelayEnd::ClosedForGood));
     log::info!(
@@ -477,7 +481,11 @@ enum RelayEnd {
     ClosedForGood,
 }
 
-fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<RelayEnd> {
+fn read_loop(
+    connection: &PipeConnection,
+    session: &Session,
+    tcp_listener: &mut Option<somsrv::tcp::LoopbackListener>,
+) -> anyhow::Result<RelayEnd> {
     loop {
         let message = read_relay_message(connection)?;
         match message {
@@ -489,6 +497,13 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<R
                 session.kill();
                 return Ok(RelayEnd::ClosedForGood);
             }
+            RelayInput::ListenTcp { port } => match somsrv::tcp::LoopbackListener::start(port, daemon_socket_path()) {
+                Ok(listener) => {
+                    log::info!("listening on 127.0.0.1:{port} for Som");
+                    *tcp_listener = Some(listener);
+                },
+                Err(err) => log::warn!("no loopback listener for Som on port {port}: {err:#}"),
+            },
             // Only ever expected once each, as the first/second messages
             // (handled in `handle_relay` before this loop starts) — a
             // repeat on the same connection would be a protocol violation

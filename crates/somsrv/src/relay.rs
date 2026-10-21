@@ -132,6 +132,7 @@ pub fn run(
     cursor_shape: Option<String>,
     scrollback: Option<usize>,
     pixel_cell_size: Option<(u16, u16)>,
+    srv_tcp_port: Option<u16>,
 ) -> anyhow::Result<()> {
     // This RELAY only exists at all for a `tmux: true` profile — a `tmux:
     // false` SSH/local profile never runs `somsrv` as a shell wrapper in
@@ -249,6 +250,12 @@ pub fn run(
             cell_height: initial_cell_height,
         },
     )?;
+
+    // Som reaches this daemon through a loopback port when there is no socket
+    // path it can use (WSL): ask for the port Som picked for this tab.
+    if let Some(port) = srv_tcp_port {
+        send(&connection, &writer, &RelayInput::ListenTcp { port })?;
+    }
 
     let reader_connection = connection.clone();
     // Config for the throwaway `Term` a `Snapshot` is restored onto below —

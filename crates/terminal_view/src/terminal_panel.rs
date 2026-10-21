@@ -1499,12 +1499,21 @@ fn free_loopback_port() -> Option<u16> {
 /// free one: a tab made from another tab's command (a split, a restore) must
 /// not bind the port the first one holds.
 fn with_fresh_forward_port(args: &mut [String]) {
-    let Some(at) = args.windows(2).position(|pair| pair[0] == "-L" && somsrv::protocol::ssh_forward_port(&pair[1]).is_some()) else {
+    let Some((at, is_ssh)) = args.windows(2).enumerate().find_map(|(at, pair)| {
+        if pair[0] == "-L" && somsrv::protocol::ssh_forward_port(&pair[1]).is_some() {
+            Some((at, true))
+        } else if pair[0] == somsrv::protocol::SRV_TCP_PORT_FLAG && pair[1].parse::<u16>().is_ok() {
+            Some((at, false))
+        } else {
+            None
+        }
+    }) else {
         return;
     };
     match free_loopback_port() {
-        Some(port) => args[at + 1] = somsrv::protocol::ssh_forward_spec(port),
-        None => log::warn!("no free loopback port for the daemon forward of a split"),
+        Some(port) if is_ssh => args[at + 1] = somsrv::protocol::ssh_forward_spec(port),
+        Some(port) => args[at + 1] = port.to_string(),
+        None => log::warn!("no free loopback port for the daemon of a split"),
     }
 }
 
@@ -1570,6 +1579,19 @@ fn wrap_remote_command_args(
     // skipping `.bash_profile`/`.profile` (only `.bashrc` still ran) and
     // never printing the MOTD a real login shell would. `-l` mirrors
     // what the ordinary profile gets automatically, restoring both.
+    // A WSL tab has no ssh connection to carry a forward, and the daemon's
+    // socket lives in the Linux file system: it is given a loopback port to
+    // listen on instead, which WSL2 carries to the same port of this
+    // machine's loopback.
+    if let RemoteKind::Wsl = remote_kind {
+        match free_loopback_port() {
+            Some(port) => {
+                wrapped_args.push(somsrv::protocol::SRV_TCP_PORT_FLAG.to_string());
+                wrapped_args.push(port.to_string());
+            },
+            None => log::warn!("no free loopback port for the daemon of a WSL tab: rich content of this tab will not show"),
+        }
+    }
     wrapped_args.push("--".to_string());
     wrapped_args.push("-l".to_string());
     wrapped_args
@@ -2507,14 +2529,15 @@ mod tmux_shell_wrapping_tests {
             RemoteKind::Wsl,
         );
         // No `-tt` for WSL — that's SSH-only (WSL has its own pty handling
-        // and doesn't go through sshd).
+        // and doesn't go through sshd). It gets a loopback port for its
+        // daemon to listen on instead, a port of its own.
         assert_eq!(
-            args,
-            vec![
-                "--cd", "~", "~/.local/bin/somsrv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
-                "--scrollback", "5000", "--", "-l"
-            ]
+            &args[..10],
+            ["--cd", "~", "~/.local/bin/somsrv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar", "--scrollback", "5000"]
         );
+        assert_eq!(args[10], "--srv-tcp-port");
+        assert!(args[11].parse::<u16>().is_ok(), "{:?}", args[11]);
+        assert_eq!(&args[12..], ["--", "-l"]);
     }
 
     #[test]
@@ -2830,9 +2853,16 @@ mod tmux_shell_wrapping_tests {
         let split_address = terminal::rich_content_srv_channel::tunnel_for_shell(&split).expect("the split carries a forward too");
         assert_ne!(split_address, tab_address, "two ssh connections cannot both listen on one port");
 
-        // A tab for WSL has no ssh connection to carry one.
+        // A tab for WSL has no ssh connection to carry one: its daemon is
+        // given a loopback port to listen on, found the same way, and a
+        // split gets a port of its own.
         let wsl_args = wrap_remote_command_args("Profile", "pane-1", vec!["-d".to_string(), "Ubuntu".to_string(), "--".to_string()], CursorShape::default(), None, RemoteKind::Wsl);
         assert!(!wsl_args.iter().any(|arg| arg == "-L"));
+        let wsl_shell = Shell::WithArguments { program: "wsl.exe".to_string(), args: wsl_args, title_override: None };
+        let wsl_address = terminal::rich_content_srv_channel::tunnel_for_shell(&wsl_shell).expect("the WSL tab names its daemon's port");
+        let (wsl_split, _) = rebuild_tmux_shell_with_fresh_pane_id(&wsl_shell).expect("a WSL tmux shell can be rebuilt");
+        let wsl_split_address = terminal::rich_content_srv_channel::tunnel_for_shell(&wsl_split).expect("the split names a port too");
+        assert_ne!(wsl_split_address, wsl_address);
     }
 
     #[test]

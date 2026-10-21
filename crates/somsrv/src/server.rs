@@ -162,67 +162,6 @@ type SessionRegistry = Arc<Mutex<HashMap<SessionKey, Arc<RegisteredSession>>>>;
 /// `handle_relay` (a PTY session) or `handle_srv_request` (the binary
 /// side-channel / admin session-management queries) — both share the
 /// SAME `registry`.
-/// Links `SSH_FORWARD_REMOTE_SOCKET` (with this account's name) to the socket
-/// just bound: the tab's own ssh connection forwards a local port to that
-/// name, which is how Som reaches this daemon without a second connection.
-#[cfg(unix)]
-fn publish_socket_alias(socket_path: &str) {
-    let Some(alias) = somsrv::protocol::daemon_socket_alias_path() else {
-        log::warn!("cannot tell this account's name: no socket alias for ssh forwards");
-        return;
-    };
-    link_alias(socket_path, &alias);
-}
-
-/// Makes `alias` a link to `socket_path`, replacing an older link of that
-/// name (a previous daemon's). Anything else at that name is left alone.
-#[cfg(unix)]
-fn link_alias(socket_path: &str, alias: &str) {
-    if alias == socket_path {
-        return;
-    }
-    if std::fs::symlink_metadata(alias).is_ok_and(|metadata| metadata.file_type().is_symlink())
-        && let Err(err) = std::fs::remove_file(alias)
-    {
-        log::warn!("cannot replace the old socket alias {alias:?}: {err}");
-        return;
-    }
-    if let Err(err) = std::os::unix::fs::symlink(socket_path, alias) {
-        log::warn!("cannot link {alias:?} to {socket_path:?}: {err}");
-    }
-}
-
-#[cfg(not(unix))]
-fn publish_socket_alias(_socket_path: &str) {}
-
-#[cfg(all(test, unix))]
-mod alias_tests {
-    use super::link_alias;
-
-    #[test]
-    fn the_alias_reaches_the_daemons_socket_and_replaces_a_stale_link() {
-        let dir = std::env::temp_dir().join(format!("somsrv-alias-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("real.sock");
-        let alias = dir.join("alias.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-
-        // A link left by an earlier daemon, pointing nowhere now.
-        std::os::unix::fs::symlink(dir.join("gone.sock"), &alias).unwrap();
-        link_alias(socket.to_str().unwrap(), alias.to_str().unwrap());
-        let accepting = std::thread::spawn(move || listener.accept().is_ok());
-        std::os::unix::net::UnixStream::connect(&alias).expect("connecting through the alias reaches the daemon's socket");
-        assert!(accepting.join().unwrap());
-
-        // A file that is not a link is somebody else's: left as it is.
-        let other = dir.join("other.sock");
-        std::fs::write(&other, b"not ours").unwrap();
-        link_alias(socket.to_str().unwrap(), other.to_str().unwrap());
-        assert_eq!(std::fs::read(&other).unwrap(), b"not ours");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
-
 pub fn run() -> anyhow::Result<()> {
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
     let cache = SrvCache::new();
@@ -230,7 +169,6 @@ pub fn run() -> anyhow::Result<()> {
     let socket_path = daemon_socket_path();
     let listener = pipe::bind(&socket_path)?;
     log::info!("somsrv daemon listening on {socket_path:?}");
-    publish_socket_alias(&socket_path);
 
     spawn_idle_shutdown_watcher();
 
@@ -433,11 +371,7 @@ fn handle_relay(connection: PipeConnection, registry: &SessionRegistry) -> anyho
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_forwarder(connection.clone(), writer.clone(), session.clone(), raw_bytes_rx, stop.clone());
 
-    // Held for as long as this relay is connected: when it goes, so does the
-    // port Som was given for this tab.
-    let mut tcp_listener = None;
-    let result = read_loop(&connection, session, &mut tcp_listener);
-    drop(tcp_listener);
+    let result = read_loop(&connection, session);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let closed_for_good = matches!(result, Ok(RelayEnd::ClosedForGood));
     log::info!(
@@ -481,11 +415,7 @@ enum RelayEnd {
     ClosedForGood,
 }
 
-fn read_loop(
-    connection: &PipeConnection,
-    session: &Session,
-    tcp_listener: &mut Option<somsrv::tcp::LoopbackListener>,
-) -> anyhow::Result<RelayEnd> {
+fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<RelayEnd> {
     loop {
         let message = read_relay_message(connection)?;
         match message {
@@ -497,13 +427,6 @@ fn read_loop(
                 session.kill();
                 return Ok(RelayEnd::ClosedForGood);
             }
-            RelayInput::ListenTcp { port } => match somsrv::tcp::LoopbackListener::start(port, daemon_socket_path()) {
-                Ok(listener) => {
-                    log::info!("listening on 127.0.0.1:{port} for Som");
-                    *tcp_listener = Some(listener);
-                },
-                Err(err) => log::warn!("no loopback listener for Som on port {port}: {err:#}"),
-            },
             // Only ever expected once each, as the first/second messages
             // (handled in `handle_relay` before this loop starts) — a
             // repeat on the same connection would be a protocol violation

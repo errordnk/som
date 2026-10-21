@@ -7288,7 +7288,7 @@ mod tests {
         unsafe {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
-            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -7425,7 +7425,7 @@ mod tests {
         unsafe {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
-            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -8655,7 +8655,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -8783,7 +8783,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -8865,7 +8865,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -8931,7 +8931,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -9690,7 +9690,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
@@ -9799,12 +9799,12 @@ mod tests {
         unsafe {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
-            let config_dir = dirs::home_dir().expect("home dir must resolve").join(".config").join("som");
-            let conpty_dir = config_dir.join("conpty");
+            let data_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som");
+            let conpty_dir = data_dir.join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }
-            let ffmpeg_dir = config_dir.join("ffmpeg");
+            let ffmpeg_dir = data_dir.join("ffmpeg");
             if ffmpeg_dir.join("avcodec-63.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(ffmpeg_dir.as_os_str())).ok();
             }
@@ -9925,7 +9925,7 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
             if conpty_dir.join("conpty.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
             }

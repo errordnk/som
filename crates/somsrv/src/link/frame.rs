@@ -281,6 +281,21 @@ impl Extractor {
         }
     }
 
+    /// Passes on what is being held back as a possible start of a frame, for
+    /// when nothing more has come to say what it is: a lone ESC is a key the
+    /// user pressed, not the start of anything. Returns whether anything was
+    /// held. Never touches a frame that has really begun.
+    pub fn take_held(&mut self, passed: &mut Vec<u8>) -> bool {
+        match self.scan {
+            Scan::Plain { held } if held > 0 => {
+                passed.extend_from_slice(&START[..held]);
+                self.scan = Scan::Plain { held: 0 };
+                true
+            },
+            _ => false,
+        }
+    }
+
     fn step(&mut self, byte: u8, passed: &mut Vec<u8>, bodies: &mut Vec<Vec<u8>>) {
         match std::mem::replace(&mut self.scan, Scan::Plain { held: 0 }) {
             Scan::Plain { held } => {
@@ -463,6 +478,25 @@ mod tests {
         let (passed, bodies) = extract_all(&[b"\x1b\x1b_SR\x1b_SRV;", b"AAAA!rest\x1b_S", b"x"]);
         assert!(bodies.is_empty());
         assert_eq!(passed, b"\x1b\x1b_SR!rest\x1b_Sx", "a damaged frame is lost, never turned into terminal input");
+    }
+
+    #[test]
+    fn a_held_start_is_passed_on_when_nothing_follows_and_a_real_frame_is_left_alone() {
+        let mut extractor = Extractor::default();
+        let (mut passed, mut bodies) = (Vec::new(), Vec::new());
+        extractor.feed(b"\x1b", &mut passed, &mut bodies);
+        assert!(passed.is_empty(), "held back, it may be the start of a frame");
+        assert!(extractor.take_held(&mut passed));
+        assert_eq!(passed, b"\x1b", "a lone ESC is a key press");
+        assert!(!extractor.take_held(&mut passed), "nothing left to give");
+
+        // The stream goes on as if nothing had been held.
+        extractor.feed(b"[A", &mut passed, &mut bodies);
+        assert_eq!(passed, b"\x1b[A");
+
+        // Inside a frame that has really begun there is nothing to give up.
+        extractor.feed(b"\x1b_SRV;AAAA", &mut passed, &mut bodies);
+        assert!(!extractor.take_held(&mut passed));
     }
 
     #[test]

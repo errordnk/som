@@ -7413,6 +7413,60 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `somsrp` run from a directory of its own, with no FFmpeg DLLs beside it
+    /// (the way it sits in a directory of the user's PATH): it still finds FFmpeg
+    /// - it puts the DLLs in Som's own data directory and adds that to the search
+    /// path - and it leaves nothing in the directory it runs from. It used to copy
+    /// five DLLs next to its `.exe`.
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn somsrp_alone_in_a_directory_finds_ffmpeg_and_leaves_no_dlls_beside_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".config").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("somsrp-alone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let somsrp = dir.join("somsrp.exe");
+        std::fs::copy(somsrv::testing::debug_binary("somsrp"), &somsrp).unwrap();
+        // somsrp starts the daemon from the binary next to it.
+        std::fs::copy(somsrv::testing::debug_binary("somsrv"), dir.join("somsrv.exe")).unwrap();
+        let video = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/aac_test_v2.mp4");
+        assert!(video.is_file(), "{video:?} not found");
+
+        let (terminal, _completion) =
+            build_test_terminal_with_arguments(cx, somsrp.to_string_lossy().into_owned(), vec![video.to_string_lossy().into_owned()]).await;
+
+        // somsrp probes the video with FFmpeg before it prints anything: a placeholder
+        // grid for it on the screen means FFmpeg was found.
+        let mut saw_video = false;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cx.run_until_parked();
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+            let placed = terminal.update(cx, |term, _| !term.rich_content_video_placements(false).is_empty());
+            if placed {
+                saw_video = true;
+                break;
+            }
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".dll"))
+            .collect();
+        drop(terminal);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(saw_video, "somsrp run alone in a directory never showed the video: FFmpeg was not found");
+        assert!(leftovers.is_empty(), "somsrp left DLLs next to itself: {leftovers:?}");
+    }
+
     fn init_ctrl_click_hyperlink_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);

@@ -7,7 +7,7 @@
 //! of its machine and carries the daemon's answers back. Nothing in between
 //! looks inside the messages.
 
-use super::frame::{Decoder, Encoder, Message, StreamBroken, split};
+use super::frame::{Decoder, Encoder, Framing, Message, StreamBroken, split};
 use crate::pipe::PipeConnection;
 use anyhow::{Context as _, Result};
 use std::collections::HashMap;
@@ -25,8 +25,8 @@ struct Outbound {
 }
 
 impl Outbound {
-    fn new(send: SendRaw) -> Self {
-        Self { encoder: Mutex::new(Encoder::default()), send }
+    fn new(send: SendRaw, framing: Framing) -> Self {
+        Self { encoder: Mutex::new(Encoder::new(framing)), send }
     }
 
     /// Sends a message as one or more frames. Each frame is numbered and
@@ -62,7 +62,7 @@ impl SrvLink {
     /// `send` writes bytes into the tab's pty input.
     pub fn new(send: SendRaw) -> Arc<Self> {
         Arc::new(Self {
-            out: Outbound::new(send),
+            out: Outbound::new(send, Framing::Input),
             decoder: Mutex::new(Decoder::default()),
             state: Mutex::new(LinkState { channels: HashMap::new() }),
             ready: AtomicBool::new(false),
@@ -172,7 +172,7 @@ impl LinkHub {
     /// daemon of this machine.
     pub fn new(send: SendRaw, connect: Box<dyn Fn() -> Result<PipeConnection> + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
-            out: Outbound::new(send),
+            out: Outbound::new(send, Framing::Output),
             decoder: Mutex::new(Decoder::default()),
             channels: Mutex::new(HashMap::new()),
             connect,

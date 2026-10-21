@@ -102,22 +102,13 @@ use smallvec::SmallVec;
 /// redundant write, `AddDllDirectory` is a per-process call regardless of
 /// what's already on disk).
 ///
-/// Also copies each DLL next to the running process's own `.exe` (not just
-/// `AddDllDirectory`'ing the data-dir copy) — confirmed live that
-/// `somsrp.exe` crashes with `STATUS_DLL_NOT_FOUND` before a single line of
-/// `main()` runs (no stderr, no extracted directory) when only
-/// `AddDllDirectory` is used: unlike `som.exe` (whose FFmpeg calls are only
-/// reachable through code paths the linker doesn't eagerly resolve, so it
-/// ends up with no static FFmpeg imports in its own PE import table at
-/// all — confirmed via `pefile`), `somsrp.exe` calls FFmpeg-backed code
-/// (`video_metadata`) directly from `main()`, so the linker keeps real
-/// static imports for `avcodec`/`avformat`/`avutil` in its PE header —
-/// Windows resolves those at process-load time, before `main()` starts,
-/// which is too early for any `AddDllDirectory` call made from inside
-/// `main()` to help. The exe's own directory is always the first place
-/// Windows' standard DLL search order checks, so a copy there closes this
-/// gap regardless of which import-resolution timing a given binary ends up
-/// with.
+/// The DLLs are NOT copied next to the running `.exe`: both binaries are linked
+/// with `/DELAYLOAD` for them (`crates/zed/build.rs`, `crates/somsrp/build.rs`),
+/// so the loader looks for each one at its first use, which is after this
+/// function has put `ffmpeg_dir` on the search path. (They used to be copied
+/// there, from before the delay-loading existed; a `somsrp.exe` run from a
+/// directory in the user's PATH then left five DLLs in it, outside the
+/// directories Som writes to.)
 #[cfg(target_os = "windows")]
 pub fn ensure_ffmpeg_extracted_and_wired() {
     use gpui::AssetSource;
@@ -130,7 +121,6 @@ pub fn ensure_ffmpeg_extracted_and_wired() {
         log::error!("SetDefaultDllDirectories failed: {err:#} — ffmpeg extraction dir may not be honored");
     }
 
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
     let ffmpeg_dir = paths::data_dir().join("ffmpeg");
     for file_name in
         ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
@@ -172,15 +162,6 @@ pub fn ensure_ffmpeg_extracted_and_wired() {
             }
         }
 
-        if let Some(exe_dir) = &exe_dir {
-            let exe_target = exe_dir.join(file_name);
-            let already_current = std::fs::read(&exe_target).is_ok_and(|existing| existing == bytes);
-            if !already_current {
-                if let Err(err) = std::fs::write(&exe_target, &bytes) {
-                    log::error!("failed to write {exe_target:?}: {err:#}");
-                }
-            }
-        }
     }
 
     if unsafe { AddDllDirectory(&HSTRING::from(ffmpeg_dir.as_os_str())) }.is_null() {

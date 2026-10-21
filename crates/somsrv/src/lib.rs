@@ -9,5 +9,6 @@ pub mod link;
 pub mod pipe;
 pub mod protocol;
 pub mod service_link;
+pub mod takeover;
 #[cfg(feature = "test-support")]
 pub mod testing;

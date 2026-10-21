@@ -22,25 +22,6 @@ name = "somsrv"
 path = "src/main.rs"
 doctest = false
 
-# Tiny standalone updater — see `bin/somsrvupd.rs`'s own module doc
-# comment for the full redeploy protocol this implements. Deliberately
-# its OWN `[[bin]]` target (not a `somsrv` subcommand) so a running
-# `somsrv` daemon can extract/spawn a fresh detached copy of it on every
-# redeploy — see `daemon.rs`'s own doc comment on why the actual rename-
-# the-live-binary step MUST happen from a separate process, never from
-# `somsrv` itself. `somsrv` embeds `somsrvupd`'s ALREADY-COMPILED bytes
-# via `rust-embed` from `embedded-upd/` (see `daemon.rs`'s `EmbeddedUpd`),
-# mirroring exactly how Som's own `assets` crate embeds pre-built
-# `somsrv` copies for each platform — a manual, pre-release step
-# (`scripts/update_somsrv_binaries.sh`), NOT an automatic per-build one:
-# `somsrvupd` must be built and copied into `embedded-upd/` BEFORE
-# `somsrv` itself is built (a plain `cargo build -p somsrv` does not
-# order this for you — the script does).
-[[bin]]
-name = "somsrvupd"
-path = "src/bin/somsrvupd.rs"
-doctest = false
-
 # The stand-in for `ssh` of the tests of remote tabs (`somsrv::testing`).
 [[bin]]
 name = "fakessh"
@@ -70,7 +51,6 @@ log.workspace = true
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 paths.workspace = true
 percent-encoding.workspace = true
-rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true

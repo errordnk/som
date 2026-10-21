@@ -75,57 +75,78 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// How long the daemon waits, after [`LIVE_CONNECTIONS`] first reads 0,
-/// before actually exiting — see [`spawn_idle_shutdown_watcher`]'s own doc
-/// comment for why this needs to be a real window rather than an
-/// immediate exit.
+/// How long no client has to be connected before the daemon shuts down - when
+/// it holds no session either.
 const IDLE_SHUTDOWN_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Spawns a background thread that exits the WHOLE daemon process
-/// (`std::process::exit(0)`) once [`LIVE_CONNECTIONS`] has read 0 for a
-/// full [`IDLE_SHUTDOWN_DELAY`] window, polling every second. This closes
-/// a real, previously-open gap: unlike the old per-pane HOLDER (which
-/// exited naturally when its one shell process died), this shared daemon
-/// used to keep running forever once started, even after every Som
-/// window and every `somsrp` process on the machine had long since
-/// closed — confirmed live (2026-09-04) as a stray `somsrv.exe` still
-/// resident well after the Som window that started it had been closed,
-/// requiring a manual `taskkill` before a fresh daemon (or a test run
-/// binding the same named pipe) could start cleanly.
+/// How long no client has to be connected before a staged redeploy is applied.
+/// Long enough to ride out the moment between one connection closing and the
+/// next one opening (a Som that restarts, a `somsrp` that ends and another
+/// that starts), short enough that closing Som is enough to get the update.
+const REDEPLOY_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the daemon does about a stretch with no client connected.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    Wait,
+    /// Switch to the build Som staged. The sessions the daemon holds end with
+    /// it: they live in this process.
+    ApplyRedeploy,
+    Shutdown,
+}
+
+fn idle_action(idle_for: std::time::Duration, holds_sessions: bool, redeploy_pending: bool) -> IdleAction {
+    if redeploy_pending && idle_for >= REDEPLOY_IDLE_DELAY {
+        return IdleAction::ApplyRedeploy;
+    }
+    // A daemon that holds sessions is what keeps a `tmux: true` tab alive while
+    // Som is closed: it must not go away with them. (It used to, after 60
+    // seconds, so a session survived a closed Som for a minute only.)
+    if !holds_sessions && idle_for >= IDLE_SHUTDOWN_DELAY {
+        return IdleAction::Shutdown;
+    }
+    IdleAction::Wait
+}
+
+/// Spawns a background thread that watches for the daemon being idle - no
+/// connection of any kind, polled every second - and acts on it, see
+/// [`idle_action`]. This closes a real gap: unlike the old per-pane HOLDER
+/// (which exited when its one shell did), this shared daemon used to keep
+/// running forever once started, even after every Som window and every `somsrp`
+/// on the machine had closed - a stray `somsrv.exe` that needed a manual
+/// `taskkill` before a fresh daemon (or a test run binding the same named pipe)
+/// could start cleanly.
 ///
-/// A plain "exit the instant the count hits 0" check is deliberately NOT
-/// what this does: the count legitimately dips to 0 for a moment between
-/// two unrelated connections all the time (e.g. a `somsrp` process
-/// finishing its own `RegisterRangeResponder` connection's teardown right
-/// as a brand new one is dialing in — see `ConnectionGuard`'s own doc
-/// comment) — exiting on that instant would kill the daemon out from
-/// under a legitimate reconnect. Re-checking after `IDLE_SHUTDOWN_DELAY`
-/// has fully elapsed with the count STILL at 0 the whole time turns a
-/// momentary dip into a much stronger, much less risky signal: nothing at
-/// all has connected in a real window of time, not just "nothing is
-/// connected in this exact instant."
-fn spawn_idle_shutdown_watcher() {
-    std::thread::spawn(|| {
+/// A raw connection count (not the session registry or the cache) is what is
+/// watched, and only a stretch of idleness counts: the count legitimately dips
+/// to 0 for a moment between two unrelated connections all the time (a `somsrp`
+/// finishing as a new one dials in), and acting on that instant would kill the
+/// daemon out from under a legitimate reconnect.
+fn spawn_idle_watcher(registry: SessionRegistry) {
+    std::thread::spawn(move || {
+        let mut idle_since: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if LIVE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
+                idle_since = None;
                 continue;
             }
-            let idle_since = std::time::Instant::now();
-            let mut still_idle = true;
-            while idle_since.elapsed() < IDLE_SHUTDOWN_DELAY {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if LIVE_CONNECTIONS.load(Ordering::Relaxed) != 0 {
-                    still_idle = false;
-                    break;
-                }
-            }
-            if still_idle {
-                log::info!(
-                    "somsrv daemon idle for {:?} with no live connections, shutting down",
-                    IDLE_SHUTDOWN_DELAY
-                );
-                std::process::exit(0);
+            let idle_for = idle_since.get_or_insert_with(std::time::Instant::now).elapsed();
+            let holds_sessions = !registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty();
+            match idle_action(idle_for, holds_sessions, somsrv::daemon::redeploy_pending()) {
+                IdleAction::Wait => {},
+                IdleAction::ApplyRedeploy => {
+                    if somsrv::daemon::check_and_apply_pending_redeploy() {
+                        log::info!("no client connected for {idle_for:?}: exiting for the redeploy that is staged");
+                        std::process::exit(0);
+                    }
+                    // The hand-off failed (and was logged); do not retry every second.
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                },
+                IdleAction::Shutdown => {
+                    log::info!("somsrv daemon idle for {idle_for:?} with no connection and no session, shutting down");
+                    std::process::exit(0);
+                },
             }
         }
     });
@@ -170,7 +191,7 @@ pub fn run() -> anyhow::Result<()> {
     let listener = pipe::bind(&socket_path)?;
     log::info!("somsrv daemon listening on {socket_path:?}");
 
-    spawn_idle_shutdown_watcher();
+    spawn_idle_watcher(registry.clone());
 
     loop {
         let connection = match pipe::accept_on(&listener) {
@@ -181,24 +202,6 @@ pub fn run() -> anyhow::Result<()> {
                 continue;
             }
         };
-
-        // Checked on EVERY new connection, not just once at startup — see
-        // `daemon::check_and_apply_pending_redeploy`'s own doc comment
-        // for the full protocol (2026-09-15 redesign: Som's side never
-        // kills anything itself anymore, it only stages `.new` + a
-        // marker file; this daemon notices the marker and drives the
-        // entire cutover). A redeploy found here means a takeover process
-        // has ALREADY been spawned (waiting for THIS process's pid to
-        // exit) — drop the connection that triggered this check (its
-        // client will simply reconnect once the new daemon comes up,
-        // same tolerance any other daemon restart already has) and exit
-        // immediately, so the takeover process's wait resolves quickly
-        // rather than after some indefinite additional idle period.
-        if somsrv::daemon::check_and_apply_pending_redeploy() {
-            log::info!("exiting to hand off to a pending redeploy");
-            drop(connection);
-            std::process::exit(0);
-        }
 
         let registry = registry.clone();
         let cache = cache.clone();
@@ -747,3 +750,30 @@ fn send(connection: &PipeConnection, writer: &Mutex<()>, message: &HolderOutput)
     Ok(())
 }
 
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_daemon_that_holds_sessions_stays_however_long_it_is_idle() {
+        assert_eq!(idle_action(Duration::from_secs(0), true, false), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(61), true, false), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(86_400), true, false), IdleAction::Wait);
+    }
+
+    #[test]
+    fn a_daemon_with_nothing_to_hold_shuts_down_after_a_minute() {
+        assert_eq!(idle_action(Duration::from_secs(59), false, false), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(60), false, false), IdleAction::Shutdown);
+    }
+
+    #[test]
+    fn a_staged_redeploy_is_applied_once_no_client_is_connected_sessions_or_not() {
+        assert_eq!(idle_action(Duration::from_secs(1), true, true), IdleAction::Wait, "not at the first quiet second");
+        assert_eq!(idle_action(Duration::from_secs(5), true, true), IdleAction::ApplyRedeploy);
+        assert_eq!(idle_action(Duration::from_secs(5), false, true), IdleAction::ApplyRedeploy);
+        assert_eq!(idle_action(Duration::from_secs(600), false, true), IdleAction::ApplyRedeploy, "before shutting down for good");
+    }
+}

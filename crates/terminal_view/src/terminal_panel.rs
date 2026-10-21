@@ -2034,9 +2034,8 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
     // `remote_mtime.is_none()` means nothing usable is at `~/.local/bin/
     // somsrv` at all (missing, or the `stat` probe itself failed) — there
     // is no running daemon to hand a careful cutover to, so the `.new` +
-    // marker + `somsrvupd` dance below would never get applied (nothing
-    // would ever connect over SRP to notice the marker in the first
-    // place). Write directly to the final path instead — safe precisely
+    // marker + takeover dance below would never get applied (the daemon
+    // applies it, and there is no daemon). Write directly to the final path instead — safe precisely
     // because there is no running process that could be executing it out
     // from under this write.
     if remote_mtime.is_none() {
@@ -2932,10 +2931,10 @@ mod tmux_shell_wrapping_tests {
     /// `ensure_remote_binary_deployed` correctly STAGES a redeploy (2026-
     /// 09-15 redesign: Som's side no longer kills anything or applies the
     /// deploy directly — it only `scp`s the new binary to `somsrv.new`
-    /// and drops a marker file; `somsrv` itself, via `somsrvupd`, applies
-    /// the actual cutover asynchronously the next time ANY client
-    /// connects — see `somsrv::daemon::check_and_apply_pending_redeploy`'s
-    /// own doc comment for that half). This test therefore only checks
+    /// and drops a marker file; `somsrv` itself applies the actual cutover
+    /// (`somsrv --takeover`) once no client is connected any more — see
+    /// `somsrv::daemon::check_and_apply_pending_redeploy`'s own doc
+    /// comment for that half). This test therefore only checks
     /// the STAGING half: `somsrv.new` exists, is executable, and reports
     /// the current version when run directly (NOT via `~/.local/bin/
     /// somsrv`, which is deliberately untouched by this call) — and the
@@ -2946,7 +2945,7 @@ mod tmux_shell_wrapping_tests {
     ///
     /// Requires a LIVE, responding `somsrv` daemon on the host already
     /// (started here via `spawn_test_relay`, same as `test_redeploy_
-    /// applies_end_to_end_via_somsrvupd` below) — `ensure_remote_binary_
+    /// applies_end_to_end_via_takeover` below) — `ensure_remote_binary_
     /// deployed` only takes the `.new` + marker staging path at all when
     /// `remote_info.is_some()` (see that function's own doc comment,
     /// 2026-09-15: with nothing live to hand a cutover to, staging would
@@ -3040,10 +3039,11 @@ mod tmux_shell_wrapping_tests {
     }
 
     /// Real SSH round-trip covering the FULL redeploy cycle end to end —
-    /// staging (`ensure_remote_binary_deployed`) AND application (`som-
-    /// srv` noticing the marker via `somsrv::daemon::check_and_apply_
-    /// pending_redeploy`, extracting/spawning `somsrvupd`, which kills the
-    /// old daemon, renames `.new` into place, and starts a fresh one).
+    /// staging (`ensure_remote_binary_deployed`) AND application (the
+    /// daemon noticing the marker while no client is connected via
+    /// `somsrv::daemon::check_and_apply_pending_redeploy`, and starting a
+    /// `somsrv --takeover` copy of itself, which waits for the old daemon
+    /// to exit, renames `.new` into place, and starts a fresh one).
     /// Deliberately verifies every step through the SAME `--version`
     /// protocol probe `ensure_remote_binary_deployed` itself already
     /// uses (`~/.local/bin/somsrv --version`) rather than any raw shell
@@ -3063,22 +3063,20 @@ mod tmux_shell_wrapping_tests {
     ///    remote already happens to be at this exact version, staging
     ///    is skipped entirely and this test has nothing left to verify;
     ///    see the `Ok(false)`-early-return guard below.
-    /// 3. Connect a SECOND real RELAY — this is the trigger:
-    ///    `check_and_apply_pending_redeploy` only runs on the daemon's
-    ///    connection-accept loop, so nothing applies the staged redeploy
-    ///    until some client actually tries to connect.
+    /// 3. Connect a SECOND real RELAY, which then ends: the daemon applies
+    ///    a staged redeploy after 5 seconds with no client connected.
     /// 4. Poll `~/.local/bin/somsrv --version` (the ordinary path, NOT
-    ///    `.new`) until it reports the just-staged version — `somsrvupd`'s
-    ///    own cutover (kill old daemon, rename, spawn new daemon) is
-    ///    asynchronous relative to this test process, so this can't be a
-    ///    single immediate assertion.
+    ///    `.new`) until it reports the just-staged version — the
+    ///    takeover (wait for the old daemon, rename, spawn the new one)
+    ///    is asynchronous relative to this test process, so this can't be
+    ///    a single immediate assertion.
     ///
     /// `#[ignore]`d by default: needs a real reachable SSH host with a
     /// clone of this repo at `~/som`. Run explicitly with:
-    /// `cargo test -p terminal_view test_redeploy_applies_end_to_end_via_somsrvupd -- --ignored --nocapture`
+    /// `cargo test -p terminal_view test_redeploy_applies_end_to_end_via_takeover -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn test_redeploy_applies_end_to_end_via_somsrvupd() {
+    fn test_redeploy_applies_end_to_end_via_takeover() {
         let host_args = integration_test_ssh_host();
         let warm_up_pane_id = format!("test-redeploy-warmup-{}", std::process::id());
         spawn_test_relay(&host_args, &warm_up_pane_id);
@@ -3090,15 +3088,14 @@ mod tmux_shell_wrapping_tests {
             return;
         }
 
-        // Trigger: connect a fresh RELAY so the daemon's accept loop
-        // runs `check_and_apply_pending_redeploy` and notices the
-        // marker this call just staged.
+        // A fresh RELAY connects and ends; once the daemon has had no client
+        // for a few seconds it notices the marker this call just staged.
         let trigger_pane_id = format!("test-redeploy-trigger-{}", std::process::id());
         spawn_test_relay(&host_args, &trigger_pane_id);
 
         let expected_version = somsrv::protocol::HandshakeInfo::current().version;
         let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
         loop {
             if let Ok(output) = run_remote_command(RemoteKind::Ssh, &version_probe) {
                 if let Ok(info) = serde_json::from_str::<somsrv::protocol::HandshakeInfo>(output.trim()) {
@@ -3109,7 +3106,7 @@ mod tmux_shell_wrapping_tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "~/.local/bin/somsrv never reported version {expected_version:?} within the timeout — somsrvupd's takeover did not complete"
+                "~/.local/bin/somsrv never reported version {expected_version:?} within the timeout — the takeover did not complete"
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }

@@ -221,7 +221,7 @@ fn a_link_that_lost_a_frame_starts_over_and_works_again() {
         // A frame that is not the next one: as if some had been lost on the way.
         // Written straight into the relay's input as Som's link would have.
         let mut encoder_probe = tab.stdin.lock().unwrap();
-        let garbage = b"\x1b_SRV;AAAAAAAAAAAAAAAAAAAAAAAAAAAA\x1b\\";
+        let garbage = b"\x1dAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x1d";
         encoder_probe.write_all(garbage).unwrap();
         encoder_probe.flush().unwrap();
         drop(encoder_probe);

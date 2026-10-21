@@ -23,8 +23,37 @@
 use base64::Engine as _;
 use std::collections::HashMap;
 
-const START: &[u8] = b"\x1b_SRV;";
-const END: &[u8] = b"\x1b\\";
+/// How a frame is marked in the stream. The two directions differ:
+///
+/// - `Output` (relay -> Som, into the output of the shell): `ESC _ SRV ; <base64>
+///   ESC \`, an APC string, which a terminal that does not know it ignores.
+/// - `Input` (Som -> relay, into what the user types): `GS <base64> GS`. Nothing
+///   a person types is a GS (Ctrl+]), and - unlike an ESC - it begins nothing
+///   else, so there is nothing to hold back and nothing to guess when a chunk
+///   ends: the Escape key passes at once, and a frame cut in two by a pause on
+///   the way (ssh, a ConPTY) is still one frame. An ESC-led frame there once let
+///   its tail through to the shell as typed text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    Output,
+    Input,
+}
+
+impl Framing {
+    fn start(self) -> &'static [u8] {
+        match self {
+            Self::Output => b"\x1b_SRV;",
+            Self::Input => b"\x1d",
+        }
+    }
+
+    fn end(self) -> &'static [u8] {
+        match self {
+            Self::Output => b"\x1b\\",
+            Self::Input => b"\x1d",
+        }
+    }
+}
 
 /// The most message bytes one frame carries.
 pub const PART_LEN: usize = 12 * 1024;
@@ -100,13 +129,23 @@ pub fn split(message: &Message) -> Vec<Part> {
 }
 
 /// Numbers and seals the frames of one direction.
-#[derive(Default)]
 pub struct Encoder {
     next_seq: u32,
+    framing: Framing,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new(Framing::Output)
+    }
 }
 
 impl Encoder {
-    /// The bytes to write for `part`: the whole escape sequence.
+    pub fn new(framing: Framing) -> Self {
+        Self { next_seq: 0, framing }
+    }
+
+    /// The bytes to write for `part`: the whole frame, markers included.
     pub fn seal(&mut self, part: &Part) -> Vec<u8> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
@@ -121,10 +160,11 @@ impl Encoder {
         body.extend_from_slice(&crc.to_le_bytes());
 
         let text = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&body);
-        let mut frame = Vec::with_capacity(START.len() + text.len() + END.len());
-        frame.extend_from_slice(START);
+        let (start, end) = (self.framing.start(), self.framing.end());
+        let mut frame = Vec::with_capacity(start.len() + text.len() + end.len());
+        frame.extend_from_slice(start);
         frame.extend_from_slice(text.as_bytes());
-        frame.extend_from_slice(END);
+        frame.extend_from_slice(end);
         frame
     }
 }
@@ -250,29 +290,35 @@ impl Decoder {
 }
 
 enum Scan {
-    /// Plain stream bytes; `held` is how many bytes of [`START`] have been
+    /// Plain stream bytes; `held` is how many bytes of the start marker have been
     /// seen at the end of the last chunk (and are not yet passed on).
     Plain { held: usize },
     /// Inside a frame: its body so far.
     Body(Vec<u8>),
-    /// Inside a frame, and the last byte was an ESC.
-    BodyEsc(Vec<u8>),
+    /// Inside a frame, and the first byte of a two-byte end marker was seen.
+    BodyEnding(Vec<u8>),
 }
 
 /// Takes frames out of a byte stream, passing everything else on in order.
-/// A chunk may end anywhere: a trailing piece that could be the start of a
-/// frame is held back until the next chunk says what it is.
+/// A chunk may end anywhere: with the `Output` framing a trailing piece that
+/// could be the start of a frame is held back until the next chunk says what it
+/// is; the `Input` framing begins with a single byte, and holds nothing back.
 pub struct Extractor {
     scan: Scan,
+    framing: Framing,
 }
 
 impl Default for Extractor {
     fn default() -> Self {
-        Self { scan: Scan::Plain { held: 0 } }
+        Self::new(Framing::Output)
     }
 }
 
 impl Extractor {
+    pub fn new(framing: Framing) -> Self {
+        Self { scan: Scan::Plain { held: 0 }, framing }
+    }
+
     /// `passed` gets the bytes that are not frames, `bodies` the bodies of the
     /// frames found.
     pub fn feed(&mut self, input: &[u8], passed: &mut Vec<u8>, bodies: &mut Vec<Vec<u8>>) {
@@ -281,26 +327,12 @@ impl Extractor {
         }
     }
 
-    /// Passes on what is being held back as a possible start of a frame, for
-    /// when nothing more has come to say what it is: a lone ESC is a key the
-    /// user pressed, not the start of anything. Returns whether anything was
-    /// held. Never touches a frame that has really begun.
-    pub fn take_held(&mut self, passed: &mut Vec<u8>) -> bool {
-        match self.scan {
-            Scan::Plain { held } if held > 0 => {
-                passed.extend_from_slice(&START[..held]);
-                self.scan = Scan::Plain { held: 0 };
-                true
-            },
-            _ => false,
-        }
-    }
-
     fn step(&mut self, byte: u8, passed: &mut Vec<u8>, bodies: &mut Vec<Vec<u8>>) {
+        let (start, end) = (self.framing.start(), self.framing.end());
         match std::mem::replace(&mut self.scan, Scan::Plain { held: 0 }) {
             Scan::Plain { held } => {
-                if byte == START[held] {
-                    if held + 1 == START.len() {
+                if byte == start[held] {
+                    if held + 1 == start.len() {
                         self.scan = Scan::Body(Vec::new());
                     } else {
                         self.scan = Scan::Plain { held: held + 1 };
@@ -308,15 +340,16 @@ impl Extractor {
                     return;
                 }
                 // Not the start of a frame after all: what was held is plain.
-                passed.extend_from_slice(&START[..held]);
-                if byte == START[0] {
+                passed.extend_from_slice(&start[..held]);
+                if byte == start[0] {
                     self.scan = Scan::Plain { held: 1 };
                 } else {
                     passed.push(byte);
                 }
             },
             Scan::Body(mut body) => match byte {
-                0x1b => self.scan = Scan::BodyEsc(body),
+                _ if byte == end[0] && end.len() == 1 => bodies.push(body),
+                _ if byte == end[0] => self.scan = Scan::BodyEnding(body),
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if body.len() < MAX_BODY_LEN => {
                     body.push(byte);
                     self.scan = Scan::Body(body);
@@ -325,11 +358,11 @@ impl Extractor {
                 // was taken for its start is lost, this byte is the stream's).
                 _ => self.step(byte, passed, bodies),
             },
-            Scan::BodyEsc(body) => {
-                if byte == END[1] {
+            Scan::BodyEnding(body) => {
+                if byte == end[1] {
                     bodies.push(body);
                 } else {
-                    // The ESC began something else (or damaged the frame).
+                    // The first byte of the end began something else (or damaged the frame).
                     self.step(byte, passed, bodies);
                 }
             },
@@ -347,7 +380,8 @@ mod tests {
     }
 
     fn body_of(frame: &[u8]) -> &[u8] {
-        &frame[START.len()..frame.len() - END.len()]
+        let framing = if frame[0] == 0x1d { Framing::Input } else { Framing::Output };
+        &frame[framing.start().len()..frame.len() - framing.end().len()]
     }
 
     #[test]
@@ -481,22 +515,49 @@ mod tests {
     }
 
     #[test]
-    fn a_held_start_is_passed_on_when_nothing_follows_and_a_real_frame_is_left_alone() {
-        let mut extractor = Extractor::default();
+    fn input_frames_start_with_nothing_a_person_types_and_hold_nothing_back() {
+        let mut encoder = Encoder::new(Framing::Input);
+        let frame = encoder.seal(&split(&Message::Data { channel: 5, bytes: b"request".to_vec() })[0]);
+        assert_eq!((frame[0], frame[frame.len() - 1]), (0x1d, 0x1d));
+        assert!(!frame.contains(&0x1b), "no ESC in an input frame");
+
+        // Keys pass at once, an Escape included, whatever comes after.
+        let mut extractor = Extractor::new(Framing::Input);
         let (mut passed, mut bodies) = (Vec::new(), Vec::new());
         extractor.feed(b"\x1b", &mut passed, &mut bodies);
-        assert!(passed.is_empty(), "held back, it may be the start of a frame");
-        assert!(extractor.take_held(&mut passed));
-        assert_eq!(passed, b"\x1b", "a lone ESC is a key press");
-        assert!(!extractor.take_held(&mut passed), "nothing left to give");
-
-        // The stream goes on as if nothing had been held.
+        assert_eq!(passed, b"\x1b", "a lone ESC reaches the shell without a wait");
         extractor.feed(b"[A", &mut passed, &mut bodies);
         assert_eq!(passed, b"\x1b[A");
 
-        // Inside a frame that has really begun there is nothing to give up.
-        extractor.feed(b"\x1b_SRV;AAAA", &mut passed, &mut bodies);
-        assert!(!extractor.take_held(&mut passed));
+        // A frame in the middle of typing is taken out, and cut anywhere it is the same.
+        let mut stream = b"ls".to_vec();
+        stream.extend_from_slice(&frame);
+        stream.extend_from_slice(b" -l\r");
+        for cut in 0..=stream.len() {
+            let (head, tail) = stream.split_at(cut);
+            let mut extractor = Extractor::new(Framing::Input);
+            let (mut passed, mut bodies) = (Vec::new(), Vec::new());
+            extractor.feed(head, &mut passed, &mut bodies);
+            extractor.feed(tail, &mut passed, &mut bodies);
+            assert_eq!(passed, b"ls -l\r", "cut at {cut}");
+            assert_eq!(bodies, vec![body_of(&frame).to_vec()], "cut at {cut}");
+        }
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.decode(body_of(&frame)).unwrap(), Some(Message::Data { channel: 5, bytes: b"request".to_vec() }));
+    }
+
+    #[test]
+    fn a_pause_inside_the_start_of_an_input_frame_cannot_let_its_tail_through() {
+        // What went wrong with an ESC-led frame: the first bytes arrived, then nothing for
+        // a while, then the rest. With a one-byte start there is no "first bytes" to give up on.
+        let mut encoder = Encoder::new(Framing::Input);
+        let frame = encoder.seal(&split(&Message::Close { channel: 9 })[0]);
+        let mut extractor = Extractor::new(Framing::Input);
+        let (mut passed, mut bodies) = (Vec::new(), Vec::new());
+        extractor.feed(&frame[..1], &mut passed, &mut bodies);
+        extractor.feed(&frame[1..], &mut passed, &mut bodies);
+        assert!(passed.is_empty(), "{passed:?} leaked");
+        assert_eq!(bodies.len(), 1);
     }
 
     #[test]

@@ -127,151 +127,92 @@ fn spawn_detached(daemon_binary_path: &Path) -> anyhow::Result<()> {
 const REDEPLOY_MARKER_NAME: &str = "somsrv.redeploy-pending";
 
 /// The staged new binary's filename, sitting next to `somsrv(.exe)` —
-/// what Som's `scp_to_remote` uploads to, and what `somsrvupd` renames
+/// what Som's `scp_to_remote` uploads to, and what the takeover renames
 /// into place once it's safe to do so.
 #[cfg(not(target_os = "windows"))]
 const REDEPLOY_STAGED_NAME_UNIX: &str = "somsrv.new";
 #[cfg(target_os = "windows")]
 const REDEPLOY_STAGED_NAME_WINDOWS: &str = "somsrv.new.exe";
 
-/// `somsrvupd`'s own compiled bytes, embedded directly into `somsrv` at
-/// BUILD time via `rust-embed` — mirrors exactly how Som's own `assets`
-/// crate embeds a pre-built `somsrv` for each remote platform
-/// (`#[include = "srv/..."]` in `assets.rs`). Reads from `embedded-upd/`
-/// (a sibling of `src/` in this crate), which `scripts/update-srv-
-/// binaries.sh` populates as a manual, pre-release step — `somsrvupd` must
-/// be built and copied there BEFORE `somsrv` itself is built, the same
-/// two-pass requirement `assets/srv/{platform}/` already has for
-/// `somsrv` inside `som` itself. Re-extracted to disk FRESH on every
-/// single redeploy (see `check_and_apply_pending_redeploy`) rather than
-/// reused if a copy happens to already be sitting there — this
-/// guarantees whatever `somsrvupd` binary actually runs is always the one
-/// bundled with the CURRENTLY installed `somsrv`, never a stale
-/// leftover from some earlier version that happened to survive on disk.
-#[derive(rust_embed::RustEmbed)]
-#[folder = "embedded-upd"]
-struct EmbeddedUpd;
-
-fn somsrvupd_bytes() -> anyhow::Result<std::borrow::Cow<'static, [u8]>> {
-    let name = if cfg!(target_os = "windows") { "somsrvupd.exe" } else { "somsrvupd" };
-    EmbeddedUpd::get(name).map(|file| file.data).ok_or_else(|| anyhow::anyhow!("somsrvupd not embedded for this platform (expected {name:?} in embedded-upd/)"))
+/// Where the redeploy marker is: next to this daemon's own binary.
+fn redeploy_marker_path() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join(REDEPLOY_MARKER_NAME))
 }
 
-/// Checks for `REDEPLOY_MARKER_NAME` next to `this_binary_path` and, if
-/// present, hands the entire cutover off to a freshly-extracted `somsrvupd`
-/// process — see that binary's own module doc comment (`bin/somsrvupd.rs`)
-/// for the full rename-and-restart sequence, which necessarily runs in a
-/// SEPARATE process: this running daemon can't safely replace/delete its
-/// own executable file while it's still the one executing it, especially
-/// on Windows, where the OS holds an exclusive lock on a running image's
-/// file.
-///
-/// Called from `server::run`'s connection-accept loop itself (the single
-/// sequential thread that owns `pipe::accept_on`), right before
-/// dispatching each new connection to its own handler thread — this is
-/// deliberately checked on every single new connection attempt, not once
-/// at startup, since a redeploy can be staged by Som at any point while
-/// this daemon has already been running for a while. Because the accept
-/// loop is single-threaded, there is in practice never more than one
-/// caller of this function alive at once WITHIN this process — but the
-/// marker file's `std::fs::remove_file` is still the mechanism that
-/// makes this safe even if that ever changed (or across a hypothetical
-/// second daemon process briefly coexisting): it's atomic at the OS
-/// level, so whichever caller's `remove_file` call actually succeeds is
-/// the one — and only one — that proceeds to spawn `somsrvupd`; anyone
-/// else sees the file already gone and returns `false` immediately, no
-/// `Mutex`/`AtomicBool` needed. If spawning `somsrvupd` itself then fails
-/// (rare — a filesystem/exec problem, not a race), the marker is WRITTEN
-/// BACK so a later connection gets another chance rather than the
-/// redeploy silently vanishing forever.
-///
-/// Returns `true` if a redeploy was found and handed off — the caller
-/// must then close every existing connection and exit immediately
-/// (WITHOUT accepting the connection that triggered this check; that
-/// connection's own client will simply reconnect once the new daemon is
-/// up, same as it already tolerates any other daemon restart). Returns
-/// `false` if nothing needs to happen (no marker, or another thread
-/// already claimed it), in which case the caller proceeds normally.
-pub fn check_and_apply_pending_redeploy() -> bool {
-    let Ok(this_binary_path) = std::env::current_exe() else { return false };
-    let Some(parent) = this_binary_path.parent() else { return false };
-    let marker_path = parent.join(REDEPLOY_MARKER_NAME);
+/// Whether Som has staged a new build for this daemon to switch to.
+pub fn redeploy_pending() -> bool {
+    redeploy_marker_path().is_some_and(|marker| marker.is_file())
+}
 
-    // The atomic hand-off point — see this function's own doc comment.
-    // Only the thread whose `remove_file` call actually succeeds
-    // continues past this point.
+/// If a redeploy is staged, hands the cutover to a copy of this very binary
+/// started as `somsrv --takeover` (see `crate::takeover`) and returns `true`:
+/// the caller must then exit at once so the takeover can replace the binary.
+/// Returns `false` when nothing is staged or the hand-off failed (the marker is
+/// put back, so a later attempt gets another chance).
+///
+/// Called by the idle watcher in `server` - only when no client is connected.
+/// It used to be called on every new connection, which dropped the tabs of a Som
+/// that was running and had just connected, and never ran at all on a host where
+/// the updater it needed was not embedded.
+///
+/// The marker's `remove_file` is the atomic claim: only a caller whose removal
+/// succeeds goes on, so two of them can never both start a takeover.
+pub fn check_and_apply_pending_redeploy() -> bool {
+    let Some(marker_path) = redeploy_marker_path() else { return false };
+    let Some(parent) = marker_path.parent().map(Path::to_path_buf) else { return false };
     if std::fs::remove_file(&marker_path).is_err() {
-        return false; // no marker, or another thread/process already took it
+        return false; // no marker, or another caller already took it
     }
 
-    log::info!("redeploy marker found at {marker_path:?} — extracting and spawning somsrvupd to take over");
-    let staged_path = staged_binary_path(parent);
-    let final_path = final_binary_path(parent);
-    let this_pid = std::process::id();
-
-    match extract_and_spawn_somsrvupd(this_pid, &staged_path, &final_path, &marker_path) {
+    log::info!("redeploy marker found at {marker_path:?} - starting the takeover");
+    let staged_path = staged_binary_path(&parent);
+    let final_path = final_binary_path(&parent);
+    match spawn_takeover(std::process::id(), &staged_path, &final_path, &marker_path) {
         Ok(()) => true,
         Err(err) => {
-            log::error!("failed to hand off the redeploy to somsrvupd, restoring the marker for a later attempt: {err:#}");
-            // Best-effort: put the marker back so a LATER connection gets
-            // another chance — this failure was in spawning the helper
-            // (a filesystem/exec problem on THIS side), not anything
-            // that would make retrying pointless the way a bad `.new`
-            // download would.
-            let _ = std::fs::write(&marker_path, b"");
+            log::error!("failed to start the takeover, putting the marker back for a later attempt: {err:#}");
+            if let Err(err) = std::fs::write(&marker_path, b"") {
+                log::error!("and the marker could not be put back: {err}");
+            }
             false
         }
     }
 }
 
-/// Extracts the embedded `somsrvupd` to a fresh copy under the OS temp
-/// directory (`std::env::temp_dir()` — `/tmp` on Linux/macOS, both
-/// commonly tmpfs-backed so this never actually touches a physical disk
-/// there; `%TEMP%` on Windows, which has no equivalent in-memory
-/// guarantee but is still the closest standard-API option available —
-/// see this module's own doc comment for why a platform split beyond
-/// this wasn't worth it: `memfd_create` is Linux-only, and the Windows/
-/// macOS alternatives to it are either fragile or commonly flagged by
-/// antivirus software for looking like process-hollowing malware), makes
-/// it executable on Unix, spawns it detached with the four positional
-/// args it expects (`bin/somsrvupd.rs`'s own `main` documents the exact
-/// protocol), and deletes the temp copy immediately after a successful
-/// spawn — the OS has already loaded the new `somsrvupd` process's own
-/// image into memory by the time `spawn` returns, so the file on disk
-/// has done its job and doesn't need to persist for the child's sake.
-/// A fresh copy is written on EVERY redeploy (never reused even if a
-/// leftover happens to still be sitting there) — see `somsrvupd_bytes`'s
-/// own doc comment for why that freshness matters.
-fn extract_and_spawn_somsrvupd(old_pid: u32, staged_path: &Path, final_path: &Path, marker_path: &Path) -> anyhow::Result<()> {
-    let somsrvupd_path = std::env::temp_dir().join(if cfg!(target_os = "windows") { "somsrvupd.exe" } else { "somsrvupd" });
-    let bytes = somsrvupd_bytes()?;
-    std::fs::write(&somsrvupd_path, bytes.as_ref()).with_context(|| format!("failed to extract somsrvupd to {somsrvupd_path:?}"))?;
+/// Starts a copy of this binary under the OS temp directory as
+/// `somsrv --takeover <old-pid> <staged> <final> <marker>`, detached. A copy,
+/// not the binary itself: the takeover replaces that file, which cannot be done
+/// while it runs (Windows) and is better not done from the process being
+/// replaced (Unix).
+fn spawn_takeover(old_pid: u32, staged_path: &Path, final_path: &Path, marker_path: &Path) -> anyhow::Result<()> {
+    let suffix = if cfg!(target_os = "windows") { ".exe" } else { "" };
+    let temp_dir = std::env::temp_dir();
+    // What earlier takeovers left (a running copy cannot be deleted on Windows).
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("somsrv-takeover-") {
+                std::fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+    let this_binary = std::env::current_exe().context("cannot tell where this somsrv is")?;
+    let copy = temp_dir.join(format!("somsrv-takeover-{old_pid}{suffix}"));
+    std::fs::copy(&this_binary, &copy).with_context(|| format!("failed to copy {this_binary:?} to {copy:?}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&somsrvupd_path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("failed to make {somsrvupd_path:?} executable"))?;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).with_context(|| format!("failed to make {copy:?} executable"))?;
     }
-
-    let spawn_result = spawn_detached_with_args(
-        &somsrvupd_path,
+    spawn_detached_with_args(
+        &copy,
         &[
+            "--takeover",
             &old_pid.to_string(),
             &staged_path.to_string_lossy(),
             &final_path.to_string_lossy(),
             &marker_path.to_string_lossy(),
         ],
-    );
-
-    // Best-effort cleanup either way: on success the OS already has the
-    // new process's image loaded, so the on-disk copy is no longer
-    // needed; on failure there's nothing useful left to clean up FOR
-    // (the caller's own error path already restores the redeploy marker
-    // for a later attempt), but leaving a stray `somsrvupd(.exe)` in the
-    // temp directory serves no purpose either way.
-    let _ = std::fs::remove_file(&somsrvupd_path);
-
-    spawn_result
+    )
 }
 
 /// Full path to the staged `.new` binary next to `parent` (the directory
@@ -296,8 +237,8 @@ fn final_binary_path(parent: &Path) -> PathBuf {
 }
 
 /// Like `spawn_detached`, but with caller-provided `args` instead of the
-/// hardcoded `["--daemon"]` — used for spawning `somsrvupd` (a different
-/// binary entirely, with its own positional argv), sharing the same
+/// hardcoded `["--daemon"]` — used for spawning the takeover (a different
+/// mode of this binary, with its own argv), sharing the same
 /// detached-process mechanics (survive the spawning process's own exit,
 /// no console window, no inherited stdio) `spawn_detached` already has.
 #[cfg(target_os = "windows")]

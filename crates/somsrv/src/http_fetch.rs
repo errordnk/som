@@ -60,7 +60,8 @@ fn fetch_service_track(cache: &SrvCache, session_id: u32, file_id: u32, service:
         remaining_ms: info.duration_ms,
         cover_url: info.cover_url.clone(),
         cover_lookup_pending: false,
-        next: None,
+        // What the player announced as coming after this track.
+        next: cache.announced_next(session_id, file_id),
     });
     stream_reader_into_cache(cache, session_id, file_id, opened.reader, opened.total_size, ContentType::Audio, String::new())
 }

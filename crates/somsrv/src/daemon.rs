@@ -132,8 +132,17 @@ fn spawn_detached(daemon_binary_path: &Path) -> anyhow::Result<()> {
 /// `false` when no daemon is running, the running one is as new, or `daemon_binary`
 /// carries no build id (so nothing can be said about it).
 pub fn replace_if_stale(daemon_binary: &Path) -> anyhow::Result<bool> {
+    if std::env::var_os(KEEP_RUNNING_DAEMON_ENV).is_some() {
+        return Ok(false);
+    }
     replace_if_stale_at(&daemon_socket_path(), daemon_binary)
 }
+
+/// When this environment variable is set, a running daemon is never replaced
+/// by [`replace_if_stale`], whatever build it is. For whoever runs several
+/// builds side by side (tests, a developer): the clients of the newest would
+/// otherwise stop the daemon the others are using, each in turn.
+pub const KEEP_RUNNING_DAEMON_ENV: &str = "SOMSRV_KEEP_DAEMON";
 
 fn replace_if_stale_at(socket_path: &str, daemon_binary: &Path) -> anyhow::Result<bool> {
     let bytes = std::fs::read(daemon_binary).with_context(|| format!("cannot read {daemon_binary:?}"))?;
@@ -254,16 +263,18 @@ mod tests {
         served_receiver
     }
 
-    fn unique_socket(name: &str) -> String {
+    /// An address for a fake daemon: a pipe name on Windows, a socket in `scratch` (a
+    /// directory of the test's own, removed when the test ends) elsewhere.
+    fn unique_socket(scratch: &Path, name: &str) -> String {
         if cfg!(windows) {
             format!(r"\\.\pipe\somsrv-test-{name}-{}", std::process::id())
         } else {
-            std::env::temp_dir().join(format!("somsrv-test-{name}-{}.sock", std::process::id())).to_string_lossy().into_owned()
+            scratch.join(format!("{name}.sock")).to_string_lossy().into_owned()
         }
     }
 
-    fn binary_of_build(build_id: u64) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("somsrv-test-binary-{build_id}-{}", std::process::id()));
+    fn binary_of_build(scratch: &Path, build_id: u64) -> PathBuf {
+        let path = scratch.join(format!("somsrv-build-{build_id}"));
         std::fs::write(&path, format!("some code SOMSRV-BUILD-ID:{build_id}: more code")).unwrap();
         path
     }
@@ -275,12 +286,13 @@ mod tests {
 
     #[test]
     fn a_daemon_older_than_the_binary_is_stopped_and_only_that_process() {
-        let socket = unique_socket("older");
+        let scratch = tempfile::tempdir().unwrap();
+        let socket = unique_socket(scratch.path(), "older");
         let mut old_daemon = sleeper();
         let mut bystander = sleeper();
         let served = fake_daemon(&socket, 1_000, old_daemon.id());
 
-        let replaced = replace_if_stale_at(&socket, &binary_of_build(2_000)).expect("replacing");
+        let replaced = replace_if_stale_at(&socket, &binary_of_build(scratch.path(), 2_000)).expect("replacing");
         served.recv_timeout(Duration::from_secs(20)).expect("the fake daemon was never asked");
         assert!(replaced, "an older daemon must be replaced");
         assert!(old_daemon.wait().is_ok(), "the daemon was not stopped");
@@ -291,11 +303,12 @@ mod tests {
 
     #[test]
     fn a_daemon_as_new_or_newer_than_the_binary_is_left_alone() {
+        let scratch = tempfile::tempdir().unwrap();
         for running_build in [2_000, 3_000] {
-            let socket = unique_socket(&format!("current-{running_build}"));
+            let socket = unique_socket(scratch.path(), &format!("current-{running_build}"));
             let mut daemon = sleeper();
             let served = fake_daemon(&socket, running_build, daemon.id());
-            assert!(!replace_if_stale_at(&socket, &binary_of_build(2_000)).expect("checking"));
+            assert!(!replace_if_stale_at(&socket, &binary_of_build(scratch.path(), 2_000)).expect("checking"));
             served.recv_timeout(Duration::from_secs(20)).expect("the fake daemon was never asked");
             assert!(daemon.try_wait().unwrap().is_none(), "the daemon was stopped though it was current");
             daemon.kill().unwrap();
@@ -305,9 +318,10 @@ mod tests {
 
     #[test]
     fn nothing_is_done_when_no_daemon_runs_or_the_binary_has_no_id() {
-        assert!(!replace_if_stale_at(&unique_socket("none"), &binary_of_build(2_000)).expect("checking"));
-        let plain = std::env::temp_dir().join(format!("somsrv-test-plain-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(!replace_if_stale_at(&unique_socket(scratch.path(), "none"), &binary_of_build(scratch.path(), 2_000)).expect("checking"));
+        let plain = scratch.path().join("somsrv-without-an-id");
         std::fs::write(&plain, b"no id in here").unwrap();
-        assert!(!replace_if_stale_at(&unique_socket("plain"), &plain).expect("checking"));
+        assert!(!replace_if_stale_at(&unique_socket(scratch.path(), "plain"), &plain).expect("checking"));
     }
 }

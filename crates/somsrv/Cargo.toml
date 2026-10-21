@@ -33,6 +33,9 @@ required-features = ["test-support"]
 # `somsrv::testing`: for the tests of other crates that run the real binaries.
 test-support = []
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
 

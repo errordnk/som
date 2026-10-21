@@ -116,148 +116,94 @@ fn spawn_detached(daemon_binary_path: &Path) -> anyhow::Result<()> {
     spawn_detached_with_args(daemon_binary_path, &["--daemon"])
 }
 
-/// The redeploy marker file's name, sitting next to `somsrv(.exe)` at
-/// `~/.local/bin/` — see `check_and_apply_pending_redeploy`'s own doc
-/// comment for the full protocol this is part of. Written by Som's
-/// `terminal_panel::ensure_remote_binary_deployed` ONLY after `somsrv.
-/// new` has been fully uploaded and made executable — its mere presence
-/// is the one-and-only signal a complete redeploy is waiting to be
-/// applied, so nothing on the `somsrv` side needs to separately verify
-/// `.new`'s integrity.
-const REDEPLOY_MARKER_NAME: &str = "somsrv.redeploy-pending";
-
-/// The staged new binary's filename, sitting next to `somsrv(.exe)` —
-/// what Som's `scp_to_remote` uploads to, and what the takeover renames
-/// into place once it's safe to do so.
-#[cfg(not(target_os = "windows"))]
-const REDEPLOY_STAGED_NAME_UNIX: &str = "somsrv.new";
-#[cfg(target_os = "windows")]
-const REDEPLOY_STAGED_NAME_WINDOWS: &str = "somsrv.new.exe";
-
-/// Where the redeploy marker is: next to this daemon's own binary.
-fn redeploy_marker_path() -> Option<PathBuf> {
-    Some(std::env::current_exe().ok()?.parent()?.join(REDEPLOY_MARKER_NAME))
+/// Makes sure the daemon already running on this machine (if one is) is not an
+/// older build than `daemon_binary`: when it is, the daemon is stopped - with the
+/// sessions it holds; the relays attached to it end as their connection goes -
+/// and `true` is returned, so that the next `connect_or_spawn` starts the daemon
+/// from the new file. A newer build wins at once, whoever is connected and
+/// whatever sessions there are: keeping the machine on one build matters more
+/// than what the old one held.
+///
+/// Called by the clients that are about to talk to the daemon (a relay, Som, a
+/// `somsrp`) with the binary they come with; it is how a new `somsrv` that has
+/// been put in place (by Som's deploy, by a rebuild) takes over from the old one
+/// the moment anything of the new version connects.
+///
+/// `false` when no daemon is running, the running one is as new, or `daemon_binary`
+/// carries no build id (so nothing can be said about it).
+pub fn replace_if_stale(daemon_binary: &Path) -> anyhow::Result<bool> {
+    replace_if_stale_at(&daemon_socket_path(), daemon_binary)
 }
 
-/// Whether Som has staged a new build for this daemon to switch to.
-pub fn redeploy_pending() -> bool {
-    redeploy_marker_path().is_some_and(|marker| marker.is_file())
-}
-
-/// If a redeploy is staged, hands the cutover to a copy of this very binary
-/// started as `somsrv --takeover` (see `crate::takeover`) and returns `true`:
-/// the caller must then exit at once so the takeover can replace the binary.
-/// Returns `false` when nothing is staged or the hand-off failed (the marker is
-/// put back, so a later attempt gets another chance).
-///
-/// Called by the idle watcher in `server` - only when no client is connected.
-/// It used to be called on every new connection, which dropped the tabs of a Som
-/// that was running and had just connected, and never ran at all on a host where
-/// the updater it needed was not embedded.
-///
-/// The marker's `remove_file` is the atomic claim: only a caller whose removal
-/// succeeds goes on, so two of them can never both start a takeover.
-pub fn check_and_apply_pending_redeploy() -> bool {
-    let Some(marker_path) = redeploy_marker_path() else { return false };
-    let Some(parent) = marker_path.parent().map(Path::to_path_buf) else { return false };
-    if std::fs::remove_file(&marker_path).is_err() {
-        return false; // no marker, or another caller already took it
+fn replace_if_stale_at(socket_path: &str, daemon_binary: &Path) -> anyhow::Result<bool> {
+    let bytes = std::fs::read(daemon_binary).with_context(|| format!("cannot read {daemon_binary:?}"))?;
+    let Some(expected) = crate::protocol::build_id_in(&bytes) else { return Ok(false) };
+    let Some(running) = probe_running_daemon(socket_path) else { return Ok(false) };
+    if running.build_id >= expected {
+        return Ok(false);
     }
+    log::info!("the daemon here is build {} and {daemon_binary:?} is build {expected}: replacing it", running.build_id);
+    stop_daemon(running.pid);
+    // Gone when nothing answers on its address any more.
+    for _ in 0..CONNECT_RETRY_ATTEMPTS {
+        if probe_running_daemon(socket_path).is_none() {
+            return Ok(true);
+        }
+        std::thread::sleep(CONNECT_RETRY_DELAY);
+    }
+    anyhow::bail!("the old daemon still answers after it was stopped")
+}
 
-    log::info!("redeploy marker found at {marker_path:?} - starting the takeover");
-    let staged_path = staged_binary_path(&parent);
-    let final_path = final_binary_path(&parent);
-    match spawn_takeover(std::process::id(), &staged_path, &final_path, &marker_path) {
-        Ok(()) => true,
-        Err(err) => {
-            log::error!("failed to start the takeover, putting the marker back for a later attempt: {err:#}");
-            if let Err(err) = std::fs::write(&marker_path, b"") {
-                log::error!("and the marker could not be put back: {err}");
-            }
-            false
+/// The handshake of the daemon on `socket_path`, if one answers; never starts one.
+fn probe_running_daemon(socket_path: &str) -> Option<crate::protocol::HandshakeInfo> {
+    use crate::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
+    let connection = PipeConnection::connect(socket_path).ok()?;
+    ConnectionKind::Srv.write_to(&connection).ok()?;
+    connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).ok()?).ok()?;
+    match serde_json::from_slice::<SrvResponse>(&connection.read_message().ok()?).ok()? {
+        SrvResponse::Handshake(info) => Some(info),
+        _ => None,
+    }
+}
+
+/// Kills the daemon that answered: the process it named in its handshake, or, for
+/// a build old enough not to name itself, this user's `somsrv` process started
+/// with `--daemon` (a daemon is always started that way). A machine can have a
+/// daemon per user, and one user's client has no business with another's.
+fn stop_daemon(pid: u32) {
+    let own_pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always).with_user(sysinfo::UpdateKind::Always),
+    );
+    if pid != 0 {
+        match system.process(sysinfo::Pid::from_u32(pid)) {
+            Some(process) if sysinfo::Pid::from_u32(pid) != own_pid => {
+                log::info!("stopping the daemon, process {pid}");
+                process.kill();
+            },
+            _ => log::debug!("the daemon, process {pid}, is already gone"),
+        }
+        return;
+    }
+    let Some(own_user) = system.process(own_pid).and_then(|process| process.user_id().cloned()) else {
+        log::warn!("cannot tell which user this process runs as: not stopping any daemon");
+        return;
+    };
+    let name = if cfg!(target_os = "windows") { "somsrv.exe" } else { "somsrv" };
+    for (pid, process) in system.processes() {
+        let is_daemon = process.name().to_string_lossy() == name && process.cmd().iter().any(|arg| arg == "--daemon");
+        if is_daemon && *pid != own_pid && process.user_id() == Some(&own_user) {
+            log::info!("stopping the daemon, process {pid}");
+            process.kill();
         }
     }
 }
 
-/// Starts a copy of this binary under the OS temp directory as
-/// `somsrv --takeover <old-pid> <staged> <final> <marker>`, detached. A copy,
-/// not the binary itself: the takeover replaces that file, which cannot be done
-/// while it runs (Windows) and is better not done from the process being
-/// replaced (Unix).
-fn spawn_takeover(old_pid: u32, staged_path: &Path, final_path: &Path, marker_path: &Path) -> anyhow::Result<()> {
-    let suffix = if cfg!(target_os = "windows") { ".exe" } else { "" };
-    let temp_dir = std::env::temp_dir();
-    // What earlier takeovers left (a running copy cannot be deleted on Windows).
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("somsrv-takeover-") {
-                std::fs::remove_file(entry.path()).ok();
-            }
-        }
-    }
-    let this_binary = std::env::current_exe().context("cannot tell where this somsrv is")?;
-    let copy = temp_dir.join(format!("somsrv-takeover-{old_pid}{suffix}"));
-    std::fs::copy(&this_binary, &copy).with_context(|| format!("failed to copy {this_binary:?} to {copy:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).with_context(|| format!("failed to make {copy:?} executable"))?;
-    }
-    spawn_detached_with_args(
-        &copy,
-        &[
-            "--takeover",
-            &old_pid.to_string(),
-            &staged_path.to_string_lossy(),
-            &final_path.to_string_lossy(),
-            &marker_path.to_string_lossy(),
-        ],
-    )
-}
-
-/// Full path to the staged `.new` binary next to `parent` (the directory
-/// `somsrv(.exe)` itself lives in) — platform-specific filename (see
-/// `REDEPLOY_STAGED_NAME_UNIX`/`_WINDOWS`'s own doc comment).
-fn staged_binary_path(parent: &Path) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        parent.join(REDEPLOY_STAGED_NAME_WINDOWS)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        parent.join(REDEPLOY_STAGED_NAME_UNIX)
-    }
-}
-
-/// Full path `.new` gets renamed TO — the ordinary `somsrv(.exe)` name,
-/// matching `binary_path_next_to_current_exe`'s own naming convention.
-fn final_binary_path(parent: &Path) -> PathBuf {
-    let binary_name = if cfg!(target_os = "windows") { "somsrv.exe" } else { "somsrv" };
-    parent.join(binary_name)
-}
-
-/// Like `spawn_detached`, but with caller-provided `args` instead of the
-/// hardcoded `["--daemon"]` — used for spawning the takeover (a different
-/// mode of this binary, with its own argv), sharing the same
-/// detached-process mechanics (survive the spawning process's own exit,
-/// no console window, no inherited stdio) `spawn_detached` already has.
-#[cfg(target_os = "windows")]
-fn spawn_detached_with_args(binary_path: &Path, args: &[&str]) -> anyhow::Result<()> {
-    use std::os::windows::process::CommandExt;
-
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    std::process::Command::new(binary_path)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-        .spawn()?;
-    Ok(())
-}
-
+/// Starts `binary_path` detached (a session of its own, no inherited stdio): it
+/// survives the process that started it.
 #[cfg(unix)]
 fn spawn_detached_with_args(binary_path: &Path, args: &[&str]) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
@@ -281,4 +227,87 @@ fn spawn_detached_with_args(binary_path: &Path, args: &[&str]) -> anyhow::Result
         .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
+
+    /// A "daemon" on an address of its own that answers one handshake as build
+    /// `build_id`, naming `pid` as the process behind it, then is gone. The receiver
+    /// gets a message once it has answered.
+    fn fake_daemon(socket: &str, build_id: u64, pid: u32) -> std::sync::mpsc::Receiver<()> {
+        let listener = crate::pipe::bind(socket).expect("binding the fake daemon's address");
+        let (served, served_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let connection = crate::pipe::accept_on(&listener).expect("accepting");
+            ConnectionKind::read_from(&connection).expect("the connection kind");
+            let request = serde_json::from_slice::<SrvRequest>(&connection.read_message().expect("the handshake")).expect("a request");
+            assert!(matches!(request, SrvRequest::Handshake(_)));
+            let info = HandshakeInfo { build_id, pid, ..HandshakeInfo::current() };
+            connection.write_message(&serde_json::to_vec(&SrvResponse::Handshake(info)).unwrap()).expect("answering");
+            served.send(()).ok();
+        });
+        // On Windows the pipe exists once the thread is waiting in `accept_on`.
+        std::thread::sleep(Duration::from_millis(300));
+        served_receiver
+    }
+
+    fn unique_socket(name: &str) -> String {
+        if cfg!(windows) {
+            format!(r"\\.\pipe\somsrv-test-{name}-{}", std::process::id())
+        } else {
+            std::env::temp_dir().join(format!("somsrv-test-{name}-{}.sock", std::process::id())).to_string_lossy().into_owned()
+        }
+    }
+
+    fn binary_of_build(build_id: u64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("somsrv-test-binary-{build_id}-{}", std::process::id()));
+        std::fs::write(&path, format!("some code SOMSRV-BUILD-ID:{build_id}: more code")).unwrap();
+        path
+    }
+
+    fn sleeper() -> std::process::Child {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) { ("ping", &["-n", "600", "127.0.0.1"]) } else { ("sleep", &["600"]) };
+        std::process::Command::new(program).args(args).stdout(std::process::Stdio::null()).spawn().expect("a process to stand for the daemon")
+    }
+
+    #[test]
+    fn a_daemon_older_than_the_binary_is_stopped_and_only_that_process() {
+        let socket = unique_socket("older");
+        let mut old_daemon = sleeper();
+        let mut bystander = sleeper();
+        let served = fake_daemon(&socket, 1_000, old_daemon.id());
+
+        let replaced = replace_if_stale_at(&socket, &binary_of_build(2_000)).expect("replacing");
+        served.recv_timeout(Duration::from_secs(20)).expect("the fake daemon was never asked");
+        assert!(replaced, "an older daemon must be replaced");
+        assert!(old_daemon.wait().is_ok(), "the daemon was not stopped");
+        assert!(bystander.try_wait().unwrap().is_none(), "a process that was not the daemon was stopped too");
+        bystander.kill().unwrap();
+        bystander.wait().ok();
+    }
+
+    #[test]
+    fn a_daemon_as_new_or_newer_than_the_binary_is_left_alone() {
+        for running_build in [2_000, 3_000] {
+            let socket = unique_socket(&format!("current-{running_build}"));
+            let mut daemon = sleeper();
+            let served = fake_daemon(&socket, running_build, daemon.id());
+            assert!(!replace_if_stale_at(&socket, &binary_of_build(2_000)).expect("checking"));
+            served.recv_timeout(Duration::from_secs(20)).expect("the fake daemon was never asked");
+            assert!(daemon.try_wait().unwrap().is_none(), "the daemon was stopped though it was current");
+            daemon.kill().unwrap();
+            daemon.wait().ok();
+        }
+    }
+
+    #[test]
+    fn nothing_is_done_when_no_daemon_runs_or_the_binary_has_no_id() {
+        assert!(!replace_if_stale_at(&unique_socket("none"), &binary_of_build(2_000)).expect("checking"));
+        let plain = std::env::temp_dir().join(format!("somsrv-test-plain-{}", std::process::id()));
+        std::fs::write(&plain, b"no id in here").unwrap();
+        assert!(!replace_if_stale_at(&unique_socket("plain"), &plain).expect("checking"));
+    }
 }

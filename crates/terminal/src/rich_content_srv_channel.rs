@@ -798,6 +798,18 @@ impl alacritty_terminal::event_loop::StreamFilter for LinkFilter {
     }
 }
 
+/// Stops the daemon of this machine when it is an older build than the `somsrv`
+/// next to Som (and with it everything it holds): the next connection starts one
+/// from the new file. Som calls it once at startup - a rebuilt or updated Som
+/// would otherwise go on talking to whatever daemon an earlier run left behind.
+pub fn replace_stale_local_daemon() {
+    match somsrv::daemon::binary_path_next_to_current_exe().and_then(|binary| somsrv::daemon::replace_if_stale(&binary)) {
+        Ok(true) => log::info!("replaced an older somsrv daemon with the build next to Som"),
+        Ok(false) => {},
+        Err(err) => log::warn!("could not check whether the somsrv daemon is current: {err:#}"),
+    }
+}
+
 /// One connection to whichever daemon `(session_id, file_id)` belongs to.
 enum SrvConnection {
     Local(somsrv::pipe::PipeConnection),

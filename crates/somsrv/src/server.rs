@@ -79,26 +79,14 @@ impl Drop for ConnectionGuard {
 /// it holds no session either.
 const IDLE_SHUTDOWN_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long no client has to be connected before a staged redeploy is applied.
-/// Long enough to ride out the moment between one connection closing and the
-/// next one opening (a Som that restarts, a `somsrp` that ends and another
-/// that starts), short enough that closing Som is enough to get the update.
-const REDEPLOY_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// What the daemon does about a stretch with no client connected.
 #[derive(Debug, PartialEq, Eq)]
 enum IdleAction {
     Wait,
-    /// Switch to the build Som staged. The sessions the daemon holds end with
-    /// it: they live in this process.
-    ApplyRedeploy,
     Shutdown,
 }
 
-fn idle_action(idle_for: std::time::Duration, holds_sessions: bool, redeploy_pending: bool) -> IdleAction {
-    if redeploy_pending && idle_for >= REDEPLOY_IDLE_DELAY {
-        return IdleAction::ApplyRedeploy;
-    }
+fn idle_action(idle_for: std::time::Duration, holds_sessions: bool) -> IdleAction {
     // A daemon that holds sessions is what keeps a `tmux: true` tab alive while
     // Som is closed: it must not go away with them. (It used to, after 60
     // seconds, so a session survived a closed Som for a minute only.)
@@ -133,16 +121,8 @@ fn spawn_idle_watcher(registry: SessionRegistry) {
             }
             let idle_for = idle_since.get_or_insert_with(std::time::Instant::now).elapsed();
             let holds_sessions = !registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty();
-            match idle_action(idle_for, holds_sessions, somsrv::daemon::redeploy_pending()) {
+            match idle_action(idle_for, holds_sessions) {
                 IdleAction::Wait => {},
-                IdleAction::ApplyRedeploy => {
-                    if somsrv::daemon::check_and_apply_pending_redeploy() {
-                        log::info!("no client connected for {idle_for:?}: exiting for the redeploy that is staged");
-                        std::process::exit(0);
-                    }
-                    // The hand-off failed (and was logged); do not retry every second.
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                },
                 IdleAction::Shutdown => {
                     log::info!("somsrv daemon idle for {idle_for:?} with no connection and no session, shutting down");
                     std::process::exit(0);
@@ -758,22 +738,14 @@ mod idle_tests {
 
     #[test]
     fn a_daemon_that_holds_sessions_stays_however_long_it_is_idle() {
-        assert_eq!(idle_action(Duration::from_secs(0), true, false), IdleAction::Wait);
-        assert_eq!(idle_action(Duration::from_secs(61), true, false), IdleAction::Wait);
-        assert_eq!(idle_action(Duration::from_secs(86_400), true, false), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(0), true), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(61), true), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(86_400), true), IdleAction::Wait);
     }
 
     #[test]
     fn a_daemon_with_nothing_to_hold_shuts_down_after_a_minute() {
-        assert_eq!(idle_action(Duration::from_secs(59), false, false), IdleAction::Wait);
-        assert_eq!(idle_action(Duration::from_secs(60), false, false), IdleAction::Shutdown);
-    }
-
-    #[test]
-    fn a_staged_redeploy_is_applied_once_no_client_is_connected_sessions_or_not() {
-        assert_eq!(idle_action(Duration::from_secs(1), true, true), IdleAction::Wait, "not at the first quiet second");
-        assert_eq!(idle_action(Duration::from_secs(5), true, true), IdleAction::ApplyRedeploy);
-        assert_eq!(idle_action(Duration::from_secs(5), false, true), IdleAction::ApplyRedeploy);
-        assert_eq!(idle_action(Duration::from_secs(600), false, true), IdleAction::ApplyRedeploy, "before shutting down for good");
+        assert_eq!(idle_action(Duration::from_secs(59), false), IdleAction::Wait);
+        assert_eq!(idle_action(Duration::from_secs(60), false), IdleAction::Shutdown);
     }
 }

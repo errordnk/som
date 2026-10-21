@@ -184,13 +184,58 @@ pub struct HandshakeInfo {
     pub version: String,
     pub os: Os,
     pub arch: Arch,
+    /// When this build was made, in Unix seconds (`BUILD_ID`). Of two builds the
+    /// one with the larger id is the newer; 0 is a build from before ids existed.
+    #[serde(default)]
+    pub build_id: u64,
+    /// The process that answers (0 from a build that did not say).
+    #[serde(default)]
+    pub pid: u32,
 }
 
 impl HandshakeInfo {
     pub fn current() -> Self {
         let (os, arch) = current_platform();
-        Self { version: env!("CARGO_PKG_VERSION").to_string(), os, arch }
+        Self { version: env!("CARGO_PKG_VERSION").to_string(), os, arch, build_id: BUILD_ID, pid: std::process::id() }
     }
+}
+
+/// The id of this build (see `build.rs`).
+pub const BUILD_ID: u64 = parse_decimal(env!("SOMSRV_BUILD_ID"));
+
+const fn parse_decimal(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    let mut value = 0u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        value = value * 10 + (bytes[index] - b'0') as u64;
+        index += 1;
+    }
+    value
+}
+
+const BUILD_MARK_PREFIX: &[u8] = b"SOMSRV-BUILD-ID:";
+
+/// The id of this build as text inside the binary, where [`build_id_in`] finds
+/// it. `#[used]` keeps it even though nothing reads it at run time.
+#[used]
+pub static BUILD_MARK: &str = concat!("SOMSRV-BUILD-ID:", env!("SOMSRV_BUILD_ID"), ":");
+
+/// The id of the `somsrv` build whose file contents are `binary`, or `None` if
+/// it is not a build that carries one.
+pub fn build_id_in(binary: &[u8]) -> Option<u64> {
+    let mut from = 0;
+    while let Some(at) = binary[from..].windows(BUILD_MARK_PREFIX.len()).position(|window| window == BUILD_MARK_PREFIX) {
+        let digits_start = from + at + BUILD_MARK_PREFIX.len();
+        let digits = binary[digits_start..].iter().take_while(|byte| byte.is_ascii_digit()).count();
+        // The needle is also a string in this very function: only the mark itself has
+        // digits followed by a colon.
+        if digits > 0 && binary.get(digits_start + digits) == Some(&b':') {
+            return std::str::from_utf8(&binary[digits_start..digits_start + digits]).ok()?.parse().ok();
+        }
+        from = digits_start;
+    }
+    None
 }
 
 /// The very FIRST message on any fresh connection to the shared daemon —
@@ -1181,6 +1226,28 @@ mod tests {
             "daemon_socket_path produced a {}-byte path (>= the {MACOS_SUN_LEN}-byte SUN_LEN limit): {path:?}",
             path.len()
         );
+    }
+
+    #[test]
+    fn the_build_id_of_a_binary_is_found_in_its_bytes() {
+        let mut binary = vec![0u8, 1, 2];
+        binary.extend_from_slice(b"SOMSRV-BUILD-ID:"); // the needle alone, as in code
+        binary.extend_from_slice(b"junk\0");
+        binary.extend_from_slice(BUILD_MARK.as_bytes());
+        binary.extend_from_slice(&[9, 9]);
+        assert_eq!(build_id_in(&binary), Some(BUILD_ID));
+        assert_eq!(build_id_in(b"no mark here SOMSRV-BUILD-ID:"), None);
+        assert_eq!(build_id_in(b"SOMSRV-BUILD-ID:123"), None, "digits without the closing colon are not a mark");
+        assert_eq!(build_id_in(b"xx SOMSRV-BUILD-ID:1700000000:yy"), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn a_handshake_from_an_older_build_without_an_id_still_reads_and_counts_as_id_zero() {
+        let old: HandshakeInfo = serde_json::from_str(r#"{"version":"0.7.0","os":"Linux","arch":"Amd64"}"#).unwrap();
+        assert_eq!((old.build_id, old.pid), (0, 0));
+        let round_trip: HandshakeInfo = serde_json::from_str(&serde_json::to_string(&HandshakeInfo::current()).unwrap()).unwrap();
+        assert_eq!(round_trip.build_id, BUILD_ID);
+        assert!(BUILD_ID > 1_700_000_000, "the build id is a plausible Unix time");
     }
 
     #[test]

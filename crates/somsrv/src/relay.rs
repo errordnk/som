@@ -521,7 +521,14 @@ fn connect_or_spawn_daemon() -> anyhow::Result<PipeConnection> {
     // rather than here (shared with `somsrp`/Som's own client-side code,
     // neither of which IS the `somsrv` binary, so they pass a
     // discovered/deployed path instead of `current_exe()`).
-    let connection = somsrv::daemon::connect_or_spawn(&std::env::current_exe()?)?;
+    let this_binary = std::env::current_exe()?;
+    // A daemon older than this relay is replaced, with everything it holds.
+    match somsrv::daemon::replace_if_stale(&this_binary) {
+        Ok(true) => log::info!("replaced an older daemon"),
+        Ok(false) => {},
+        Err(err) => log::warn!("could not check whether the running daemon is current: {err:#}"),
+    }
+    let connection = somsrv::daemon::connect_or_spawn(&this_binary)?;
     ConnectionKind::Relay.write_to(&connection)?;
     Ok(connection)
 }

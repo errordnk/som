@@ -297,6 +297,9 @@ fn main() {
     #[cfg(target_os = "windows")]
     terminal::rich_content_video_player::ensure_ffmpeg_extracted_and_wired();
 
+    // A daemon left over from an older build is replaced before anything connects to it.
+    terminal::rich_content_srv_channel::replace_stale_local_daemon();
+
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));

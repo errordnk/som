@@ -145,6 +145,10 @@ struct Inner {
     /// Latest "now playing" for a radio stream (`set_now_playing`),
     /// replayed to a subscriber that arrives later.
     now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
+    /// The track the player said comes after the one a key plays
+    /// (`set_announced_next`), for the "now playing" the service's own reply
+    /// is turned into.
+    announced_next: HashMap<CacheKey, somsrv::protocol::NextTrack>,
     /// `(index, len)` of the playlist entry a key is (`set_playlist`).
     playlists: HashMap<CacheKey, (u32, u32, Option<String>, bool)>,
     /// The CUE sheet a key plays (`set_cue_sheet`).
@@ -465,6 +469,25 @@ impl SrvCache {
 
     /// Records `info` as the latest "now playing" of its key and pushes it
     /// to every current subscriber.
+    /// Remembers the track that comes after the one `(session_id, file_id)`
+    /// plays (`None`: none is known), as the player announced it.
+    pub fn set_announced_next(&self, session_id: u32, file_id: u32, next: Option<somsrv::protocol::NextTrack>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match next {
+            Some(next) => {
+                inner.announced_next.insert((session_id, file_id), next);
+            },
+            None => {
+                inner.announced_next.remove(&(session_id, file_id));
+            },
+        }
+    }
+
+    /// What `set_announced_next` was last told for the key.
+    pub fn announced_next(&self, session_id: u32, file_id: u32) -> Option<somsrv::protocol::NextTrack> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).announced_next.get(&(session_id, file_id)).cloned()
+    }
+
     pub fn set_now_playing(&self, info: somsrv::protocol::NowPlayingInfo) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (info.session_id, info.file_id);
@@ -1203,6 +1226,28 @@ mod tests {
     }
 
     /// Subscribes to `(1, 2)` and returns the `NowPlaying` infos pushed.
+    #[test]
+    fn the_announced_next_track_is_kept_per_key_and_can_be_cleared() {
+        let cache = SrvCache::new();
+        let next = |title: &str| somsrv::protocol::NextTrack {
+            artist: "A".into(),
+            title: title.into(),
+            album: String::new(),
+            year: None,
+            duration_ms: 1000,
+            cover_url: Some("https://x/c.jpg".into()),
+        };
+        assert_eq!(cache.announced_next(1, 2), None);
+        cache.set_announced_next(1, 2, Some(next("one")));
+        cache.set_announced_next(3, 4, Some(next("other")));
+        assert_eq!(cache.announced_next(1, 2).unwrap().title, "one");
+        cache.set_announced_next(1, 2, Some(next("two")));
+        assert_eq!(cache.announced_next(1, 2).unwrap().title, "two", "the latest announcement wins");
+        assert_eq!(cache.announced_next(3, 4).unwrap().title, "other");
+        cache.set_announced_next(1, 2, None);
+        assert_eq!(cache.announced_next(1, 2), None, "a track with no known successor clears it");
+    }
+
     fn collect_now_playing(cache: &SrvCache) -> Arc<Mutex<Vec<somsrv::protocol::NowPlayingInfo>>> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();

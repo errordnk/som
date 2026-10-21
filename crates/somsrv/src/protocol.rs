@@ -633,6 +633,16 @@ pub enum SrvRequest {
         /// next on the last. A client that does not send it gets `true`.
         #[serde(default = "default_looping")]
         looping: bool,
+        /// Everything already known of THIS track (a radio batch says it
+        /// before the track is opened): its tags and cover are shown at once,
+        /// not when the service has opened the stream.
+        #[serde(default)]
+        current: Option<NextTrack>,
+        /// The track after this one, when the player knows it (a radio's batch):
+        /// `somsrv` passes it on in `NowPlayingInfo::next`, so Som can fetch its
+        /// cover before it starts.
+        #[serde(default)]
+        next: Option<NextTrack>,
     },
     /// Sent by Som on a fresh, one-shot connection when the user presses
     /// previous (`delta: -1`) or next (`delta: 1`) on a playlist
@@ -788,9 +798,10 @@ pub enum RadioEvent {
 }
 
 /// One track of a radio batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RadioTrack {
     pub id: String,
+    /// "artist - title", the way a list shows it.
     pub title: String,
     /// The link that plays it.
     pub target: String,
@@ -799,6 +810,19 @@ pub struct RadioTrack {
     /// The year of its album, when the service says.
     #[serde(default)]
     pub year: Option<u32>,
+    /// What the service knows of the track, so that its tags and cover can be
+    /// had before it starts (see `SrvRequest::AnnounceTrack`): the artists, the
+    /// title alone, the album, the length, the cover link.
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub duration_ms: u32,
+    #[serde(default)]
+    pub cover_url: Option<String>,
 }
 
 /// daemon -> `somsrp`/other SRP clients, answering a `SrvRequest`.

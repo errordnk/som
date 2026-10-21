@@ -830,6 +830,10 @@ struct PlaylistPosition {
     /// The track belongs to a radio: its widget shows the radio's icons
     /// (see [`announce_radio_state`]).
     radio: bool,
+    /// What the radio's batch already says of this track, and of the one after
+    /// it (see `SrvRequest::AnnounceTrack`): tags and cover ahead of the stream.
+    current: Option<somsrv::protocol::NextTrack>,
+    next: Option<somsrv::protocol::NextTrack>,
 }
 
 /// One playable entry of a parsed playlist.
@@ -856,6 +860,8 @@ fn announce_track(ids: SrpIds, position: &PlaylistPosition, tags: Option<somsrv:
             position.target.clone(),
             tags,
             position.looping,
+            position.current.clone(),
+            position.next.clone(),
         )
     });
     if let Err(err) = result {
@@ -1387,7 +1393,7 @@ fn stream_file(path: &str, audio_stream_index: Option<u32>, subtitle_stream_inde
 /// announced with a playlist length of `0` - "not in a playlist" - so Som
 /// shows its title but no previous/next buttons.
 fn run_standalone(entry: PlaylistEntry) -> Result<(), String> {
-    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone(), cue: None, looping: true, radio: false };
+    let position = PlaylistPosition { index: 0, len: 0, title: entry.title.clone(), target: entry.target.clone(), cue: None, looping: true, radio: false, current: None, next: None };
     if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
         stream_url(&entry.target, &position)
     } else {
@@ -1563,6 +1569,8 @@ fn stream_cue(path: &str) -> Result<(), String> {
             cue: entry.cue.clone(),
             looping: true,
             radio: false,
+            current: None,
+            next: None,
         };
         return stream_file_impl(&entry.target, None, None, Some(&position));
     }
@@ -1711,6 +1719,19 @@ struct RadioEntry {
     station: String,
 }
 
+/// What the radio's batch says of a track, as `somsrv` is told it ahead of the
+/// stream (`SrvRequest::AnnounceTrack`).
+fn announced_track(track: &somsrv::protocol::RadioTrack) -> somsrv::protocol::NextTrack {
+    somsrv::protocol::NextTrack {
+        artist: track.artist.clone(),
+        title: if track.name.is_empty() { track.title.clone() } else { track.name.clone() },
+        album: track.album.clone(),
+        year: track.year,
+        duration_ms: track.duration_ms,
+        cover_url: track.cover_url.clone(),
+    }
+}
+
 /// Tells the radio what happened to a track. A failure is only worth a
 /// line on the terminal: the radio plays on without feedback.
 fn radio_feedback(
@@ -1817,6 +1838,18 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             return Ok(());
         }
         PLAYLIST_STEP.store(0, std::sync::atomic::Ordering::Release);
+        // The track after this one is wanted before this one starts: its tags
+        // and cover are fetched while this one plays. When this is the last of
+        // the batch, the next batch is asked for now, the way the service's own
+        // player does, not when this one ends.
+        if cursor + 1 >= played.len() {
+            let (radio, last) = (played[cursor].station.clone(), played[cursor].track.id.clone());
+            match fetch_radio_entries(service, &radio, Some(&last)) {
+                Ok(more) => played.extend(more),
+                // Not fatal: the radio is asked again when this track ends.
+                Err(err) => eprint!("somsrp: could not get the next tracks ahead of time: {err}\r\n"),
+            }
+        }
         let entry = &played[cursor];
         *CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CurrentRadioTrack {
             service,
@@ -1832,6 +1865,8 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             cue: None,
             looping: false,
             radio: true,
+            current: Some(announced_track(&entry.track)),
+            next: played.get(cursor + 1).map(|following| announced_track(&following.track)),
         };
         radio_feedback(service, Some(entry), &entry.station, &entry.batch_id, RadioEvent::TrackStarted, 0.0);
         let started = std::time::Instant::now();
@@ -1983,6 +2018,8 @@ fn run_playlist(entries: Vec<PlaylistEntry>, looping: bool) -> Result<(), String
             cue: entry.cue.clone(),
             looping,
             radio: false,
+            current: None,
+            next: None,
         };
         let result = if entry.target.starts_with("http://") || entry.target.starts_with("https://") {
             stream_url(&entry.target, &position)
@@ -2358,6 +2395,29 @@ fn write_raw_stdout(bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn a_radio_track_is_announced_with_what_its_batch_says_of_it() {
+        let track = somsrv::protocol::RadioTrack {
+            id: "38526".to_string(),
+            title: "Portishead - Roads".to_string(),
+            artist: "Portishead".to_string(),
+            name: "Roads".to_string(),
+            album: "Dummy".to_string(),
+            year: Some(1994),
+            duration_ms: 300_000,
+            cover_url: Some("https://x/c.jpg".to_string()),
+            ..Default::default()
+        };
+        let announced = announced_track(&track);
+        assert_eq!((announced.artist.as_str(), announced.title.as_str(), announced.album.as_str()), ("Portishead", "Roads", "Dummy"));
+        assert_eq!((announced.year, announced.duration_ms), (Some(1994), 300_000));
+        assert_eq!(announced.cover_url.as_deref(), Some("https://x/c.jpg"));
+
+        // A batch from before the tags were carried says only the combined title.
+        let bare = somsrv::protocol::RadioTrack { title: "Portishead - Roads".to_string(), ..Default::default() };
+        assert_eq!(announced_track(&bare).title, "Portishead - Roads");
+    }
+
     use super::*;
 
     /// Isolates `video_metadata` from everything else `stream_file` does
@@ -2509,7 +2569,7 @@ yandex:wave
 
     fn radio_entry(id: &str, station: &str) -> RadioEntry {
         RadioEntry {
-            track: somsrv::protocol::RadioTrack { id: id.to_string(), title: id.to_string(), target: String::new(), liked: false, year: None },
+            track: somsrv::protocol::RadioTrack { id: id.to_string(), title: id.to_string(), ..Default::default() },
             batch_id: String::new(),
             station: station.to_string(),
         }

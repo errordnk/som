@@ -30,7 +30,7 @@ pub fn run(old_pid: u32, staged_path: &std::path::Path, final_path: &std::path::
     // Safe now — `old_pid` (the only process that could have been
     // executing `final_path`) is confirmed gone. `staged_path` and
     // `final_path` are always DIFFERENT files (`somsrv.new` vs
-    // `somsrv`), so this rename never touches whatever `somsrvupd`
+    // `somsrv`), so this rename never touches whatever the takeover
     // ITSELF is currently executing from either.
     std::fs::rename(staged_path, final_path)
         .map_err(|err| anyhow::anyhow!("failed to rename {staged_path:?} onto {final_path:?}: {err}"))?;
@@ -84,7 +84,7 @@ fn wait_for_pid_to_exit(pid: u32, graceful_timeout: Duration, total_timeout: Dur
 
         let elapsed = start.elapsed();
         if elapsed >= total_timeout {
-            eprintln!("somsrvupd: gave up waiting for old somsrv process {pid} to exit after {total_timeout:?}, proceeding anyway");
+            eprintln!("takeover: gave up waiting for old somsrv process {pid} to exit after {total_timeout:?}, proceeding anyway");
             return;
         }
         if !forced && elapsed >= graceful_timeout {
@@ -105,9 +105,9 @@ fn force_kill(system: &mut sysinfo::System, sysinfo_pid: sysinfo::Pid) {
 /// renamed `final_path` — mirrors `somsrv::daemon`'s own detached-spawn
 /// mechanics (survives this process's own exit, no console window, no
 /// inherited stdio), duplicated here rather than shared: `daemon.rs`
-/// lives in the library half of this crate and `somsrvupd` deliberately
+/// lives in the library half of this crate and the takeover deliberately
 /// depends on as little of it as possible (see this file's own module
-/// doc comment — `somsrvupd` is meant to stay small and simple, a
+/// doc comment — the takeover is meant to stay small and simple, a
 /// dependency this codebase can trust to keep working even if `somsrv`
 /// itself is mid-crash).
 #[cfg(target_os = "windows")]

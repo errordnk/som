@@ -682,19 +682,15 @@ impl TerminalView {
             }
         }
 
-        // For Standalone mode: always show cursor when not focused or in special modes
-        if !focused
-            || self
-                .terminal
-                .read(cx)
-                .last_content
-                .mode
-                .contains(TermMode::ALT_SCREEN)
-        {
+        // For Standalone mode: always show cursor when not focused
+        if !focused {
             return true;
         }
 
-        // When focused, check blinking settings and blink manager state
+        // When focused, check blinking settings and blink manager state. This
+        // holds in the alternate screen too (mc, micro, vim): the cursor
+        // blinks there exactly as it does at the prompt, like in other
+        // terminals.
         match TerminalSettings::get_global(cx).blinking {
             TerminalBlink::Off => true,
             TerminalBlink::TerminalControlled => {

@@ -172,6 +172,21 @@ struct WakeupPacing {
     after_input: std::time::Duration,
 }
 
+/// How long the event loop in `TerminalBuilder::subscribe` waits for more PTY
+/// events before it hands what it has to the terminal: none by default, the
+/// events that are already queued go in together and nothing waits for a
+/// timer. Waiting 4 ms was in fact a whole timer tick (15.6 ms on Windows) and
+/// added 5 ms on average, up to 15, to every step of a held key scrolling in
+/// micro, and made steps get skipped; the output of a 30 MB `cat` costs the
+/// same either way. `SOM_EVENT_BATCH_MS` brings a window back (for measuring).
+fn event_batch_window() -> std::time::Duration {
+    static WINDOW: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let millis = std::env::var("SOM_EVENT_BATCH_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        std::time::Duration::from_millis(millis)
+    })
+}
+
 fn wakeup_pacing() -> WakeupPacing {
     static PACING: std::sync::OnceLock<WakeupPacing> = std::sync::OnceLock::new();
     *PACING.get_or_init(|| {
@@ -1006,7 +1021,7 @@ impl TerminalBuilder {
                     #[cfg(not(any(test, feature = "test-support")))]
                     let mut timer = cx
                         .background_executor()
-                        .timer(std::time::Duration::from_millis(4))
+                        .timer(event_batch_window())
                         .fuse();
 
                     let mut wakeup = false;

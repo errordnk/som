@@ -190,7 +190,7 @@ pub struct TabProfile {
     /// doc comment above.
     pub lua: bool,
     /// Explicit remote OS for this profile's SSH/WSL host — `"win"`,
-    /// `"mac"`, or `"lnx"` (default). Picks which pre-built `somsrv`
+    /// `"mac"`, `"lnx-arm"`, or `"lnx"` (default). Picks which pre-built `somsrv`
     /// binary `terminal_panel::ensure_remote_binary_deployed` uploads;
     /// see `workspace::RemoteOs`'s own doc comment for why this
     /// replaced a `uname`-based guess (2026-09-15).

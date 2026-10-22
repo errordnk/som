@@ -80,7 +80,7 @@ Windows, macOS, Linux — one codebase, native speed. Each build is a self-conta
 
 - **Windows** — amd64 · an embedded patched ConPTY from the Windows Terminal project, without the standard system-console bugs.
 - **macOS** — Apple Silicon (arm64) · native integration with the system title bar and trackpad gestures.
-- **Linux** — amd64 · X11 and Wayland through GPUI; `somsrv` deploys to remote Linux servers too.
+- **Linux** — amd64 and arm64 (Raspberry Pi 5) · X11 and Wayland through GPUI; `somsrv` deploys to remote Linux servers too.
 
 ## Configuration
 

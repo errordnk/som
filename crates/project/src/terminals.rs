@@ -58,6 +58,34 @@ pub fn parse_shell_command(cmd: &str) -> (String, Vec<String>) {
     (program, args)
 }
 
+/// A bare `ssh` in a profile's `shell` on Windows is resolved through `PATH`,
+/// and Git for Windows puts its own `usr\bin` (the MSYS/Cygwin build of ssh)
+/// ahead of `System32\OpenSSH`. That build is several times slower under
+/// ConPTY: measured against the Windows OpenSSH client with the same 240
+/// held arrow-key presses in micro, it needs 9-16 s more to catch up and
+/// leaves 1-6 lines out of every frame, while the Windows client (like
+/// Windows Terminal, which runs it) shows every line with no lag. The `tmux`
+/// and `srp` tabs already name `System32\OpenSSH\ssh.exe` explicitly; this
+/// does the same for plain `ssh` tabs. Anything else (another program, an
+/// explicit path) is returned as is, as is a machine without the Windows
+/// client.
+#[cfg(target_os = "windows")]
+pub fn prefer_windows_openssh(program: String) -> String {
+    if !(program.eq_ignore_ascii_case("ssh") || program.eq_ignore_ascii_case("ssh.exe")) {
+        return program;
+    }
+    let candidate = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()))
+        .join("System32")
+        .join("OpenSSH")
+        .join("ssh.exe");
+    if candidate.is_file() { candidate.to_string_lossy().into_owned() } else { program }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn prefer_windows_openssh(program: String) -> String {
+    program
+}
+
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
@@ -111,6 +139,7 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let (program, args) = parse_shell_command(&shell_cmd);
+        let program = prefer_windows_openssh(program);
         let shell = if args.is_empty() {
             Shell::Program(program)
         } else {
@@ -366,6 +395,35 @@ impl Project {
                 })
         } else {
             Task::ready(None).shared()
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefer_windows_openssh_tests {
+    use super::prefer_windows_openssh;
+
+    #[test]
+    fn programs_other_than_a_bare_ssh_are_left_alone() {
+        for program in ["pwsh.exe", "wsl", "somsrv", "/usr/bin/ssh", "sshd"] {
+            assert_eq!(prefer_windows_openssh(program.to_string()), program);
+        }
+        let explicit = r"C:\Program Files\Git\usr\bin\ssh.exe";
+        assert_eq!(prefer_windows_openssh(explicit.to_string()), explicit, "an explicit path is the user's choice");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_bare_ssh_becomes_the_windows_openssh_client_when_it_is_there() {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        let client = std::path::PathBuf::from(windir).join("System32").join("OpenSSH").join("ssh.exe");
+        for spelling in ["ssh", "SSH", "ssh.exe"] {
+            let resolved = prefer_windows_openssh(spelling.to_string());
+            if client.is_file() {
+                assert_eq!(std::path::PathBuf::from(&resolved), client);
+            } else {
+                assert_eq!(resolved, spelling);
+            }
         }
     }
 }

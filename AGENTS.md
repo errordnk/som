@@ -125,6 +125,15 @@ cargo check -p som 2>&1 | tail -20
 - macOS/Linux ignore all of the above — `ffmpeg-sys-next` only probes
   vcpkg under MSVC and otherwise uses system pkg-config (brew / apt).
 
+## macOS: сборка падает в aws-lc-sys (libSystem.tbd "unknown architecture")
+
+Симптом: `ld: tapi error: malformed file ... MacOSX27.0.sdk/usr/lib/libSystem.B.tbd`. Причина не в
+исходниках: SDK по умолчанию (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`) новее, чем
+понимает установленный линкер. Лечится выбором согласованного SDK: на dev-mac это
+`[env] SDKROOT = ".../CommandLineTools/SDKs/MacOSX26.5.sdk"` в `~/.cargo/config.toml` (пользовательский
+файл, НЕ репозиторий: путь зависит от машины, в checked-in `.cargo/config.toml` его прописывать
+нельзя — сломает машины без этого SDK). На свежем mac с согласованными Xcode/CLT ничего не нужно.
+
 ## On-disk layout (client machine) — `crates/paths/src/paths.rs`
 
 Three separate directories, never mixed:

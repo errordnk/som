@@ -2734,6 +2734,31 @@ mod tmux_shell_wrapping_tests {
         assert!(rebuild_tmux_shell_with_fresh_pane_id(&Shell::Program("bash".to_string())).is_none());
     }
 
+    /// Every platform a profile's `os` can name has its own binary embedded,
+    /// built for that platform, with a readable build id.
+    #[test]
+    fn every_remote_os_has_an_embedded_somsrv_built_for_it() {
+        const ELF_AARCH64: u16 = 0xB7;
+        const ELF_X86_64: u16 = 0x3E;
+        for (remote_os, magic) in [
+            (workspace::RemoteOs::Win, &b"MZ"[..]),
+            (workspace::RemoteOs::Mac, &[0xCF, 0xFA, 0xED, 0xFE][..]),
+            (workspace::RemoteOs::Lnx, &b"ELF"[..]),
+            (workspace::RemoteOs::LnxArm, &b"ELF"[..]),
+        ] {
+            let (os, arch) = remote_os_to_platform(remote_os);
+            let bytes = embedded_somsrv_bytes(os, arch).expect("embedded somsrv");
+            assert!(bytes.starts_with(magic), "{remote_os:?}: not an executable of the right kind");
+            assert!(somsrv::protocol::build_id_in(&bytes).is_some(), "{remote_os:?}: no build id in the binary");
+            let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+            match remote_os {
+                workspace::RemoteOs::Lnx => assert_eq!(machine, ELF_X86_64),
+                workspace::RemoteOs::LnxArm => assert_eq!(machine, ELF_AARCH64),
+                _ => {},
+            }
+        }
+    }
+
     /// Overridable via env var, same convention `terminal`'s own SSH
     /// integration tests use — defaults to `localhost` (a local sshd, e.g.
     /// WSL2's own on this dev machine) so the test suite doesn't depend on

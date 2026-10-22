@@ -107,6 +107,8 @@ One JSON file, live reload. `~/.config/som/settings.json` — edit it, save, and
 
 **What's configurable:** theme, font and ligatures, cursor shape and color, scroll speed, tab profiles with any command (a plain shell, `ssh`, `wsl`), a hotkey for every action, terminal padding, startup window position and size.
 
+**`ssh` tabs on Windows run the Windows OpenSSH client.** A bare `ssh` in a profile's `shell` is resolved to `System32\OpenSSH\ssh.exe`, not to the MSYS build that comes with Git for Windows (which usually sits first in `PATH`). Under ConPTY the MSYS build is several times slower: scrolling in micro or mc over `ssh` fell seconds behind the keyboard and skipped lines. With the Windows client every line is drawn, as in Windows Terminal. If you want another client, give its full path in `shell`.
+
 The default profile is marked with `"default": true` — that's the one `Ctrl+Shift+=` and the "+" button open.
 
 ## Themes

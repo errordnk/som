@@ -783,6 +783,7 @@
       <div>
         <h3 style="color: var(--fg0); font-size: 18px; margin-top:0;">Что настраивается</h3>
         <p style="color: var(--muted); font-size: 15px;">Тема, шрифт и лигатуры, форма и цвет курсора, скорость прокрутки, профили вкладок с любыми командами (обычный shell, <code>ssh</code>, <code>wsl</code>), горячие клавиши на каждое действие, отступы терминала, стартовая позиция и размер окна.</p>
+        <p style="color: var(--muted); font-size: 15px;"><strong>Вкладки <code>ssh</code> в Windows запускают клиент Windows OpenSSH.</strong> Голый <code>ssh</code> в <code>shell</code> профиля превращается в <code>System32\OpenSSH\ssh.exe</code>, а не в MSYS-сборку из Git for Windows (она обычно стоит в <code>PATH</code> первой). Под ConPTY MSYS-сборка в разы медленнее: прокрутка в micro или mc по <code>ssh</code> отставала от клавиатуры на секунды и пропускала строки. С клиентом Windows рисуется каждая строка, как в Windows Terminal. Нужен другой клиент — укажите полный путь в <code>shell</code>.</p>
         <p style="color: var(--muted); font-size: 15px;">Профиль по умолчанию помечается флагом <code>"default": true</code> — именно его открывает <kbd>Ctrl+Shift+=</kbd> и кнопка «+».</p>
       </div>
     </div>

@@ -156,25 +156,17 @@ pub fn submit(mut record: Record) {
         handle.into_inner()
     });
     if let Some(file) = file_guard.as_mut() {
-        struct SizedWriter<'a> {
-            file: &'a mut std::fs::File,
-            written: u64,
-        }
-        impl io::Write for SizedWriter<'_> {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.file.write(buf)?;
-                self.written += buf.len() as u64;
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                self.file.flush()
-            }
-        }
         let file_size_bytes = {
-            let mut writer = SizedWriter { file, written: 0 };
+            // The whole line is built in memory and handed to the file in ONE
+            // write: formatting straight into the unbuffered `File` made a
+            // system call per piece of the line (time, level, source,
+            // message, newline), and at `trace` level a screenful of
+            // terminal output is hundreds of lines - the UI stalled in
+            // `NtWriteFile` (92% of the busy thread) while scrolling.
+            use std::fmt::Write as _;
+            let mut line = String::with_capacity(256);
             _ = writeln!(
-                &mut writer,
+                &mut line,
                 "{} {} {} {}",
                 chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
                 LEVEL_OUTPUT_STRINGS[record.level as usize],
@@ -186,7 +178,9 @@ pub fn submit(mut record: Record) {
                 },
                 record.message
             );
-            SINK_FILE_SIZE_BYTES.fetch_add(writer.written, Ordering::AcqRel) + writer.written
+            _ = file.write_all(line.as_bytes());
+            let written = line.len() as u64;
+            SINK_FILE_SIZE_BYTES.fetch_add(written, Ordering::AcqRel) + written
         };
         if file_size_bytes > SINK_FILE_SIZE_BYTES_MAX {
             *file_guard = None;

@@ -129,7 +129,10 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: "all".to_string(), days: 7 }
+        // Only errors unless the user asks for more (`log.level` in
+        // settings.json, or `ZED_LOG` in the environment): every log line is
+        // a system call, and at `trace` there are a lot of lines.
+        Self { level: "error".to_string(), days: 7 }
     }
 }
 

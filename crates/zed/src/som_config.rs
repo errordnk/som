@@ -169,7 +169,7 @@ pub struct ScrollConfig {
     pub alternate_scroll: Option<String>,
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TabProfile {
     pub name: String,
@@ -183,7 +183,8 @@ pub struct TabProfile {
     /// `true` everywhere it's supported, keeping the field only as an
     /// explicit opt-out.
     pub tmux: bool,
-    /// Independent opt-in to the SRP (rich content) side of `somsrv` —
+    /// On by default (opt out with `"srp": false`): the SRP (rich content)
+    /// side of `somsrv` —
     /// see `workspace::TabProfile::srp`'s own doc comment for the full
     /// policy (2026-09-15: `tmux`/`srp`/`lua` are three independent
     /// feature flags that all share the same underlying SRP connection
@@ -212,6 +213,25 @@ pub struct TabProfile {
     /// already running elevated this has no effect — the tab simply opens
     /// in place. Ignored on macOS/Linux.
     pub admin: bool,
+}
+
+/// The same as `derive(Default)` would give, except `srp`: rich content over
+/// the tab's own connection is on unless a profile says `"srp": false`.
+impl Default for TabProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            icon: None,
+            shell: None,
+            home: None,
+            tmux: false,
+            srp: true,
+            lua: false,
+            os: String::new(),
+            default: false,
+            admin: false,
+        }
+    }
 }
 
 impl SomConfig {
@@ -680,6 +700,17 @@ mod tests {
 
     /// What the watcher hands to `TabProfiles::set` on every change of
     /// settings.json: a profile edited to `"srp": true` must come out with it.
+    #[test]
+    fn srp_is_on_for_a_profile_unless_it_opts_out() {
+        let profile: TabProfile = serde_json::from_str(r#"{ "name": "box", "shell": "ssh box" }"#).unwrap();
+        assert!(profile.srp, "no `srp` key: on");
+        assert!(TabProfile::default().srp, "a default profile agrees with the parsed one");
+        let off: TabProfile = serde_json::from_str(r#"{ "name": "box", "shell": "ssh box", "srp": false }"#).unwrap();
+        assert!(!off.srp, "an explicit false opts out");
+        assert!(!profile.tmux && !profile.lua, "the other two flags stay opt-in");
+    }
+
+
     #[test]
     fn tab_profiles_follow_an_edited_settings_file() {
         let before = SomConfig::parse(r#"{"tabs":[{"name":"wsl","shell":"wsl --cd ~"}]}"#).expect("parses");

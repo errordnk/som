@@ -554,6 +554,32 @@ impl SomConfig {
         Ok(config)
     }
 
+    /// The tab profiles in the form the rest of Som reads them: each profile
+    /// with the keystroke bound to its `NewTab<N>` action.
+    pub fn tab_profiles(&self) -> Vec<workspace::TabProfile> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let key_name = format!("NewTab{}", i + 1);
+                let keystroke = self.keys.iter().find(|(_, v)| *v == &key_name).map(|(k, _)| k.clone());
+                workspace::TabProfile {
+                    name: t.name.clone(),
+                    shell: t.shell.clone(),
+                    keystroke,
+                    icon: t.icon.clone(),
+                    home: t.home.clone(),
+                    tmux: t.tmux,
+                    srp: t.srp,
+                    lua: t.lua,
+                    os: workspace::RemoteOs::parse(&t.os),
+                    default: t.default,
+                    admin: t.admin,
+                }
+            })
+            .collect()
+    }
+
     pub fn watch(fs: Arc<dyn Fs>, cx: &mut App) {
         let settings_path = paths::config_dir().join("settings.json");
         let (mut rx, _watcher) = settings::watch_config_file(
@@ -569,6 +595,7 @@ impl SomConfig {
                         cx.update(|cx| {
                             config.apply_settings(cx);
                             config.apply_keys(cx);
+                            workspace::TabProfiles::set(config.tab_profiles(), cx);
 
                             let padding = config.window.padding.clone().unwrap_or_default();
                             workspace::SomWindowSettings::set(
@@ -647,6 +674,21 @@ impl SomConfig {
 mod tests {
     use super::*;
     use gpui::{Keystroke, Modifiers, TestAppContext};
+
+    /// What the watcher hands to `TabProfiles::set` on every change of
+    /// settings.json: a profile edited to `"srp": true` must come out with it.
+    #[test]
+    fn tab_profiles_follow_an_edited_settings_file() {
+        let before = SomConfig::parse(r#"{"tabs":[{"name":"wsl","shell":"wsl --cd ~"}]}"#).expect("parses");
+        assert!(!before.tab_profiles()[0].srp);
+
+        let after = SomConfig::parse(r#"{"tabs":[{"name":"wsl","shell":"wsl --cd ~","srp":true},{"name":"x","shell":"sh","os":"lnx-arm"}]}"#)
+            .expect("parses");
+        let profiles = after.tab_profiles();
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles[0].srp);
+        assert_eq!(profiles[1].os, workspace::RemoteOs::LnxArm);
+    }
 
     /// Every keystroke string that ships in `assets/macos.json`'s default
     /// `keys` map, hand-copied so a change to the asset doesn't silently

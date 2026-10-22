@@ -117,11 +117,13 @@ An ordered array of tab profiles. The bare `NewTab` action (`Ctrl+Shift+=`/`Cmd+
 |---|---|---|---|
 | `name` | string | `""` | Tab title, and the label used in the profile picker dropdown. |
 | `icon` | string | none | Glyph shown on the tab (works best with a Nerd Font — see `font.face`). |
-| `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. |
+| `shell` | string | system default shell | Command to run. Supports plain shells, `ssh <host>`, and `wsl` invocations. On Windows a bare `ssh` runs the Windows OpenSSH client, see below. |
 | `home` | string | none | Working directory; `~` is expanded. Must resolve to an existing directory or is ignored. |
 | `tmux` | bool | `false` | Opt-in to the `somsrv` backend for this profile — keeps the session alive across Som restarts. See [somsrv](#somsrv-keeping-remote-sessions-alive). |
 | `admin` | bool | `false` | Local shells only (ignored for `ssh`/`wsl` profiles): open this profile in a new Som window running as administrator/root — UAC on Windows, an admin-password dialog via `osascript` on macOS, `pkexec` (polkit) on Linux. Declining the prompt opens nothing. The elevated window holds just this one tab, reads your normal `settings.json`, and does not save or restore the session. |
 | `default` | bool | `false` | Marks this profile as the one the `+` button/bare `NewTab` action opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
+
+**`ssh` on Windows.** A bare `ssh` (or `ssh.exe`) in a profile's `shell` is run as `%WINDIR%\System32\OpenSSH\ssh.exe`, the Windows OpenSSH client - the same one Windows Terminal runs - and not as whatever `PATH` finds first. Git for Windows puts its own MSYS build of `ssh` ahead of it, and under ConPTY that build is several times slower: holding an arrow key in micro or mc over `ssh` left a backlog of seconds and skipped 1-6 lines per frame, while the Windows client shows every line. `tmux`/`srp` tabs already used the Windows client. A `shell` that names the program by path (`"C:\Program Files\Git\usr\bin\ssh.exe" host`) is left as written, and on a machine without `System32\OpenSSH` the bare name is resolved through `PATH` as before.
 
 ### `keys`
 

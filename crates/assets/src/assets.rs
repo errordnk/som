@@ -46,8 +46,7 @@ use rust_embed::RustEmbed;
 // `Arc<RenderImage>` across repeated paints.
 #[include = "images/dna.png"]
 // Pre-built somsrv binaries for every remote platform Som's `tmux: true`
-// profiles support (Windows amd64, macOS arm64, Linux amd64 — NOT
-// linux-arm, which stays permanently unsupported) — see
+// profiles support (Windows amd64, macOS arm64, Linux amd64, Linux arm64) — see
 // `terminal_view::terminal_panel::stage_embedded_somsrv_to_temp_file`,
 // which writes these bytes out to a throwaway temp file for the duration
 // of a single `scp` deploy (no permanent on-disk cache). Kept up to date
@@ -56,6 +55,7 @@ use rust_embed::RustEmbed;
 #[include = "srv/windows-amd/somsrv.exe"]
 #[include = "srv/macos-arm/somsrv"]
 #[include = "srv/linux-amd/somsrv"]
+#[include = "srv/linux-arm/somsrv"]
 // The Windows Terminal project's improved ConPTY backend — see `crates/zed/
 // build.rs`'s doc comment for where these are downloaded from (a pinned
 // nupkg version) and `crates/zed/src/main.rs`'s startup extraction, which

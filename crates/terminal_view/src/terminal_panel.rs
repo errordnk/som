@@ -1958,13 +1958,14 @@ fn stage_embedded_somsrv_to_temp_file(os: somsrv::protocol::Os, arch: somsrv::pr
 /// Maps the profile's own explicit `RemoteOs` (from `settings.json`'s
 /// `os` field — no heuristics, see that type's own doc comment) onto the
 /// `(Os, Arch)` pair `ensure_embedded_binary_available` needs — this
-/// codebase's three supported platform combos, `Lnx` always meaning
-/// `linux-amd` (`linux-arm` stays permanently unsupported).
+/// codebase's four supported platform combos, `Lnx` always meaning
+/// `linux-amd` and `LnxArm` meaning `linux-arm`.
 fn remote_os_to_platform(os: workspace::RemoteOs) -> (somsrv::protocol::Os, somsrv::protocol::Arch) {
     match os {
         workspace::RemoteOs::Win => (somsrv::protocol::Os::Windows, somsrv::protocol::Arch::Amd64),
         workspace::RemoteOs::Mac => (somsrv::protocol::Os::Darwin, somsrv::protocol::Arch::Arm64),
         workspace::RemoteOs::Lnx => (somsrv::protocol::Os::Linux, somsrv::protocol::Arch::Amd64),
+        workspace::RemoteOs::LnxArm => (somsrv::protocol::Os::Linux, somsrv::protocol::Arch::Arm64),
     }
 }
 

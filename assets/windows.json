@@ -11,7 +11,7 @@
     "selection": "#88c0d0"
   },
   "log": {
-    "level": "trace",
+    "level": "error",
     "days": 7
   },
   "font": {

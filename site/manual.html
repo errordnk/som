@@ -362,7 +362,7 @@
     <div class="doc-table-wrap">
       <table class="doc-table">
         <tr><th>Ключ</th><th>Тип</th><th>По умолчанию</th><th>Эффект</th></tr>
-        <tr><td><code>log.level</code></td><td>строка</td><td><code>"all"</code> (<code>"trace"</code> в Windows-шаблоне)</td><td>Уровень фильтрации логов, читается один раз при старте.</td></tr>
+        <tr><td><code>log.level</code></td><td>строка</td><td><code>"error"</code></td><td>Уровень фильтрации логов, читается один раз при старте; переменная окружения <code>ZED_LOG</code>, если задана, главнее. На <code>"trace"</code> построчная трассировка разбора escape-последовательностей остаётся на уровне <code>debug</code> — включается по имени, например <code>ZED_LOG=trace,alacritty_terminal::vt_ops=trace</code>.</td></tr>
         <tr><td><code>log.days</code></td><td>число</td><td><code>7</code></td><td>Только Windows: сколько дней ротированных лог-файлов хранить.</td></tr>
       </table>
     </div>

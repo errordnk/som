@@ -42,6 +42,12 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     // usvg prints a lot of warnings on rendering an SVG with partial errors, which
     // can happen a lot with the SVG preview
     ("usvg::parser", log::LevelFilter::Error),
+    // The terminal parser traces every escape sequence it applies: a screenful
+    // of redrawn text is hundreds of lines, and with the whole program at
+    // `trace` writing them made scrolling crawl. Capped here, so `trace`
+    // stays usable for everything else; ask for them by name when needed:
+    // `ZED_LOG=trace,alacritty_terminal::vt_ops=trace`.
+    ("alacritty_terminal::vt_ops", log::LevelFilter::Debug),
 ];
 
 /// Sets the environment filter. The FIRST one wins: with `RUST_LOG`/
@@ -828,6 +834,37 @@ mod tests {
             ),
             EnabledStatus::NotConfigured,
             "Module crate::module::default::sub should not be affected by crate::module::default filter"
+        );
+    }
+
+    #[test]
+    fn the_per_escape_sequence_trace_is_off_by_default_but_can_be_asked_for() {
+        use log::Level;
+
+        let scope = scope_new(&["alacritty_terminal"]);
+        let vt_ops = Some("alacritty_terminal::vt_ops");
+
+        let by_default =
+            ScopeMap::new_from_settings_and_env(&HashMap::default(), None, DEFAULT_FILTERS);
+        assert_eq!(
+            by_default.is_enabled(&scope, vt_ops, Level::Trace),
+            EnabledStatus::Disabled,
+            "the firehose is capped even when the whole program runs at trace"
+        );
+        assert_eq!(by_default.is_enabled(&scope, vt_ops, Level::Debug), EnabledStatus::Enabled);
+        assert_eq!(
+            by_default.is_enabled(&scope, Some("alacritty_terminal::term"), Level::Trace),
+            EnabledStatus::NotConfigured,
+            "the rest of the terminal crate follows the global level"
+        );
+
+        let env = env_config::parse("trace,alacritty_terminal::vt_ops=trace").unwrap();
+        let asked_for =
+            ScopeMap::new_from_settings_and_env(&HashMap::default(), Some(&env), DEFAULT_FILTERS);
+        assert_eq!(
+            asked_for.is_enabled(&scope, vt_ops, Level::Trace),
+            EnabledStatus::Enabled,
+            "naming the module in the environment filter turns it back on"
         );
     }
 

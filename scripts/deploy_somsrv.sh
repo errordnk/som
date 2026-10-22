@@ -19,18 +19,18 @@ MAC=mac
 WIN_SRV_DIR="$HOME/.config/som/srv"
 
 echo "==> building on $DEB (linux-amd)"
-ssh "$DEB" "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
+ssh "$DEB" "cd ~/src/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
 
 echo "==> building on $MAC (macos-arm)"
-ssh "$MAC" "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
+ssh "$MAC" "cd ~/src/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
 
 echo "==> building locally on windows-amd"
 (cd "$(dirname "$0")/.." && cargo build --release -p somsrv)
 
 echo "==> collecting binaries to $WIN_SRV_DIR"
 mkdir -p "$WIN_SRV_DIR/windows-amd" "$WIN_SRV_DIR/macos-arm" "$WIN_SRV_DIR/linux-amd"
-scp "$DEB:~/som/target/release/somsrv" "$WIN_SRV_DIR/linux-amd/somsrv"
-scp "$MAC:~/som/target/release/somsrv" "$WIN_SRV_DIR/macos-arm/somsrv"
+scp "$DEB:~/src/som/target/release/somsrv" "$WIN_SRV_DIR/linux-amd/somsrv"
+scp "$MAC:~/src/som/target/release/somsrv" "$WIN_SRV_DIR/macos-arm/somsrv"
 cp "$(dirname "$0")/../target/release/somsrv.exe" "$WIN_SRV_DIR/windows-amd/somsrv.exe"
 
 echo "==> distributing full set to $DEB and $MAC"

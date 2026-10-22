@@ -8910,6 +8910,58 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_widget_hides_the_cursor_and_shows_it_again_when_left(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::HSTRING;
+            let conpty_dir =
+                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
+            if conpty_dir.join("conpty.dll").is_file() {
+                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
+            }
+        }
+
+        let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
+        let (terminal, completion_rx) = build_test_terminal_with_arguments(
+            cx,
+            somsrp_path.to_string_lossy().into_owned(),
+            vec![giphy_path.to_string_lossy().into_owned()],
+        )
+        .await;
+
+        let cursor_shown = |terminal: &Entity<Terminal>, cx: &mut TestAppContext| {
+            terminal.update(cx, |term, _| term.term.lock().mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR))
+        };
+        let mut widget_up = false;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+            if !terminal.update(cx, |term, _| term.rich_content_placements()).is_empty() {
+                widget_up = true;
+                break;
+            }
+        }
+        assert!(widget_up, "the widget never came up");
+        assert!(!cursor_shown(&terminal, cx), "the cursor must be hidden while the widget is up");
+
+        terminal.update(cx, |term, _| term.input(b"".to_vec()));
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            if completion_rx.try_recv().is_ok() {
+                break;
+            }
+        }
+        cx.run_until_parked();
+        assert!(cursor_shown(&terminal, cx), "the cursor must be back once the widget is left");
+    }
+
+    #[gpui::test]
     async fn test_rich_content_markdown_placement_reaches_the_paint_path_via_a_real_process(cx: &mut TestAppContext) {
         // Markdown counterpart to `test_rich_content_placements_reach_the_
         // paint_path_via_a_real_process` above — proves the SRP_LUA.md

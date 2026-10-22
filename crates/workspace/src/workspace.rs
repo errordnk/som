@@ -449,7 +449,7 @@ pub struct TabProfile {
     /// The remote host's OS for this profile's SSH/WSL shell, used by
     /// `terminal_view::terminal_panel::ensure_remote_binary_deployed` to
     /// pick which pre-built `somsrv` binary to upload — explicit and
-    /// user-configured (`settings.json`'s `os: "win"|"mac"|"lnx"`), NOT
+    /// user-configured (`settings.json`'s `os: "win"|"mac"|"lnx"|"lnx-arm"`), NOT
     /// detected via a `uname` probe (2026-09-15 redesign: a remote-
     /// platform guess added round-trip latency and its own failure mode
     /// for no real benefit once every profile can just say what it is).
@@ -462,21 +462,22 @@ pub struct TabProfile {
     pub admin: bool,
 }
 
-/// The three remote platforms Som ships a pre-built `somsrv` for (see
+/// The four remote platforms Som ships a pre-built `somsrv` for (see
 /// `somsrv::protocol::platform_dir_name` / `assets/srv/{platform}/`) —
 /// `"lnx"` is `TabProfile::os`'s default (a real remote SSH/WSL target
 /// is far more often Linux than Windows or macOS in practice, per
 /// explicit user direction 2026-09-15) so a profile with no `os` field
 /// at all still deploys something reasonable rather than silently
 /// guessing Windows for what's usually a Linux box. `Lnx` always means
-/// `linux-amd` — `linux-arm` stays permanently unsupported, so there is
-/// no separate arm variant to choose here.
+/// `linux-amd`; a 64-bit ARM Linux box (a Raspberry Pi 5, say) is
+/// `LnxArm` (`"lnx-arm"`), `linux-arm` in the asset tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RemoteOs {
     Win,
     Mac,
     #[default]
     Lnx,
+    LnxArm,
 }
 
 impl RemoteOs {
@@ -490,6 +491,7 @@ impl RemoteOs {
         match value {
             "win" => Self::Win,
             "mac" => Self::Mac,
+            "lnx-arm" => Self::LnxArm,
             _ => Self::Lnx,
         }
     }
@@ -538,6 +540,25 @@ impl SomWindowSettings {
 
     fn get(cx: &gpui::App) -> SomWindowSettings {
         cx.try_global::<SomWindowSettings>().copied().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod remote_os_tests {
+    use super::RemoteOs;
+
+    #[test]
+    fn every_platform_name_parses_to_its_own_variant() {
+        assert_eq!(RemoteOs::parse("win"), RemoteOs::Win);
+        assert_eq!(RemoteOs::parse("mac"), RemoteOs::Mac);
+        assert_eq!(RemoteOs::parse("lnx"), RemoteOs::Lnx);
+        assert_eq!(RemoteOs::parse("lnx-arm"), RemoteOs::LnxArm);
+    }
+
+    #[test]
+    fn anything_else_is_a_linux_amd_box() {
+        assert_eq!(RemoteOs::parse(""), RemoteOs::Lnx);
+        assert_eq!(RemoteOs::parse("lnx-arm64"), RemoteOs::Lnx);
     }
 }
 

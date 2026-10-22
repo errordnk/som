@@ -20,7 +20,7 @@
 # with crates/zed/Cargo.toml's — see HandshakeInfo's doc comment).
 #
 # Requires: git pushed to origin/main already (this pulls, doesn't push);
-# WSL installed with its own ~/som clone; passwordless SSH to the mac build
+# WSL installed with its own ~/src/som clone; passwordless SSH to the mac build
 # server (192.168.50.6) already set up (same as Som itself needs for its
 # own `mac` SSH profile).
 set -euo pipefail
@@ -30,18 +30,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ASSETS_SRV_DIR="$REPO_ROOT/assets/srv"
 
 echo "==> building linux-amd via WSL"
-wsl -- bash -lc "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
+wsl -- bash -lc "cd ~/src/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
 
 echo "==> building macos-arm via $MAC_HOST"
-ssh "$MAC_HOST" "cd ~/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
+ssh "$MAC_HOST" "cd ~/src/som && git pull && (source ~/.cargo/env 2>/dev/null; cargo build --release -p somsrv)"
 
 echo "==> building windows-amd locally"
 (cd "$REPO_ROOT" && cargo build --release -p somsrv)
 
 echo "==> collecting binaries into $ASSETS_SRV_DIR"
 mkdir -p "$ASSETS_SRV_DIR/windows-amd" "$ASSETS_SRV_DIR/macos-arm" "$ASSETS_SRV_DIR/linux-amd"
-wsl -- bash -lc "cat ~/som/target/release/somsrv" > "$ASSETS_SRV_DIR/linux-amd/somsrv"
-scp "$MAC_HOST:~/som/target/release/somsrv" "$ASSETS_SRV_DIR/macos-arm/somsrv"
+wsl -- bash -lc "cat ~/src/som/target/release/somsrv" > "$ASSETS_SRV_DIR/linux-amd/somsrv"
+scp "$MAC_HOST:~/src/som/target/release/somsrv" "$ASSETS_SRV_DIR/macos-arm/somsrv"
 cp "$REPO_ROOT/target/release/somsrv.exe" "$ASSETS_SRV_DIR/windows-amd/somsrv.exe"
 chmod +x "$ASSETS_SRV_DIR/linux-amd/somsrv" "$ASSETS_SRV_DIR/macos-arm/somsrv"
 

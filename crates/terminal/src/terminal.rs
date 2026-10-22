@@ -155,8 +155,9 @@ const AUDIO_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_
 const FORCE_REDRAW_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// How the view is told about new terminal output - see
-/// `Terminal::emit_wakeup_throttled`. `SOM_REDRAW_QUIET_MS` and
-/// `SOM_REDRAW_MAX_MS` override the values (for measuring).
+/// `Terminal::emit_wakeup_throttled`. `SOM_REDRAW_QUIET_MS`,
+/// `SOM_REDRAW_MAX_MS`, `SOM_REDRAW_IDLE_MS` and `SOM_REDRAW_INPUT_MS` override
+/// the values (for measuring).
 #[derive(Clone, Copy)]
 struct WakeupPacing {
     /// A pause in the output this long ends a burst.
@@ -166,6 +167,9 @@ struct WakeupPacing {
     /// Output arriving this long after the previous piece starts a burst
     /// anew: it is drawn at once.
     leading_idle: std::time::Duration,
+    /// Output arriving within this long after the user's input is drawn at
+    /// once, never held back: it is the answer to what they just did.
+    after_input: std::time::Duration,
 }
 
 fn wakeup_pacing() -> WakeupPacing {
@@ -179,6 +183,7 @@ fn wakeup_pacing() -> WakeupPacing {
             quiet: millis("SOM_REDRAW_QUIET_MS", 60),
             max_wait: millis("SOM_REDRAW_MAX_MS", 250),
             leading_idle: millis("SOM_REDRAW_IDLE_MS", 100),
+            after_input: millis("SOM_REDRAW_INPUT_MS", 150),
         }
     })
 }
@@ -551,6 +556,7 @@ impl TerminalBuilder {
             redraw_due: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_wakeup_seen: std::cell::Cell::new(None),
             wakeup_pending: std::cell::Cell::new(false),
+            last_input: std::cell::Cell::new(None),
             placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
             last_full_placeholder_scan: std::cell::Cell::new(None),
             markdown_origins_cache: std::cell::RefCell::new(None),
@@ -913,6 +919,7 @@ impl TerminalBuilder {
                 redraw_due: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 last_wakeup_seen: std::cell::Cell::new(None),
                 wakeup_pending: std::cell::Cell::new(false),
+                last_input: std::cell::Cell::new(None),
                 placeholders_scanned_generation: std::cell::Cell::new(u64::MAX),
                 last_full_placeholder_scan: std::cell::Cell::new(None),
                 markdown_origins_cache: std::cell::RefCell::new(None),
@@ -1450,6 +1457,9 @@ pub struct Terminal {
     /// When the last piece of output was seen.
     last_wakeup_seen: std::cell::Cell<Option<Instant>>,
     wakeup_pending: std::cell::Cell<bool>,
+    /// When the user last sent input to the child (keys, paste, mouse) -
+    /// output that follows it is drawn at once, see `emit_wakeup_throttled`.
+    last_input: std::cell::Cell<Option<Instant>>,
     /// `grid_generation` as of the last scan of the live screen for
     /// placeholder cells.
     placeholders_scanned_generation: std::cell::Cell<u64>,
@@ -1793,6 +1803,13 @@ impl Terminal {
         let pacing = wakeup_pacing();
         let now = Instant::now();
         let previous_wake = self.last_wakeup_seen.replace(Some(now));
+        let after_input = self.last_input.get().is_some_and(|at| now.duration_since(at) < pacing.after_input);
+        if after_input {
+            // Holding an arrow key in a file manager: every step of the
+            // highlight must be drawn, not one in 250 ms.
+            self.emit_wakeup_now(cx);
+            return;
+        }
         let burst = previous_wake.is_some_and(|at| now.duration_since(at) < pacing.leading_idle);
         if !burst && !self.wakeup_pending.get() {
             self.emit_wakeup_now(cx);
@@ -5821,6 +5838,13 @@ impl Terminal {
         }
     }
 
+    /// `write_to_pty` for what the user did (as opposed to the terminal's own
+    /// replies to queries): remembers when, so the answer is drawn promptly.
+    fn write_user_input_to_pty(&self, input: impl Into<Cow<'static, [u8]>>) {
+        self.last_input.set(Some(Instant::now()));
+        self.write_to_pty(input);
+    }
+
     pub fn input(&mut self, input: impl Into<Cow<'static, [u8]>>) {
         self.events
             .push_back(InternalEvent::Scroll(AlacScroll::Bottom));
@@ -5834,7 +5858,7 @@ impl Terminal {
         #[cfg(any(test, feature = "test-support"))]
         self.input_log.push(input.to_vec());
 
-        self.write_to_pty(input);
+        self.write_user_input_to_pty(input);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -6161,7 +6185,7 @@ impl Terminal {
                 && let Some(bytes) =
                     mouse_moved_report(point, e.pressed_button, e.modifiers, self.last_content.mode)
             {
-                self.write_to_pty(bytes);
+                self.write_user_input_to_pty(bytes);
             }
         } else {
             // A mouse move is only worth a redraw when it changes what is
@@ -6402,7 +6426,7 @@ impl Terminal {
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode)
             {
-                self.write_to_pty(bytes);
+                self.write_user_input_to_pty(bytes);
             }
         } else {
             match e.button {
@@ -6471,7 +6495,7 @@ impl Terminal {
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, false, self.last_content.mode)
             {
-                self.write_to_pty(bytes);
+                self.write_user_input_to_pty(bytes);
             }
         } else {
             if e.button == MouseButton::Left && setting.copy_on_select {
@@ -6538,7 +6562,7 @@ impl Terminal {
                 if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
                 {
                     for scroll in scrolls {
-                        self.write_to_pty(scroll);
+                        self.write_user_input_to_pty(scroll);
                     }
                 };
             } else if self
@@ -6547,7 +6571,7 @@ impl Terminal {
                 .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
                 && !e.shift
             {
-                self.write_to_pty(alt_scroll(scroll_lines));
+                self.write_user_input_to_pty(alt_scroll(scroll_lines));
             } else {
                 let scroll = AlacScroll::Delta(scroll_lines);
 
@@ -11516,5 +11540,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Counts the `Wakeup`s - the redraws asked for - while `outputs` pieces
+    /// of output arrive back to back, the way they do while a key is held.
+    fn wakeups_during_a_burst_of_output(
+        cx: &mut TestAppContext,
+        user_input_first: bool,
+        outputs: usize,
+    ) -> usize {
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+        let wakeups = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = wakeups.clone();
+        window.update(|_, cx| {
+            cx.subscribe(&terminal, move |_, event: &Event, _| {
+                if matches!(event, Event::Wakeup) {
+                    counter.set(counter.get() + 1);
+                }
+            })
+            .detach();
+        });
+        window.update_window_entity(&terminal, |terminal, _window, cx| {
+            if user_input_first {
+                terminal.input(b"j".to_vec());
+            }
+            for _ in 0..outputs {
+                terminal.emit_wakeup_throttled(cx);
+            }
+        });
+        wakeups.get()
+    }
+
+    #[gpui::test]
+    async fn output_after_user_input_is_drawn_piece_by_piece(cx: &mut TestAppContext) {
+        // Holding an arrow key in a file manager: each step of the highlight
+        // is a piece of output right after the user's input, and every one
+        // of them must be drawn - not one in `max_wait`.
+        assert_eq!(wakeups_during_a_burst_of_output(cx, true, 8), 8);
+    }
+
+    #[gpui::test]
+    async fn output_nobody_asked_for_is_still_coalesced(cx: &mut TestAppContext) {
+        // A program that repaints by itself (pstop, a radio widget) stays
+        // throttled: the first piece is drawn at once, the rest wait.
+        assert_eq!(wakeups_during_a_burst_of_output(cx, false, 8), 1);
     }
 }

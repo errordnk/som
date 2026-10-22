@@ -432,32 +432,7 @@ fn main() {
             cx,
         );
 
-        let profiles: Vec<workspace::TabProfile> = som_config
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let idx = i + 1;
-                let key_name = format!("NewTab{}", idx);
-                let keystroke = som_config.keys.iter()
-                    .find(|(_, v)| *v == &key_name)
-                    .map(|(k, _)| k.clone());
-                workspace::TabProfile {
-                    name: t.name.clone(),
-                    shell: t.shell.clone(),
-                    keystroke,
-                    icon: t.icon.clone(),
-                    home: t.home.clone(),
-                    tmux: t.tmux,
-                    srp: t.srp,
-                    lua: t.lua,
-                    os: workspace::RemoteOs::parse(&t.os),
-                    default: t.default,
-                    admin: t.admin,
-                }
-            })
-            .collect();
-        title_bar::TabProfiles::set(profiles, cx);
+        title_bar::TabProfiles::set(som_config.tab_profiles(), cx);
 
         title_bar::init(cx);
 

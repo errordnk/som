@@ -123,11 +123,40 @@ fn main() {
         eprint!("somsrp: panicked: {info}\r\n");
     }));
 
+    // The widget owns the whole screen: the terminal's own cursor would
+    // blink on top of it. Shown again when the widget is left, however.
+    let cursor_guard = CursorGuard::hide();
     let result = stream_file(path, audio_stream_index, subtitle_stream_index);
+    drop(cursor_guard);
     drop(raw_guard);
     if let Err(err) = result {
         eprintln!("somsrp: failed to stream {path}: {err}");
         std::process::exit(1);
+    }
+}
+
+/// Hides the terminal's cursor (`CSI ? 25 l`) for as long as it lives and
+/// shows it again (`CSI ? 25 h`) when dropped.
+struct CursorGuard;
+
+impl CursorGuard {
+    fn hide() -> Self {
+        write_cursor_mode(false);
+        Self
+    }
+}
+
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        write_cursor_mode(true);
+    }
+}
+
+fn write_cursor_mode(visible: bool) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    if let Err(err) = stdout.write_all(if visible { b"[?25h" } else { b"[?25l" }).and_then(|()| stdout.flush()) {
+        eprintln!("somsrp: cannot change the cursor visibility: {err}");
     }
 }
 
@@ -428,6 +457,7 @@ fn query_cell_size_px_uncached() -> Option<(u32, u32)> {
             match stdin.read(&mut byte) {
                 Ok(1) => {
                     if byte[0] == ETX {
+                        write_cursor_mode(true);
                         std::process::exit(130);
                     }
                     buf.push(byte[0]);
@@ -491,6 +521,7 @@ fn query_cell_count_uncached() -> Option<(u32, u32)> {
             match stdin.read(&mut byte) {
                 Ok(1) => {
                     if byte[0] == ETX {
+                        write_cursor_mode(true);
                         std::process::exit(130);
                     }
                     buf.push(byte[0]);

@@ -437,7 +437,9 @@ impl Session {
             return;
         }
         *last_bounds = bounds;
-        self.term.lock().resize(bounds);
+        // No reflow: a placeholder grid is made of deliberately wide, unwrapped
+        // rows, and reflowing them would break the widget before Som sees it.
+        self.term.lock().resize_with_reflow(bounds, false);
         let window_size: WindowSize = bounds.into();
         self.pty_tx.0.send(Msg::Resize(window_size)).ok();
     }
@@ -467,7 +469,9 @@ impl Session {
         // the RELAY's initial "unknown" (`0`) sentinel.
         let bounds = bounds.with_pixel_size(bounds.cell_width, bounds.cell_height, Some(*last_bounds));
         *last_bounds = bounds;
-        self.term.lock().resize(bounds);
+        // No reflow: a placeholder grid is made of deliberately wide, unwrapped
+        // rows, and reflowing them would break the widget before Som sees it.
+        self.term.lock().resize_with_reflow(bounds, false);
         let window_size: WindowSize = bounds.into();
         self.pty_tx.0.send(Msg::Resize(window_size)).ok();
     }

@@ -134,6 +134,12 @@ const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 /// for anything but its first size-set. See `created_at` on `Terminal`.
 const RESIZE_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long after a terminal is created the screen a restored (tmux) session
+/// paints is assumed to have arrived. The restored grid was printed for the
+/// size the pane had before, and no resize event follows it, so the
+/// placeholder grids in it are rewritten to the current size once, then.
+const RESTORE_RESYNC_DELAY: std::time::Duration = std::time::Duration::from_millis(3000);
+
 /// How often audio is kept going while nothing is painted - see
 /// `Terminal::keep_audio_going`. The end of a track is noticed this late at
 /// most.
@@ -577,6 +583,7 @@ impl TerminalBuilder {
             rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
             last_rich_content_force_redraw: std::cell::Cell::new(None),
             created_at: Instant::now(),
+            restore_resync_done: false,
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
@@ -938,6 +945,7 @@ impl TerminalBuilder {
                 rich_content_audio_last_range_request: std::cell::RefCell::new(std::collections::HashMap::new()),
                 last_rich_content_force_redraw: std::cell::Cell::new(None),
                 created_at: Instant::now(),
+                restore_resync_done: false,
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
@@ -1716,6 +1724,7 @@ pub struct Terminal {
     /// rendering is never stale on the LOCAL side — only a remote PTY that
     /// hasn't yet been told about the real size can show stale content.
     created_at: Instant,
+    restore_resync_done: bool,
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
@@ -6001,6 +6010,12 @@ impl Terminal {
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
+        if !self.restore_resync_done && self.created_at.elapsed() >= RESTORE_RESYNC_DELAY {
+            self.restore_resync_done = true;
+            let bounds = self.last_content.terminal_bounds;
+            self.resync_rich_content_placements(&mut terminal, bounds.cell_width, bounds.line_height);
+        }
+
         self.last_content = Self::make_content(&terminal, &self.last_content);
     }
 
@@ -7462,6 +7477,58 @@ mod tests {
         drop(terminal);
         assert!(saw_video, "somsrp run alone in a directory never showed the video: FFmpeg was not found");
         assert!(leftovers.is_empty(), "somsrp left DLLs next to itself: {leftovers:?}");
+    }
+
+    #[gpui::test]
+    async fn a_restored_screen_with_a_smaller_widget_grid_is_resynced_to_the_pane(cx: &mut TestAppContext) {
+        // A restored (tmux) session paints the screen it had before: a
+        // placeholder grid printed for a smaller pane. The terminal is
+        // already at its real size and no resize event follows, so without
+        // the one-time resync the widget would cover only part of the pane.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(9.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+        window.run_until_parked();
+
+        let mut screen = String::from("[2J[H[38;2;2;3;4m[58;2;6;7;8m");
+        for row in 0..5u32 {
+            for column in 0..40u32 {
+                if let Some(cell) = kitty_graphics_placeholder::encode_cell(row, column) {
+                    screen.extend(cell);
+                }
+            }
+            screen.push_str("
+");
+        }
+        window.update_window_entity(&terminal, |terminal, _window, cx| terminal.write_output(screen.as_bytes(), cx));
+        window.run_until_parked();
+
+        let before = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            term.renderable_content().display_iter.filter(|i| i.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR).count()
+        });
+        assert_eq!(before, 200, "the restored grid is 40x5");
+
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.created_at = Instant::now() - RESTORE_RESYNC_DELAY;
+            terminal.sync(window, cx);
+        });
+        let after = window.update_window_entity(&terminal, |terminal, _window, _cx| {
+            let term = terminal.term.lock();
+            term.renderable_content().display_iter.filter(|i| i.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR).count()
+        });
+        assert_eq!(after, 3000, "the widget must fill the whole 100x30 pane");
     }
 
     fn init_ctrl_click_hyperlink_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {

@@ -63,7 +63,7 @@ Confirmed by direct code reading (2026-09-02), not assumption:
   placements.
 - Neither `somsrv` nor `crates/terminal` links any Lua crate today
   (confirmed via `Cargo.toml`/`Cargo.lock` grep — zero hits for `mlua`/
-  `rlua`/`lua-src`). yazi (`C:\home\dnk\yazi-fork-work`) already depends
+  `rlua`/`lua-src`). yazi (`C:\Users\dnk\src\yazi`) already depends
   on `mlua 0.12` with `features = ["anyhow", "async", "error-send",
   "macros", "serde"]` and uses it as the reference pattern for both
   runtimes here — see "Runtime setup" below.

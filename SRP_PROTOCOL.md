@@ -77,7 +77,7 @@ enum SrvResponse {
 
 ### VTE-патч: полный 8-бит APC
 
-**Файл:** `errordnk/vte` (форк, локальный клон `C:\home\dnk\vte-fork-work`), коммит `649d0a6`. `errordnk/alacritty` обновлён на новый vte-rev, коммит `c9f86ad4`. `som`'s `Cargo.toml:151` — `rev = "c9f86ad4"`.
+**Файл:** `errordnk/vte` (форк, локальный клон `C:\Users\dnk\src\vte`), коммит `649d0a6`. `errordnk/alacritty` обновлён на новый vte-rev, коммит `c9f86ad4`. `som`'s `Cargo.toml:151` — `rev = "c9f86ad4"`.
 
 Оригинальный (непатченый) `advance_apc_string` пропускал только `0x00-0x17,0x19,0x1C-0x7E` (7-бит ASCII минус `0x18,0x1A,0x1B`) — весь диапазон `0x80-0xFF` молча терялся, `0x9C` (8-bit ST) обрывал строку, `0x7F` (DEL) молча терялся.
 

@@ -145,6 +145,15 @@ Sensible defaults, fully remappable. Every Som-specific action sits on `Ctrl+Shi
 cargo build -p som --release
 ```
 
+**macOS:** with a consistent Xcode / Command Line Tools install nothing else is needed. If the build fails in `aws-lc-sys` with `ld: tapi error: malformed file … MacOSX27.0.sdk/usr/lib/libSystem.B.tbd`, the default SDK is newer than the installed linker understands. Point cargo at an older installed SDK in your own `~/.cargo/config.toml` (the path depends on the machine, so it does not belong in this repository):
+
+```toml
+[env]
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+```
+
+`ls /Library/Developer/CommandLineTools/SDKs` lists what is installed.
+
 ---
 
 Som is built on [GPUI](https://gpui.rs/) — the same engine that carries the [Zed](https://github.com/zed-industries/zed) editor, whose source is much of how GPUI got learned in the first place. GPL-3.0-or-later.

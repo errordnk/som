@@ -56,7 +56,7 @@ Two behaviors are fixed and not configurable: the terminal bell is always silent
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `log.level` | string | `"all"` (`"trace"` on the shipped Windows template) | Log filter level, read once at startup. |
+| `log.level` | string | `"error"` | Log filter level, read once at startup; the `ZED_LOG` environment variable, if set, wins. At `"trace"` the per-escape-sequence trace of the terminal parser stays capped at `debug` - ask for it by name, e.g. `ZED_LOG=trace,alacritty_terminal::vt_ops=trace`. |
 | `log.days` | number | `7` | Windows only: how many days of rotated log files to keep. |
 
 ### `font`

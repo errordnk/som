@@ -852,7 +852,10 @@ impl TerminalBuilder {
             // inserting a CR, so every real newline arrives as `\r\r\n` —
             // one extra blank line per newline. See `EventLoop::collapse_
             // cr_cr_lf` and `is_tmux_relay_shell`.
-            .collapse_cr_cr_lf(is_tmux_relay_shell);
+            // Windows only: the second CR comes from ConPTY. Elsewhere the collapse
+            // eats a real newline (a lone `\r\r\n` is dropped whole - Enter vanishes
+            // and the output of a command is glued to its line, seen on macOS).
+            .collapse_cr_cr_lf(cfg!(windows) && is_tmux_relay_shell);
 
             // TEMP DIAG (2026-09-15): raw PTY-byte capture for the
             // phantom-screen-mush-after-backspace investigation — compare

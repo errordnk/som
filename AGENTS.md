@@ -90,7 +90,7 @@ assets          — bundled fonts, icons
 1. **No stubs.** When removing functionality, delete it completely. Never replace with `todo!()`, `unimplemented!()`, or empty impls.
 2. **Do not touch** `terminal`, `terminal_view` (except dead code removal), `gpui`, `ui`, `settings`, `theme`.
 3. **After every block of changes:** `cargo check -p som` via Bash.
-4. **Release builds** are run by the developer manually. Never automate them.
+4. **Release builds** are never started on the agent's own initiative (not after a fix, not "to verify"). When the developer EXPLICITLY asks for a release build (e.g. "собери релизы для всех платформ"), build it: `cargo build --release -p som` on every platform asked for. A platform the current machine cannot build (cross-OS, missing system libs) is reported as such, not silently skipped - build what can be built here and give the exact command for the rest.
 5. **No agents/subagents** — work in the main conversation only.
 6. **Speak Russian** with the user.
 7. **Never use** `unwrap()` — use `?` or `.log_err()`.
@@ -361,4 +361,4 @@ assets/settings/default-linux.json
 - **gpui и terminal — трогать можно** (подтверждено пользователем)
 - **Не реструктурировать** `terminal_view`, `ui`, `settings`, `theme` — только мёртвый код
 - **После каждого блока изменений:** `cargo check -p som`
-- **Release builds:** запускает разработчик вручную, никогда не автоматизировать
+- **Release builds:** сам не запускать; но если разработчик ЯВНО просит собрать релиз (в том числе для всех платформ) — собирать. Платформы, которые на этой машине собрать нельзя, назвать явно и дать команду

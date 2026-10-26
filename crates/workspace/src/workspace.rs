@@ -430,7 +430,7 @@ pub struct NewTerminal {
 /// entries. Named fields deliberately, rather than a positional tuple — a
 /// tuple here previously caused a real bug where `working_dir` was assumed to
 /// be the 3rd element but that position actually held `keystroke`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TabProfile {
     pub name: String,
     pub shell: Option<String>,
@@ -460,6 +460,26 @@ pub struct TabProfile {
     /// See `som_config::TabProfile::admin` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub admin: bool,
+}
+
+/// `tmux`, `srp` and `lua` are on unless a profile turns them off (see
+/// `som_config::TabProfile`).
+impl Default for TabProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            shell: None,
+            keystroke: None,
+            icon: None,
+            home: None,
+            tmux: true,
+            srp: true,
+            lua: true,
+            os: RemoteOs::default(),
+            default: false,
+            admin: false,
+        }
+    }
 }
 
 /// The four remote platforms Som ships a pre-built `somsrv` for (see

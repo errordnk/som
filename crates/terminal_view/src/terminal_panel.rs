@@ -423,7 +423,7 @@ impl TerminalPanel {
 
     /// Opens an SSH/WSL `tmux`/`srp`/`lua` profile's tab, trying the real
     /// SRP-wrapped connection FIRST and transparently falling back to a
-    /// plain SSH shell if it doesn't come up within 5 seconds — see this
+    /// plain SSH shell if it does not come up (a failure within 5 seconds); it is shown as soon as the relay says hello over the link — see this
     /// session's plan doc (`Som-srv deploy/SRP-connect redesign`) for the
     /// full policy this implements (2026-09-15): Som never pre-flights
     /// whether `somsrv` exists on the remote host before trying; it just
@@ -521,38 +521,66 @@ impl TerminalPanel {
 
         // Subscribed BEFORE this terminal is wrapped into any visible
         // `TerminalView` — see this function's own doc comment.
-        let (failure_tx, failure_rx) = futures::channel::oneshot::channel::<terminal::Event>();
-        let failure_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(failure_tx)));
+        let (failure_tx, mut failure_rx) = futures::channel::mpsc::unbounded::<()>();
         let subscription = window_handle.update(cx, |_, _, cx| {
             cx.subscribe(&terminal, move |_terminal, event, _cx| {
-                if matches!(event, terminal::Event::SpawnFailed(_) | terminal::Event::CloseTerminal)
-                    && let Some(tx) = failure_tx.borrow_mut().take()
-                {
-                    let _ = tx.send(event.clone());
+                if matches!(event, terminal::Event::SpawnFailed(_) | terminal::Event::CloseTerminal) {
+                    failure_tx.unbounded_send(()).ok();
                 }
             })
         })?;
 
-        let srp_came_up = match gpui::FutureExt::with_timeout(failure_rx, std::time::Duration::from_secs(5), cx.background_executor()).await {
-            Ok(Ok(early_event)) => {
-                log::debug!("SRP connect for pane {pane_id:?} failed early: {early_event:?}");
-                false
+        // The tab is shown at once: it has to be on screen to be laid out and sized, and the relay
+        // waits for that size before it says anything (see `settled_initial_size`), so a tab that
+        // waited to be shown until the relay spoke would wait for the relay's own timeout.
+        // Should the attempt fail, this item is replaced below by a plain ssh shell.
+        let srp_item_id = window_handle.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &terminal, tab_name.clone(), tab_icon.clone(), profile_index, window, cx)
+            })
+        })??;
+
+        // The attempt is up when the relay says hello over the link (a remote tab) or the
+        // screen shows text and no failure follows within SRP_SETTLE (a local one, which has no
+        // link). A failure ends it at once; a connection that shows nothing for
+        // SRP_ATTEMPT_LIMIT is taken to be up (a login that waits for input), as before.
+        let started = std::time::Instant::now();
+        let mut text_at: Option<std::time::Instant> = None;
+        let mut last_text_check = started;
+        let srp_came_up = loop {
+            if terminal.update(cx, |terminal, _| terminal.srp_link_ready()) {
+                break true;
             }
-            Ok(Err(_)) => true, // sender dropped without firing — subscription outlived the terminal cleanly
-            Err(gpui::Timeout) => true, // 5s elapsed with no early failure signal
+            if text_at.is_none() && last_text_check.elapsed() >= SRP_TEXT_CHECK_INTERVAL {
+                last_text_check = std::time::Instant::now();
+                if terminal.update(cx, |terminal, _| !terminal.get_content().trim().is_empty()) {
+                    text_at = Some(std::time::Instant::now());
+                }
+            }
+            if text_at.is_some_and(|at| at.elapsed() >= SRP_SETTLE) {
+                break true;
+            }
+            let Some(remaining) = SRP_ATTEMPT_LIMIT.checked_sub(started.elapsed()) else {
+                break true;
+            };
+            let tick = remaining.min(SRP_POLL_INTERVAL);
+            match gpui::FutureExt::with_timeout(futures::StreamExt::next(&mut failure_rx), tick, cx.background_executor()).await {
+                Ok(Some(())) => {
+                    log::debug!("SRP connect for pane {pane_id:?} failed early");
+                    break false;
+                }
+                // The terminal and its subscription are gone cleanly.
+                Ok(None) => break true,
+                Err(gpui::Timeout) => {}
+            }
         };
         drop(subscription);
 
         if srp_came_up {
-            let item_id = window_handle.update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &terminal, tab_name, tab_icon, profile_index, window, cx)
-                })
-            })??;
-            return Ok((item_id, Some(pane_id)));
+            return Ok((srp_item_id, Some(pane_id)));
         }
 
-        log::info!("SRP connect for pane {pane_id:?} did not come up within 5s, falling back to plain SSH");
+        log::info!("SRP connect for pane {pane_id:?} did not come up, falling back to plain SSH");
         let (plain_program, plain_args) = plain_ssh_shell(&profile)?;
         let plain_terminal = project
             .update(cx, |project, cx| {
@@ -561,7 +589,7 @@ impl TerminalPanel {
             .await?;
         let item_id = window_handle.update(cx, |_, window, cx| {
             workspace.update(cx, |workspace, cx| {
-                Self::wrap_terminal_into_pane(workspace, placeholder_item_id, &plain_terminal, tab_name, tab_icon, profile_index, window, cx)
+                Self::wrap_terminal_into_pane(workspace, srp_item_id, &plain_terminal, tab_name, tab_icon, profile_index, window, cx)
             })
         })??;
         Ok((item_id, None))
@@ -2950,4 +2978,32 @@ mod tmux_shell_wrapping_tests {
         run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();
     }
 
+}
+
+/// How long an SRP connect attempt may stay without saying hello over the link
+/// before it is taken to be up anyway (a quiet but live connection, e.g. a login
+/// that waits for input). It is a ceiling, not a delay: a connection whose relay
+/// says hello is accepted at once.
+const SRP_ATTEMPT_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the attempt looks whether the relay has said hello.
+const SRP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often it looks whether the screen shows text yet.
+const SRP_TEXT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a failure may follow the first text and still count against the attempt: `ssh`
+/// prints its error (`Permission denied`, `Connection refused`, a missing `somsrv`) and exits
+/// within milliseconds of each other.
+const SRP_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[cfg(test)]
+mod srp_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn the_poll_is_far_finer_than_the_old_blind_wait() {
+        assert!(SRP_POLL_INTERVAL * 100 <= SRP_ATTEMPT_LIMIT);
+        assert!(SRP_SETTLE < SRP_ATTEMPT_LIMIT / 10);
+    }
 }

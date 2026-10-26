@@ -281,6 +281,29 @@ fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundReg
     merged
 }
 
+/// Splits `height_device_px` into a whole number of rows of about
+/// `nominal_row_device_px` each. Returns the row count and the exact (fractional) row height in
+/// device pixels, so that `rows * row_height == height_device_px`.
+fn fit_rows(height_device_px: f32, nominal_row_device_px: f32) -> (usize, f32) {
+    let nominal = nominal_row_device_px.max(1.0);
+    let rows = ((height_device_px / nominal).round() as usize).max(1);
+    (rows, height_device_px / rows as f32)
+}
+
+/// Returns the logical `(line_height, element_height)` for a terminal that must exactly fill
+/// `height_device_px`. The element height carries a small surplus (a twentieth of a row, far
+/// below a device pixel) so that `height / line_height` can never round down to one row short
+/// through f32 error: `TerminalBounds::num_lines` floors that quotient.
+fn fit_terminal_height(
+    height_device_px: f32,
+    nominal_line_height: f32,
+    scale_factor: f32,
+) -> (f32, f32) {
+    let (rows, row_device_px) = fit_rows(height_device_px, nominal_line_height * scale_factor);
+    let line_height = row_device_px / scale_factor;
+    (line_height, line_height * (rows as f32 + 0.05))
+}
+
 /// The GPUI element that paints the terminal.
 /// We need to keep a reference to the model for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
 pub struct TerminalElement {
@@ -1024,7 +1047,6 @@ impl Element for TerminalElement {
 
                     let mut size = bounds.size;
                     size.width -= gutter;
-                    let available_height = size.height;
 
                     // https://github.com/zed-industries/zed/issues/2750
                     // if the terminal is one column wide, rendering 🦀
@@ -1036,31 +1058,26 @@ impl Element for TerminalElement {
                     let mut origin = bounds.origin;
                     origin.x += gutter;
 
-                    if matches!(self.terminal_view.read(cx).mode, TerminalMode::Standalone) {
-                        let scale_factor = window.scale_factor();
-                        let line_height_pixels = px(line_height);
-                        let line_height_device_px = (f32::from(line_height_pixels) * scale_factor)
-                            .round()
-                            .max(1.0) as i32;
-                        let available_height_device_px =
-                            (f32::from(available_height) * scale_factor)
-                                .floor()
-                                .max(0.0) as i32;
+                    let standalone =
+                        matches!(self.terminal_view.read(cx).mode, TerminalMode::Standalone);
+                    let mut line_height = line_height;
+                    if standalone {
+                        // Fit a whole number of rows between the top edge and the exact bottom
+                        // edge of the element (in device pixels), stretching/shrinking the
+                        // line spacing by a fraction of a pixel per row, so that the last row
+                        // ends exactly on the bottom edge of the window.
+                        let scale_factor = window.scale_factor().max(f32::EPSILON);
+                        let top_device_px = (f32::from(bounds.origin.y) * scale_factor).floor();
+                        let bottom_device_px = (f32::from(bounds.origin.y + bounds.size.height)
+                            * scale_factor)
+                            .round();
+                        let height_device_px = (bottom_device_px - top_device_px).max(1.0);
+                        let (row_height, fitted_height) =
+                            fit_terminal_height(height_device_px, line_height, scale_factor);
 
-                        let rows =
-                            ((available_height_device_px / line_height_device_px) as usize).max(1);
-                        let snapped_height_device_px = (rows as i32) * line_height_device_px;
-                        let padding_device_px =
-                            (available_height_device_px - snapped_height_device_px).max(0);
-
-                        let snapped_height =
-                            px(snapped_height_device_px as f32 / scale_factor.max(1.0));
-                        let padding = px(padding_device_px as f32 / scale_factor.max(1.0));
-
-                        size.height = snapped_height;
-                        if self.terminal.read(cx).scrolled_to_bottom() {
-                            origin.y += padding;
-                        }
+                        line_height = row_height;
+                        size.height = px(fitted_height);
+                        origin.y = px(top_device_px / scale_factor);
                     }
 
                     // Snap to device pixels to avoid subpixel jitter while resizing.
@@ -1071,7 +1088,9 @@ impl Element for TerminalElement {
                         Pixels::from((f32::from(value) * scale_factor).floor() / scale_factor)
                     };
                     origin.x = snap_px(origin.x);
-                    origin.y = snap_px(origin.y);
+                    if !standalone {
+                        origin.y = snap_px(origin.y);
+                    }
 
                     (
                         TerminalBounds::new(px(line_height), cell_width, Bounds { origin, size }),
@@ -4251,6 +4270,59 @@ mod tests {
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};
     use ui::utils::apca_contrast;
+
+    #[test]
+    fn fit_rows_ends_exactly_on_the_bottom_edge() {
+        // A 4K window at 150% scale: nominal row 23.4 device px, many different heights.
+        for height in 400..2400 {
+            let (rows, row) = fit_rows(height as f32, 23.4);
+            assert!(rows >= 1);
+            // The rows fill the height with no gap (within float rounding)...
+            assert!(
+                (rows as f32 * row - height as f32).abs() < 0.01,
+                "height {height}: {rows} rows x {row}"
+            );
+            // ...and the line spacing never strays more than a pixel from the nominal one
+            // once there are enough rows for that to be meaningful.
+            if rows > 20 {
+                assert!((row - 23.4).abs() < 0.6, "height {height}: row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_gets_exactly_the_rows_that_are_drawn() {
+        // The row count the terminal derives from the final bounds must equal the number of
+        // rows fit_rows chose, for any window height and scale (a mismatch leaves a gap or
+        // clips the last row).
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0] {
+            for height_device_px in 300..2400 {
+                let height = height_device_px as f32;
+                let (rows, _) = fit_rows(height, 15.6 * scale);
+                let (line_height, element_height) = fit_terminal_height(height, 15.6, scale);
+                let bounds = TerminalBounds::new(
+                    px(line_height),
+                    px(8.0),
+                    Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: size(px(800.0), px(element_height)),
+                    },
+                );
+                assert_eq!(
+                    bounds.num_lines(),
+                    rows,
+                    "scale {scale}, height {height_device_px}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_rows_keeps_at_least_one_row() {
+        assert_eq!(fit_rows(5.0, 23.4).0, 1);
+        assert_eq!(fit_rows(0.0, 23.4).0, 1);
+        assert_eq!(fit_rows(40.0, 0.0).0, 40);
+    }
 
     #[test]
     fn test_is_decorative_character() {

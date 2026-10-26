@@ -537,6 +537,7 @@ impl TerminalBuilder {
             vi_mode_enabled: false,
             is_remote_terminal: false,
             is_tmux_relay_shell: false,
+            startup_device_attributes_answered: false,
             srv_link: None,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
@@ -903,6 +904,7 @@ impl TerminalBuilder {
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 is_tmux_relay_shell,
+                startup_device_attributes_answered: false,
                 srv_link,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
@@ -1363,6 +1365,11 @@ pub struct Terminal {
     /// whatever the real client program (e.g. `yazi`) is currently
     /// rendering.
     is_tmux_relay_shell: bool,
+    /// Whether the device-attributes query Windows ConPTY sends when it starts has been
+    /// answered. ConPTY holds back ALL output of the program inside it (a `somsrv`
+    /// relay, `ssh`, `wsl`) until it hears the answer, or gives up after about five
+    /// seconds - the delay every such tab used to have before it showed anything.
+    startup_device_attributes_answered: bool,
     /// The way to the `somsrv` daemon of the machine this terminal runs on,
     /// when that is another machine (an ssh or wsl tab running a `somsrv`
     /// relay): carried in the tab's own pty stream. `None` for a local tab,
@@ -1954,7 +1961,16 @@ impl Terminal {
             // mode bits from the Redrawer's explicit resend, independent
             // of this gate.
             AlacTermEvent::PtyWrite(out) => {
-                if !self.is_tmux_relay_shell {
+                // The query of ConPTY itself (the first thing it writes, before the program
+                // in it has said anything) is not one a HOLDER could answer: it never sees
+                // it. So the first device-attributes answer always goes through, even for a
+                // relay.
+                let startup_query =
+                    cfg!(windows) && !self.startup_device_attributes_answered && is_device_attributes_reply(&out);
+                if startup_query {
+                    self.startup_device_attributes_answered = true;
+                    self.write_to_pty(out.into_bytes())
+                } else if !self.is_tmux_relay_shell {
                     self.write_to_pty(out.into_bytes())
                 }
             }
@@ -2465,6 +2481,12 @@ impl Terminal {
 
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
+    }
+
+    /// True once the relay of this remote SRP tab has said it speaks the link: the
+    /// connection is up. Always false for a tab that has no link.
+    pub fn srp_link_ready(&self) -> bool {
+        self.srv_link.as_ref().is_some_and(|link| link.is_ready())
     }
 
     pub fn set_cursor_shape(&mut self, cursor_shape: CursorShape) {
@@ -11607,5 +11629,28 @@ mod tests {
         // A program that repaints by itself (pstop, a radio widget) stays
         // throttled: the first piece is drawn at once, the rest wait.
         assert_eq!(wakeups_during_a_burst_of_output(cx, false, 8), 1);
+    }
+}
+
+/// Whether `reply` is an answer to a device-attributes query (`ESC [ ? ... c`).
+fn is_device_attributes_reply(reply: &str) -> bool {
+    reply.starts_with("\x1b[?") && reply.ends_with('c')
+}
+
+#[cfg(test)]
+mod device_attributes_tests {
+    use super::is_device_attributes_reply;
+
+    #[test]
+    fn recognizes_the_answer_to_a_device_attributes_query() {
+        assert!(is_device_attributes_reply("\x1b[?6c"));
+        assert!(is_device_attributes_reply("\x1b[?1;2c"));
+    }
+
+    #[test]
+    fn other_answers_are_not_device_attributes() {
+        assert!(!is_device_attributes_reply("\x1b[?2004;1$y")); // a mode report
+        assert!(!is_device_attributes_reply("\x1b[8;24;80t")); // a size report
+        assert!(!is_device_attributes_reply("c"));
     }
 }

@@ -37,7 +37,7 @@ At the core of Som is [GPUI](https://gpui.rs/): GPU rendering and a theming syst
 
 ## somsrv: sessions that don't die
 
-A minimal tmux-alike built directly into Som. Open an SSH tab with `"tmux": true` and from then on the connection to the host can drop as many times as it likes.
+A minimal tmux-alike built directly into Som. Open an SSH tab (on by default; `"tmux": false` opts a profile out) and from then on the connection to the host can drop as many times as it likes.
 
 - Close Som or lose the connection — the process on the remote machine keeps running.
 - On reconnect you see the same scrollback and the same running programs, not a new session.
@@ -49,7 +49,7 @@ A minimal tmux-alike built directly into Som. Open an SSH tab with `"tmux": true
 - One daemon per host serves all your sessions, instead of a process per tab.
 
 ```
-Som (client)                    SSH tab with tmux: true
+Som (client)                    SSH tab (tmux on)
       │
       ▼
 HOLDER on the remote host       holds the real shell and PTY, lives independently of Som

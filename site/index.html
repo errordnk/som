@@ -633,7 +633,7 @@
       <div>
         <span class="spotlight-badge">Фирменная фича</span>
         <h2>somsrv: сессии, которые не умирают</h2>
-        <p class="section-sub">Свой минималистичный аналог tmux, встроенный прямо в Som. Открыли SSH-таб с <code>"tmux": true</code> — и дальше связь с хостом можно рвать сколько угодно раз.</p>
+        <p class="section-sub">Свой минималистичный аналог tmux, встроенный прямо в Som. Открыли SSH-таб (включено по умолчанию, <code>"tmux": false</code> отключает) — и дальше связь с хостом можно рвать сколько угодно раз.</p>
         <ul>
           <li><span class="chk">✓</span> Закрыли Som или потеряли связь — процесс на удалённой машине продолжает работать</li>
           <li><span class="chk">✓</span> При переподключении вы видите тот же scrollback и те же запущенные программы, а не новую сессию</li>
@@ -649,7 +649,7 @@
         <div class="diagram-row">
           <div class="diagram-box">
             <div class="t">Som (клиент)</div>
-            <div class="d">SSH-таб с tmux: true</div>
+            <div class="d">SSH-таб (tmux включён)</div>
           </div>
           <div class="diagram-arrow">→</div>
         </div>

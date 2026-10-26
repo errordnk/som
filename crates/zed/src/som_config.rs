@@ -176,12 +176,9 @@ pub struct TabProfile {
     pub icon: Option<String>,
     pub shell: Option<String>,
     pub home: Option<String>,
-    /// Opt-in to somsrv: the tab's terminal(s) run inside a detached
-    /// `somsrv` process that survives Som closing, instead of a
-    /// plain PTY owned directly by Som. Defaults to `false` (explicit
-    /// opt-in) for now; the long-term direction is to default this to
-    /// `true` everywhere it's supported, keeping the field only as an
-    /// explicit opt-out.
+    /// On by default (opt out with `"tmux": false`): the tab's terminal(s) run inside a
+    /// detached `somsrv` process that survives Som closing, instead of a plain PTY owned
+    /// directly by Som.
     pub tmux: bool,
     /// On by default (opt out with `"srp": false`): the SRP (rich content)
     /// side of `somsrv` —
@@ -190,8 +187,8 @@ pub struct TabProfile {
     /// feature flags that all share the same underlying SRP connection
     /// attempt, `terminal_view::terminal_panel`'s `wants_srp`).
     pub srp: bool,
-    /// Independent opt-in to Lua scripting over `somsrv` — see `srp`'s
-    /// doc comment above.
+    /// On by default (opt out with `"lua": false`): Lua scripting over `somsrv` — see
+    /// `srp`'s doc comment above.
     pub lua: bool,
     /// Explicit remote OS for this profile's SSH/WSL host — `"win"`,
     /// `"mac"`, `"lnx-arm"`, or `"lnx"` (default). Picks which pre-built `somsrv`
@@ -215,8 +212,8 @@ pub struct TabProfile {
     pub admin: bool,
 }
 
-/// The same as `derive(Default)` would give, except `srp`: rich content over
-/// the tab's own connection is on unless a profile says `"srp": false`.
+/// The same as `derive(Default)` would give, except `tmux`, `srp` and `lua`: all three
+/// are on unless a profile says `false` for them.
 impl Default for TabProfile {
     fn default() -> Self {
         Self {
@@ -224,9 +221,9 @@ impl Default for TabProfile {
             icon: None,
             shell: None,
             home: None,
-            tmux: false,
+            tmux: true,
             srp: true,
-            lua: false,
+            lua: true,
             os: String::new(),
             default: false,
             admin: false,
@@ -707,14 +704,17 @@ mod tests {
         assert!(TabProfile::default().srp, "a default profile agrees with the parsed one");
         let off: TabProfile = serde_json::from_str(r#"{ "name": "box", "shell": "ssh box", "srp": false }"#).unwrap();
         assert!(!off.srp, "an explicit false opts out");
-        assert!(!profile.tmux && !profile.lua, "the other two flags stay opt-in");
+        assert!(profile.tmux && profile.lua, "the other two flags are on by default as well");
+        let all_off: TabProfile =
+            serde_json::from_str(r#"{ "name": "box", "shell": "ssh box", "tmux": false, "srp": false, "lua": false }"#).unwrap();
+        assert!(!all_off.tmux && !all_off.srp && !all_off.lua, "each of them opts out on its own");
     }
 
 
     #[test]
     fn tab_profiles_follow_an_edited_settings_file() {
         let before = SomConfig::parse(r#"{"tabs":[{"name":"wsl","shell":"wsl --cd ~"}]}"#).expect("parses");
-        assert!(!before.tab_profiles()[0].srp);
+        assert!(before.tab_profiles()[0].srp, "no `srp` key: on");
 
         let after = SomConfig::parse(r#"{"tabs":[{"name":"wsl","shell":"wsl --cd ~","srp":true},{"name":"x","shell":"sh","os":"lnx-arm"}]}"#)
             .expect("parses");

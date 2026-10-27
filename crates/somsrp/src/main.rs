@@ -125,13 +125,42 @@ fn main() {
 
     // The widget owns the whole screen: the terminal's own cursor would
     // blink on top of it. Shown again when the widget is left, however.
+    // It is a full-screen widget like htop: it runs on the alternate screen, so that leaving it
+    // brings back the terminal exactly as it was, with nothing of the widget in the scrollback.
+    let screen_guard = AltScreenGuard::enter();
     let cursor_guard = CursorGuard::hide();
     let result = stream_file(path, audio_stream_index, subtitle_stream_index);
     drop(cursor_guard);
+    drop(screen_guard);
     drop(raw_guard);
     if let Err(err) = result {
         eprintln!("somsrp: failed to stream {path}: {err}");
         std::process::exit(1);
+    }
+}
+
+/// Switches to the alternate screen (`CSI ? 1049 h`) for as long as it lives and back to the
+/// main screen (`CSI ? 1049 l`) when dropped.
+struct AltScreenGuard;
+
+impl AltScreenGuard {
+    fn enter() -> Self {
+        write_alt_screen(true);
+        Self
+    }
+}
+
+impl Drop for AltScreenGuard {
+    fn drop(&mut self) {
+        write_alt_screen(false);
+    }
+}
+
+fn write_alt_screen(enter: bool) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    if let Err(err) = stdout.write_all(if enter { b"[?1049h" } else { b"[?1049l" }).and_then(|()| stdout.flush()) {
+        eprintln!("somsrp: cannot switch the screen: {err}");
     }
 }
 
@@ -458,6 +487,7 @@ fn query_cell_size_px_uncached() -> Option<(u32, u32)> {
                 Ok(1) => {
                     if byte[0] == ETX {
                         write_cursor_mode(true);
+                        write_alt_screen(false);
                         std::process::exit(130);
                     }
                     buf.push(byte[0]);
@@ -522,6 +552,7 @@ fn query_cell_count_uncached() -> Option<(u32, u32)> {
                 Ok(1) => {
                     if byte[0] == ETX {
                         write_cursor_mode(true);
+                        write_alt_screen(false);
                         std::process::exit(130);
                     }
                     buf.push(byte[0]);
@@ -926,30 +957,59 @@ fn spawn_ctrlc_watcher() {
     if WATCHER_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    std::thread::spawn(|| {
+    let (tx, rx) = std::sync::mpsc::channel::<u8>();
+    std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut byte = [0u8; 1];
-        loop {
-            match stdin.read(&mut byte) {
-                Ok(0) => return, // stdin closed
-                Ok(_) => {
-                    if byte[0] == ETX || byte[0] == ESC || byte[0] == b'q' || byte[0] == b'Q' {
+        while let Ok(1) = stdin.read(&mut byte) {
+            if tx.send(byte[0]).is_err() {
+                return;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        while let Ok(byte) = rx.recv() {
+            if byte == ESC {
+                // A bare Escape ends the widget; an escape sequence (the arrow keys the terminal
+                // makes of the mouse wheel, a focus report, ...) arrives in one piece and is ignored.
+                match rx.recv_timeout(ESC_SEQUENCE_WAIT) {
+                    Ok(b'[') => {
+                        // CSI: parameters, then a final byte in 0x40..=0x7e.
+                        while let Ok(next) = rx.recv_timeout(ESC_SEQUENCE_WAIT) {
+                            if (0x40..=0x7e).contains(&next) {
+                                break;
+                            }
+                        }
+                        continue;
+                    },
+                    Ok(b'O') => {
+                        // SS3: a single final byte.
+                        let _ = rx.recv_timeout(ESC_SEQUENCE_WAIT);
+                        continue;
+                    },
+                    Ok(_) | Err(_) => {
                         CTRL_C_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
                         return;
-                    }
-                    if PLAYLIST_MODE.load(std::sync::atomic::Ordering::Acquire) {
-                        match byte[0] {
-                            b'n' | b'N' => PLAYLIST_STEP.store(1, std::sync::atomic::Ordering::Release),
-                            b'p' | b'P' => PLAYLIST_STEP.store(-1, std::sync::atomic::Ordering::Release),
-                            _ => {},
-                        }
-                    }
-                },
-                Err(_) => return,
+                    },
+                }
+            }
+            if byte == ETX || byte == b'q' || byte == b'Q' {
+                CTRL_C_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+            if PLAYLIST_MODE.load(std::sync::atomic::Ordering::Acquire) {
+                match byte {
+                    b'n' | b'N' => PLAYLIST_STEP.store(1, std::sync::atomic::Ordering::Release),
+                    b'p' | b'P' => PLAYLIST_STEP.store(-1, std::sync::atomic::Ordering::Release),
+                    _ => {},
+                }
             }
         }
     });
 }
+
+/// How long the key watcher waits for the rest of an escape sequence after `ESC`.
+const ESC_SEQUENCE_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// Session/file id pair identifying one SRP transfer on the wire — see
 /// [`new_ids`]'s doc comment for how these are derived and why they're

@@ -1195,7 +1195,13 @@ impl Render for TerminalView {
                         self.block_below_cursor.clone(),
                         self.mode.clone(),
                     ))
-                    .when(self.content_mode(window, cx).is_scrollable(), |div| {
+                    // A full-screen app has no scrollback to scroll: no
+                    // scrollbar, and its column goes to the terminal (which
+                    // resizes the pty). It comes back when the app exits.
+                    .when(
+                        self.content_mode(window, cx).is_scrollable()
+                            && !self.terminal.read(cx).is_alt_screen(),
+                        |div| {
                         let colors = cx.theme().colors();
                         div.custom_scrollbars(
                             Scrollbars::for_settings::<TerminalScrollbarSettingsWrapper>()
@@ -1208,7 +1214,8 @@ impl Render for TerminalView {
                             window,
                             cx,
                         )
-                    }),
+                    },
+                    ),
             )
     }
 }

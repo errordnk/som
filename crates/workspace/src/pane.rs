@@ -331,6 +331,12 @@ pub enum Event {
     RemovedItem {
         item: Box<dyn ItemHandle>,
     },
+    /// An item already in the pane moved from index `from` to `to` (a tab
+    /// dragged to another place); the items between shifted by one.
+    ItemMoved {
+        from: usize,
+        to: usize,
+    },
     Split {
         direction: SplitDirection,
         mode: SplitMode,
@@ -364,6 +370,11 @@ impl fmt::Debug for Event {
             Event::RemovedItem { item } => f
                 .debug_struct("RemovedItem")
                 .field("item", &item.item_id())
+                .finish(),
+            Event::ItemMoved { from, to } => f
+                .debug_struct("ItemMoved")
+                .field("from", from)
+                .field("to", to)
                 .finish(),
             Event::Split { direction, mode } => f
                 .debug_struct("Split")
@@ -1249,6 +1260,12 @@ impl Pane {
                     } else if insertion_index <= self.active_item_index {
                         self.active_item_index += 1;
                     }
+                    // Before the ActivateItem below: the workspace keys each
+                    // tab's split panes by tab index and must remap them first.
+                    cx.emit(Event::ItemMoved {
+                        from: existing_item_index,
+                        to: insertion_index,
+                    });
                 }
 
                 cx.notify();

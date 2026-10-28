@@ -824,7 +824,7 @@ mod somsrv_sessions_tests {
             .update(cx, |workspace, _window, cx| {
                 let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
                 let item_id = item.entity_id();
-                workspace.set_tmux_sessions_for_item(item_id, vec!["main-pane-id".to_string()]);
+                workspace.set_tmux_sessions_for_item(item_id, vec!["main-pane-id".to_string()], cx);
                 item_id
             })
             .unwrap();
@@ -836,7 +836,7 @@ mod somsrv_sessions_tests {
             .update(cx, |workspace, _window, cx| {
                 let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
                 pane_ids.push("first-split-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids);
+                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids, cx);
                 let _ = cx;
             })
             .unwrap();
@@ -846,7 +846,7 @@ mod somsrv_sessions_tests {
             .update(cx, |workspace, _window, cx| {
                 let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
                 pane_ids.push("second-split-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids);
+                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids, cx);
                 let _ = cx;
             })
             .unwrap();
@@ -886,7 +886,7 @@ mod somsrv_sessions_tests {
 
                 let mut pane_ids = workspace.tmux_sessions_for_item(item_id).unwrap_or_default();
                 pane_ids.push("only-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(item_id, pane_ids);
+                workspace.set_tmux_sessions_for_item(item_id, pane_ids, cx);
                 item_id
             })
             .unwrap();
@@ -4348,8 +4348,18 @@ impl Workspace {
     /// `somsrv` pane ids backing `item`'s tab, so a later
     /// `som_persist_db_json` call can write them into db.json's
     /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
-    pub fn set_tmux_sessions_for_item(&mut self, item_id: gpui::EntityId, pane_ids: Vec<String>) {
+    ///
+    /// Writes db.json right away: the ids arrive after the tab itself (its
+    /// terminal comes up asynchronously), and a db.json written without them
+    /// makes the next launch start new sessions instead of reattaching.
+    pub fn set_tmux_sessions_for_item(
+        &mut self,
+        item_id: gpui::EntityId,
+        pane_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.som_tab_tmux_sessions.insert(item_id, pane_ids);
+        self.som_persist_db_json(cx);
     }
 
     /// Reads back whatever `set_tmux_sessions_for_item` has recorded for

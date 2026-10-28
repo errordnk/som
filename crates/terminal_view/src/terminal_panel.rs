@@ -147,8 +147,8 @@ impl TerminalPanel {
                     )
                     .await?;
                     if let Some(pane_id) = srp_pane_id {
-                        workspace.update(cx, |workspace, _cx| {
-                            workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.set_tmux_sessions_for_item(item_id, vec![pane_id], cx);
                         })?;
                     }
 
@@ -851,8 +851,8 @@ impl TerminalPanel {
                         // has no tmux session to record.
                         if let Some(pane_id) = srp_pane_id {
                             window_handle.update(cx, |_, _, cx| {
-                                workspace.update(cx, |workspace, _cx| {
-                                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id]);
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.set_tmux_sessions_for_item(item_id, vec![pane_id], cx);
                                 })
                             })??;
                         }

@@ -100,14 +100,26 @@ fn spawn_detached(daemon_binary_path: &Path) -> anyhow::Result<()> {
 
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    std::process::Command::new(daemon_binary_path)
-        .arg("--daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-        .spawn()?;
+    let spawn = |flags: u32| {
+        std::process::Command::new(daemon_binary_path)
+            .arg("--daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    // The relay that spawns the daemon runs inside the terminal's kill-on-close
+    // job (see alacritty's ConPTY): a daemon left in it would die with the Som
+    // window, taking every session with it. So it breaks away from the job;
+    // where a job does not allow that the spawn fails, and the daemon is
+    // started as before.
+    if spawn(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).is_err() {
+        log::warn!("somsrv daemon could not break away from its job; it will end with this terminal");
+        spawn(DETACHED_PROCESS | CREATE_NO_WINDOW)?;
+    }
     Ok(())
 }
 

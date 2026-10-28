@@ -6046,6 +6046,13 @@ impl Terminal {
         self.input(paste_text.into_bytes());
     }
 
+    /// Whether a full-screen app (htop, an editor) has the alternate screen
+    /// now. Read live from the terminal, not from `last_content`, which is
+    /// only as fresh as the last frame's `sync`.
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let term = self.term.clone();
         // `lock()` (fair), NOT `lock_unfair()` — this runs on the render

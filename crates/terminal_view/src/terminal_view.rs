@@ -1409,7 +1409,7 @@ impl Item for TerminalView {
                         let tab_item_id = tab_item.item_id();
                         let mut pane_ids = workspace.tmux_sessions_for_item(tab_item_id).unwrap_or_default();
                         pane_ids.push(pane_id);
-                        workspace.set_tmux_sessions_for_item(tab_item_id, pane_ids);
+                        workspace.set_tmux_sessions_for_item(tab_item_id, pane_ids, cx);
                     })
                     .ok();
             }

@@ -183,16 +183,25 @@ impl LayoutRect {
     }
 
     pub fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
-        let position = {
-            let alac_point = self.point;
-            point(
-                (origin.x + alac_point.column as f32 * dimensions.cell_width).floor(),
-                origin.y + alac_point.line as f32 * dimensions.line_height,
-            )
+        // Row edges snap to whole device pixels. A row is a fractional number of device
+        // pixels tall (the terminal is fitted to its window), so unsnapped quads of
+        // neighbouring rows leave a one-pixel seam showing the background below them.
+        // Both edges come from the same expression, so row N's bottom is row N+1's top.
+        let scale = window.scale_factor().max(f32::EPSILON);
+        let line = self.point.line as f32;
+        let row_edge = |line: f32| {
+            ((f32::from(origin.y) + line * f32::from(dimensions.line_height)) * scale).round()
+                / scale
         };
+        let top = row_edge(line);
+        let bottom = row_edge(line + 1.0);
+        let position = point(
+            (origin.x + self.point.column as f32 * dimensions.cell_width).floor(),
+            px(top),
+        );
         let size = point(
             (dimensions.cell_width * self.num_of_cells as f32).ceil(),
-            dimensions.line_height,
+            px(bottom - top),
         )
         .into();
 

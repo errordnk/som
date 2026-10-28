@@ -182,7 +182,17 @@ impl LayoutRect {
         }
     }
 
-    pub fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
+    /// `right_edge` is where the element ends. The grid is a whole number of
+    /// cells, so a sliver narrower than a cell is left over on the right; a
+    /// rect reaching the last column stretches over it, so a full-screen
+    /// app's scrollbar (cells with a background) sits flush with the edge.
+    pub fn paint(
+        &self,
+        origin: Point<Pixels>,
+        dimensions: &TerminalBounds,
+        right_edge: Pixels,
+        window: &mut Window,
+    ) {
         // Row edges snap to whole device pixels. A row is a fractional number of device
         // pixels tall (the terminal is fitted to its window), so unsnapped quads of
         // neighbouring rows leave a one-pixel seam showing the background below them.
@@ -199,11 +209,12 @@ impl LayoutRect {
             (origin.x + self.point.column as f32 * dimensions.cell_width).floor(),
             px(top),
         );
-        let size = point(
-            (dimensions.cell_width * self.num_of_cells as f32).ceil(),
-            px(bottom - top),
-        )
-        .into();
+        let mut width = (dimensions.cell_width * self.num_of_cells as f32).ceil();
+        let end_column = self.point.column.max(0) as usize + self.num_of_cells;
+        if end_column >= dimensions.num_columns() && right_edge > position.x + width {
+            width = right_edge - position.x;
+        }
+        let size = point(width, px(bottom - top)).into();
 
         window.paint_quad(fill(Bounds::new(position, size), self.color));
     }
@@ -1429,7 +1440,7 @@ impl Element for TerminalElement {
                     });
 
                     for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, window);
+                        rect.paint(origin, &layout.dimensions, bounds.right(), window);
                     }
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {

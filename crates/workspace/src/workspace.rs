@@ -998,6 +998,94 @@ mod somsrv_sessions_tests {
             })
             .unwrap();
     }
+
+    /// The tabs a dragged tab jumps over keep their own split panes too.
+    #[gpui::test]
+    async fn the_tabs_a_dragged_tab_passes_keep_their_split_panes(cx: &mut TestAppContext) {
+        let app_state = cx.update(AppState::test);
+        let project = cx.update(|cx| {
+            Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
+        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        // Tabs A, B, C.
+        let (main_pane, ids) = window
+            .update(cx, |workspace, window, cx| {
+                let pane = workspace.panes.first().unwrap().clone();
+                let mut ids = Vec::new();
+                for _ in 0..3 {
+                    let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
+                    ids.push(item.entity_id());
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(item), true, true, None, window, cx)
+                    });
+                }
+                (pane, ids)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // A gets one split, B gets two; C has none.
+        for (tab, splits) in [(0, 1), (1, 2)] {
+            window
+                .update(cx, |_, window, cx| {
+                    main_pane.update(cx, |pane, cx| pane.activate_item(tab, true, true, window, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            for _ in 0..splits {
+                let split = window
+                    .update(cx, |workspace, window, cx| {
+                        workspace.som_split_active_pane_awaited(window, cx)
+                    })
+                    .unwrap();
+                split.await;
+                cx.run_until_parked();
+            }
+        }
+        let panes_of = |cx: &mut gpui::VisualTestContext, tab: usize| {
+            window
+                .update(cx, |_, window, cx| {
+                    main_pane.update(cx, |pane, cx| pane.activate_item(tab, true, true, window, cx));
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window.update(cx, |workspace, _, _| workspace.panes.len()).unwrap()
+        };
+        assert_eq!(panes_of(cx, 0), 2);
+        assert_eq!(panes_of(cx, 1), 3);
+        assert_eq!(panes_of(cx, 2), 1);
+
+        // Active A dragged to the end: B, C, A. B takes A's place.
+        assert_eq!(panes_of(cx, 0), 2);
+        window
+            .update(cx, |_, window, cx| {
+                move_item(&main_pane, &main_pane, ids[0], 2, true, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(panes_of(cx, 2), 2, "A keeps its split");
+        assert_eq!(panes_of(cx, 0), 3, "B, in A's old place, keeps its two");
+        assert_eq!(panes_of(cx, 1), 1, "C keeps none");
+
+        // Inactive C dragged to the front, B active: C, B, A.
+        assert_eq!(panes_of(cx, 0), 3);
+        window
+            .update(cx, |_, window, cx| {
+                move_item(&main_pane, &main_pane, ids[2], 0, false, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                assert_eq!(workspace.panes.len(), 3, "B, still active, still shows its two");
+            })
+            .unwrap();
+        assert_eq!(panes_of(cx, 0), 1, "C keeps none");
+        assert_eq!(panes_of(cx, 1), 3, "B keeps its two");
+        assert_eq!(panes_of(cx, 2), 2, "A keeps its split");
+    }
 }
 
 /// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).

@@ -896,6 +896,108 @@ mod somsrv_sessions_tests {
             .unwrap();
         assert_eq!(sessions, Some(vec!["only-pane-id".to_string()]));
     }
+
+    /// Dragging a tab to another place keeps its split panes with it: they
+    /// are keyed by tab index, and the tab that took the old place used to
+    /// inherit them.
+    #[gpui::test]
+    async fn a_dragged_tab_keeps_its_split_panes(cx: &mut TestAppContext) {
+        let app_state = cx.update(AppState::test);
+        let project = cx.update(|cx| {
+            Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
+        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        // Tabs A, B, C; A active.
+        let (main_pane, ids) = window
+            .update(cx, |workspace, window, cx| {
+                let pane = workspace.panes.first().unwrap().clone();
+                let mut ids = Vec::new();
+                for _ in 0..3 {
+                    let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
+                    ids.push(item.entity_id());
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(Box::new(item), true, true, None, window, cx)
+                    });
+                }
+                pane.update(cx, |pane, cx| pane.activate_item(0, true, true, window, cx));
+                (pane, ids)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // A gets a split pane.
+        let split = window
+            .update(cx, |workspace, window, cx| {
+                workspace.som_split_active_pane_awaited(window, cx)
+            })
+            .unwrap();
+        split.await;
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                assert_eq!(workspace.panes.len(), 2, "A shows its split");
+                assert_eq!(workspace.som_tab_splits.get(&0), Some(&1));
+            })
+            .unwrap();
+
+        // Drag A (with its live split) to the end: B, C, A.
+        window
+            .update(cx, |_, window, cx| {
+                move_item(&main_pane, &main_pane, ids[0], 2, true, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, cx| {
+                assert_eq!(main_pane.read(cx).active_item_index(), 2);
+                assert_eq!(workspace.som_active_tab_index, 2);
+                assert_eq!(workspace.panes.len(), 2, "A still shows its split");
+                assert_eq!(workspace.som_tab_splits.get(&2), Some(&1));
+                assert_eq!(workspace.som_tab_splits.get(&0), None, "B has no split");
+            })
+            .unwrap();
+
+        // Switching to B (now first) hides A's split, and B gets none.
+        window
+            .update(cx, |_, window, cx| {
+                main_pane.update(cx, |pane, cx| pane.activate_item(0, true, true, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                assert_eq!(workspace.panes.len(), 1, "B has no split");
+                assert!(workspace.som_parked_splits.contains_key(&2));
+            })
+            .unwrap();
+
+        // Drag A, parked, back to the front: A, B, C. Then show it.
+        window
+            .update(cx, |_, window, cx| {
+                move_item(&main_pane, &main_pane, ids[0], 0, false, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                assert!(workspace.som_parked_splits.contains_key(&0));
+                assert_eq!(workspace.som_active_tab_index, 1, "B moved to index 1");
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                main_pane.update(cx, |pane, cx| pane.activate_item(0, true, true, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                assert_eq!(workspace.panes.len(), 2, "A shows its split again");
+            })
+            .unwrap();
+    }
 }
 
 /// Closes the active item in the main (tab) pane, regardless of which split pane has focus (Som).
@@ -5455,6 +5557,38 @@ impl Workspace {
                             self.som_active_tab_index = new_count - 1;
                         }
                     }
+                    self.som_persist_tab_state(cx);
+                }
+            }
+            pane::Event::ItemMoved { from, to } => {
+                // A tab dragged to another place in the main pane: its split
+                // panes are keyed by tab index, so they follow the tab, and
+                // the tabs it jumped over shift by one with theirs.
+                let is_main_pane = self.panes.first().map_or(false, |p| p == pane);
+                if is_main_pane {
+                    let (from, to) = (*from, *to);
+                    let moved = |k: usize| {
+                        if k == from {
+                            to
+                        } else if from < to && k > from && k <= to {
+                            k - 1
+                        } else if to < from && k >= to && k < from {
+                            k + 1
+                        } else {
+                            k
+                        }
+                    };
+                    macro_rules! remap_map {
+                        ($map:expr) => {{
+                            $map = $map.drain().map(|(k, v)| (moved(k), v)).collect();
+                        }};
+                    }
+                    remap_map!(self.som_tab_splits);
+                    remap_map!(self.som_parked_splits);
+                    remap_map!(self.som_tab_flexes);
+                    remap_map!(self.som_tab_active_pane);
+                    remap_map!(self.som_tab_active_pane_index);
+                    self.som_active_tab_index = moved(self.som_active_tab_index);
                     self.som_persist_tab_state(cx);
                 }
             }

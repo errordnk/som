@@ -281,6 +281,23 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _ = (workspace_id, window, cx);
         unimplemented!("clone_on_split() must be implemented if can_split() returns true")
     }
+    /// `clone_on_split` for a Som split whose pane takes `pane_uuid` (restore
+    /// names the UUID a split reattaches to; `None` makes a fresh one). It is
+    /// handed in rather than asked of the workspace: the workspace is the one
+    /// splitting, so it is mid-update while this runs.
+    fn clone_on_split_as(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        pane_uuid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>>
+    where
+        Self: Sized,
+    {
+        _ = pane_uuid;
+        self.clone_on_split(workspace_id, window, cx)
+    }
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
@@ -513,6 +530,13 @@ pub trait ItemHandle: 'static + Send {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Option<Box<dyn ItemHandle>>>;
+    fn clone_on_split_as(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        pane_uuid: Option<String>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Option<Box<dyn ItemHandle>>>;
     fn added_to_pane(
         &self,
         workspace: &mut Workspace,
@@ -737,6 +761,20 @@ impl<T: Item> ItemHandle for Entity<T> {
         cx: &mut App,
     ) -> Task<Option<Box<dyn ItemHandle>>> {
         let task = self.update(cx, |item, cx| item.clone_on_split(workspace_id, window, cx));
+        cx.background_spawn(async move {
+            task.await
+                .map(|handle| Box::new(handle) as Box<dyn ItemHandle>)
+        })
+    }
+
+    fn clone_on_split_as(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        pane_uuid: Option<String>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Option<Box<dyn ItemHandle>>> {
+        let task = self.update(cx, |item, cx| item.clone_on_split_as(workspace_id, pane_uuid, window, cx));
         cx.background_spawn(async move {
             task.await
                 .map(|handle| Box::new(handle) as Box<dyn ItemHandle>)
@@ -1473,7 +1511,20 @@ pub mod test {
 
         fn clone_on_split(
             &self,
+            workspace_id: Option<WorkspaceId>,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Task<Option<Entity<Self>>>
+        where
+            Self: Sized,
+        {
+            self.clone_on_split_as(workspace_id, None, window, cx)
+        }
+
+        fn clone_on_split_as(
+            &self,
             _workspace_id: Option<WorkspaceId>,
+            pane_uuid: Option<String>,
             _: &mut Window,
             cx: &mut Context<Self>,
         ) -> Task<Option<Entity<Self>>>
@@ -1503,7 +1554,7 @@ pub mod test {
                         .iter()
                         .map(|_| cx.focus_handle())
                         .collect(),
-                    som_pane_uuid: uuid::Uuid::new_v4().to_string(),
+                    som_pane_uuid: pane_uuid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     removed_count: Default::default(),
                 }
             })))

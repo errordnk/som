@@ -407,11 +407,18 @@ pub fn run(
     let mut typed = Vec::new();
     let mut frames = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut input = crate::term_size::relay_input();
     loop {
-        let read = match std::io::stdin().read(&mut buf) {
-            Ok(0) => break, // EOF — Som closed its side
+        let read = match input.read(&mut buf) {
+            Ok(0) => {
+                log::info!("relay input ended (EOF): Som closed its side");
+                break;
+            }
             Ok(n) => n,
-            Err(_) => break,
+            Err(err) => {
+                log::warn!("relay input read failed, ending the relay: {err}");
+                break;
+            }
         };
         typed.clear();
         frames.clear();
@@ -450,8 +457,9 @@ pub fn run(
         if filtered.is_empty() {
             continue;
         }
-        if send(&connection, &writer, &RelayInput::Bytes(filtered)).is_err() {
-            break; // holder gone
+        if let Err(err) = send(&connection, &writer, &RelayInput::Bytes(filtered)) {
+            log::warn!("relay could not pass {read} input byte(s) to the holder, ending the relay: {err:#}");
+            break;
         }
     }
 

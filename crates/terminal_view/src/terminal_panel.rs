@@ -641,16 +641,10 @@ impl TerminalPanel {
         cx.spawn(async move |cx| {
             let db_state = workspace::som_db::load_som_db();
 
-            // Every tmux pane_id `db.json` currently knows about, across
-            // every tab (including splits) — the live set `kill_orphaned_
-            // holders` below cleans remote HOLDER processes against. Built
-            // once, up front, from the SAME `db_state` the restore loop
-            // below reads, before that loop can generate any FRESH pane_ids
-            // of its own (a tab whose saved `tmux_sessions` is missing/
-            // corrupt gets a brand new one) — an orphan-cleanup pass must
-            // never race against pane_ids Som itself is about to start
-            // relying on this run.
-            let live_pane_ids: Vec<String> = db_state.pane_ids().map(String::from).collect();
+            // The remote hosts the restored tabs run on, each once: their
+            // sessions are reconciled after restore (see
+            // `close_unplaced_remote_sessions`).
+            let mut remote_hosts: Vec<(Vec<String>, RemoteKind)> = Vec::new();
             let active_tab = db_state.active_tab();
             // Which of the active tab's panes had focus (0 is the main one),
             // found by its UUID.
@@ -790,7 +784,11 @@ impl TerminalPanel {
                     let (remote_program, host_args) =
                         project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
                     let remote_kind = classify_remote(&remote_program);
-                    let live_pane_ids = live_pane_ids.clone();
+                    if matches!(remote_kind, RemoteKind::Ssh | RemoteKind::Wsl)
+                        && !remote_hosts.iter().any(|(args, kind)| *args == host_args && *kind == remote_kind)
+                    {
+                        remote_hosts.push((host_args.clone(), remote_kind));
+                    }
                     let workspace = workspace.clone();
                     let profile = profile.clone();
                     let cwd = cwd.clone();
@@ -822,13 +820,6 @@ impl TerminalPanel {
                             Some(tab_profile_index),
                         )
                         .await?;
-                        // Orphan cleanup runs in the background, detached, strictly
-                        // AFTER this tab has opened (SRP or fallback plain SSH).
-                        if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
-                            let host_args = host_args.clone();
-                            let live_pane_ids = live_pane_ids.clone();
-                            cx.background_spawn(async move { kill_orphaned_holders(&host_args, remote_kind, &live_pane_ids) }).detach();
-                        }
                         anyhow::Ok(item_id)
                     });
                     tab_creations.push((db_index, tab.split_panes().to_vec(), created));
@@ -1140,9 +1131,10 @@ impl TerminalPanel {
                 })
                 .ok();
 
-            // This machine's daemon hands over every session it holds; the
-            // ones the restored tabs did not take are closed (see
-            // `close_unplaced_local_sessions`).
+            // Each daemon — this machine's and every remote host's — hands
+            // over every session it holds for this client; the ones the
+            // restored tabs did not take are closed (see
+            // `close_unplaced_local_sessions`, `close_unplaced_remote_sessions`).
             let placed: Option<Vec<String>> = window_handle
                 .update(cx, |_, _, cx| {
                     workspace.upgrade().and_then(|workspace| {
@@ -1155,7 +1147,18 @@ impl TerminalPanel {
                 .ok()
                 .flatten();
             if let Some(placed) = placed {
-                cx.background_spawn(async move { close_unplaced_local_sessions(&placed) }).await;
+                let local = cx.background_spawn({
+                    let placed = placed.clone();
+                    async move { close_unplaced_local_sessions(&placed) }
+                });
+                // A remote host can be slow or unreachable: its reconcile
+                // never holds up the restore's end.
+                for (host_args, remote_kind) in remote_hosts {
+                    let placed = placed.clone();
+                    cx.background_spawn(async move { close_unplaced_remote_sessions(&host_args, remote_kind, &placed) })
+                        .detach();
+                }
+                local.await;
             }
 
             window_handle.update(cx, |_, _, cx| workspace::SomRestoreActivity::end(cx)).ok();
@@ -1553,8 +1556,8 @@ pub fn is_local_tmux_shell(shell: &Shell) -> bool {
 /// `placed` — the panes the restored tabs took. The daemon hands over all of
 /// this client's sessions; what Som could not place is closed by Som, so a
 /// session never outlives the pane it belonged to across a restart. Local
-/// sessions only: a remote host's are handled per host by
-/// `kill_orphaned_holders`. No daemon running is nothing to do.
+/// sessions only: a remote host's are closed by
+/// `close_unplaced_remote_sessions`. No daemon running is nothing to do.
 fn close_unplaced_local_sessions(placed: &[String]) {
     let sessions = match somsrv::admin::list_sessions(None) {
         Ok(sessions) => sessions,
@@ -1666,58 +1669,30 @@ fn shell_quote(script: &str) -> String {
     format!("'{}'", script.replace('\'', r#"'\''"#))
 }
 
-/// Tears down every session the daemon on the far end of an SSH `tmux:
-/// true` profile is holding for THIS SAME client machine (matched by
-/// `client_id`, mirroring `somsrv::protocol::ssh_client_id`'s
-/// `<user>@<ip>` shape) whose `pane_id` isn't in `live_pane_ids` — i.e. a
-/// session for a pane that isn't (or is no longer) in THIS client's
-/// `db.json` at all, so nothing running on this machine will EVER try to
-/// reattach to it again. Called once per host during `restore_som_tabs`,
-/// right alongside the existing deploy-check SSH round-trip (piggybacking
-/// on that same "we're already paying for one SSH connection to this host
-/// anyway" moment rather than adding a second one).
+/// The remote side of `close_unplaced_local_sessions`: the daemon on the
+/// far end of an SSH or WSL profile hands over every session it holds for
+/// THIS client, and each one no restored pane took (`placed`) is closed.
 ///
-/// Uses `somsrv::admin`'s `--list-sessions`/`--kill-session` CLI
-/// subcommands (run over SSH via `run_remote_command`, same as the
-/// `--version` deploy-check probe) rather than a `ps`-grep — the OLD
-/// per-pane-HOLDER architecture had one OS process per session, with
-/// `--client-id`/`--pane-id` visible on ITS OWN command line for a `ps`
-/// probe to grep; the shared daemon has exactly one process for every
-/// session on the host, so session identity now lives in ITS registry,
-/// not in any process's argv. Asking the daemon directly (via its own
-/// admin protocol) is also simply more precise than a `ps`-grep ever was.
+/// "This client" is the `client_id` the relay registered its sessions
+/// under: `<user>@<ip>` over SSH (`somsrv::protocol::ssh_client_id`, read
+/// back here over the same kind of connection by `read_this_client_id`),
+/// none at all inside WSL (no sshd, no `$SSH_CLIENT`). Scoping by it keeps
+/// the sessions another machine's Som has on the same host out of reach:
+/// they are not this client's to place.
 ///
-/// Deliberately keyed on `db.json` membership, not "how long has this
-/// session been idle" or "is its shell process busy" — those need per-pane
-/// state this function has no access to and, more importantly, would be
-/// WRONG for a real live pane that's simply not the active tab right now (a
-/// background tab's session is idle but absolutely not an orphan). A
-/// pane_id db.json doesn't know about at all, by contrast, can never be
-/// reattached to by anything — the ONLY way Som ever learns a pane_id to
-/// reattach to is by reading it back out of db.json in the first place
-/// (see `restore_som_tabs`'s own pane_id lookup) or by a currently-open tab
-/// that already put it there, both of which `live_pane_ids` already
-/// covers.
-///
-/// Scoping to `client_id` matters whenever more than one Som installation
-/// SSHes into the same remote host (e.g. a Windows machine AND a Mac both
-/// connect to `deb`) — a session the OTHER machine created is invisible to
-/// THIS machine's `db.json` and would look orphaned by pane_id alone, even
-/// though it's perfectly live from that other machine's point of view.
-///
-/// Best-effort: a failure here (host unreachable, `somsrv` too old to
-/// understand `--list-sessions`) is logged and swallowed rather than
-/// propagated — this is housekeeping, not something that should block a
-/// tab from restoring.
-fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pane_ids: &[String]) {
-    // WSL has no long-lived cross-restart daemon session of its own the way
-    // an SSH profile's remote host does (see `wrap_remote_command_args`'s
-    // `-tt` doc comment) — nothing to clean up there.
-    if !matches!(remote_kind, RemoteKind::Ssh) {
-        return;
-    }
-    let Some(this_client_id) = read_this_client_id(host_args, remote_kind) else {
-        return;
+/// Runs `somsrv --list-sessions`/`--kill-session` on the host (the same
+/// probe shape as the `--version` deploy check). Best-effort: an
+/// unreachable host or a daemon that is not running is logged and left.
+fn close_unplaced_remote_sessions(host_args: &[String], remote_kind: RemoteKind, placed: &[String]) {
+    let this_client_id = match remote_kind {
+        RemoteKind::Ssh => match read_this_client_id(host_args, remote_kind) {
+            Some(client_id) => client_id,
+            None => return,
+        },
+        // Sessions started inside WSL carry no client id: the CLI takes an
+        // empty one for that.
+        RemoteKind::Wsl => String::new(),
+        RemoteKind::Local => return,
     };
     let this_client_id = this_client_id.as_str();
 
@@ -1727,11 +1702,11 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
     let sessions_json = match run_remote_command(remote_kind, &list_probe) {
         Ok(output) => output,
         Err(err) => {
-            log::warn!("failed to list remote somsrv sessions for orphan cleanup, skipping: {err:#}");
+            log::info!("no remote somsrv sessions to reconcile on {host_args:?}: {err:#}");
             return;
         }
     };
-    let sessions: Vec<somsrv::protocol::SessionInfo> = match serde_json::from_str(sessions_json.trim()) {
+    let sessions: Vec<somsrv::protocol::SessionInfo> = match serde_json::from_str(session_list_line(&sessions_json)) {
         Ok(sessions) => sessions,
         Err(err) => {
             log::warn!("failed to parse somsrv --list-sessions output, skipping: {err:#} (output: {sessions_json:?})");
@@ -1739,24 +1714,31 @@ fn kill_orphaned_holders(host_args: &[String], remote_kind: RemoteKind, live_pan
         }
     };
 
-    let orphaned_pane_ids = orphaned_pane_ids(&sessions, live_pane_ids);
-    if orphaned_pane_ids.is_empty() {
+    let unplaced = orphaned_pane_ids(&sessions, placed);
+    if unplaced.is_empty() {
         return;
     }
-    log::info!("killing {} orphaned somsrv session(s) not in db.json: {orphaned_pane_ids:?}", orphaned_pane_ids.len());
-    for pane_id in orphaned_pane_ids {
+    log::info!("closing {} somsrv session(s) on {host_args:?} no restored pane took: {unplaced:?}", unplaced.len());
+    for pane_id in unplaced {
         let kill_script = format!("~/.local/bin/somsrv --kill-session {} {}", shell_quote(this_client_id), shell_quote(pane_id));
         let quoted_kill_script = shell_quote(&kill_script);
         let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
         if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
-            log::warn!("failed to kill orphaned somsrv session {pane_id:?}: {err:#}");
+            log::warn!("failed to close somsrv session {pane_id:?} on {host_args:?}: {err:#}");
         }
     }
 }
 
+/// The line of a remote `somsrv --list-sessions` run that holds its JSON:
+/// a login shell may print its own lines first (a version manager's init
+/// does, inside WSL).
+fn session_list_line(output: &str) -> &str {
+    output.lines().rev().map(str::trim).find(|line| line.starts_with('[')).unwrap_or("")
+}
+
 /// Filters `sessions` (already scoped to `this_client_id` by
 /// `SrvRequest::ListSessions` itself) down to the `pane_id`s NOT present
-/// in `live_pane_ids`. Pulled out of `kill_orphaned_holders` itself so
+/// in `live_pane_ids`. Pulled out of `close_unplaced_remote_sessions` so
 /// this filtering logic can be unit-tested without an actual SSH
 /// round-trip.
 fn orphaned_pane_ids<'a>(sessions: &'a [somsrv::protocol::SessionInfo], live_pane_ids: &[String]) -> Vec<&'a str> {
@@ -2006,7 +1988,7 @@ fn remote_os_to_platform(os: workspace::RemoteOs) -> (somsrv::protocol::Os, soms
 /// together, over THIS SAME SSH connection, so sshd reports the exact
 /// same source IP any OTHER invocation from this same client machine
 /// (i.e. a RELAY registering a session) already got and passed down as
-/// its own `client_id`. Used by `kill_orphaned_holders` to scope itself
+/// its own `client_id`. Used by `close_unplaced_remote_sessions` to scope itself
 /// to only THIS client's own sessions.
 fn read_this_client_id(host_args: &[String], remote_kind: RemoteKind) -> Option<String> {
     // Prefixed with a marker rather than trusting this to be the FIRST
@@ -2351,12 +2333,22 @@ mod tmux_shell_wrapping_tests {
     }
 
     #[test]
+    fn a_session_list_is_read_past_what_the_login_shell_prints() {
+        let output = "/usr/local/bin/fnm\n[{\"profile_name\":\"wsl\",\"pane_id\":\"p\",\"client_id\":null}]\n";
+        let sessions: Vec<somsrv::protocol::SessionInfo> =
+            serde_json::from_str(session_list_line(output)).expect("the JSON line");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pane_id, "p");
+        assert_eq!(session_list_line("no daemon\n"), "", "no JSON line is nothing to parse");
+    }
+
+    #[test]
     fn orphan_scan_flags_a_session_whose_pane_id_is_not_in_db_json() {
         // `SrvRequest::ListSessions` is already scoped to a single
         // `client_id` server-side, so this filter only needs to check
         // `live_pane_ids` membership — no `--client-id` string comparison
         // to get wrong the way the old `ps`-grep design once did (see
-        // `kill_orphaned_holders`'s doc comment for that history).
+        // `close_unplaced_remote_sessions`'s doc comment for that history).
         let sessions = vec![session("deb", "dead-pane", "dnk@192.168.50.2")];
         let orphaned = orphaned_pane_ids(&sessions, &["live-pane".to_string()]);
         assert_eq!(orphaned, vec!["dead-pane"]);
@@ -2906,7 +2898,7 @@ mod tmux_shell_wrapping_tests {
     /// Real SSH round-trip: registers two sessions with the remote daemon
     /// (spawning it if not already running, via the real RELAY invocation
     /// — NOT a fabricated shortcut), one with a pane_id NOT in
-    /// `live_pane_ids`, confirms `kill_orphaned_holders` kills it via
+    /// `live_pane_ids`, confirms `close_unplaced_remote_sessions` kills it via
     /// `SrvRequest::KillSession`, and confirms a SEPARATE session whose
     /// pane_id IS in `live_pane_ids` survives — the two behaviors this
     /// function exists to balance (see its own doc comment). Uses the
@@ -2919,7 +2911,7 @@ mod tmux_shell_wrapping_tests {
     /// `#[ignore]`d by default — same reachability requirement as the
     /// deploy tests above, plus a working `somsrv` binary already at
     /// `~/.local/bin/somsrv`. Run explicitly with:
-    /// `cargo test -p terminal_view test_kill_orphaned_holders_only_kills_the_orphan -- --ignored --nocapture`
+    /// `cargo test -p terminal_view test_close_unplaced_remote_sessions_only_closes_the_unplaced -- --ignored --nocapture`
 
     /// Spawns a real RELAY (`somsrv <profile> <pane-id> <program>`,
     /// backgrounded via `nohup ... &`) — the exact same invocation shape
@@ -2952,7 +2944,7 @@ mod tmux_shell_wrapping_tests {
     }
 
     fn read_back_this_connections_client_id(host_args: &[String]) -> String {
-        // Same marker-prefix technique `kill_orphaned_holders` itself uses
+        // Same marker-prefix technique `close_unplaced_remote_sessions` itself uses
         // (see its own doc comment) — a login shell can print unrelated
         // profile-script noise (e.g. a version manager's init banner) to
         // stdout BEFORE this echo ever runs, so blindly taking the first
@@ -2972,7 +2964,7 @@ mod tmux_shell_wrapping_tests {
 
     #[test]
     #[ignore]
-    fn test_kill_orphaned_holders_only_kills_the_orphan() {
+    fn test_close_unplaced_remote_sessions_only_closes_the_unplaced() {
         let host_args = integration_test_ssh_host();
         let orphan_pane_id = format!("test-orphan-{}", std::process::id());
         let live_pane_id = format!("test-live-{}", std::process::id());
@@ -2984,7 +2976,7 @@ mod tmux_shell_wrapping_tests {
         // before the orphan-scan probe below lists sessions.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        kill_orphaned_holders(&host_args, RemoteKind::Ssh, std::slice::from_ref(&live_pane_id));
+        close_unplaced_remote_sessions(&host_args, RemoteKind::Ssh, std::slice::from_ref(&live_pane_id));
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(

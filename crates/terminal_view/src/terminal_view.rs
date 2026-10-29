@@ -124,6 +124,10 @@ pub struct TerminalView {
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
+    /// The pane's UUID when its shell is not a tmux one (a tmux shell's
+    /// UUID is its session id, read off the shell itself — see
+    /// `Item::som_pane_uuid`).
+    plain_pane_uuid: String,
     _self_handle: WeakEntity<Self>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
@@ -293,6 +297,7 @@ impl TerminalView {
             custom_title: tab_name,
             custom_icon: tab_icon,
             ime_state: None,
+            plain_pane_uuid: uuid::Uuid::new_v4().to_string(),
             _self_handle: cx.entity().downgrade(),
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
@@ -1221,6 +1226,16 @@ impl Render for TerminalView {
 }
 
 impl Item for TerminalView {
+    /// A tmux pane's UUID is the `somsrv` session id its shell runs in, read
+    /// off the shell every time (a restarted terminal may run another one);
+    /// any other pane's is its own, made with it.
+    fn som_pane_uuid(&self, cx: &App) -> Option<String> {
+        Some(
+            crate::terminal_panel::tmux_pane_id(self.terminal().read(cx).shell())
+                .unwrap_or_else(|| self.plain_pane_uuid.clone()),
+        )
+    }
+
     type Event = ItemEvent;
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
@@ -1355,7 +1370,13 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
-        let mut fresh_pane_id: Option<String> = None;
+        // Restore names the UUID this split reattaches to; a split the user
+        // makes gets a fresh one.
+        let pane_uuid = self
+            .workspace
+            .update(cx, |workspace, _| workspace.take_som_next_split_pane_uuid())
+            .ok()
+            .flatten();
         let Ok(terminal) = self.project.update(cx, |project, cx| {
             // Prefer the terminal's own CWD; fall back to home dir so split panes
             // don't inherit Som's process directory.
@@ -1370,9 +1391,8 @@ impl Item for TerminalView {
             // substitutes a fresh pane_id; anything else falls through to
             // the normal exact-copy clone.
             let source_shell = self.terminal().read(cx).shell();
-            match crate::terminal_panel::rebuild_tmux_shell_for_split(source_shell) {
-                Some((fresh_shell, pane_id)) => {
-                    fresh_pane_id = Some(pane_id);
+            match crate::terminal_panel::rebuild_tmux_shell_for_split(source_shell, pane_uuid) {
+                Some((fresh_shell, _pane_id)) => {
                     project.clone_terminal_with_shell(self.terminal(), Some(fresh_shell), cx, cwd)
                 }
                 None => project.clone_terminal(self.terminal(), cx, cwd),
@@ -1380,10 +1400,9 @@ impl Item for TerminalView {
         }) else {
             return Task::ready(None);
         };
-        let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             let terminal = terminal.await.log_err()?;
-            let new_view = this.update_in(cx, |this, window, cx| {
+            this.update_in(cx, |this, window, cx| {
                 cx.new(|cx| {
                     TerminalView::new(
                         terminal,
@@ -1395,32 +1414,7 @@ impl Item for TerminalView {
                     )
                 })
             })
-            .ok()?;
-            // If this WAS a tmux-wrapped shell, the new split just got its
-            // OWN fresh pane_id above — record it under the TAB's item_id
-            // (not this split pane's own, brand new one) in `Workspace::
-            // som_tab_tmux_sessions`, alongside whatever pane_ids that tab
-            // already has, so a later restore reattaches this split to its
-            // own still-alive HOLDER instead of losing track of it and
-            // starting a fresh session. Without this, `som_persist_db_json`
-            // only ever wrote the tab's FIRST (main pane) pane_id, silently
-            // dropping every split's — confirmed as a real bug: a tab's
-            // `db.json` entry like `"6.2:<one-uuid>"` (extra_splits=2 but
-            // only one pane_id) meant both splits reconnected to brand-new
-            // HOLDERs on every restore, leaking the old ones.
-            if let Some(pane_id) = fresh_pane_id {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        let Some(main_pane) = workspace.panes().first().cloned() else { return };
-                        let Some(tab_item) = main_pane.read(cx).active_item() else { return };
-                        let tab_item_id = tab_item.item_id();
-                        let mut pane_ids = workspace.tmux_sessions_for_item(tab_item_id).unwrap_or_default();
-                        pane_ids.push(pane_id);
-                        workspace.set_tmux_sessions_for_item(tab_item_id, pane_ids, cx);
-                    })
-                    .ok();
-            }
-            Some(new_view)
+            .ok()
         })
     }
 
@@ -1465,6 +1459,15 @@ impl Item for TerminalView {
     /// sent, and closing behaves exactly as before this was added.
     fn on_removed(&self, cx: &mut Context<Self>) {
         let shell = self.terminal().read(cx).shell().clone();
+        // A session of THIS machine's daemon is closed by asking the daemon
+        // directly — certain, and immediate. A remote one goes through the
+        // relay below.
+        if crate::terminal_panel::is_local_tmux_shell(&shell) {
+            if let Some(pane_id) = crate::terminal_panel::tmux_pane_id(&shell) {
+                somsrv::admin::kill_session(None, pane_id).log_err();
+            }
+            return;
+        }
         if crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(&shell).is_none() {
             return;
         }

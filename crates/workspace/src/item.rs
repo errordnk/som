@@ -215,6 +215,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn deactivated(&mut self, _window: &mut Window, _: &mut Context<Self>) {}
     fn discarded(&self, _project: Entity<Project>, _window: &mut Window, _cx: &mut Context<Self>) {}
     fn on_removed(&self, _cx: &mut Context<Self>) {}
+    /// The pane's own identity in Som's `db.json` (see `som_db`): for a
+    /// terminal, its UUID — for a `tmux: true` one also its `somsrv` session
+    /// id. `None` for anything that is not a Som pane.
+    fn som_pane_uuid(&self, _cx: &App) -> Option<String> {
+        None
+    }
     fn workspace_deactivated(&mut self, _window: &mut Window, _: &mut Context<Self>) {}
     fn pane_changed(&mut self, _new_pane_id: EntityId, _cx: &mut Context<Self>) {}
     fn navigate(
@@ -516,6 +522,7 @@ pub trait ItemHandle: 'static + Send {
     );
     fn deactivated(&self, window: &mut Window, cx: &mut App);
     fn on_removed(&self, cx: &mut App);
+    fn som_pane_uuid(&self, cx: &App) -> Option<String>;
     fn workspace_deactivated(&self, window: &mut Window, cx: &mut App);
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool;
     fn item_id(&self) -> EntityId;
@@ -937,6 +944,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.update(cx, |item, cx| item.on_removed(cx));
     }
 
+    fn som_pane_uuid(&self, cx: &App) -> Option<String> {
+        self.read(cx).som_pane_uuid(cx)
+    }
+
     fn workspace_deactivated(&self, window: &mut Window, cx: &mut App) {
         self.update(cx, |this, cx| this.workspace_deactivated(window, cx));
     }
@@ -1200,6 +1211,12 @@ pub mod test {
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
+        /// This test pane's UUID (`Item::som_pane_uuid`); a split clone
+        /// gets its own, as a real terminal split does.
+        pub som_pane_uuid: String,
+        /// How many times `on_removed` ran — shared, so it can still be
+        /// read once the item itself is gone.
+        pub removed_count: std::rc::Rc<Cell<usize>>,
     }
 
     impl project::ProjectItem for TestProjectItem {
@@ -1292,6 +1309,8 @@ pub mod test {
                 focus_handle: cx.focus_handle(),
                 serialize: None,
                 child_focus_handles: Vec::new(),
+                som_pane_uuid: uuid::Uuid::new_v4().to_string(),
+                removed_count: Default::default(),
             }
         }
 
@@ -1484,8 +1503,18 @@ pub mod test {
                         .iter()
                         .map(|_| cx.focus_handle())
                         .collect(),
+                    som_pane_uuid: uuid::Uuid::new_v4().to_string(),
+                    removed_count: Default::default(),
                 }
             })))
+        }
+
+        fn som_pane_uuid(&self, _cx: &App) -> Option<String> {
+            Some(self.som_pane_uuid.clone())
+        }
+
+        fn on_removed(&self, _cx: &mut Context<Self>) {
+            self.removed_count.set(self.removed_count.get() + 1);
         }
 
         fn is_dirty(&self, _: &App) -> bool {

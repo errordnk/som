@@ -791,28 +791,27 @@ mod som_restore_activity_tests {
     }
 }
 
+/// Tells every item of `pane` that it is going for good
+/// (`Item::on_removed`) — a terminal ends its session then. A pane taken out
+/// of the layout (`remove_pane`, `PaneGroup::remove`) drops its items without
+/// that, which left a closed split's session running in the daemon forever.
+fn som_end_items_of(pane: &Entity<Pane>, cx: &mut App) {
+    let items: Vec<Box<dyn ItemHandle>> = pane.read(cx).items().map(|item| item.boxed_clone()).collect();
+    for item in items {
+        item.on_removed(cx);
+    }
+}
+
 #[cfg(test)]
 mod somsrv_sessions_tests {
     use super::*;
     use gpui::TestAppContext;
 
-    /// Real `Workspace`, `Project`, and window — not a plain HashMap unit
-    /// test — exercising `set_tmux_sessions_for_item`/`tmux_sessions_for_
-    /// item` through GPUI's own entity update path. Regression coverage
-    /// for a real bug: a tmux tab with split panes only ever persisted
-    /// its MAIN pane's pane_id to db.json (e.g. `"6.2:<one-uuid>"` despite
-    /// `extra_splits == 2`), silently losing every split's pane_id on each
-    /// restore and leaking an orphaned HOLDER process per split, per
-    /// restart, on the remote host — confirmed live against a real deb
-    /// host (24 accumulated orphaned HOLDER processes from repeated
-    /// testing before this fix). `TerminalView::clone_on_split` now reads
-    /// back whatever's already recorded for the tab's item_id and APPENDS
-    /// the new split's fresh pane_id, rather than overwriting — this test
-    /// exercises exactly that read-modify-write sequence against a real
-    /// `Workspace` entity, standing in for what `clone_on_split` actually
-    /// does once a split's terminal finishes connecting.
+    /// `db.json` is read off the live panes: a tab with two splits is its
+    /// main pane's UUID and then its splits', in order, and the focused split
+    /// is the active pane — no separately kept count or id list involved.
     #[gpui::test]
-    async fn appending_a_splits_pane_id_keeps_the_mains_pane_id_too(cx: &mut TestAppContext) {
+    async fn db_state_lists_a_tabs_panes_by_uuid_from_the_live_layout(cx: &mut TestAppContext) {
         let app_state = cx.update(AppState::test);
         let project = cx.update(|cx| {
             Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
@@ -820,57 +819,49 @@ mod somsrv_sessions_tests {
         let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
         let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
 
-        let main_item_id = window
-            .update(cx, |workspace, _window, cx| {
+        let main_uuid = window
+            .update(cx, |workspace, window, cx| {
+                let pane = workspace.panes.first().unwrap().clone();
                 let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
-                let item_id = item.entity_id();
-                workspace.set_tmux_sessions_for_item(item_id, vec!["main-pane-id".to_string()], cx);
-                item_id
+                let uuid = item.read(cx).som_pane_uuid.clone();
+                pane.update(cx, |pane, cx| pane.add_item(Box::new(item), true, true, None, window, cx));
+                uuid
             })
             .unwrap();
+        cx.run_until_parked();
+        for _ in 0..2 {
+            let split = window
+                .update(cx, |workspace, window, cx| workspace.som_split_active_pane_awaited(window, cx))
+                .unwrap();
+            split.await;
+            cx.run_until_parked();
+        }
 
-        // Simulates `clone_on_split`'s own read-modify-write: read back
-        // whatever's already recorded for this tab, append the new
-        // split's freshly-generated pane_id, write the combined list back.
-        window
-            .update(cx, |workspace, _window, cx| {
-                let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
-                pane_ids.push("first-split-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids, cx);
-                let _ = cx;
+        let (state, split_uuids, focused) = window
+            .update(cx, |workspace, _, cx| {
+                let split_uuids: Vec<String> = workspace
+                    .som_split_panes
+                    .iter()
+                    .filter_map(|pane| pane.upgrade())
+                    .filter_map(|pane| pane.read(cx).active_item())
+                    .filter_map(|item| item.som_pane_uuid(cx))
+                    .collect();
+                let focused = workspace.active_pane.read(cx).active_item().and_then(|item| item.som_pane_uuid(cx));
+                (workspace.som_db_state(cx).unwrap(), split_uuids, focused)
             })
             .unwrap();
-
-        // A second split (level 1, cascading off the first) does the same.
-        window
-            .update(cx, |workspace, _window, cx| {
-                let mut pane_ids = workspace.tmux_sessions_for_item(main_item_id).unwrap_or_default();
-                pane_ids.push("second-split-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(main_item_id, pane_ids, cx);
-                let _ = cx;
-            })
-            .unwrap();
-
-        let final_sessions = window
-            .update(cx, |workspace, _window, _cx| workspace.tmux_sessions_for_item(main_item_id))
-            .unwrap();
-        assert_eq!(
-            final_sessions,
-            Some(vec![
-                "main-pane-id".to_string(),
-                "first-split-pane-id".to_string(),
-                "second-split-pane-id".to_string(),
-            ]),
-            "all three pane_ids (main + both splits) must survive, in creation order"
-        );
+        assert_eq!(split_uuids.len(), 2, "two live splits");
+        let mut expected = vec![main_uuid];
+        expected.extend(split_uuids);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].panes, expected, "main first, then the splits, by UUID");
+        assert_eq!(state.active_pane, focused, "the focused pane, by UUID");
     }
 
+    /// Closing a split tells its item it is gone for good (a terminal ends
+    /// its `somsrv` session then), and the split's UUID leaves the tab.
     #[gpui::test]
-    async fn an_item_with_no_recorded_sessions_yet_starts_from_an_empty_list(cx: &mut TestAppContext) {
-        // A plain (non-tmux) tab, or a tmux tab's very FIRST pane_id being
-        // recorded — `tmux_sessions_for_item` must return `None`/an empty
-        // starting point rather than panicking, so `clone_on_split`'s
-        // `.unwrap_or_default()` fallback is exercised for real here too.
+    async fn closing_a_split_ends_its_item_and_drops_its_uuid(cx: &mut TestAppContext) {
         let app_state = cx.update(AppState::test);
         let project = cx.update(|cx| {
             Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
@@ -878,23 +869,37 @@ mod somsrv_sessions_tests {
         let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
         let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
 
-        let item_id = window
-            .update(cx, |workspace, _window, cx| {
+        window
+            .update(cx, |workspace, window, cx| {
+                let pane = workspace.panes.first().unwrap().clone();
                 let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
-                let item_id = item.entity_id();
-                assert_eq!(workspace.tmux_sessions_for_item(item_id), None);
-
-                let mut pane_ids = workspace.tmux_sessions_for_item(item_id).unwrap_or_default();
-                pane_ids.push("only-pane-id".to_string());
-                workspace.set_tmux_sessions_for_item(item_id, pane_ids, cx);
-                item_id
+                pane.update(cx, |pane, cx| pane.add_item(Box::new(item), true, true, None, window, cx));
             })
             .unwrap();
-
-        let sessions = window
-            .update(cx, |workspace, _window, _cx| workspace.tmux_sessions_for_item(item_id))
+        cx.run_until_parked();
+        let split = window
+            .update(cx, |workspace, window, cx| workspace.som_split_active_pane_awaited(window, cx))
             .unwrap();
-        assert_eq!(sessions, Some(vec!["only-pane-id".to_string()]));
+        split.await;
+        cx.run_until_parked();
+
+        let removed = window
+            .update(cx, |workspace, _, cx| {
+                let split = workspace.som_split_panes.last().and_then(|pane| pane.upgrade()).unwrap();
+                let item = split.read(cx).active_item().unwrap();
+                item.downcast::<crate::item::test::TestItem>().unwrap().read(cx).removed_count.clone()
+            })
+            .unwrap();
+        window
+            .update(cx, |workspace, window, cx| workspace.som_pop_last_split_pane(true, window, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(removed.get(), 1, "the split's item was told it is gone");
+        let panes = window
+            .update(cx, |workspace, _, cx| workspace.som_db_state(cx).unwrap().tabs[0].panes.len())
+            .unwrap();
+        assert_eq!(panes, 1, "only the main pane is left");
     }
 
     /// Dragging a tab to another place keeps its split panes with it: they
@@ -938,7 +943,6 @@ mod somsrv_sessions_tests {
         window
             .update(cx, |workspace, _, _| {
                 assert_eq!(workspace.panes.len(), 2, "A shows its split");
-                assert_eq!(workspace.som_tab_splits.get(&0), Some(&1));
             })
             .unwrap();
 
@@ -954,8 +958,9 @@ mod somsrv_sessions_tests {
                 assert_eq!(main_pane.read(cx).active_item_index(), 2);
                 assert_eq!(workspace.som_active_tab_index, 2);
                 assert_eq!(workspace.panes.len(), 2, "A still shows its split");
-                assert_eq!(workspace.som_tab_splits.get(&2), Some(&1));
-                assert_eq!(workspace.som_tab_splits.get(&0), None, "B has no split");
+                let state = workspace.som_db_state(cx).unwrap();
+                assert_eq!(state.tabs[2].panes.len(), 2, "A keeps its split");
+                assert_eq!(state.tabs[0].panes.len(), 1, "B has no split");
             })
             .unwrap();
 
@@ -1821,33 +1826,25 @@ pub struct Workspace {
     // explicitly closed (som_close_pane / som_unsplit_pane) or the tab changes.
     // This prevents rapid Ctrl+\ from creating duplicate SSH connections.
     som_level_locked: [bool; 3],
-    som_tab_splits: std::collections::HashMap<usize, usize>,
     som_parked_splits: std::collections::HashMap<usize, (Vec<Entity<Pane>>, Vec<f32>, Option<Entity<Pane>>)>,
     som_active_tab_index: usize,
     som_pending_remove_index: Option<usize>,
     som_tab_active_pane: std::collections::HashMap<usize, WeakEntity<Pane>>,
-    som_tab_active_pane_index: std::collections::HashMap<usize, usize>,
     som_tab_flexes: std::collections::HashMap<usize, Vec<f32>>,
     /// Which settings.json `tabs[]` profile index each open tab (main-pane
     /// item) was created from, keyed by that item's `EntityId`. Used to
     /// reconstruct `som_db.json`'s "x.y" tab entries without guessing the
     /// profile back from a possibly-ambiguous or user-renamed tab title.
     som_tab_profile_index: std::collections::HashMap<gpui::EntityId, usize>,
-    /// `somsrv` pane ids for tmux tabs (main pane + splits, main
-    /// first), keyed by the *main* item's `EntityId` — mirrors
-    /// `som_tab_profile_index`. A pane id is just a UUID string used as
-    /// that pane's `somsrv` pipe name (see `project_som_tmux`
-    /// memory, "Обновление 17"/19) — NOT a protocol session id to `Attach`
-    /// with anymore (that concept is gone along with the old JSON IPC
-    /// protocol). Populated by `terminal_view` right after creating a tmux
-    /// tab (it generates the pane id itself before ever invoking
-    /// `somsrv`), since `workspace` can't name anything
-    /// tmux-specific itself (dependency points the other way). Read back in
-    /// `som_persist_db_json` to fill db.json's `tmux_sessions` field, so a
-    /// later launch reuses the same pane id (and thus reconnects to the
-    /// same still-running HOLDER, if one survived) instead of generating a
-    /// fresh one. Non-tmux tabs never get an entry here.
-    som_tab_tmux_sessions: std::collections::HashMap<gpui::EntityId, Vec<String>>,
+    /// Set while launch-time restore rebuilds the tabs from `db.json`, which
+    /// is not written meanwhile: tabs still on their way would drop out of
+    /// it. Restore writes it once when done (`set_som_restoring(false)`).
+    som_restoring: bool,
+    /// The UUID the next split takes — set by restore right before it
+    /// splits a pane it rebuilds from `db.json`, so the split reattaches to
+    /// that pane's session; taken by the terminal the split creates. `None`
+    /// for a split the user makes, which gets a fresh UUID.
+    som_next_split_pane_uuid: Option<String>,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -2113,15 +2110,14 @@ impl Workspace {
             som_split_panes: Vec::new(),
             som_split_in_progress: false,
             som_level_locked: [false; 3],
-            som_tab_splits: std::collections::HashMap::new(),
             som_parked_splits: std::collections::HashMap::new(),
             som_active_tab_index: 0,
             som_pending_remove_index: None,
             som_tab_active_pane: std::collections::HashMap::new(),
-            som_tab_active_pane_index: std::collections::HashMap::new(),
             som_tab_flexes: std::collections::HashMap::new(),
             som_tab_profile_index: std::collections::HashMap::new(),
-            som_tab_tmux_sessions: std::collections::HashMap::new(),
+            som_restoring: false,
+            som_next_split_pane_uuid: None,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -4534,31 +4530,24 @@ impl Workspace {
         self.add_item_to_main_pane_at(item, profile_index, None, window, cx);
     }
 
-    /// Records `pane_ids` (main pane + splits, main first) as the
-    /// `somsrv` pane ids backing `item`'s tab, so a later
-    /// `som_persist_db_json` call can write them into db.json's
-    /// `tmux_sessions` field. See `som_tab_tmux_sessions`'s doc comment.
-    ///
-    /// Writes db.json right away: the ids arrive after the tab itself (its
-    /// terminal comes up asynchronously), and a db.json written without them
-    /// makes the next launch start new sessions instead of reattaching.
-    pub fn set_tmux_sessions_for_item(
-        &mut self,
-        item_id: gpui::EntityId,
-        pane_ids: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.som_tab_tmux_sessions.insert(item_id, pane_ids);
-        self.som_persist_db_json(cx);
+    /// Marks launch-time restore as running (`db.json` is left alone) or
+    /// done (`db.json` is written from the restored tabs right away).
+    pub fn set_som_restoring(&mut self, restoring: bool, cx: &mut Context<Self>) {
+        self.som_restoring = restoring;
+        if !restoring {
+            self.som_persist_db_json(cx);
+        }
     }
 
-    /// Reads back whatever `set_tmux_sessions_for_item` has recorded for
-    /// `item_id` so far — used by `TerminalView::clone_on_split` to APPEND
-    /// a new split's freshly-generated pane_id to the tab's existing list
-    /// (main pane's pane_id, plus any earlier splits') rather than
-    /// clobbering it with a single-element list.
-    pub fn tmux_sessions_for_item(&self, item_id: gpui::EntityId) -> Option<Vec<String>> {
-        self.som_tab_tmux_sessions.get(&item_id).cloned()
+    /// Names the UUID the next split's pane takes (see
+    /// `som_next_split_pane_uuid`).
+    pub fn set_som_next_split_pane_uuid(&mut self, pane_uuid: Option<String>) {
+        self.som_next_split_pane_uuid = pane_uuid;
+    }
+
+    /// Takes the UUID the split being created should use, if restore named one.
+    pub fn take_som_next_split_pane_uuid(&mut self) -> Option<String> {
+        self.som_next_split_pane_uuid.take()
     }
 
     /// Records `profile_index` (settings.json's `tabs[]` array index) as
@@ -5388,15 +5377,6 @@ impl Workspace {
         // Track which pane was last focused per tab (for split pane memory)
         let tab_index = self.panes.first().map(|p| p.read(cx).active_item_index()).unwrap_or(0);
         self.som_tab_active_pane.insert(tab_index, pane.downgrade());
-        // Compute pane index: 0=main, 1..=3=splits
-        let pane_index = if self.panes.first().map_or(false, |p| p == &pane) {
-            0usize
-        } else {
-            self.som_split_panes.iter().position(|w| w.upgrade().as_ref() == Some(&pane))
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        };
-        self.som_tab_active_pane_index.insert(tab_index, pane_index);
         self.som_persist_tab_state(cx);
 
         // If this pane is in a dock, preserve that dock when dismissing zoomed items.
@@ -5596,7 +5576,6 @@ impl Workspace {
                     entry.remove();
                 }
                 self.som_tab_profile_index.remove(&item.item_id());
-                self.som_tab_tmux_sessions.remove(&item.item_id());
                 cx.emit(Event::ItemRemoved {
                     item_id: item.item_id(),
                 });
@@ -5616,11 +5595,9 @@ impl Workspace {
                                 $map = shifted;
                             }};
                         }
-                        remap_map!(self.som_tab_splits);
                         remap_map!(self.som_parked_splits);
                         remap_map!(self.som_tab_flexes);
                         remap_map!(self.som_tab_active_pane);
-                        remap_map!(self.som_tab_active_pane_index);
                         // If the closed tab was itself the active one, don't guess its
                         // replacement by offset — Pane::close_item_by_id already picked
                         // whichever neighboring item is now active. Read that directly.
@@ -5636,11 +5613,9 @@ impl Workspace {
                         }
                     } else {
                         // Fallback: just drop indices out of range.
-                        self.som_tab_splits.retain(|&k, _| k < new_count);
                         self.som_parked_splits.retain(|&k, _| k < new_count);
                         self.som_tab_flexes.retain(|&k, _| k < new_count);
                         self.som_tab_active_pane.retain(|&k, _| k < new_count);
-                        self.som_tab_active_pane_index.retain(|&k, _| k < new_count);
                         if new_count > 0 && self.som_active_tab_index >= new_count {
                             self.som_active_tab_index = new_count - 1;
                         }
@@ -5671,11 +5646,9 @@ impl Workspace {
                             $map = $map.drain().map(|(k, v)| (moved(k), v)).collect();
                         }};
                     }
-                    remap_map!(self.som_tab_splits);
                     remap_map!(self.som_parked_splits);
                     remap_map!(self.som_tab_flexes);
                     remap_map!(self.som_tab_active_pane);
-                    remap_map!(self.som_tab_active_pane_index);
                     self.som_active_tab_index = moved(self.som_active_tab_index);
                     self.som_persist_tab_state(cx);
                 }
@@ -5833,21 +5806,13 @@ impl Workspace {
             }
         };
 
-        // Capture the main pane's active tab index — we'll save the split count for it
-        let main_pane = self.panes.first().cloned();
-        let main_tab_index = main_pane.as_ref().map(|p| p.read(cx).active_item_index());
-
         self.som_split_in_progress = true;
         let task = self.split_and_clone(pane_to_split, direction, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(new_pane) = task.await {
                 this.update(cx, |this, inner_cx| {
                     this.som_split_panes.push(new_pane.downgrade());
-                    if let Some(tab_index) = main_tab_index {
-                        let count = this.som_split_panes.len();
-                        this.som_tab_splits.insert(tab_index, count);
-                        this.som_persist_tab_state(inner_cx);
-                    }
+                    this.som_persist_tab_state(inner_cx);
                     this.som_split_in_progress = false;
                 }).ok();
             } else {
@@ -5882,7 +5847,9 @@ impl Workspace {
         let freed_level = self.som_split_panes.len();
         if freed_level < 3 { self.som_level_locked[freed_level] = false; }
 
-        let tab_index = main_pane.read(cx).active_item_index();
+        // The pane is going for good: its items are told so (a terminal
+        // ends its session). `remove_pane` drops them without it.
+        som_end_items_of(&last, cx);
 
         if restore_focus {
             // Focus the pane to the left of the removed one, or main if none remain.
@@ -5896,12 +5863,6 @@ impl Workspace {
             self.remove_pane(last, None, window, cx);
         }
 
-        let count = self.som_split_panes.len();
-        if count == 0 {
-            self.som_tab_splits.remove(&tab_index);
-        } else {
-            self.som_tab_splits.insert(tab_index, count);
-        }
         self.som_persist_tab_state(cx);
     }
 
@@ -5950,20 +5911,20 @@ impl Workspace {
             self.som_split_panes.retain(|p| p.upgrade().is_some());
             let to_remove: Vec<Entity<Pane>> = self.som_split_panes.drain(..).filter_map(|w| w.upgrade()).collect();
             for p in &to_remove {
+                som_end_items_of(p, cx);
                 self.panes.retain(|x| x != p);
                 self.center.remove(p, cx).log_err();
             }
         } else if let Some((parked, _, _)) = self.som_parked_splits.remove(&target_idx) {
             // Split panes for a non-active tab live parked (off-tree) — tear those down.
             for p in &parked {
+                som_end_items_of(p, cx);
                 self.panes.retain(|x| x != p);
                 self.center.remove(p, cx).log_err();
             }
         }
-        self.som_tab_splits.remove(&target_idx);
         self.som_tab_flexes.remove(&target_idx);
         self.som_tab_active_pane.remove(&target_idx);
-        self.som_tab_active_pane_index.remove(&target_idx);
 
         if closing_active_tab {
             let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
@@ -6185,62 +6146,71 @@ impl Workspace {
         self.som_persist_db_json(cx);
     }
 
-    /// Writes `~/.config/som/db.json` from the live tab/pane state. Replaces
-    /// the kvp/SQLite-based `som_persist_tab_state` as the source of truth for
-    /// what gets restored on launch — see `som_db.rs` for the file format.
-    /// Called from the same trigger points `som_persist_tab_state` is (tab
-    /// focus, split creation/removal, tab close/switch).
+    /// Writes `~/.config/som/db.json` from the live tabs (see `som_db.rs`
+    /// for the format). Called from every point the layout changes (tab
+    /// focus, split creation/removal, tab close/switch/move) and on quit.
     fn som_persist_db_json(&mut self, cx: &mut Context<Self>) {
         // An admin-launched child window (see `som_admin`) holds a single
         // ad-hoc tab, not the user's saved session — writing it out would
         // replace the main window's real tab layout with that one tab.
-        if som_admin::is_admin_session() {
+        if som_admin::is_admin_session() || self.som_restoring {
             return;
         }
-        let Some(main_pane) = self.panes.first().cloned() else {
+        let Some(state) = self.som_db_state(cx) else {
             return;
         };
-        let main_pane = main_pane.read(cx);
-        let tabs: Vec<som_db::SomDbTab> = main_pane
-            .items()
-            .enumerate()
-            .map(|(tab_index, item)| {
-                let profile_index = self
-                    .som_tab_profile_index
-                    .get(&item.item_id())
-                    .copied()
-                    .unwrap_or(0);
-                let extra_splits = self.som_tab_splits.get(&tab_index).copied().unwrap_or(0);
-                let tmux_sessions = self.som_tab_tmux_sessions.get(&item.item_id()).cloned();
-                som_db::SomDbTab {
-                    profile_index,
-                    extra_splits,
-                    tmux_sessions,
-                }
-            })
-            .collect();
-        if tabs.is_empty() {
-            return;
-        }
-        let active_tab = self.som_active_tab_index.min(tabs.len() - 1);
-        let active_pane = self
-            .som_tab_active_pane_index
-            .get(&active_tab)
-            .copied()
-            .unwrap_or(0)
-            .min(tabs[active_tab].extra_splits);
         // Preserve whatever windowed-mode bounds are already on disk — this
         // function only knows about tabs/panes, not window geometry (that's
-        // tracked separately via `save_window_bounds_to_som_db`), so
-        // overwriting with `None` here would silently forget the user's
-        // last window size/position on every tab/split change.
+        // tracked separately via `save_window_bounds_to_som_db`).
         let window_bounds = som_db::load_som_db().window_bounds;
-        som_db::save_som_db(&som_db::SomDbState {
-            tabs,
-            active_tab,
-            active_pane,
-            window_bounds,
-        });
+        som_db::save_som_db(&som_db::SomDbState { window_bounds, ..state });
+    }
+
+    /// The tabs as `db.json` states them, read off the live panes: each tab's
+    /// main item, then the items of its split panes (live in the layout for
+    /// the active tab, parked for the others), every one by its UUID. The
+    /// tab's pane list therefore always matches what is on screen — there is
+    /// no separate count or id list kept alongside to drift from it. A tab
+    /// whose item has no UUID (not a terminal) is left out. `None` when there
+    /// is nothing to write.
+    pub fn som_db_state(&self, cx: &App) -> Option<som_db::SomDbState> {
+        let main_pane = self.panes.first()?.read(cx);
+        let pane_uuid = |pane: &Entity<Pane>| pane.read(cx).active_item().and_then(|item| item.som_pane_uuid(cx));
+        let mut tabs = Vec::new();
+        for (tab_index, item) in main_pane.items().enumerate() {
+            let Some(main_uuid) = item.som_pane_uuid(cx) else {
+                continue;
+            };
+            let split_uuids: Vec<String> = if tab_index == self.som_active_tab_index {
+                self.som_split_panes.iter().filter_map(|pane| pane.upgrade()).filter_map(|pane| pane_uuid(&pane)).collect()
+            } else {
+                self.som_parked_splits
+                    .get(&tab_index)
+                    .map(|(panes, _, _)| panes.iter().filter_map(|pane| pane_uuid(pane)).collect())
+                    .unwrap_or_default()
+            };
+            let mut panes = vec![main_uuid];
+            panes.extend(split_uuids);
+            panes.truncate(som_db::MAX_PANES_PER_TAB);
+            tabs.push(som_db::SomDbTab {
+                profile_index: self.som_tab_profile_index.get(&item.item_id()).copied().unwrap_or(0),
+                panes,
+            });
+        }
+        if tabs.is_empty() {
+            return None;
+        }
+        // The focused pane, when it is the active tab's main pane or one of
+        // its splits.
+        let active = &self.active_pane;
+        let active_pane = if self.panes.first() == Some(active)
+            || self.som_split_panes.iter().any(|pane| pane.upgrade().as_ref() == Some(active))
+        {
+            pane_uuid(active)
+        } else {
+            None
+        };
+        Some(som_db::SomDbState { tabs, active_pane, window_bounds: None })
     }
 
     pub fn join_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {

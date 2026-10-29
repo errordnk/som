@@ -248,9 +248,9 @@ The settings are read by `somsrv` on the machine `somsrp` runs on.
 
 ## Session persistence (db.json)
 
-Som remembers your open tabs, their split layout, (for `tmux: true` tabs) their remote session IDs, and — when `window.mode` is `"windowed"` — the window's last position and size, all in `~/.config/som/db.json`. Relaunching Som puts you back where you left off, including reattaching to still-running remote shells rather than starting fresh ones.
+Som remembers your open tabs, their split layout, the pane that had focus and — when `window.mode` is `"windowed"` — the window's last position and size, all in `~/.config/som/db.json`. Each tab is stored as its profile plus the UUIDs of its panes (the main pane first, then its splits); a pane's UUID is the id of its `somsrv` session. Relaunching Som puts you back where you left off, each pane reattaching to its own still-running shell rather than starting a fresh one.
 
-This file is rewritten automatically whenever you open/close a tab or split, switch tabs, resize/move the window, or quit — you shouldn't need to touch it directly. If it's ever missing or corrupted, Som just falls back to a single empty tab (and default window placement) rather than failing to start.
+The file is written from what is actually open, whenever you open/close a tab or split, switch tabs, resize/move the window, or quit — you shouldn't need to touch it directly. If it's missing, corrupted or in an older format, Som just falls back to a single empty tab (and default window placement) rather than failing to start.
 
 ## Restore on launch
 
@@ -267,9 +267,9 @@ Every tab profile routes its terminal through a small companion process (`somsrv
 
 - **Local shells:** a detached process holds the real shell and PTY; it keeps running even if Som is closed, so reopening Som reconnects to the exact same session (scrollback, running programs, and all) instead of starting over.
 - **Remote shells (`ssh`/`wsl`):** the same mechanism runs on the far end — Som deploys a small pre-built `somsrv` binary to `~/.local/bin/` on the remote host (only re-copying it when the version is out of date) and the remote shell runs inside it. This means a flaky connection or closing Som doesn't kill your remote session; reconnecting picks the same shell back up. The pre-built binary itself comes bundled inside Som (Windows, macOS, Linux amd64 and Linux arm64 such as a Raspberry Pi 5). Which one gets deployed is chosen by the profile's `"os"` field: `"win"`, `"mac"`, `"lnx"` (the default) or `"lnx-arm"`.
-- Each tmux-backed pane gets its own persistent session, identified internally by a UUID — this is transparent to you, but it's what's saved in `db.json` to make reattachment possible.
-- Som periodically cleans up abandoned remote sessions (ones that no longer correspond to anything in your current tab list) on the same machine, so stale processes don't accumulate on hosts you connect to often. This is best-effort: if it fails for some reason, it's logged and ignored rather than blocking your tab from opening.
-- Splitting a tmux-backed tab works the same as any other tab — each new split pane gets its own independent persistent session (its own pane_id), not a shared one.
+- Each tmux-backed pane gets its own persistent session, identified by a UUID — this is transparent to you, but it's what's saved in `db.json` to make reattachment possible. Splitting a tab gives the new pane its own independent session, not a shared one.
+- **Closing a pane or a tab ends its session** (locally and on the remote host). Quitting Som, a crash or a dropped connection keeps it, to be picked up on the next launch.
+- **No leftover sessions.** On launch, each daemon — this machine's and that of every host a restored tab runs on — hands over all the sessions it holds for you from this computer; Som gives each one back to the pane with its UUID and closes every session no pane took. Over SSH "you from this computer" is your user on the host plus this computer's address, so sessions another machine has on the same host are left alone; inside WSL it is every session its daemon holds (only Windows can reach it). A host with no tab open is not checked, and a host that is slow or unreachable doesn't hold up the launch.
 
 This feature has no separate settings.json toggle beyond the per-profile `"tmux": false` opt-out — there's no global on/off switch. `tmux`, `srp` and `lua` are all on by default; a profile that sets all three to `false` runs as a plain PTY.
 

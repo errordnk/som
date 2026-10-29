@@ -3,46 +3,54 @@
 //!
 //! Stored at `~/.config/som/db.json` as:
 //! ```json
-//! {"tabs": ["3.0", "1.2", "4.1"], "active": "1.1"}
+//! {
+//!   "tabs": [
+//!     {"profile": 0, "panes": ["<uuid>", "<uuid>"]},
+//!     {"profile": 2, "panes": ["<uuid>"]}
+//!   ],
+//!   "active_pane": "<uuid>",
+//!   "window_bounds": "x,y,width,height"
+//! }
 //! ```
-//! Each tab entry is `"x.y"`: `x` is the index into settings.json's `tabs[]`
-//! profile list, `y` is how many extra split panes that tab has (0-3). The
-//! array's own position is the tab's left-to-right order in the tab bar.
-//! `active` is `"i.j"`: `i` is the index into the `tabs` array (which open tab
-//! is active), `j` is which pane within that tab is active (0 = main,
-//! 1-3 = split panes). A missing/unreadable file falls back to a single tab
-//! using profile 0, no splits, active — `{"tabs": ["0.0"], "active": "0.0"}`.
+//! **Panes are identified by UUID, never by position.** Each tab names the
+//! settings.json profile it opens (`profile`, an index into `tabs[]` there)
+//! and its panes: the main pane first, then its splits (at most three). A
+//! pane's UUID is the pane's own identity — for a `tmux: true` profile it is
+//! also the `somsrv` session id (`pane_id`) the pane's shell runs in, so a
+//! restored pane reattaches to its session by that id. `active_pane` names
+//! the focused pane by UUID; the tab holding it is the active tab. The array
+//! order is the tab bar's left-to-right order.
 //!
-//! Tabs whose profile has `tmux: true` additionally carry their
-//! `somsrv` pane ids as a third, colon-separated segment:
-//! `"x.y:uuid1,uuid2,uuid3"` — one pane id per pane (main first, then splits
-//! in creation order), only ever written for tabs that are actually tmux. A
-//! plain (non-tmux) tab never has this segment at all — it's not "no
-//! sessions", it's "not applicable". Each pane id is a UUID string used as
-//! that pane's `somsrv` pipe name (see `project_som_tmux` memory,
-//! "Обновление 17"/19) — restoring a tab reuses the same id so it
-//! reconnects to the same still-running HOLDER process if one survived,
-//! rather than starting a fresh shell. (Formerly a protocol session id to
-//! `Attach` with — that concept is gone along with the old JSON IPC
-//! protocol; the on-disk format/validation is unchanged, just the meaning
-//! of what's stored.)
+//! A missing or unreadable file (including any older format) falls back to
+//! a single tab of profile 0 with one fresh pane.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// At most three splits beside a tab's main pane.
+pub const MAX_PANES_PER_TAB: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SomDbTab {
+    /// Index into settings.json's `tabs[]` profile list.
+    #[serde(rename = "profile")]
     pub profile_index: usize,
-    pub extra_splits: usize,
-    /// One `somsrv` pane id per live pane (main first, then splits
-    /// in order), only ever present for tabs whose profile has `tmux:
-    /// true`. `None` for a plain (non-tmux) tab — this is NOT "no sessions
-    /// to restore", it's "this tab was never tmux in the first place".
-    /// Length must match `1 + extra_splits` when present; restore treats a
-    /// mismatched length as corrupt and falls back to creating fresh
-    /// sessions for the whole tab rather than trying to partially trust it.
-    pub tmux_sessions: Option<Vec<String>>,
+    /// The tab's panes by UUID: the main pane first, then its splits.
+    /// Never empty, at most `MAX_PANES_PER_TAB`.
+    pub panes: Vec<String>,
+}
+
+impl SomDbTab {
+    /// A tab of `profile_index` with one fresh pane.
+    pub fn fresh(profile_index: usize) -> Self {
+        Self { profile_index, panes: vec![Uuid::new_v4().to_string()] }
+    }
+
+    /// The panes after the main one.
+    pub fn split_panes(&self) -> &[String] {
+        self.panes.get(1..).unwrap_or_default()
+    }
 }
 
 /// Windowed-mode OS window position/size, in physical pixels. Only ever
@@ -61,35 +69,42 @@ pub struct SomWindowBounds {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SomDbState {
     pub tabs: Vec<SomDbTab>,
-    pub active_tab: usize,
-    pub active_pane: usize,
+    /// The focused pane, by UUID. `None` (or a UUID no tab has) means the
+    /// first tab's main pane.
+    pub active_pane: Option<String>,
     pub window_bounds: Option<SomWindowBounds>,
 }
 
 impl Default for SomDbState {
     fn default() -> Self {
-        Self {
-            tabs: vec![SomDbTab {
-                profile_index: 0,
-                extra_splits: 0,
-                tmux_sessions: None,
-            }],
-            active_tab: 0,
-            active_pane: 0,
-            window_bounds: None,
-        }
+        Self { tabs: vec![SomDbTab::fresh(0)], active_pane: None, window_bounds: None }
     }
 }
 
-/// Raw on-disk shape, kept separate from `SomDbState` so a malformed "x.y"
-/// entry degrades gracefully (that one tab is dropped/clamped) instead of
-/// failing to parse the whole file.
+impl SomDbState {
+    /// The tab holding `active_pane`, or the first tab.
+    pub fn active_tab(&self) -> usize {
+        self.active_pane
+            .as_deref()
+            .and_then(|active| self.tabs.iter().position(|tab| tab.panes.iter().any(|pane| pane == active)))
+            .unwrap_or(0)
+    }
+
+    /// Every pane UUID across every tab.
+    pub fn pane_ids(&self) -> impl Iterator<Item = &str> {
+        self.tabs.iter().flat_map(|tab| tab.panes.iter().map(String::as_str))
+    }
+}
+
+/// On-disk shape. Tabs are validated one by one after parsing, so a single
+/// malformed tab is dropped rather than failing the whole file.
 #[derive(Debug, Serialize, Deserialize)]
 struct SomDbFile {
-    tabs: Vec<String>,
-    active: String,
-    /// `"x,y,width,height"`, physical pixels. Absent (old file, or windowed
-    /// mode never used) means "no remembered windowed-mode geometry yet".
+    tabs: Vec<SomDbTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_pane: Option<String>,
+    /// `"x,y,width,height"`, physical pixels. Absent means "no remembered
+    /// windowed-mode geometry yet".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_bounds: Option<String>,
 }
@@ -110,109 +125,76 @@ fn parse_window_bounds(s: &str) -> Option<SomWindowBounds> {
     Some(SomWindowBounds { x, y, width, height })
 }
 
-fn parse_pair(s: &str) -> Option<(usize, usize)> {
-    let (a, b) = s.split_once('.')?;
-    Some((a.parse().ok()?, b.parse().ok()?))
-}
-
-/// Parses one `tabs[]` entry: `"x.y"` or `"x.y:uuid1,uuid2,..."`. The tmux
-/// session-id segment is validated against `extra_splits` (must have exactly
-/// `1 + extra_splits` ids) — a mismatch is treated as corrupt data for that
-/// segment only, so the tab still restores as a plain (non-tmux) tab rather
-/// than failing entirely.
-fn parse_tab_entry(s: &str) -> Option<SomDbTab> {
-    let (pair, sessions_part) = match s.split_once(':') {
-        Some((pair, rest)) => (pair, Some(rest)),
-        None => (s, None),
-    };
-    let (profile_index, extra_splits) = parse_pair(pair)?;
-    let extra_splits = extra_splits.min(3);
-
-    let tmux_sessions = sessions_part.and_then(|rest| {
-        // Validated as UUIDs (rejects corrupt/garbage data), but stored as
-        // plain strings — a pane id is just a pipe-name component now, not
-        // a typed protocol identifier (see module doc comment).
-        let ids: Option<Vec<String>> =
-            rest.split(',').map(|part| Uuid::parse_str(part).ok().map(|id| id.to_string())).collect();
-        let ids = ids?;
-        (ids.len() == 1 + extra_splits).then_some(ids)
-    });
-
-    Some(SomDbTab {
-        profile_index,
-        extra_splits,
-        tmux_sessions,
-    })
+/// A tab is kept if it has 1..=`MAX_PANES_PER_TAB` panes, every one a UUID
+/// and none repeated anywhere in the file (`seen`) — two panes sharing an id
+/// would share one `somsrv` session.
+fn valid_tab(tab: &SomDbTab, seen: &mut std::collections::HashSet<String>) -> bool {
+    (1..=MAX_PANES_PER_TAB).contains(&tab.panes.len())
+        && tab.panes.iter().all(|pane| Uuid::parse_str(pane).is_ok())
+        && tab.panes.iter().all(|pane| seen.insert(pane.clone()))
 }
 
 pub fn som_db_path() -> PathBuf {
     paths::config_dir().join("db.json")
 }
 
-/// Loads and parses `db.json`, falling back to the single-default-tab state
-/// on any I/O error, JSON error, or if the file is entirely empty/unparsable.
-/// Individual malformed tab entries are skipped rather than failing the load.
-pub fn load_som_db() -> SomDbState {
-    let path = som_db_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+/// Parses `db.json`'s contents. Anything that is not this format (an older
+/// one included) gives the default single-tab state; individual invalid tabs
+/// are dropped.
+fn parse_som_db(contents: &str) -> SomDbState {
+    let Ok(file) = serde_json::from_str::<SomDbFile>(contents) else {
         return SomDbState::default();
     };
-    let Ok(file) = serde_json::from_str::<SomDbFile>(&contents) else {
-        return SomDbState::default();
-    };
-
-    let tabs: Vec<SomDbTab> = file.tabs.iter().filter_map(|s| parse_tab_entry(s)).collect();
-
+    let mut seen = std::collections::HashSet::new();
+    let tabs: Vec<SomDbTab> = file.tabs.into_iter().filter(|tab| valid_tab(tab, &mut seen)).collect();
     if tabs.is_empty() {
         return SomDbState::default();
     }
-
-    let (active_tab, active_pane) = parse_pair(&file.active).unwrap_or((0, 0));
-    let active_tab = active_tab.min(tabs.len() - 1);
-    let max_pane = tabs[active_tab].extra_splits;
-    let active_pane = active_pane.min(max_pane);
-
-    let window_bounds = file.window_bounds.as_deref().and_then(parse_window_bounds);
-
     SomDbState {
         tabs,
-        active_tab,
-        active_pane,
-        window_bounds,
+        active_pane: file.active_pane,
+        window_bounds: file.window_bounds.as_deref().and_then(parse_window_bounds),
     }
 }
 
-/// Serializes and writes `db.json`. Synchronous — the file is tiny and this
-/// is called infrequently (tab/split creation, close, switch), so there's no
-/// need for the debounced-write machinery Zed's heavier SQLite persistence
-/// uses.
-pub fn save_som_db(state: &SomDbState) {
+/// Loads `db.json`, falling back to the single-default-tab state on any I/O
+/// or format error.
+pub fn load_som_db() -> SomDbState {
+    match std::fs::read_to_string(som_db_path()) {
+        Ok(contents) => parse_som_db(&contents),
+        Err(_) => SomDbState::default(),
+    }
+}
+
+fn format_som_db(state: &SomDbState) -> anyhow::Result<String> {
     let file = SomDbFile {
-        tabs: state
-            .tabs
-            .iter()
-            .map(|t| {
-                let pair = format!("{}.{}", t.profile_index, t.extra_splits);
-                match &t.tmux_sessions {
-                    Some(ids) => {
-                        let ids = ids.join(",");
-                        format!("{pair}:{ids}")
-                    }
-                    None => pair,
-                }
-            })
-            .collect(),
-        active: format!("{}.{}", state.active_tab, state.active_pane),
+        tabs: state.tabs.clone(),
+        active_pane: state.active_pane.clone(),
         window_bounds: state.window_bounds.as_ref().map(format_window_bounds),
     };
-    let Ok(json) = serde_json::to_string_pretty(&file) else {
-        return;
-    };
+    Ok(serde_json::to_string_pretty(&file)?)
+}
+
+/// Serializes and writes `db.json`. Synchronous — the file is tiny and this
+/// is called infrequently (tab/split creation, close, switch). Written to a
+/// temporary file and renamed over the old one, so a crash mid-write never
+/// leaves a truncated file behind.
+pub fn save_som_db(state: &SomDbState) {
+    if let Err(err) = write_som_db(state) {
+        log::error!("failed to write db.json: {err:#}");
+    }
+}
+
+fn write_som_db(state: &SomDbState) -> anyhow::Result<()> {
+    let json = format_som_db(state)?;
     let path = som_db_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::write(path, json);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Read-modify-write just the window bounds, leaving tabs/active untouched.
@@ -443,66 +425,71 @@ pub fn clear_trusted_worktrees() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_pair() {
-        assert_eq!(parse_pair("3.0"), Some((3, 0)));
-        assert_eq!(parse_pair("1.2"), Some((1, 2)));
-        assert_eq!(parse_pair("bad"), None);
-        assert_eq!(parse_pair("1.x"), None);
+    fn uuid() -> String {
+        Uuid::new_v4().to_string()
     }
 
     #[test]
-    fn default_state_is_single_tab() {
+    fn default_state_is_one_tab_with_one_fresh_pane() {
         let s = SomDbState::default();
-        assert_eq!(
-            s.tabs,
-            vec![SomDbTab { profile_index: 0, extra_splits: 0, tmux_sessions: None }]
-        );
-        assert_eq!(s.active_tab, 0);
-        assert_eq!(s.active_pane, 0);
+        assert_eq!(s.tabs.len(), 1);
+        assert_eq!(s.tabs[0].profile_index, 0);
+        assert_eq!(s.tabs[0].panes.len(), 1);
+        assert!(Uuid::parse_str(&s.tabs[0].panes[0]).is_ok());
+        assert_eq!(s.active_tab(), 0);
     }
 
     #[test]
-    fn clamps_extra_splits_to_three() {
-        let (_, y) = parse_pair("0.9").unwrap();
-        assert_eq!(y.min(3), 3);
+    fn formats_and_parses_symmetrically() {
+        let (a, b, c) = (uuid(), uuid(), uuid());
+        let state = SomDbState {
+            tabs: vec![
+                SomDbTab { profile_index: 1, panes: vec![a.clone(), b.clone()] },
+                SomDbTab { profile_index: 0, panes: vec![c.clone()] },
+            ],
+            active_pane: Some(b.clone()),
+            window_bounds: Some(SomWindowBounds { x: 1, y: 2, width: 3, height: 4 }),
+        };
+        let parsed = parse_som_db(&format_som_db(&state).expect("formats"));
+        assert_eq!(parsed, state);
+        assert_eq!(parsed.active_tab(), 0, "the tab holding the active pane");
+        assert_eq!(parsed.tabs[0].split_panes(), [b]);
     }
 
     #[test]
-    fn parses_plain_tab_entry_without_tmux_sessions() {
-        let tab = parse_tab_entry("3.2").unwrap();
-        assert_eq!(tab.profile_index, 3);
-        assert_eq!(tab.extra_splits, 2);
-        assert_eq!(tab.tmux_sessions, None);
+    fn an_older_format_gives_the_default() {
+        let old = "e3fb3908-8b82-4f7e-b65d-11f4bff2b878";
+        let parsed = parse_som_db(&format!(r#"{{"tabs": ["0.0:{old}"], "active": "0.0"}}"#));
+        assert_eq!(parsed.tabs.len(), 1);
+        assert_ne!(parsed.tabs[0].panes[0], old);
     }
 
     #[test]
-    fn parses_tab_entry_with_tmux_sessions() {
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let entry = format!("0.1:{id1},{id2}");
-        let tab = parse_tab_entry(&entry).unwrap();
-        assert_eq!(tab.profile_index, 0);
-        assert_eq!(tab.extra_splits, 1);
-        assert_eq!(tab.tmux_sessions, Some(vec![id1.to_string(), id2.to_string()]));
+    fn invalid_tabs_are_dropped_and_the_rest_kept() {
+        let (a, b) = (uuid(), uuid());
+        let five: Vec<String> = (0..5).map(|_| uuid()).collect();
+        let json = serde_json::json!({
+            "tabs": [
+                {"profile": 0, "panes": [a]},
+                {"profile": 1, "panes": []},
+                {"profile": 2, "panes": ["not-a-uuid"]},
+                {"profile": 3, "panes": five},
+                {"profile": 4, "panes": [a]},
+                {"profile": 5, "panes": [b]},
+            ],
+        });
+        let parsed = parse_som_db(&json.to_string());
+        let profiles: Vec<usize> = parsed.tabs.iter().map(|tab| tab.profile_index).collect();
+        assert_eq!(profiles, [0, 5], "empty, non-UUID, too many and repeated panes are dropped");
     }
 
     #[test]
-    fn tmux_sessions_length_mismatch_falls_back_to_none() {
-        // extra_splits=0 means 1 pane expected, but two ids given.
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let entry = format!("0.0:{id1},{id2}");
-        let tab = parse_tab_entry(&entry).unwrap();
-        assert_eq!(tab.tmux_sessions, None);
-    }
-
-    #[test]
-    fn tab_entry_formats_and_parses_symmetrically() {
-        let id = Uuid::new_v4();
-        let tab = SomDbTab { profile_index: 1, extra_splits: 0, tmux_sessions: Some(vec![id.to_string()]) };
-        let formatted = format!("{}.{}:{}", tab.profile_index, tab.extra_splits, id);
-        let parsed = parse_tab_entry(&formatted).unwrap();
-        assert_eq!(parsed, tab);
+    fn an_unknown_active_pane_means_the_first_tab() {
+        let state = SomDbState {
+            tabs: vec![SomDbTab::fresh(0), SomDbTab::fresh(1)],
+            active_pane: Some(uuid()),
+            window_bounds: None,
+        };
+        assert_eq!(state.active_tab(), 0);
     }
 }

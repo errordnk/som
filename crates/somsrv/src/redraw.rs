@@ -205,6 +205,15 @@ impl Redrawer {
         // treated as a swap here — `last_grid` already starts empty, so
         // that first call is already a full repaint on its own merit.
         let alt_screen = term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        // The client has to be in the same screen: a full-screen app's snapshot
+        // painted onto the client's primary screen would leave it believing
+        // there is scrollback to show (a scrollbar, a column taken from the
+        // app) and, on the app's exit, return to the wrong screen. The client
+        // starts on the primary screen, so the first redraw of an alternate
+        // one switches to it, before anything is painted.
+        if self.last_alt_screen.unwrap_or(false) != alt_screen {
+            out.write_all(if alt_screen { b"[?1049h" } else { b"[?1049l" })?;
+        }
         if self.last_alt_screen.is_some_and(|was_alt| was_alt != alt_screen) {
             self.last_grid.clear();
             // The virtual write-cursor (`cursor_line`/`cursor_col`,
@@ -702,6 +711,33 @@ mod tests {
     /// Deliberately drives `Term`/`Redrawer` directly (no real PTY/`Session`)
     /// so the exact bytes are controlled precisely, rather than depending on
     /// a real `htop`/`micro` binary being installed wherever this test runs.
+    /// A snapshot of a full-screen app (htop, fresh) must put the client in the
+    /// alternate screen too, so it knows no scrollback is in play; a plain
+    /// shell's snapshot leaves it on the primary one.
+    #[test]
+    fn redraw_puts_the_client_in_the_screen_the_term_is_in() {
+        let bounds = SessionBounds::new(40, 10);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+
+        let mut app_term = Term::new(Config::default(), &bounds, VoidListener);
+        parser.advance(&mut app_term, b"PS>[?1049h[3;1Hhtop");
+        let mut bytes = Vec::new();
+        Redrawer::new().redraw(&app_term, &mut bytes).expect("redraw");
+        let mut client = Term::new(Config::default(), &bounds, VoidListener);
+        parser.advance(&mut client, &bytes);
+        assert!(client.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN), "the client is in the alternate screen");
+        let text: String = client.renderable_content().display_iter.map(|indexed| indexed.cell.c).collect();
+        assert!(text.contains("htop") && !text.contains("PS>"), "the app's screen, not the shell's, is what shows: {text:?}");
+
+        let mut shell_term = Term::new(Config::default(), &bounds, VoidListener);
+        parser.advance(&mut shell_term, b"PS>");
+        let mut bytes = Vec::new();
+        Redrawer::new().redraw(&shell_term, &mut bytes).expect("redraw");
+        let mut client = Term::new(Config::default(), &bounds, VoidListener);
+        parser.advance(&mut client, &bytes);
+        assert!(!client.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN), "a shell stays on the primary screen");
+    }
+
     #[test]
     fn redraw_repaints_the_whole_screen_after_an_alt_screen_swap_even_where_content_coincides() {
         let bounds = SessionBounds::new(80, 24);

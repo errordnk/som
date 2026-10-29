@@ -858,6 +858,51 @@ mod somsrv_sessions_tests {
         assert_eq!(state.active_pane, focused, "the focused pane, by UUID");
     }
 
+    /// Restore names the UUID a split takes; the workspace hands it to the
+    /// item it clones while it is itself mid-update (the item must not ask
+    /// the workspace for it: that update would panic and abort Som).
+    #[gpui::test]
+    async fn a_split_takes_the_uuid_restore_names(cx: &mut TestAppContext) {
+        let app_state = cx.update(AppState::test);
+        let project = cx.update(|cx| {
+            Project::local(app_state.fs.clone(), None, project::LocalProjectFlags::default(), cx)
+        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+
+        window
+            .update(cx, |workspace, window, cx| {
+                let pane = workspace.panes.first().unwrap().clone();
+                let item = cx.new(|cx| crate::item::test::TestItem::new(cx));
+                pane.update(cx, |pane, cx| pane.add_item(Box::new(item), true, true, None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let named = "6f1c2a52-7d6e-4a8e-9b0e-3d1f0c9a4b21".to_string();
+        let split = window
+            .update(cx, |workspace, window, cx| {
+                workspace.set_som_next_split_pane_uuid(Some(named.clone()));
+                workspace.som_split_active_pane_awaited(window, cx)
+            })
+            .unwrap();
+        split.await;
+        cx.run_until_parked();
+
+        let (split_uuid, pending) = window
+            .update(cx, |workspace, _, cx| {
+                let split_uuid = workspace
+                    .som_split_panes
+                    .first()
+                    .and_then(|pane| pane.upgrade())
+                    .and_then(|pane| pane.read(cx).active_item())
+                    .and_then(|item| item.som_pane_uuid(cx));
+                (split_uuid, workspace.som_next_split_pane_uuid.clone())
+            })
+            .unwrap();
+        assert_eq!(split_uuid, Some(named), "the split took the UUID restore named");
+        assert_eq!(pending, None, "the UUID is used once");
+    }
+
     /// Closing a split tells its item it is gone for good (a terminal ends
     /// its `somsrv` session then), and the split's UUID leaves the tab.
     #[gpui::test]
@@ -4545,11 +4590,6 @@ impl Workspace {
         self.som_next_split_pane_uuid = pane_uuid;
     }
 
-    /// Takes the UUID the split being created should use, if restore named one.
-    pub fn take_som_next_split_pane_uuid(&mut self) -> Option<String> {
-        self.som_next_split_pane_uuid.take()
-    }
-
     /// Records `profile_index` (settings.json's `tabs[]` array index) as
     /// the profile backing `item_id`'s tab — same bookkeeping `add_item_
     /// to_main_pane_at` already does inline for a brand new tab, exposed
@@ -5723,13 +5763,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Pane>>> {
+        self.split_and_clone_as(pane, direction, None, window, cx)
+    }
+
+    /// `split_and_clone` whose new pane takes `pane_uuid` (see
+    /// `Item::clone_on_split_as`).
+    pub fn split_and_clone_as(
+        &mut self,
+        pane: Entity<Pane>,
+        direction: SplitDirection,
+        pane_uuid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Pane>>> {
         let Some(item) = pane.read(cx).active_item() else {
             return Task::ready(None);
         };
         if !item.can_split(cx) {
             return Task::ready(None);
         }
-        let task = item.clone_on_split(self.database_id(), window, cx);
+        let task = item.clone_on_split_as(self.database_id(), pane_uuid, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(clone) = task.await {
                 this.update_in(cx, |this, window, cx| {
@@ -5807,7 +5860,8 @@ impl Workspace {
         };
 
         self.som_split_in_progress = true;
-        let task = self.split_and_clone(pane_to_split, direction, window, cx);
+        let pane_uuid = self.som_next_split_pane_uuid.take();
+        let task = self.split_and_clone_as(pane_to_split, direction, pane_uuid, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             if let Some(new_pane) = task.await {
                 this.update(cx, |this, inner_cx| {

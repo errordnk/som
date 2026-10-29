@@ -42,7 +42,7 @@ A minimal tmux-alike built directly into Som. Open an SSH tab (on by default; `"
 - Close Som or lose the connection — the process on the remote machine keeps running.
 - On reconnect you see the same scrollback and the same running programs, not a new session.
 - Works locally too: the shell survives a restart of Som on the same machine.
-- Automatically cleans up orphaned processes on remote hosts.
+- No leftover sessions: closing a pane or a tab ends its session, and on launch every session no pane took back is closed — locally and on remote hosts.
 - `somsrv` itself is three-platform too: host and client can each be Windows, macOS or Linux in any combination — a Windows machine holds a local session at home and a living session on a remote Linux server just the same.
 - Binaries for all three platforms are embedded in Som and deploy themselves to the server — nothing to copy by hand.
 - A full headless terminal lives on the host: reconnecting hands over a snapshot of its state rather than a replay of the last bytes, so the screen comes back correct — borders, colors and cursor position included.

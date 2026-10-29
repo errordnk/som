@@ -110,6 +110,102 @@ pub fn enable_raw_input_mode() {
     }
 }
 
+/// The RELAY's stdin, read as bytes. On Windows a console stdin is read
+/// with `ReadConsoleW` directly: `std::io::stdin()` treats Ctrl+Z (`0x1A`)
+/// as the DOS end of input — it drops a trailing one, and a read of a lone
+/// Ctrl+Z comes back as 0 bytes, which ended the RELAY as if Som had closed
+/// its side (the pane froze, its session left behind). Here it is a key
+/// like any other, passed on to the shell.
+pub fn relay_input() -> Box<dyn std::io::Read + Send> {
+    #[cfg(windows)]
+    if let Some(console) = ConsoleInput::open() {
+        return Box::new(console);
+    }
+    Box::new(std::io::stdin())
+}
+
+#[cfg(windows)]
+struct ConsoleInput {
+    handle: windows::Win32::Foundation::HANDLE,
+    /// The first half of a surrogate pair the last read ended on.
+    high_surrogate: Option<u16>,
+}
+
+// SAFETY: a console handle is a process-wide kernel handle, usable from any
+// thread; only the RELAY's input loop ever reads through this one.
+#[cfg(windows)]
+unsafe impl Send for ConsoleInput {}
+
+#[cfg(windows)]
+impl ConsoleInput {
+    fn open() -> Option<Self> {
+        use windows::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
+
+        // SAFETY: plain handle query; `mode` is a valid out-pointer.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE).ok()?;
+            let mut mode = Default::default();
+            GetConsoleMode(handle, &mut mode).ok()?;
+            Some(Self { handle, high_surrogate: None })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Read for ConsoleInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use windows::Win32::Foundation::{ERROR_OPERATION_ABORTED, GetLastError};
+        use windows::Win32::System::Console::ReadConsoleW;
+
+        // A UTF-16 unit is at most 3 UTF-8 bytes (a surrogate pair, 2 units,
+        // is 4), so this many units always fit `buf`.
+        let capacity = (buf.len() / 3).clamp(1, 1024);
+        loop {
+            let mut units = [0u16; 1024];
+            let start = usize::from(self.high_surrogate.is_some());
+            if let Some(high) = self.high_surrogate.take() {
+                units[0] = high;
+            }
+            let mut read = 0u32;
+            // SAFETY: `units[start..capacity]` is valid writable memory for
+            // `capacity - start` UTF-16 units; no input control, so Ctrl+Z
+            // is read as an ordinary character.
+            unsafe {
+                ReadConsoleW(
+                    self.handle,
+                    units[start..].as_mut_ptr().cast(),
+                    (capacity.max(start + 1) - start) as u32,
+                    &mut read,
+                    None,
+                )
+            }
+            .map_err(std::io::Error::other)?;
+            if read == 0 {
+                // Ctrl+C/Ctrl+Break wakes the read with nothing in it.
+                // SAFETY: reads this thread's last-error value.
+                if unsafe { GetLastError() } == ERROR_OPERATION_ABORTED {
+                    continue;
+                }
+                return Ok(0);
+            }
+            let mut end = start + read as usize;
+            if (0xD800..0xDC00).contains(&units[end - 1]) {
+                end -= 1;
+                self.high_surrogate = Some(units[end]);
+            }
+            let mut written = 0;
+            for decoded in char::decode_utf16(units[..end].iter().copied()) {
+                let ch = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+                written += ch.encode_utf8(&mut buf[written..]).len();
+            }
+            // Only a lone first half came in: wait for the rest of it.
+            if written > 0 {
+                return Ok(written);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 pub fn current_size() -> Option<(u16, u16)> {
     #[repr(C)]

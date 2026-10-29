@@ -999,7 +999,7 @@ impl TerminalPanel {
 
                 // Each split reattaches to the session named by its UUID:
                 // the workspace hands the UUID to the terminal the split
-                // creates (`Workspace::take_som_next_split_pane_uuid`).
+                // creates (`Item::clone_on_split_as`).
                 for split_pane in split_panes {
                     let split_task = window_handle
                         .update(cx, |_, window, cx| {

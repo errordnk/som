@@ -1370,13 +1370,16 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
-        // Restore names the UUID this split reattaches to; a split the user
-        // makes gets a fresh one.
-        let pane_uuid = self
-            .workspace
-            .update(cx, |workspace, _| workspace.take_som_next_split_pane_uuid())
-            .ok()
-            .flatten();
+        self.clone_on_split_as(workspace_id, None, window, cx)
+    }
+
+    fn clone_on_split_as(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        pane_uuid: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>> {
         let Ok(terminal) = self.project.update(cx, |project, cx| {
             // Prefer the terminal's own CWD; fall back to home dir so split panes
             // don't inherit Som's process directory.

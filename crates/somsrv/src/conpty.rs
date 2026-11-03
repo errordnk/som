@@ -119,11 +119,15 @@ mod tests {
     #[test]
     fn nothing_is_kept_outside_settings_and_logs() {
         let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let this = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("conpty.rs");
         let mut offenders = Vec::new();
         let mut stack = vec![crates];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).unwrap().flatten() {
                 let path = entry.path();
+                if same_file(&path, &this) {
+                    continue;
+                }
                 if path.is_dir() {
                     // `paths` defines these folders (and keeps Zed's unused ones)
                     if path.file_name().is_some_and(|name| name != "target" && name != "paths") {

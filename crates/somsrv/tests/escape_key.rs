@@ -15,6 +15,7 @@ fn a_lone_escape_typed_into_the_tab_reaches_the_shell() {
     std::thread::spawn(move || {
         // The "shell" reads one raw byte and prints it in hex.
         let script = "stty raw -echo; od -An -tx1 -N1; sleep 30";
+        somsrv::protocol::use_test_daemon();
         let pane_id = format!("escape-key-{}", std::process::id());
         let mut relay = std::process::Command::new(env!("CARGO_BIN_EXE_somsrv"))
             .args(["escape-key", pane_id.as_str(), "sh", "-c", script])

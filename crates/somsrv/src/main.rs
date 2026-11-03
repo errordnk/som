@@ -277,7 +277,7 @@ fn main() {
 fn init_logging(profile_name: &str, pane_id: &str, is_daemon: bool) {
     zlog::init();
     let log_path: &'static std::path::PathBuf = Box::leak(Box::new(if is_daemon {
-        paths::logs_dir().join("somsrv-daemon.log")
+        paths::logs_dir().join(format!("somsrv-daemon{}.log", somsrv::protocol::instance_suffix()))
     } else {
         paths::logs_dir().join(format!("somsrv-{profile_name}-{pane_id}-relay.log"))
     }));

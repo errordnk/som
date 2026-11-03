@@ -20,16 +20,50 @@ use serde::{Deserialize, Serialize};
 /// hardcodes `/tmp` rather than trusting `$TMPDIR` — see the historical
 /// `SUN_LEN` overflow this avoided, `project_som_tmux` memory,
 /// "Обновление 30").
+///
+/// [`INSTANCE_ENV`] names a separate daemon with its own address, lock and
+/// log, so tests never reach the user's daemon (nor the user's Som theirs).
 #[cfg(windows)]
 pub fn daemon_socket_path() -> String {
-    r"\\.\pipe\somsrv".to_string()
+    format!(r"\\.\pipe\somsrv{}", instance_suffix())
 }
 
 #[cfg(unix)]
 pub fn daemon_socket_path() -> String {
     let dir = std::path::Path::new("/tmp");
     let _ = std::fs::create_dir_all(dir);
-    dir.join(format!("somsrv-{}.sock", unsafe { libc::getuid() })).to_string_lossy().into_owned()
+    dir.join(format!("somsrv-{}{}.sock", unsafe { libc::getuid() }, instance_suffix())).to_string_lossy().into_owned()
+}
+
+/// When set (to a short name such as `test`), every `somsrv` and `somsrp`
+/// started with it uses a daemon of its own: `somsrv-<name>` instead of
+/// `somsrv` in the pipe or socket, the single-instance lock and the daemon
+/// log. Set by `testing::debug_binary` for every real-process test, as a
+/// test daemon on the user's address once took over the user's tabs (it
+/// was started with the test's environment, `NO_COLOR=1` included, and Som
+/// connected to it as to its own; 2026-11-03).
+pub const INSTANCE_ENV: &str = "SOMSRV_INSTANCE";
+
+/// Makes this test process, and every process it starts from now on, use
+/// the test daemon (`INSTANCE_ENV=test`), and never replace a running one
+/// (`KEEP_RUNNING_DAEMON_ENV`: the tests run in parallel, possibly on
+/// different builds). Every test that reaches a daemon calls this first.
+pub fn use_test_daemon() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: set once, before the caller starts any process or daemon
+    // connection; the tests of a run all set the same values.
+    ONCE.call_once(|| unsafe {
+        std::env::set_var(INSTANCE_ENV, "test");
+        std::env::set_var(crate::daemon::KEEP_RUNNING_DAEMON_ENV, "1");
+    });
+}
+
+/// `-<name>` for [`INSTANCE_ENV`], empty when it is unset or empty.
+pub fn instance_suffix() -> String {
+    match std::env::var(INSTANCE_ENV) {
+        Ok(name) if !name.is_empty() => format!("-{name}"),
+        _ => String::new(),
+    }
 }
 
 /// `<remote-username>@<client-ip>` identifying BOTH the OS account that
@@ -1277,5 +1311,35 @@ mod tests {
     #[test]
     fn daemon_socket_path_is_stable_across_calls() {
         assert_eq!(daemon_socket_path(), daemon_socket_path(), "the fixed daemon address must not vary between calls");
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn the_test_daemon_has_an_address_of_its_own() {
+        use_test_daemon();
+        assert_eq!(instance_suffix(), "-test");
+        assert!(daemon_socket_path().contains("somsrv-test") || daemon_socket_path().ends_with("-test.sock"), "{}", daemon_socket_path());
+    }
+
+    /// A test that starts or reaches a daemon outside `testing::debug_binary`
+    /// must ask for the test daemon first, or it runs against the user's
+    /// (`tests/relay_sessions.rs` did, and its sessions went to the user's
+    /// daemon; 2026-11-03).
+    #[test]
+    fn every_integration_test_that_reaches_a_daemon_uses_the_test_one() {
+        let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(tests).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let reaches_a_daemon = text.contains("connect_or_spawn") || text.contains("CARGO_BIN_EXE_somsrv");
+            if reaches_a_daemon && !text.contains("use_test_daemon()") {
+                offenders.push(entry.path());
+            }
+        }
+        assert!(offenders.is_empty(), "these reach a daemon without use_test_daemon(): {offenders:?}");
     }
 }

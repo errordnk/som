@@ -460,6 +460,9 @@ pub struct TabProfile {
     /// See `som_config::TabProfile::admin` doc comment — same field, just
     /// carried through into the runtime profile list.
     pub admin: bool,
+    /// See `som_config::TabProfile::bypass_vpn` doc comment — same field, just
+    /// carried through into the runtime profile list.
+    pub bypass_vpn: bool,
 }
 
 /// `tmux`, `srp` and `lua` are on unless a profile turns them off (see
@@ -478,6 +481,7 @@ impl Default for TabProfile {
             os: RemoteOs::default(),
             default: false,
             admin: false,
+            bypass_vpn: false,
         }
     }
 }

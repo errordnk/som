@@ -210,6 +210,12 @@ pub struct TabProfile {
     /// already running elevated this has no effect — the tab simply opens
     /// in place. Ignored on macOS/Linux.
     pub admin: bool,
+    /// SSH profiles only, macOS/Linux: every `ssh`/`scp` this profile spawns
+    /// (the tab itself, the `somsrv` deploy check and upload, session
+    /// probes) binds to the physical interface carrying the default route
+    /// (Wi-Fi/LAN), so the tab's traffic bypasses a VPN tunnel. See
+    /// `terminal_view::terminal_panel::profile_shell_command`.
+    pub bypass_vpn: bool,
 }
 
 /// The same as `derive(Default)` would give, except `tmux`, `srp` and `lua`: all three
@@ -227,6 +233,7 @@ impl Default for TabProfile {
             os: String::new(),
             default: false,
             admin: false,
+            bypass_vpn: false,
         }
     }
 }
@@ -595,6 +602,7 @@ impl SomConfig {
                     os: workspace::RemoteOs::parse(&t.os),
                     default: t.default,
                     admin: t.admin,
+                    bypass_vpn: t.bypass_vpn,
                 }
             })
             .collect()

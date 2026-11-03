@@ -124,6 +124,8 @@ The theme format matches Zed's, so any Zed theme works without conversion. Som s
 
 Installing: download the theme's JSON file into `~/.config/som/themes/`, then set `window.theme` in `settings.json` to the value of the `"name"` field *from inside the file itself* — it doesn't always match the file name, and some files describe several variants at once.
 
+**Far Manager keeps its own colors.** While Far runs in a pane (Som knows it by Far's window title), the pane draws the 16 base colors as Windows' classic console does — navy panels, aqua frames — since Far's color scheme is made for them; with a theme's palette its panels came out washed out. When Far exits, the theme's colors come back.
+
 ## Keybindings
 
 Sensible defaults, fully remappable. Every Som-specific action sits on `Ctrl+Shift+*` so it doesn't collide with standard system shortcuts.

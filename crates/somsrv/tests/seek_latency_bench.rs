@@ -56,6 +56,7 @@ fn daemon_binary_path() -> std::path::PathBuf {
 }
 
 fn connect_and_handshake(daemon_binary: &std::path::Path) -> PipeConnection {
+    somsrv::protocol::use_test_daemon();
     let connection = somsrv::daemon::connect_or_spawn(daemon_binary).expect("connecting to somsrv daemon");
     ConnectionKind::Srv.write_to(&connection).expect("writing connection kind");
     let payload = serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap();

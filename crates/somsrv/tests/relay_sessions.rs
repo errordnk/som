@@ -37,6 +37,7 @@ struct Relay {
 
 impl Relay {
     fn start(pane_id: &str) -> Relay {
+        somsrv::protocol::use_test_daemon();
         let mut child = Command::new(env!("CARGO_BIN_EXE_somsrv"))
             .args(["relay-test", pane_id, shell_program(), "--cursor-shape", "block"])
             .stdin(Stdio::piped())

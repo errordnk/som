@@ -32,6 +32,7 @@ struct Tab {
 
 impl Tab {
     fn start() -> Tab {
+        somsrv::protocol::use_test_daemon();
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let pane_id = format!("link-test-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let shell = if cfg!(windows) { "cmd.exe" } else { "sh" };
@@ -97,6 +98,7 @@ impl Tab {
 }
 
 fn player() -> PipeConnection {
+    somsrv::protocol::use_test_daemon();
     let connection = somsrv::daemon::connect_or_spawn(std::path::Path::new(env!("CARGO_BIN_EXE_somsrv"))).expect("reaching the daemon");
     ConnectionKind::Srv.write_to(&connection).unwrap();
     connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();

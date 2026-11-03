@@ -4,42 +4,215 @@ use std::borrow::Cow;
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
-#[derive(Debug, PartialEq, Eq)]
-enum AlacModifiers {
-    None,
-    Alt,
-    Ctrl,
-    Shift,
-    CtrlShift,
-    Other,
+/// The key that was pressed, independent of the keyboard layout: the USB HID
+/// usage reported by the platform (`Keystroke.physical_key`) when there is
+/// one, otherwise `Keystroke.key`. A Russian "с" on the C key is still `c`.
+fn base_key(keystroke: &Keystroke) -> Cow<'_, str> {
+    if let Some(name) = keystroke.physical_key.and_then(hid_key_name) {
+        return Cow::Borrowed(name);
+    }
+    if keystroke.key.chars().count() > 1 {
+        Cow::Owned(keystroke.key.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(keystroke.key.as_str())
+    }
 }
 
-impl AlacModifiers {
-    fn new(ks: &Keystroke) -> Self {
-        match (
-            ks.modifiers.alt,
-            ks.modifiers.control,
-            ks.modifiers.shift,
-            ks.modifiers.platform,
-        ) {
-            (false, false, false, false) => AlacModifiers::None,
-            (true, false, false, false) => AlacModifiers::Alt,
-            (false, true, false, false) => AlacModifiers::Ctrl,
-            (false, false, true, false) => AlacModifiers::Shift,
-            (false, true, true, false) => AlacModifiers::CtrlShift,
-            _ => AlacModifiers::Other,
-        }
+/// Whether shift was held. The platforms drop `modifiers.shift` for digits and
+/// punctuation and report the shifted character in `key` instead (`:` for
+/// shift-;), so for those it is recovered from `key` against the physical key.
+fn shift_held(keystroke: &Keystroke, base: &str) -> bool {
+    if keystroke.modifiers.shift {
+        return true;
     }
+    let mut key = keystroke.key.chars();
+    let mut base_chars = base.chars();
+    let (Some(k), None, Some(b), None) = (key.next(), key.next(), base_chars.next(), base_chars.next())
+    else {
+        return false;
+    };
+    if k == b || b.is_ascii_alphabetic() {
+        return false;
+    }
+    // the layout's own upper-case letter on this key, or the US shifted symbol
+    let us_shifted = match b {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        '`' => '~',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => return false,
+    };
+    k == us_shifted || (k.is_alphabetic() && k.is_uppercase())
+}
 
-    fn any(&self) -> bool {
-        match &self {
-            AlacModifiers::None => false,
-            AlacModifiers::Alt => true,
-            AlacModifiers::Ctrl => true,
-            AlacModifiers::Shift => true,
-            AlacModifiers::CtrlShift => true,
-            AlacModifiers::Other => true,
-        }
+/// Base (unshifted, US-QWERTY) name of a USB HID keyboard usage. Keypad keys
+/// and anything not listed return `None` and fall back to `Keystroke.key`.
+fn hid_key_name(usage: u32) -> Option<&'static str> {
+    const LETTERS: &str = "abcdefghijklmnopqrstuvwxyz";
+    const DIGITS: &str = "123456789";
+    const FUNCTION: [&str; 12] = [
+        "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    ];
+    Some(match usage {
+        0x04..=0x1d => &LETTERS[(usage - 0x04) as usize..(usage - 0x03) as usize],
+        0x1e..=0x26 => &DIGITS[(usage - 0x1e) as usize..(usage - 0x1d) as usize],
+        0x27 => "0",
+        0x28 => "enter",
+        0x29 => "escape",
+        0x2a => "backspace",
+        0x2b => "tab",
+        0x2c => "space",
+        0x2d => "-",
+        0x2e => "=",
+        0x2f => "[",
+        0x30 => "]",
+        0x31 => "\\",
+        0x33 => ";",
+        0x34 => "'",
+        0x35 => "`",
+        0x36 => ",",
+        0x37 => ".",
+        0x38 => "/",
+        0x3a..=0x45 => FUNCTION[(usage - 0x3a) as usize],
+        0x49 => "insert",
+        0x4a => "home",
+        0x4b => "pageup",
+        0x4c => "delete",
+        0x4d => "end",
+        0x4e => "pagedown",
+        0x4f => "right",
+        0x50 => "left",
+        0x51 => "down",
+        0x52 => "up",
+        _ => return None,
+    })
+}
+
+/// Keys with a fixed sequence when pressed without modifiers.
+fn plain_special(key: &str, mode: &TermMode) -> Option<&'static str> {
+    let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    Some(match key {
+        "home" if app_cursor => "\x1bOH",
+        "home" => "\x1b[H",
+        "end" if app_cursor => "\x1bOF",
+        "end" => "\x1b[F",
+        "up" if app_cursor => "\x1bOA",
+        "up" => "\x1b[A",
+        "down" if app_cursor => "\x1bOB",
+        "down" => "\x1b[B",
+        "right" if app_cursor => "\x1bOC",
+        "right" => "\x1b[C",
+        "left" if app_cursor => "\x1bOD",
+        "left" => "\x1b[D",
+        "back" => "\x7f",
+        "insert" => "\x1b[2~",
+        "delete" => "\x1b[3~",
+        "pageup" => "\x1b[5~",
+        "pagedown" => "\x1b[6~",
+        "f1" => "\x1bOP",
+        "f2" => "\x1bOQ",
+        "f3" => "\x1bOR",
+        "f4" => "\x1bOS",
+        "f5" => "\x1b[15~",
+        "f6" => "\x1b[17~",
+        "f7" => "\x1b[18~",
+        "f8" => "\x1b[19~",
+        "f9" => "\x1b[20~",
+        "f10" => "\x1b[21~",
+        "f11" => "\x1b[23~",
+        "f12" => "\x1b[24~",
+        "f13" => "\x1b[25~",
+        "f14" => "\x1b[26~",
+        "f15" => "\x1b[28~",
+        "f16" => "\x1b[29~",
+        "f17" => "\x1b[31~",
+        "f18" => "\x1b[32~",
+        "f19" => "\x1b[33~",
+        "f20" => "\x1b[34~",
+        _ => return None,
+    })
+}
+
+/// xterm sequences for cursor, editing and function keys with modifiers.
+fn modified_special(key: &str, keystroke: &Keystroke) -> Option<String> {
+    let code = modifier_code(keystroke);
+    Some(match key {
+        "up" => format!("\x1b[1;{code}A"),
+        "down" => format!("\x1b[1;{code}B"),
+        "right" => format!("\x1b[1;{code}C"),
+        "left" => format!("\x1b[1;{code}D"),
+        "f1" => format!("\x1b[1;{code}P"),
+        "f2" => format!("\x1b[1;{code}Q"),
+        "f3" => format!("\x1b[1;{code}R"),
+        "f4" => format!("\x1b[1;{code}S"),
+        "f5" => format!("\x1b[15;{code}~"),
+        "f6" => format!("\x1b[17;{code}~"),
+        "f7" => format!("\x1b[18;{code}~"),
+        "f8" => format!("\x1b[19;{code}~"),
+        "f9" => format!("\x1b[20;{code}~"),
+        "f10" => format!("\x1b[21;{code}~"),
+        "f11" => format!("\x1b[23;{code}~"),
+        "f12" => format!("\x1b[24;{code}~"),
+        "f13" => format!("\x1b[25;{code}~"),
+        "f14" => format!("\x1b[26;{code}~"),
+        "f15" => format!("\x1b[28;{code}~"),
+        "f16" => format!("\x1b[29;{code}~"),
+        "f17" => format!("\x1b[31;{code}~"),
+        "f18" => format!("\x1b[32;{code}~"),
+        "f19" => format!("\x1b[33;{code}~"),
+        "f20" => format!("\x1b[34;{code}~"),
+        "insert" => format!("\x1b[2;{code}~"),
+        "delete" => format!("\x1b[3;{code}~"),
+        "pageup" => format!("\x1b[5;{code}~"),
+        "pagedown" => format!("\x1b[6;{code}~"),
+        "end" => format!("\x1b[1;{code}F"),
+        "home" => format!("\x1b[1;{code}H"),
+        _ => return None,
+    })
+}
+
+/// `CSI <codepoint> ; <modifiers> u` (fixterms/kitty): the encoding for key
+/// combinations that have no legacy terminal sequence, so that a program that
+/// asks for them can tell them apart.
+fn csi_u(codepoint: u32, keystroke: &Keystroke) -> Cow<'static, str> {
+    Cow::Owned(format!("\x1b[{};{}u", codepoint, modifier_code(keystroke)))
+}
+
+/// Legacy control byte for ctrl + `c` (`c` is the unshifted key), if there is one.
+fn ctrl_byte(c: char, shift: bool) -> Option<u8> {
+    match c {
+        'a'..='z' | 'A'..='Z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
+        '2' | '@' => Some(0x00),
+        '3' => (!shift).then_some(0x1b),
+        '4' => (!shift).then_some(0x1c),
+        '5' => (!shift).then_some(0x1d),
+        '6' | '^' => Some(0x1e),
+        '7' => (!shift).then_some(0x1f),
+        '8' => (!shift).then_some(0x7f),
+        '`' => (!shift).then_some(0x00),
+        '[' => (!shift).then_some(0x1b),
+        '\\' => (!shift).then_some(0x1c),
+        ']' => (!shift).then_some(0x1d),
+        '-' | '/' | '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
     }
 }
 
@@ -48,182 +221,105 @@ pub fn to_esc_str(
     mode: &TermMode,
     option_as_meta: bool,
 ) -> Option<Cow<'static, str>> {
-    let modifiers = AlacModifiers::new(keystroke);
+    let name = base_key(keystroke);
+    let key = name.as_ref();
+    let shift = if keystroke.physical_key.is_some() {
+        shift_held(keystroke, key)
+    } else {
+        keystroke.modifiers.shift
+    };
+    let (alt, ctrl) = (keystroke.modifiers.alt, keystroke.modifiers.control);
+    let mut with_shift = keystroke.clone();
+    with_shift.modifiers.shift = shift;
+    let keystroke = &with_shift;
+    let any = shift || alt || ctrl;
 
-    // Manual Bindings including modifiers
-    let manual_esc_str: Option<&'static str> = match (keystroke.key.as_ref(), &modifiers) {
-        //Basic special keys
-        ("tab", AlacModifiers::None) => Some("\x09"),
-        ("escape", AlacModifiers::None) => Some("\x1b"),
-        ("enter", AlacModifiers::None) => Some("\x0d"),
-        ("enter", AlacModifiers::Shift) => Some("\x0a"),
-        ("enter", AlacModifiers::Alt) => Some("\x1b\x0d"),
-        ("backspace", AlacModifiers::None) => Some("\x7f"),
-        //Interesting escape codes
-        ("tab", AlacModifiers::Shift) => Some("\x1b[Z"),
-        ("backspace", AlacModifiers::Ctrl) => Some("\x08"),
-        ("backspace", AlacModifiers::Alt) => Some("\x1b\x7f"),
-        ("backspace", AlacModifiers::Shift) => Some("\x7f"),
-        ("space", AlacModifiers::Ctrl) => Some("\x00"),
-        ("home", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOH"),
-        ("home", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[H"),
-        ("end", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOF"),
-        ("end", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[F"),
-        ("up", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOA"),
-        ("up", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[A"),
-        ("down", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOB"),
-        ("down", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[B"),
-        ("right", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOC"),
-        ("right", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[C"),
-        ("left", AlacModifiers::None) if mode.contains(TermMode::APP_CURSOR) => Some("\x1bOD"),
-        ("left", AlacModifiers::None) if !mode.contains(TermMode::APP_CURSOR) => Some("\x1b[D"),
-        ("back", AlacModifiers::None) => Some("\x7f"),
-        ("insert", AlacModifiers::None) => Some("\x1b[2~"),
-        ("delete", AlacModifiers::None) => Some("\x1b[3~"),
-        ("pageup", AlacModifiers::None) => Some("\x1b[5~"),
-        ("pagedown", AlacModifiers::None) => Some("\x1b[6~"),
-        ("f1", AlacModifiers::None) => Some("\x1bOP"),
-        ("f2", AlacModifiers::None) => Some("\x1bOQ"),
-        ("f3", AlacModifiers::None) => Some("\x1bOR"),
-        ("f4", AlacModifiers::None) => Some("\x1bOS"),
-        ("f5", AlacModifiers::None) => Some("\x1b[15~"),
-        ("f6", AlacModifiers::None) => Some("\x1b[17~"),
-        ("f7", AlacModifiers::None) => Some("\x1b[18~"),
-        ("f8", AlacModifiers::None) => Some("\x1b[19~"),
-        ("f9", AlacModifiers::None) => Some("\x1b[20~"),
-        ("f10", AlacModifiers::None) => Some("\x1b[21~"),
-        ("f11", AlacModifiers::None) => Some("\x1b[23~"),
-        ("f12", AlacModifiers::None) => Some("\x1b[24~"),
-        ("f13", AlacModifiers::None) => Some("\x1b[25~"),
-        ("f14", AlacModifiers::None) => Some("\x1b[26~"),
-        ("f15", AlacModifiers::None) => Some("\x1b[28~"),
-        ("f16", AlacModifiers::None) => Some("\x1b[29~"),
-        ("f17", AlacModifiers::None) => Some("\x1b[31~"),
-        ("f18", AlacModifiers::None) => Some("\x1b[32~"),
-        ("f19", AlacModifiers::None) => Some("\x1b[33~"),
-        ("f20", AlacModifiers::None) => Some("\x1b[34~"),
-        // NumpadEnter, Action::Esc("\n".into());
-        //Mappings for caret notation keys
-        ("a", AlacModifiers::Ctrl) => Some("\x01"), //1
-        ("A", AlacModifiers::CtrlShift) => Some("\x01"), //1
-        ("b", AlacModifiers::Ctrl) => Some("\x02"), //2
-        ("B", AlacModifiers::CtrlShift) => Some("\x02"), //2
-        ("c", AlacModifiers::Ctrl) => Some("\x03"), //3
-        ("C", AlacModifiers::CtrlShift) => Some("\x03"), //3
-        ("d", AlacModifiers::Ctrl) => Some("\x04"), //4
-        ("D", AlacModifiers::CtrlShift) => Some("\x04"), //4
-        ("e", AlacModifiers::Ctrl) => Some("\x05"), //5
-        ("E", AlacModifiers::CtrlShift) => Some("\x05"), //5
-        ("f", AlacModifiers::Ctrl) => Some("\x06"), //6
-        ("F", AlacModifiers::CtrlShift) => Some("\x06"), //6
-        ("g", AlacModifiers::Ctrl) => Some("\x07"), //7
-        ("G", AlacModifiers::CtrlShift) => Some("\x07"), //7
-        ("h", AlacModifiers::Ctrl) => Some("\x08"), //8
-        ("H", AlacModifiers::CtrlShift) => Some("\x08"), //8
-        ("i", AlacModifiers::Ctrl) => Some("\x09"), //9
-        ("I", AlacModifiers::CtrlShift) => Some("\x09"), //9
-        ("j", AlacModifiers::Ctrl) => Some("\x0a"), //10
-        ("J", AlacModifiers::CtrlShift) => Some("\x0a"), //10
-        ("k", AlacModifiers::Ctrl) => Some("\x0b"), //11
-        ("K", AlacModifiers::CtrlShift) => Some("\x0b"), //11
-        ("l", AlacModifiers::Ctrl) => Some("\x0c"), //12
-        ("L", AlacModifiers::CtrlShift) => Some("\x0c"), //12
-        ("m", AlacModifiers::Ctrl) => Some("\x0d"), //13
-        ("M", AlacModifiers::CtrlShift) => Some("\x0d"), //13
-        ("n", AlacModifiers::Ctrl) => Some("\x0e"), //14
-        ("N", AlacModifiers::CtrlShift) => Some("\x0e"), //14
-        ("o", AlacModifiers::Ctrl) => Some("\x0f"), //15
-        ("O", AlacModifiers::CtrlShift) => Some("\x0f"), //15
-        ("p", AlacModifiers::Ctrl) => Some("\x10"), //16
-        ("P", AlacModifiers::CtrlShift) => Some("\x10"), //16
-        ("q", AlacModifiers::Ctrl) => Some("\x11"), //17
-        ("Q", AlacModifiers::CtrlShift) => Some("\x11"), //17
-        ("r", AlacModifiers::Ctrl) => Some("\x12"), //18
-        ("R", AlacModifiers::CtrlShift) => Some("\x12"), //18
-        ("s", AlacModifiers::Ctrl) => Some("\x13"), //19
-        ("S", AlacModifiers::CtrlShift) => Some("\x13"), //19
-        ("t", AlacModifiers::Ctrl) => Some("\x14"), //20
-        ("T", AlacModifiers::CtrlShift) => Some("\x14"), //20
-        ("u", AlacModifiers::Ctrl) => Some("\x15"), //21
-        ("U", AlacModifiers::CtrlShift) => Some("\x15"), //21
-        ("v", AlacModifiers::Ctrl) => Some("\x16"), //22
-        ("V", AlacModifiers::CtrlShift) => Some("\x16"), //22
-        ("w", AlacModifiers::Ctrl) => Some("\x17"), //23
-        ("W", AlacModifiers::CtrlShift) => Some("\x17"), //23
-        ("x", AlacModifiers::Ctrl) => Some("\x18"), //24
-        ("X", AlacModifiers::CtrlShift) => Some("\x18"), //24
-        ("y", AlacModifiers::Ctrl) => Some("\x19"), //25
-        ("Y", AlacModifiers::CtrlShift) => Some("\x19"), //25
-        ("z", AlacModifiers::Ctrl) => Some("\x1a"), //26
-        ("Z", AlacModifiers::CtrlShift) => Some("\x1a"), //26
-        ("@", AlacModifiers::Ctrl) => Some("\x00"), //0
-        ("[", AlacModifiers::Ctrl) => Some("\x1b"), //27
-        ("\\", AlacModifiers::Ctrl) => Some("\x1c"), //28
-        ("]", AlacModifiers::Ctrl) => Some("\x1d"), //29
-        ("^", AlacModifiers::Ctrl) => Some("\x1e"), //30
-        ("_", AlacModifiers::Ctrl) => Some("\x1f"), //31
-        ("?", AlacModifiers::Ctrl) => Some("\x7f"), //127
+    // The platform key (Win / Cmd) has no terminal encoding of its own; the
+    // modifier-aware sequences below simply ignore it.
+    if keystroke.modifiers.platform {
+        return modified_special(key, keystroke).map(Cow::Owned);
+    }
+
+    // AltGr arrives as ctrl+alt and produces text: let the text input have it.
+    if ctrl && alt && keystroke.key_char.is_some() {
+        return None;
+    }
+
+    // On macOS, option composes characters unless it is told to act as meta.
+    let alt_is_meta = !cfg!(target_os = "macos") || option_as_meta;
+
+    let fixed: Option<&'static str> = match (key, shift, alt, ctrl) {
+        ("enter", false, false, false) => Some("\x0d"),
+        // A terminal cannot tell ctrl-enter from ctrl-j; programs read LF as ctrl-enter.
+        ("enter", true, false, false) | ("enter", false, false, true) => Some("\x0a"),
+        ("enter", false, true, false) => Some("\x1b\x0d"),
+        ("tab", false, false, false) => Some("\x09"),
+        ("tab", true, false, false) => Some("\x1b[Z"),
+        ("escape", false, false, false) => Some("\x1b"),
+        ("escape", false, true, false) => Some("\x1b\x1b"),
+        ("backspace", false, false, false) | ("backspace", true, false, false) => Some("\x7f"),
+        ("backspace", false, false, true) => Some("\x08"),
+        ("backspace", false, true, false) => Some("\x1b\x7f"),
+        ("backspace", false, true, true) => Some("\x1b\x08"),
+        ("space", _, false, true) => Some("\x00"),
+        ("space", _, true, true) => Some("\x1b\x00"),
+        ("space", _, true, false) if alt_is_meta => Some("\x1b "),
         _ => None,
     };
-    if let Some(esc_str) = manual_esc_str {
+    if let Some(esc_str) = fixed {
         return Some(Cow::Borrowed(esc_str));
     }
 
-    // Automated bindings applying modifiers
-    if modifiers.any() {
-        let modifier_code = modifier_code(keystroke);
-        let modified_esc_str = match keystroke.key.as_ref() {
-            "up" => Some(format!("\x1b[1;{}A", modifier_code)),
-            "down" => Some(format!("\x1b[1;{}B", modifier_code)),
-            "right" => Some(format!("\x1b[1;{}C", modifier_code)),
-            "left" => Some(format!("\x1b[1;{}D", modifier_code)),
-            "f1" => Some(format!("\x1b[1;{}P", modifier_code)),
-            "f2" => Some(format!("\x1b[1;{}Q", modifier_code)),
-            "f3" => Some(format!("\x1b[1;{}R", modifier_code)),
-            "f4" => Some(format!("\x1b[1;{}S", modifier_code)),
-            "F5" => Some(format!("\x1b[15;{}~", modifier_code)),
-            "f6" => Some(format!("\x1b[17;{}~", modifier_code)),
-            "f7" => Some(format!("\x1b[18;{}~", modifier_code)),
-            "f8" => Some(format!("\x1b[19;{}~", modifier_code)),
-            "f9" => Some(format!("\x1b[20;{}~", modifier_code)),
-            "f10" => Some(format!("\x1b[21;{}~", modifier_code)),
-            "f11" => Some(format!("\x1b[23;{}~", modifier_code)),
-            "f12" => Some(format!("\x1b[24;{}~", modifier_code)),
-            "f13" => Some(format!("\x1b[25;{}~", modifier_code)),
-            "f14" => Some(format!("\x1b[26;{}~", modifier_code)),
-            "f15" => Some(format!("\x1b[28;{}~", modifier_code)),
-            "f16" => Some(format!("\x1b[29;{}~", modifier_code)),
-            "f17" => Some(format!("\x1b[31;{}~", modifier_code)),
-            "f18" => Some(format!("\x1b[32;{}~", modifier_code)),
-            "f19" => Some(format!("\x1b[33;{}~", modifier_code)),
-            "f20" => Some(format!("\x1b[34;{}~", modifier_code)),
-            "insert" => Some(format!("\x1b[2;{}~", modifier_code)),
-            "pageup" => Some(format!("\x1b[5;{}~", modifier_code)),
-            "pagedown" => Some(format!("\x1b[6;{}~", modifier_code)),
-            "end" => Some(format!("\x1b[1;{}F", modifier_code)),
-            "home" => Some(format!("\x1b[1;{}H", modifier_code)),
-            _ => None,
+    if !any {
+        return plain_special(key, mode).map(Cow::Borrowed);
+    }
+
+    if let Some(esc_str) = modified_special(key, keystroke) {
+        return Some(Cow::Owned(esc_str));
+    }
+
+    // Named keys that have no legacy sequence for this modifier combination.
+    match key {
+        "enter" => return Some(csi_u(13, keystroke)),
+        "tab" => return Some(csi_u(9, keystroke)),
+        "escape" => return Some(csi_u(27, keystroke)),
+        "backspace" => return Some(csi_u(127, keystroke)),
+        "space" => return Some(csi_u(32, keystroke)),
+        _ => {}
+    }
+
+    // Printable keys: letters, digits, punctuation.
+    let mut chars = key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if !ctrl && !alt {
+        // shift alone is plain text
+        return None;
+    }
+    if alt && !alt_is_meta {
+        return None;
+    }
+    let base = c.to_ascii_lowercase();
+
+    if ctrl {
+        let Some(byte) = ctrl_byte(c, shift) else {
+            return Some(csi_u(base as u32, keystroke));
         };
-        if let Some(esc_str) = modified_esc_str {
-            return Some(Cow::Owned(esc_str));
-        }
+        let control = char::from(byte);
+        return Some(Cow::Owned(if alt {
+            format!("\x1b{control}")
+        } else {
+            control.to_string()
+        }));
     }
 
-    if !cfg!(target_os = "macos") || option_as_meta {
-        let is_alt_lowercase_ascii = modifiers == AlacModifiers::Alt && keystroke.key.is_ascii();
-        let is_alt_uppercase_ascii =
-            keystroke.modifiers.alt && keystroke.modifiers.shift && keystroke.key.is_ascii();
-        if is_alt_lowercase_ascii || is_alt_uppercase_ascii {
-            let key = if is_alt_uppercase_ascii {
-                &keystroke.key.to_ascii_uppercase()
-            } else {
-                &keystroke.key
-            };
-            return Some(Cow::Owned(format!("\x1b{}", key)));
-        }
+    // alt without ctrl: meta prefix
+    if shift && !c.is_ascii_alphabetic() {
+        return Some(csi_u(base as u32, keystroke));
     }
-
-    None
+    let shown = if shift { c.to_ascii_uppercase() } else { c };
+    Some(Cow::Owned(format!("\x1b{shown}")))
 }
 
 ///   Code     Modifiers
@@ -384,6 +480,107 @@ mod test {
                 format!("\x1b{}", key)
             );
         }
+    }
+
+    fn esc(source: &str) -> Option<String> {
+        to_esc_str(&Keystroke::parse(source).unwrap(), &TermMode::NONE, true).map(|s| s.into_owned())
+    }
+
+    /// A keystroke as the platform reports it under a non-Latin layout: the
+    /// layout's character in `key`, the physical key in `physical_key`.
+    fn physical(key: &str, usage: u32, ctrl: bool, alt: bool, shift: bool) -> Option<String> {
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                control: ctrl,
+                alt,
+                shift,
+                ..Default::default()
+            },
+            key: key.to_string(),
+            key_char: None,
+            physical_key: Some(usage),
+            ..Default::default()
+        };
+        to_esc_str(&ks, &TermMode::NONE, true).map(|s| s.into_owned())
+    }
+
+    #[test]
+    fn keys_not_characters() {
+        // Russian layout: "с" on the C key, "х" on the [ key, "ж" on the ; key.
+        assert_eq!(physical("с", 0x06, true, false, false).as_deref(), Some("\x03"));
+        assert_eq!(physical("с", 0x06, true, false, true).as_deref(), Some("\x03"));
+        assert_eq!(physical("с", 0x06, false, true, false).as_deref(), Some("\x1bc"));
+        assert_eq!(physical("с", 0x06, true, true, false).as_deref(), Some("\x1b\x03"));
+        assert_eq!(physical("х", 0x2f, true, false, false).as_deref(), Some("\x1b"));
+        assert_eq!(physical("ж", 0x33, true, false, false).as_deref(), Some("\x1b[59;5u"));
+        // shift dropped by the platform and folded into `key`
+        assert_eq!(physical(":", 0x33, true, false, false).as_deref(), Some("\x1b[59;6u"));
+        assert_eq!(physical("Ж", 0x33, true, false, false).as_deref(), Some("\x1b[59;6u"));
+        assert_eq!(physical("@", 0x1f, true, false, false).as_deref(), Some("\x00"));
+        assert_eq!(physical("!", 0x1e, false, true, false).as_deref(), Some("\x1b[49;4u"));
+        assert_eq!(physical("1", 0x1e, false, true, false).as_deref(), Some("\x1b1"));
+        // plain and shifted typing stays text
+        assert_eq!(physical("с", 0x06, false, false, false), None);
+        assert_eq!(physical("С", 0x06, false, false, true), None);
+    }
+
+    #[test]
+    fn every_modifier_combination_is_sent() {
+        let mods = ["shift", "ctrl", "alt", "ctrl-shift", "alt-shift", "ctrl-alt", "ctrl-alt-shift"];
+        let mut keys: Vec<String> = ('a'..='z').map(|c| c.to_string()).collect();
+        keys.extend(('0'..='9').map(|c| c.to_string()));
+        keys.extend(["-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "`"].map(String::from));
+        let named = [
+            "space", "enter", "tab", "escape", "backspace", "delete", "insert", "home", "end",
+            "pageup", "pagedown", "up", "down", "left", "right",
+        ];
+        keys.extend(named.map(String::from));
+        keys.extend((1..=12).map(|i| format!("f{i}")));
+        for key in &keys {
+            for m in mods {
+                let printable = key.chars().count() == 1 || key == "space";
+                if m == "shift" && printable {
+                    // shifted characters are typed text
+                    continue;
+                }
+                assert!(esc(&format!("{m}-{key}")).is_some(), "{m}-{key} sends nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_sequences() {
+        assert_eq!(esc("ctrl-enter").as_deref(), Some("\x0a"));
+        assert_eq!(esc("ctrl-shift-enter").as_deref(), Some("\x1b[13;6u"));
+        assert_eq!(esc("ctrl-shift-a").as_deref(), Some("\x01"));
+        assert_eq!(esc("ctrl-alt-a").as_deref(), Some("\x1b\x01"));
+        assert_eq!(esc("ctrl-2").as_deref(), Some("\x00"));
+        assert_eq!(esc("ctrl-6").as_deref(), Some("\x1e"));
+        assert_eq!(esc("ctrl-1").as_deref(), Some("\x1b[49;5u"));
+        assert_eq!(esc("ctrl-/").as_deref(), Some("\x1f"));
+        assert_eq!(esc("ctrl-delete").as_deref(), Some("\x1b[3;5~"));
+        assert_eq!(esc("shift-delete").as_deref(), Some("\x1b[3;2~"));
+        assert_eq!(esc("shift-f5").as_deref(), Some("\x1b[15;2~"));
+        assert_eq!(esc("ctrl-f5").as_deref(), Some("\x1b[15;5~"));
+        assert_eq!(esc("alt-escape").as_deref(), Some("\x1b\x1b"));
+        assert_eq!(esc("ctrl-tab").as_deref(), Some("\x1b[9;5u"));
+        assert_eq!(esc("ctrl-alt-shift-a").as_deref(), Some("\x1b\x01"));
+    }
+
+    #[test]
+    fn altgr_text_is_left_to_text_input() {
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Default::default()
+            },
+            key: "q".to_string(),
+            key_char: Some("@".to_string()),
+            physical_key: Some(0x14),
+            ..Default::default()
+        };
+        assert_eq!(to_esc_str(&ks, &TermMode::NONE, false), None);
     }
 
     #[test]

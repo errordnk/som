@@ -293,8 +293,6 @@ fn main() {
     #[cfg(target_os = "windows")]
     enable_additive_dll_search_directories();
     #[cfg(target_os = "windows")]
-    ensure_conpty_extracted_and_wired();
-    #[cfg(target_os = "windows")]
     terminal::rich_content_video_player::ensure_ffmpeg_extracted_and_wired();
 
     // A daemon left over from an older build is replaced before anything connects to it.
@@ -321,9 +319,6 @@ fn main() {
             .as_deref()
             .unwrap_or("unknown"),
     );
-
-    #[cfg(windows)]
-    check_for_conpty_dll();
 
     let app = build_application().with_assets(Assets);
 
@@ -773,53 +768,11 @@ fn parse_url_arg(arg: &str, _cx: &App) -> String {
     }
 }
 
-/// Extracts Som's embedded, patched `conpty.dll`/`OpenConsole.exe` (the
-/// Windows Terminal project's improved ConPTY backend — see `crates/zed/
-/// build.rs`'s doc comment for where these come from) to `~/.config/som/
-/// conpty/` if not already there, then points `SetDllDirectoryW` at that
-/// directory so `alacritty_terminal`'s `LoadLibraryW(w!("conpty.dll"))`
-/// (no path — relies on the standard DLL search order) finds Som's own
-/// bundled copy before falling through to whatever baseline conpty.dll
-/// ships built into `System32` on Windows 10 1809+. Deliberately NOT
-/// written next to `som.exe` itself — the whole point is for Som to stay
-/// launchable from an arbitrary (possibly read-only) directory without
-/// assuming anything else sits beside it.
-///
-/// Must run before the first `Terminal`/PTY is created — called early in
-/// `main()`, right after logging is set up (so a failure here is at least
-/// visible) and long before any window/workspace exists.
-#[cfg(target_os = "windows")]
-fn ensure_conpty_extracted_and_wired() {
-    use gpui::AssetSource;
-
-    let conpty_dir = paths::data_dir().join("conpty");
-    for (asset_path, file_name) in
-        [("conpty/conpty.dll", "conpty.dll"), ("conpty/OpenConsole.exe", "OpenConsole.exe")]
-    {
-        let target = conpty_dir.join(file_name);
-        if target.is_file() {
-            continue;
-        }
-        let Some(bytes) = Assets.load(asset_path).ok().flatten() else {
-            log::error!("missing embedded asset {asset_path:?} — terminal will fall back to the system conpty");
-            continue;
-        };
-        if let Err(err) = std::fs::create_dir_all(&conpty_dir) {
-            log::error!("failed to create {conpty_dir:?}: {err:#}");
-            continue;
-        }
-        if let Err(err) = std::fs::write(&target, &bytes) {
-            log::error!("failed to write {target:?}: {err:#}");
-        }
-    }
-
-    add_dll_search_directory(&conpty_dir, "conpty");
-}
-
-/// `AddDllDirectory` calls are silently ignored by the loader unless the
-/// process has opted into the "default dirs + explicitly added dirs" search
-/// order via `SetDefaultDllDirectories` first — must run once, before any
-/// `AddDllDirectory` call.
+/// Restricts the process's DLL search to the default safe directories
+/// (`som.exe`'s own folder, System32, and folders added with
+/// `AddDllDirectory` - the FFmpeg extraction dir), never PATH or the current
+/// directory. `AddDllDirectory` calls are silently ignored by the loader
+/// unless this ran first - must run once, before any `AddDllDirectory` call.
 #[cfg(target_os = "windows")]
 fn enable_additive_dll_search_directories() {
     unsafe {
@@ -827,26 +780,7 @@ fn enable_additive_dll_search_directories() {
             LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
         };
         if let Err(err) = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) {
-            log::error!(
-                "SetDefaultDllDirectories failed: {err:#} — conpty/ffmpeg extraction dirs may not be honored"
-            );
-        }
-    }
-}
-
-/// Adds `dir` to the process's DLL search path via `AddDllDirectory`
-/// (additive — unlike `SetDllDirectoryW`, which replaces the single
-/// existing user-defined search directory, `AddDllDirectory` can be called
-/// once per extracted-asset directory without one wiping the other out).
-#[cfg(target_os = "windows")]
-fn add_dll_search_directory(dir: &std::path::Path, label: &str) {
-    unsafe {
-        use windows::Win32::System::LibraryLoader::AddDllDirectory;
-        use windows::core::HSTRING;
-        if AddDllDirectory(&HSTRING::from(dir.as_os_str())).is_null() {
-            log::error!(
-                "AddDllDirectory({dir:?}) failed for {label} — related features may fall back to the system search path"
-            );
+            log::error!("SetDefaultDllDirectories failed: {err:#} - the ffmpeg extraction dir may not be honored");
         }
     }
 }
@@ -939,21 +873,3 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     .detach()
 }
 
-
-#[cfg(target_os = "windows")]
-fn check_for_conpty_dll() {
-    use windows::{
-        Win32::{Foundation::FreeLibrary, System::LibraryLoader::LoadLibraryW},
-        core::w,
-    };
-
-    if let Ok(hmodule) = unsafe { LoadLibraryW(w!("conpty.dll")) } {
-        unsafe {
-            FreeLibrary(hmodule)
-                .context("Failed to free conpty.dll")
-                .log_err();
-        }
-    } else {
-        log::warn!("Failed to load conpty.dll. Terminal will work with reduced functionality.");
-    }
-}

@@ -4,6 +4,8 @@
 //! private to the binary; Som only ever talks to a running server over the
 //! pipe protocol, it never links against session/PTY internals directly.
 pub mod admin;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod conpty;
 pub mod daemon;
 pub mod link;
 pub mod pipe;

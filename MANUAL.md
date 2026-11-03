@@ -27,7 +27,7 @@ Three separate directories, kept deliberately apart — configuration, extracted
 | `~/.config/som/themes/nord.json` | The bundled "Nord" theme, written out on first launch. |
 | `~/.config/som/db.json` | Tab/split/session layout, rewritten on every tab/split change and on quit. Not something you should hand-edit; described below for troubleshooting. |
 | `~/.local/share/som/ffmpeg/` (Windows only) | Embedded FFmpeg decode libraries, auto-extracted on first launch for the video player. Not something you need to provide. |
-| `~/.local/share/som/conpty/` (Windows only) | Som's own patched ConPTY backend, auto-extracted on first launch. |
+| `%TEMP%\som-conpty-<hash>\` (Windows only) | The Windows Terminal project's ConPTY (`conpty.dll`, `OpenConsole.exe`) Som's terminals run in, written from the binary and checked before every new terminal. Windows' own console drops the escape sequences Som's rich content travels in. Safe to delete: it is written again. |
 | `~/.local/state/som/logs/` | Daily log files. Check here first if something isn't working as expected. |
 
 On macOS/Linux, the extracted-binaries and logs paths follow the platform's own XDG-style conventions instead (`~/Library/Application Support/Som` and `~/Library/Logs/Som` on macOS; `$XDG_DATA_HOME/som` and `$XDG_STATE_HOME/som` on Linux) — only `~/.config/som` (settings/db/themes) is the same path everywhere.

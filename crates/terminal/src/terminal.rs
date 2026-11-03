@@ -773,6 +773,8 @@ impl TerminalBuilder {
             };
 
             //Setup the pty...
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            somsrv::conpty::wire();
             let pty = match tty::new(&pty_options, TerminalBounds::default().into(), window_id) {
                 Ok(pty) => pty,
                 Err(error) => {
@@ -7369,16 +7371,6 @@ mod tests {
     #[gpui::test]
     async fn a_remote_tab_reaches_the_daemon_of_its_host_through_its_own_pty(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        // The patched ConPTY the real Som ships, as the other real-process tests use.
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         // The stand-in for ssh (named `ssh`, as the tab's command is): it drops
         // `-tt <host> ~/.local/bin/somsrv` and runs the relay with the rest.
@@ -7506,14 +7498,6 @@ mod tests {
     #[gpui::test]
     async fn somsrp_alone_in_a_directory_finds_ffmpeg_and_leaves_no_dlls_beside_it(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
         let scratch = tempfile::tempdir().unwrap();
         let dir = scratch.path().to_path_buf();
         let somsrp = dir.join("somsrp.exe");
@@ -8779,23 +8763,6 @@ mod tests {
         // where the process was confirmed still running.
         cx.executor().allow_parking();
 
-        // Same patched-conpty.dll setup `test_somsrp_displays_a_realistic_large_photo_sized_image`
-        // uses — without it, this test falls back to Windows' own
-        // baseline ConPTY implementation, which has materially different
-        // (worse, per `alacritty_terminal`'s own doc comment on
-        // `conpty.rs`) buffering behavior than the patched one this
-        // project ships/expects in production.
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
-
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
@@ -8913,16 +8880,6 @@ mod tests {
         // rendering check.
         cx.executor().allow_parking();
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
@@ -8984,16 +8941,6 @@ mod tests {
     async fn a_widget_hides_the_cursor_and_shows_it_again_when_left(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         let somsrp_path = somsrv::testing::debug_binary("somsrp");
@@ -9047,16 +8994,6 @@ mod tests {
         // from at real paint time.
         cx.executor().allow_parking();
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let scratch = tempfile::tempdir().unwrap();
         let markdown_dir = scratch.path().to_path_buf();
@@ -9112,16 +9049,6 @@ mod tests {
         // painting only ever visits ids still found in the live grid).
         cx.executor().allow_parking();
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let giphy_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../giphy.gif");
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
@@ -9871,16 +9798,6 @@ mod tests {
         // matching `rich_content_audio_player`'s own test tolerance).
         cx.executor().allow_parking();
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let tone_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_fixtures/tone.flac");
         assert!(tone_path.is_file(), "test_fixtures/tone.flac not found at {tone_path:?}");
@@ -9976,8 +9893,7 @@ mod tests {
         // whole pipeline end-to-end through a real `somsrp` child process
         // (real ConPTY): transport -> cache -> `ffmpeg-next` decode ->
         // `RichContentVideoPlayer::current_frame`. Requires the extracted
-        // FFmpeg DLLs to be on the DLL search path (same conpty.dll dance
-        // below, plus FFmpeg's own) — skips gracefully if they aren't
+        // FFmpeg DLLs to be on the DLL search path — skips gracefully if they aren't
         // present rather than failing, matching every other "needs a real
         // device/runtime dependency" test's tolerance in this file.
         cx.executor().allow_parking();
@@ -9986,10 +9902,6 @@ mod tests {
             use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
             use windows::core::HSTRING;
             let data_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som");
-            let conpty_dir = data_dir.join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
             let ffmpeg_dir = data_dir.join("ffmpeg");
             if ffmpeg_dir.join("avcodec-63.dll").is_file() {
                 SetDllDirectoryW(&HSTRING::from(ffmpeg_dir.as_os_str())).ok();
@@ -10106,16 +10018,6 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
 
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let conpty_dir =
-                dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som").join("conpty");
-            if conpty_dir.join("conpty.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(conpty_dir.as_os_str())).ok();
-            }
-        }
 
         let yazi_path = std::env::var("SOM_TEST_YAZI_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| {
             std::path::PathBuf::from(if cfg!(windows) {

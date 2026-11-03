@@ -27,7 +27,7 @@ At the core of Som is [GPUI](https://gpui.rs/): GPU rendering and a theming syst
 - **Themes out of the box** — the theme format matches Zed's, so Catppuccin, Tokyo Night, Dracula, One Dark Pro and any other Zed theme work without conversion.
 - **Nerd Font and ligatures** — full control over OpenType features: ligatures, stylistic sets, font weight 100–900 — everything you'd expect from a real editor engine.
 - **One portable binary, ~40 MB** — no installation, no setup: download `som`, run it from any folder, it works immediately. It downloads nothing on first launch, asks for no runtimes and leaves no traces in the system.
-- **Everything it needs is embedded** — the binary carries per-OS settings, the theme, fonts (including a proportional one, for markdown), icons, `somsrv` for all three platforms, a patched ConPTY and the FFmpeg video decoder. All zstd-compressed and unpacked automatically on first launch. FFmpeg was separately trimmed to just the codecs in use: together with compression that took the five DLLs from ~18 MB raw to ~2 MB embedded and cut ~15 MB — about 29% — off the binary.
+- **Everything it needs is embedded** — the binary carries per-OS settings, the theme, fonts (including a proportional one, for markdown), icons, `somsrv` for all three platforms, the Windows Terminal project's ConPTY and the FFmpeg video decoder. All zstd-compressed and unpacked automatically on first launch. FFmpeg was separately trimmed to just the codecs in use: together with compression that took the five DLLs from ~18 MB raw to ~2 MB embedded and cut ~15 MB — about 29% — off the binary.
 - **Flexible window modes** — windowed / maximized / fullscreen / minimized, precise terminal padding from the window edge, fixed startup position and size.
 - **Configurable keybindings** — every action, from a new tab to split focus, is remappable in JSON. The defaults are thought through separately for Windows, macOS and Linux.
 - **Content right in the terminal** — Som Rich Protocol: the bundled `somsrp` renders images, video, audio and markdown straight into the terminal stream (more below).
@@ -78,7 +78,7 @@ Som implements its own binary protocol for streaming rich content, so `somsrp` (
 
 Windows, macOS, Linux — one codebase, native speed. Each build is a self-contained binary for its platform, with no installer and no external dependencies. The feature set is identical everywhere: splits, themes, living sessions and in-terminal content don't depend on where you work from.
 
-- **Windows** — amd64 · an embedded patched ConPTY from the Windows Terminal project, without the standard system-console bugs.
+- **Windows** — amd64 · the Windows Terminal project's ConPTY, embedded: Windows' own console drops the escape sequences Som's rich content travels in.
 - **macOS** — Apple Silicon (arm64) · native integration with the system title bar and trackpad gestures.
 - **Linux** — amd64 and arm64 (Raspberry Pi 5) · X11 and Wayland through GPUI; `somsrv` deploys to remote Linux servers too.
 

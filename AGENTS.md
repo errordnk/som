@@ -145,8 +145,50 @@ Three separate directories, never mixed:
   `$XDG_DATA_HOME/som` convention one category over; macOS uses `~/Library/Application
   Support/Som`). Runtime-extracted **binary artifacts**: embedded FFmpeg DLLs
   (`ensure_ffmpeg_extracted_and_wired`, `crates/terminal/src/rich_content_video_player.rs`)
-  and ConPTY (`ensure_conpty_extracted_and_wired`, `crates/zed/src/main.rs`) both extract
-  here, under `data_dir().join("ffmpeg")`/`data_dir().join("conpty")`.
+  extract here, under `data_dir().join("ffmpeg")`.
+
+## Windows defaults, and the one ConPTY exception (HARD RULES)
+
+Som runs on what Windows itself provides. Every departure is written down in
+this section with its reason; a departure that is not here is a bug.
+
+The only one: terminals run in the Windows Terminal project's ConPTY
+(`conpty.dll` + `OpenConsole.exe`, an unmodified Microsoft build,
+Microsoft.Windows.Console.ConPTY 1.24.260303001), not in Windows' own conhost.
+**Why:** conhost drops APC strings (`ESC _ ... ESC \`): SRP's link frames for
+remote tabs, and anything else a program sends that conhost does not know.
+Checked 2026-11-03: `before<APC>after` came out of conhost as `beforeafter`,
+intact out of OpenConsole. `somsrv` forwards its sessions' raw output to Som,
+so its ConPTY must pass them too.
+
+**How it works, and the only way it may work:**
+- The pair lives ONLY inside the binary: zstd-compressed in `somsrv`
+  (`assets/conpty/*.zst`, `crates/somsrv/src/conpty.rs`), and so inside `som.exe`
+  through the embedded `somsrv`. Nothing is installed, nothing is shipped beside
+  an exe, nothing is downloaded at build time.
+- `somsrv::conpty::wire()` runs right before EVERY `tty::new` on Windows (Som's
+  window in `crates/terminal`, `somsrv`'s sessions in `session.rs`). It writes
+  the pair to `%TEMP%\som-conpty-<content hash>\` as temporary (memory-cached)
+  files, compares them byte for byte, rewrites anything that is not ours, and
+  hands the folder to the `alacritty` fork's `set_conpty_dir`.
+- The fork loads `conpty.dll` by FULL PATH from that folder only. If the
+  folder is not set or the file is missing, it uses Windows' own ConPTY and
+  logs why.
+
+**Never:**
+- load `conpty.dll` (or start `OpenConsole.exe`) by bare name or let the DLL
+  search order find it: not PATH, not the current folder, not beside `som.exe`
+  or `somsrv.exe`, not `System32`, not `~/.local/share/som` or any other folder
+  of ours, not another program's install (on 2026-11-03 `somsrv` was found
+  running on Contour Terminal's copy from PATH, and when Contour was removed
+  the console silently changed);
+- extract the pair anywhere but `%TEMP%\som-conpty-<hash>`, or skip the
+  byte-for-byte check "because the file is already there";
+- "fix" a ConPTY problem by switching to Windows' own conhost: it breaks SRP.
+  Change the pinned version instead (see the update note in `conpty.rs`).
+
+`somsrv`'s test `no_other_code_loads_conpty_by_name` fails if any other source
+in the workspace mentions `conpty.dll`.
 - **`state_dir()`**/**`logs_dir()`** — `~/.local/state/som` on Windows (same XDG category
   Linux/FreeBSD already uses via `dirs::state_dir()`). Logs (`logs_dir()` = `state_dir()
   .join("logs")`) and other transient application state live here — never under `data_dir()`.

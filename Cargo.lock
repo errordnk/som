@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.1-dev"
-source = "git+https://github.com/errordnk/alacritty?rev=88b98dbf#88b98dbf844d46221752aa2d77e046ad0490a135"
+source = "git+https://github.com/errordnk/alacritty?rev=3455fc1c#3455fc1c82dbeff6ed7a7fc45625b824350cd388"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.0",

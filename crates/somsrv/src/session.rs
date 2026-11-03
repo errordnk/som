@@ -208,6 +208,8 @@ impl Session {
             escape_args,
         };
 
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        somsrv::conpty::wire();
         let pty = tty::new(&pty_options, bounds.into(), 0).context("failed to spawn pty")?;
         let pid = process_pid(&pty);
 

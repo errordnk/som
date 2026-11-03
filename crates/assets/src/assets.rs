@@ -56,17 +56,8 @@ use rust_embed::RustEmbed;
 #[include = "srv/macos-arm/somsrv"]
 #[include = "srv/linux-amd/somsrv"]
 #[include = "srv/linux-arm/somsrv"]
-// The Windows Terminal project's improved ConPTY backend — see `crates/zed/
-// build.rs`'s doc comment for where these are downloaded from (a pinned
-// nupkg version) and `crates/zed/src/main.rs`'s startup extraction, which
-// writes these bytes out to `paths::data_dir().join("conpty")` (never
-// next to som.exe itself, so Som stays runnable from an arbitrary/read-
-// only directory) and
-// points `SetDllDirectoryW` there before any terminal is created. Refreshed
-// manually by copying `target/release/{conpty.dll,OpenConsole.exe}` here
-// whenever build.rs's pinned `conpty_url` version bumps — not automated.
-#[include = "conpty/conpty.dll"]
-#[include = "conpty/OpenConsole.exe"]
+// (The ConPTY files in `conpty/` are not embedded here: `somsrv` carries
+// them for both itself and Som's window - see `crates/somsrv/src/conpty.rs`.)
 // Decode-only FFmpeg shared libs, trimmed to just the demuxers/decoders
 // Som's video player actually uses (mov/matroska/avi containers,
 // h264/hevc/vp9/av1/mpeg4 codecs — see `vcpkg-overlays/ffmpeg/
@@ -86,9 +77,7 @@ use rust_embed::RustEmbed;
 // (see `decompress_zst` below) to keep that weight out of `som.exe`
 // itself. Lazily extracted-and-decompressed to `paths::data_dir().join(
 // "ffmpeg")` by `ensure_ffmpeg_extracted_and_wired` in `crates/terminal/
-// src/rich_content_video_player.rs`,
-// same lazy-extraction pattern `conpty/` above uses, just with a
-// decompression step in between. macOS/Linux builds not yet added.
+// src/rich_content_video_player.rs`. macOS/Linux builds not yet added.
 //
 // Measured impact of BOTH the decoder trim (previous paragraph) and
 // this compression, together, on a real build (2026-08-27): the five

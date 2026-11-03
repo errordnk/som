@@ -6,6 +6,8 @@
 pub mod admin;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod conpty;
+#[cfg(windows)]
+pub mod tmp_files;
 pub mod daemon;
 pub mod link;
 pub mod pipe;

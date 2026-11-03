@@ -34,14 +34,6 @@ use terminal::kitty_graphics_placeholder;
 const CHUNK_SIZE: usize = 65536;
 
 fn main() {
-    // somsrp links ffmpeg-next/ffmpeg-sys-next directly (see `video_metadata`
-    // below) — as its own OS process, it needs the same DLL-search-path
-    // wiring `som.exe` does for its embedded video playback, since the two
-    // are independent processes and neither's DLL search path is inherited
-    // by the other.
-    #[cfg(target_os = "windows")]
-    terminal::rich_content_video_player::ensure_ffmpeg_extracted_and_wired();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // `-a <N>` selects which of the container's audio streams to decode,
@@ -409,6 +401,9 @@ fn video_metadata(
 ) -> Result<terminal::rich_content_transport::ContentMetadata, String> {
     use terminal::rich_content_transport::{ContentMetadata, VideoCodec};
 
+    if !terminal::rich_content_video_player::ffmpeg_ready() {
+        return Err("FFmpeg is unavailable (see the log)".to_string());
+    }
     let _ = ffmpeg_next::init();
     let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;
     let stream_io = ffmpeg_next::format::context::StreamIo::from_read_seek(file)

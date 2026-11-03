@@ -75,9 +75,9 @@ use rust_embed::RustEmbed;
 // other embedded asset in this crate, and DLL machine code compresses
 // well under zstd — worth the one-time decompression cost at startup
 // (see `decompress_zst` below) to keep that weight out of `som.exe`
-// itself. Lazily extracted-and-decompressed to `paths::data_dir().join(
-// "ffmpeg")` by `ensure_ffmpeg_extracted_and_wired` in `crates/terminal/
-// src/rich_content_video_player.rs`. macOS/Linux builds not yet added.
+// itself. Decompressed into `%TEMP%\som-ffmpeg-<hash>` when a video is
+// first opened, by `ffmpeg_ready` in `crates/terminal/src/
+// rich_content_video_player.rs`. macOS/Linux builds not yet added.
 //
 // Measured impact of BOTH the decoder trim (previous paragraph) and
 // this compression, together, on a real build (2026-08-27): the five

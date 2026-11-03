@@ -55,9 +55,9 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// This is set once and cached for subsequent calls.
 /// On macOS, this is `~/Library/Application Support/Zed`.
 /// On Linux/FreeBSD, this is `$XDG_DATA_HOME/zed`.
-/// On Windows, this is `~/.local/share/som` — deliberately separate from
-/// `CONFIG_DIR` (`~/.config/som`, JSON-only) so runtime-extracted binary
-/// artifacts (FFmpeg DLLs, ConPTY) never mix with settings/db/theme files.
+/// On Windows, this is `~/.local/share/som`. Som itself writes nothing here
+/// (only settings and logs are kept; the binaries it carries go to tmp - see
+/// AGENTS.md, "On-disk layout"); it remains for the inherited Zed code.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
@@ -212,7 +212,7 @@ pub fn temp_dir() -> &'static PathBuf {
         }
 
         if cfg!(target_os = "windows") {
-            return home_dir().join(".cache").join(APP_NAME_LOWERCASE);
+            return std::env::temp_dir().join(APP_NAME_LOWERCASE);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -241,11 +241,10 @@ pub fn logs_dir() -> &'static PathBuf {
         if cfg!(target_os = "macos") {
             home_dir().join("Library/Logs").join(APP_NAME)
         } else if cfg!(target_os = "windows") {
-            // `state_dir()` (`~/.local/state/som`), not `data_dir()`
-            // (`~/.local/share/som`, reserved for runtime-extracted
-            // binary artifacts like FFmpeg/ConPTY) — logs are transient
-            // application state, same XDG category `~/.local/state`
-            // already implies on Linux/FreeBSD via `dirs::state_dir()`.
+            // `state_dir()` (`~/.local/state/som`), not `data_dir()`:
+            // logs are transient application state, same XDG category
+            // `~/.local/state` already implies on Linux/FreeBSD via
+            // `dirs::state_dir()`.
             state_dir().join("logs")
         } else {
             data_dir().join("logs")

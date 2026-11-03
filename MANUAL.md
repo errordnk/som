@@ -19,18 +19,18 @@ This document describes every user-facing feature of Som and every option in `~/
 
 ## Where things live
 
-Three separate directories, kept deliberately apart — configuration, extracted binaries, and logs never mix:
+Som keeps only two things on disk: your configuration and its logs. Fonts are loaded from the binary straight into memory; the libraries Windows has to load from a file are written to the system temp folder and can be deleted at any time.
 
 | Path | Purpose |
 |---|---|
 | `~/.config/som/settings.json` | Your configuration. Created from a platform-specific template on first launch. Watched and live-reloaded — edits apply immediately, with an in-app error banner if the JSON is invalid. |
 | `~/.config/som/themes/nord.json` | The bundled "Nord" theme, written out on first launch. |
 | `~/.config/som/db.json` | Tab/split/session layout, rewritten on every tab/split change and on quit. Not something you should hand-edit; described below for troubleshooting. |
-| `~/.local/share/som/ffmpeg/` (Windows only) | Embedded FFmpeg decode libraries, auto-extracted on first launch for the video player. Not something you need to provide. |
+| `%TEMP%\som-ffmpeg-<hash>\` (Windows only) | The FFmpeg decode libraries for the video player, written from the binary when a video is first opened and checked before every video. Safe to delete: it is written again. |
 | `%TEMP%\som-conpty-<hash>\` (Windows only) | The Windows Terminal project's ConPTY (`conpty.dll`, `OpenConsole.exe`) Som's terminals run in, written from the binary and checked before every new terminal. Windows' own console drops the escape sequences Som's rich content travels in. Safe to delete: it is written again. |
 | `~/.local/state/som/logs/` | Daily log files. Check here first if something isn't working as expected. |
 
-On macOS/Linux, the extracted-binaries and logs paths follow the platform's own XDG-style conventions instead (`~/Library/Application Support/Som` and `~/Library/Logs/Som` on macOS; `$XDG_DATA_HOME/som` and `$XDG_STATE_HOME/som` on Linux) — only `~/.config/som` (settings/db/themes) is the same path everywhere.
+On macOS/Linux, the logs path follows the platform's own conventions instead (`~/Library/Logs/Som` on macOS, `$XDG_DATA_HOME/som/logs` on Linux) — only `~/.config/som` (settings/db/themes) is the same path everywhere.
 
 `somsrv` (the binary this deploys to remote hosts for SSH sessions) is staged straight from Som's own embedded copy into a throwaway temp file for the duration of each deploy — nothing permanent is kept on disk for it.
 

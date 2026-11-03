@@ -13,71 +13,56 @@
 //! installed: the DLL is loaded by full path only (see the `alacritty`
 //! fork's `set_conpty_dir`), never found on PATH.
 //!
-//! [`wire`] runs before every pseudoconsole is created: tmp may have been
-//! cleaned in the meantime, and a file that is not byte for byte ours is
-//! written again.
+//! [`wire`] runs before every pseudoconsole is created. The first one of a
+//! process checks every byte (and writes again anything that is not ours);
+//! later ones only check that the files are still there, as tmp may have
+//! been cleaned in the meantime.
 //!
 //! To update: put the new pair from the nupkg's `runtimes/win-x64/native/
 //! conpty.dll` and `build/native/runtimes/x64/OpenConsole.exe` through zstd
 //! (level 19) into `assets/conpty/*.zst`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use sha2::{Digest, Sha256};
+use crate::tmp_files;
 
 const FILES: [(&str, &[u8]); 2] = [
     ("conpty.dll", include_bytes!("../../../assets/conpty/conpty.dll.zst")),
     ("OpenConsole.exe", include_bytes!("../../../assets/conpty/OpenConsole.exe.zst")),
 ];
 
+/// Whether this process has already checked the files byte for byte.
+static VERIFIED: AtomicBool = AtomicBool::new(false);
+
 /// Makes the next pseudoconsole use our ConPTY. If it cannot be written,
 /// Windows' own is used and the reason is logged.
 pub fn wire() {
-    match ensure(&std::env::temp_dir()) {
-        Ok(dir) => alacritty_terminal::tty::set_conpty_dir(dir),
+    let dir = folder(&std::env::temp_dir());
+    let present = || FILES.iter().all(|(name, _)| dir.join(name).is_file());
+    if VERIFIED.load(Ordering::Relaxed) && present() {
+        alacritty_terminal::tty::set_conpty_dir(dir);
+        return;
+    }
+    match ensure(&dir) {
+        Ok(()) => {
+            VERIFIED.store(true, Ordering::Relaxed);
+            alacritty_terminal::tty::set_conpty_dir(dir);
+        },
         Err(err) => log::error!("ConPTY files not written, Windows' own console is used: {err:#}"),
     }
 }
 
-/// Writes the files into their folder in `tmp` unless they are already there,
-/// byte for byte; returns the folder.
-fn ensure(tmp: &Path) -> anyhow::Result<PathBuf> {
-    let mut hash = Sha256::new();
-    for (_, compressed) in FILES {
-        hash.update(compressed);
-    }
-    let digest = hash.finalize();
-    let dir = tmp.join(format!("som-conpty-{}", hex::encode(&digest[..6])));
-    std::fs::create_dir_all(&dir)?;
-    for (name, compressed) in FILES {
-        let bytes = zstd::stream::decode_all(compressed)?;
-        write_unless_same(&dir.join(name), &bytes)?;
-    }
-    Ok(dir)
+fn folder(tmp: &Path) -> PathBuf {
+    tmp_files::folder(tmp, "som-conpty", &FILES.map(|(_, compressed)| compressed))
 }
 
-fn write_unless_same(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if std::fs::read(path).is_ok_and(|current| current == bytes) {
-        return Ok(());
+/// Writes the files into `dir` unless they are already there, byte for byte.
+fn ensure(dir: &Path) -> anyhow::Result<()> {
+    for (name, compressed) in FILES {
+        let bytes = zstd::stream::decode_all(compressed)?;
+        tmp_files::write_unless_same(&dir.join(name), &bytes)?;
     }
-    use std::io::Write as _;
-    use std::os::windows::fs::OpenOptionsExt as _;
-    // FILE_ATTRIBUTE_TEMPORARY: Windows keeps the file in its memory cache
-    // and avoids writing it to the disk. (It has to be a file: conpty.dll is
-    // loaded and OpenConsole.exe started by path, and delete-on-close would
-    // stop the loader from opening it.)
-    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
-    // a file of ours that a running console holds cannot be replaced in
-    // place, but then it is not different either: write beside, then swap
-    let fresh = path.with_extension("new");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .attributes(FILE_ATTRIBUTE_TEMPORARY)
-        .open(&fresh)?
-        .write_all(bytes)?;
-    std::fs::rename(&fresh, path)?;
     Ok(())
 }
 
@@ -88,12 +73,13 @@ mod tests {
     #[test]
     fn the_files_are_written_once_and_rewritten_when_changed() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = ensure(tmp.path()).unwrap();
+        let dir = folder(tmp.path());
+        ensure(&dir).unwrap();
         let dll = dir.join("conpty.dll");
         assert!(dll.is_file() && dir.join("OpenConsole.exe").is_file());
         // a stranger's copy in its place is replaced
         std::fs::write(&dll, b"not ours").unwrap();
-        assert_eq!(ensure(tmp.path()).unwrap(), dir);
+        ensure(&dir).unwrap();
         let expected = zstd::stream::decode_all(FILES[0].1).unwrap();
         assert_eq!(std::fs::read(&dll).unwrap(), expected);
     }
@@ -124,6 +110,41 @@ mod tests {
             }
         }
         assert!(offenders.is_empty(), "only crates/somsrv/src/conpty.rs may name conpty.dll: {offenders:?}");
+    }
+
+    /// Som keeps only settings and logs on disk (AGENTS.md, "On-disk layout"):
+    /// nothing may use `data_dir()` (`~/.local/share/som`) or a cache folder
+    /// of its own. `paths::temp_dir()` is allowed only as `fs`'s fallback for
+    /// an atomic write next to a file that has no parent folder.
+    #[test]
+    fn nothing_is_kept_outside_settings_and_logs() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `paths` defines these folders (and keeps Zed's unused ones)
+                    if path.file_name().is_some_and(|name| name != "target" && name != "paths") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let allowed_temp = path.ends_with(Path::new("fs").join("src").join("fs.rs"));
+                if text.contains("paths::data_dir(")
+                    || text.contains("paths::hang_traces_dir(")
+                    || (text.contains("paths::temp_dir(") && !allowed_temp)
+                {
+                    offenders.push(path);
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "Som keeps only settings and logs on disk; these use other folders: {offenders:?}");
     }
 
     fn same_file(a: &Path, b: &Path) -> bool {

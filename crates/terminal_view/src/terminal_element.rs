@@ -382,6 +382,7 @@ impl TerminalElement {
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
         selection: Option<SelectionRange>,
         minimum_contrast: f32,
+        console_palette: bool,
         cx: &App,
     ) -> (Vec<LayoutRect>, Vec<BatchedTextRun>) {
         let start_time = Instant::now();
@@ -416,6 +417,10 @@ impl TerminalElement {
             for cell in line {
                 let mut fg = cell.fg;
                 let mut bg = cell.bg;
+                if console_palette {
+                    fg = classic_console_color(fg);
+                    bg = classic_console_color(bg);
+                }
                 if cell.flags.contains(Flags::INVERSE) {
                     mem::swap(&mut fg, &mut bg);
                 }
@@ -1168,6 +1173,7 @@ impl Element for TerminalElement {
                     cursor,
                     ..
                 } = &self.terminal.read(cx).last_content;
+                let console_palette = self.terminal.read(cx).console_palette;
                 let mode = *mode;
                 let display_offset = *display_offset;
 
@@ -1214,6 +1220,7 @@ impl Element for TerminalElement {
                             .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
                         *selection,
                         minimum_contrast,
+                        console_palette,
                         cx,
                     )
                 } else {
@@ -1247,6 +1254,7 @@ impl Element for TerminalElement {
                             .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
                         *selection,
                         minimum_contrast,
+                        console_palette,
                         cx,
                     )
                 };
@@ -4239,6 +4247,19 @@ fn to_highlighted_range_lines(
 }
 
 /// Converts a 2, 8, or 24 bit color ANSI color to the GPUI equivalent.
+/// One of the 16 base colors as Windows' classic console draws it (exact, so
+/// it is not adjusted for contrast either); any other color as it is.
+fn classic_console_color(color: terminal::alacritty_terminal::vte::ansi::Color) -> terminal::alacritty_terminal::vte::ansi::Color {
+    use terminal::alacritty_terminal::vte::ansi::{Color, Rgb};
+    let index = match color {
+        Color::Named(named) if (named as usize) < 16 => named as usize,
+        Color::Indexed(index) if index < 16 => index as usize,
+        _ => return color,
+    };
+    let (r, g, b) = terminal::CLASSIC_CONSOLE_COLORS[index];
+    Color::Spec(Rgb { r, g, b })
+}
+
 pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme: &Theme) -> Hsla {
     let colors = theme.colors();
     match fg {

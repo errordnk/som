@@ -323,3 +323,5 @@ Since Som's theme format is the same one Zed itself uses, any Zed theme JSON fil
 - [Dracula](https://github.com/dracula/zed/blob/main/themes/dracula.json)
 
 To install one: download the raw JSON file into `~/.config/som/themes/`, then set `window.theme` in settings.json to the theme's `"name"` field from inside that file (open the file and check — it isn't always the same as the filename, and some files define multiple named variants).
+
+While Far Manager runs in a pane, the pane ignores the theme's 16 base ANSI colors and draws them as Windows' classic console palette (navy, aqua, silver...), which Far's color scheme is made for; the theme's other colors and contrast adjustment don't apply to them. Som recognizes Far by its window title (`{path} - Far 3.0...`), so it works in local, `tmux: true` and nested tabs alike, and the theme's colors return when Far exits and restores the shell's title.

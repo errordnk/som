@@ -530,6 +530,7 @@ impl TerminalBuilder {
 
             selection_head: None,
             breadcrumb_text: String::new(),
+            console_palette: false,
             scroll_px: px(0.),
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
@@ -899,6 +900,7 @@ impl TerminalBuilder {
 
                 selection_head: None,
                 breadcrumb_text: String::new(),
+                console_palette: false,
                 scroll_px: px(0.),
                 next_link_id: 0,
                 selection_phase: SelectionPhase::Ended,
@@ -1350,6 +1352,10 @@ pub struct Terminal {
     pub selection_head: Option<AlacPoint>,
 
     pub breadcrumb_text: String,
+    /// Far Manager runs in this terminal (its window title says so): the
+    /// 16 base colors are drawn as Windows' classic console colors, which
+    /// Far's own color scheme is made for. See [`is_far_title`].
+    pub console_palette: bool,
     title_override: Option<String>,
     scroll_px: Pixels,
     next_link_id: usize,
@@ -1892,6 +1898,13 @@ impl Terminal {
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
         match event {
             AlacTermEvent::Title(title) => {
+                // Before the shell's own title is ignored below: it is what Far
+                // puts back when it exits, and the palette must go back with it.
+                let console_palette = is_far_title(&title);
+                if console_palette != self.console_palette {
+                    self.console_palette = console_palette;
+                    cx.notify();
+                }
                 // ignore default shell program title change as windows always sends those events
                 // and it would end up showing the shell executable path in breadcrumbs
                 #[cfg(windows)]
@@ -1910,6 +1923,7 @@ impl Terminal {
                 cx.emit(Event::BreadcrumbsChanged);
             }
             AlacTermEvent::ResetTitle => {
+                self.console_palette = false;
                 self.breadcrumb_text = String::new();
                 cx.emit(Event::BreadcrumbsChanged);
             }
@@ -7146,6 +7160,50 @@ fn content_index_for_mouse(pos: Point<Pixels>, terminal_bounds: &TerminalBounds)
     let clamped_row = min(row, terminal_bounds.screen_lines() - 1);
     clamped_row * terminal_bounds.columns() + clamped_col
 }
+
+/// Whether a window title is Far Manager's: `{C:\path} - Far 3.0.6446.0 x64`,
+/// `{cmd} - Far 3.0...` while it runs a command, with `Administrator: ` in
+/// front when elevated.
+pub fn is_far_title(title: &str) -> bool {
+    title.split(" - Far ").nth(1).is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod far_title_tests {
+    use super::is_far_title;
+
+    #[test]
+    fn far_is_known_by_its_title() {
+        assert!(is_far_title(r"{C:\Users\dnk\.local\bin} - Far 3.0.6446.0 x64"));
+        assert!(is_far_title(r"Administrator: {D:\fallen5} - Far 3.0.6446.0 x64"));
+        assert!(is_far_title("{git status} - Far 3.0.6446.0 x64"));
+        assert!(!is_far_title(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert!(!is_far_title("notes - Far away.txt - micro"));
+        assert!(!is_far_title(""));
+    }
+}
+
+/// Windows' classic console colors (conhost's legacy palette) in ANSI order:
+/// what Far's color scheme is made for (navy panels, aqua frames). Used in
+/// place of the theme's 16 base colors while Far runs (`console_palette`).
+pub const CLASSIC_CONSOLE_COLORS: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0x80, 0x00, 0x00),
+    (0x00, 0x80, 0x00),
+    (0x80, 0x80, 0x00),
+    (0x00, 0x00, 0x80),
+    (0x80, 0x00, 0x80),
+    (0x00, 0x80, 0x80),
+    (0xC0, 0xC0, 0xC0),
+    (0x80, 0x80, 0x80),
+    (0xFF, 0x00, 0x00),
+    (0x00, 0xFF, 0x00),
+    (0xFF, 0xFF, 0x00),
+    (0x00, 0x00, 0xFF),
+    (0xFF, 0x00, 0xFF),
+    (0x00, 0xFF, 0xFF),
+    (0xFF, 0xFF, 0xFF),
+];
 
 /// Converts an 8 bit ANSI color to its GPUI equivalent.
 /// Accepts `usize` for compatibility with the `alacritty::Colors` interface,

@@ -468,7 +468,7 @@ impl TerminalPanel {
     ) -> anyhow::Result<(gpui::EntityId, Option<String>)> {
         // The somsrv on the host first: the relay this tab starts must be the build
         // embedded in this Som, and an older one is replaced before it is used.
-        let (remote_program, host_args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+        let (remote_program, host_args) = profile_shell_command(&profile);
         let remote_kind = classify_remote(&remote_program);
         if let RemoteKind::Ssh | RemoteKind::Wsl = remote_kind {
             let profile_os = profile.os;
@@ -781,8 +781,7 @@ impl TerminalPanel {
                     // slow, real SSH round-trip) connect attempt can never
                     // block the `for` loop from moving on to the NEXT
                     // tab's restore.
-                    let (remote_program, host_args) =
-                        project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+                    let (remote_program, host_args) = profile_shell_command(&profile);
                     let remote_kind = classify_remote(&remote_program);
                     if matches!(remote_kind, RemoteKind::Ssh | RemoteKind::Wsl)
                         && !remote_hosts.iter().any(|(args, kind)| *args == host_args && *kind == remote_kind)
@@ -1303,6 +1302,97 @@ fn wants_srp(profile: &workspace::TabProfile) -> bool {
     profile.tmux || profile.srp || profile.lua
 }
 
+/// `parse_shell_command` of a profile's `shell` — plus, for an SSH profile
+/// with `bypassVpn`, `-o BindInterface=<interface>` in front of its own
+/// args. Every `ssh`/`scp` a tab spawns (the PTY itself, `somsrv`'s
+/// deploy check and upload, the session probes) derives its `host_args`
+/// from here, so the option reaches all of them, and a split or restored
+/// pane keeps it because those rebuild from the already-built `Shell`.
+/// The interface is looked up at each call, so switching between Wi-Fi
+/// and Ethernet is picked up by the next tab. A failed lookup is logged
+/// and the tab connects unbound (through the VPN) rather than not at all.
+fn profile_shell_command(profile: &workspace::TabProfile) -> (String, Vec<String>) {
+    let (program, mut args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+    if profile.bypass_vpn && matches!(classify_remote(&program), RemoteKind::Ssh) {
+        match physical_default_interface() {
+            Ok(interface) => {
+                args.insert(0, format!("BindInterface={interface}"));
+                args.insert(0, "-o".to_string());
+            }
+            Err(err) => log::error!("bypassVpn for profile {:?}: {err:#}", profile.name),
+        }
+    }
+    (program, args)
+}
+
+/// The interface the system's own `default` route goes through. A
+/// WireGuard-style VPN (AmneziaVPN among them) takes over traffic with
+/// `0/1` + `128/1` routes and leaves `default` on Wi-Fi/LAN, so this is
+/// the interface to bind to for bypassing it. A `default` that itself
+/// points into a tunnel is reported as an error instead of being used.
+#[cfg(target_os = "macos")]
+fn physical_default_interface() -> anyhow::Result<String> {
+    let output = util::command::new_std_command("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .context("failed to run `route -n get default`")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let interface = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(|name| name.trim().to_string())
+        .context("`route -n get default` printed no interface")?;
+    ensure_not_tunnel(interface)
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn physical_default_interface() -> anyhow::Result<String> {
+    let output = util::command::new_std_command("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .context("failed to run `ip route show default`")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let interface = stdout
+        .split_whitespace()
+        .skip_while(|word| *word != "dev")
+        .nth(1)
+        .map(str::to_string)
+        .context("`ip route show default` printed no interface")?;
+    ensure_not_tunnel(interface)
+}
+
+#[cfg(target_os = "windows")]
+fn physical_default_interface() -> anyhow::Result<String> {
+    anyhow::bail!("bypassVpn is not supported on Windows (its OpenSSH has no BindInterface)")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_not_tunnel(interface: String) -> anyhow::Result<String> {
+    if ["utun", "tun", "wg", "ipsec", "ppp"].iter().any(|prefix| interface.starts_with(prefix)) {
+        anyhow::bail!("the default route itself goes through the tunnel interface {interface:?}");
+    }
+    Ok(interface)
+}
+
+/// The `-o Key=Value` options among an SSH profile's `host_args`, for
+/// `scp`: it takes the same `-o` options as `ssh`, but not every other
+/// `ssh` flag (`-p` is `-P` there), so only these are passed on.
+fn ssh_config_options(host_args: &[String]) -> Vec<String> {
+    let mut options = Vec::new();
+    let mut args = host_args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-o" {
+            if let Some(value) = args.next() {
+                options.push(arg.clone());
+                options.push(value.clone());
+            }
+        } else if arg.starts_with("-o") {
+            options.push(arg.clone());
+        }
+    }
+    options
+}
+
 /// Builds the SRP-wrapped `(program, args)` for an SSH/WSL profile that
 /// wants SRP (`wants_srp` is `true`) — see `open_srp_or_plain_ssh`'s doc
 /// comment for how the caller actually decides whether the resulting
@@ -1320,7 +1410,7 @@ fn tmux_wrapped_shell(
     scrollback: Option<usize>,
     cell_pixel_size: Option<(u16, u16)>,
 ) -> anyhow::Result<(String, Vec<String>)> {
-    let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+    let (program, args) = profile_shell_command(profile);
     match classify_remote(&program) {
         RemoteKind::Local => {
             let server_path = somsrv_binary_path()?;
@@ -1367,7 +1457,7 @@ fn tmux_wrapped_shell(
 /// specifically rather than whatever the profile's own flags would
 /// otherwise pick.
 fn plain_ssh_shell(profile: &workspace::TabProfile) -> anyhow::Result<(String, Vec<String>)> {
-    let (program, args) = project::terminals::parse_shell_command(profile.shell.as_deref().unwrap_or(""));
+    let (program, args) = profile_shell_command(profile);
     match classify_remote(&program) {
         RemoteKind::Local => anyhow::bail!("plain_ssh_shell is only meaningful for SSH/WSL profiles"),
         kind @ (RemoteKind::Ssh | RemoteKind::Wsl) => {
@@ -2092,6 +2182,7 @@ fn scp_to_remote(host_args: &[String], local_path: &std::path::Path, remote_path
     let local_size = std::fs::metadata(local_path).map(|m| m.len());
     log::debug!("deploy-check: scp starting, local_path={local_path:?} (size={local_size:?}) -> {destination:?}");
     let output = util::command::new_std_command(windows_openssh_binary("scp"))
+        .args(ssh_config_options(host_args))
         .arg(local_path)
         .arg(&destination)
         .output()
@@ -2262,6 +2353,32 @@ mod tmux_shell_wrapping_tests {
             Some((9, 18)),
         );
         assert_eq!(args, vec!["dnk", "pane-uuid-7", "pwsh.exe", "--cursor-shape", "block", "--cell-pixel-size", "9;18"]);
+    }
+
+    #[test]
+    fn bypass_vpn_binds_only_ssh_profiles_and_scp_gets_only_the_o_options() {
+        let profile = |shell: &str, bypass_vpn: bool| workspace::TabProfile {
+            shell: Some(shell.to_string()),
+            bypass_vpn,
+            ..Default::default()
+        };
+        let (_, plain) = profile_shell_command(&profile("ssh -p 2222 me@host", false));
+        assert_eq!(plain, ["-p", "2222", "me@host"], "without bypassVpn the args stay as written");
+        let (_, local) = profile_shell_command(&profile("zsh -l", true));
+        assert_eq!(local, ["-l"], "bypassVpn has nothing to bind for a local shell");
+        let (_, wsl) = profile_shell_command(&profile("wsl -d Debian", true));
+        assert_eq!(wsl, ["-d", "Debian"], "nor for wsl");
+
+        let host_args = ["-o", "BindInterface=en1", "-p", "2222", "-oServerAliveInterval=5", "me@host"].map(String::from);
+        assert_eq!(ssh_config_options(&host_args), ["-o", "BindInterface=en1", "-oServerAliveInterval=5"]);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_tunnel_interface_is_never_used_as_the_physical_one() {
+        assert!(ensure_not_tunnel("utun5".to_string()).is_err());
+        assert!(ensure_not_tunnel("wg0".to_string()).is_err());
+        assert_eq!(ensure_not_tunnel("en1".to_string()).ok().as_deref(), Some("en1"));
     }
 
     #[test]

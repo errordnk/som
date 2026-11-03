@@ -9892,21 +9892,11 @@ mod tests {
         // decodes_and_plays_via_a_real_process` (audio) above — proves the
         // whole pipeline end-to-end through a real `somsrp` child process
         // (real ConPTY): transport -> cache -> `ffmpeg-next` decode ->
-        // `RichContentVideoPlayer::current_frame`. Requires the extracted
-        // FFmpeg DLLs to be on the DLL search path — skips gracefully if they aren't
-        // present rather than failing, matching every other "needs a real
-        // device/runtime dependency" test's tolerance in this file.
+        // `RichContentVideoPlayer::current_frame`. The FFmpeg DLLs come from
+        // the binary, as in Som itself.
         cx.executor().allow_parking();
 
-        unsafe {
-            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-            use windows::core::HSTRING;
-            let data_dir = dirs::home_dir().expect("home dir must resolve").join(".local").join("share").join("som");
-            let ffmpeg_dir = data_dir.join("ffmpeg");
-            if ffmpeg_dir.join("avcodec-63.dll").is_file() {
-                SetDllDirectoryW(&HSTRING::from(ffmpeg_dir.as_os_str())).ok();
-            }
-        }
+        let ffmpeg_ready = crate::rich_content_video_player::ffmpeg_ready();
 
         let video_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sample_1920x1080.mkv");
         if !video_path.is_file() {
@@ -9946,30 +9936,8 @@ mod tests {
             }
         }
 
-        if !ffmpeg_dlls_extracted() {
-            eprintln!(
-                "skipping strict assertion: FFmpeg DLLs not found under the data dir's ffmpeg/ \
-                 subdirectory — run Som at least once first, or copy them there manually for this test"
-            );
-            return;
-        }
-
+        assert!(ffmpeg_ready, "the embedded FFmpeg DLLs could not be put in tmp (see the log)");
         assert!(saw_placement, "rich_content_video_placements() never returned a placement within the poll budget");
-    }
-
-    #[cfg(target_os = "windows")]
-    fn ffmpeg_dlls_extracted() -> bool {
-        // Checks the REAL system data dir directly (not `paths::data_dir()`,
-        // which is a process-global `OnceLock` fixed to a fake `cfg!(test)`
-        // path — see that function's own doc comment) — this is real state
-        // on the developer's actual machine, not something a test should
-        // isolate itself from. Mirrors `paths::data_dir()`'s own Windows
-        // branch (`home_dir().join(".local").join("share").join("som")`)
-        // — this test only ever runs on Windows (the only platform Som
-        // ships FFmpeg decoding for today).
-        dirs::home_dir()
-            .map(|home| home.join(".local").join("share").join("som").join("ffmpeg").join("avcodec-63.dll").is_file())
-            .unwrap_or(false)
     }
 
     #[gpui::test]

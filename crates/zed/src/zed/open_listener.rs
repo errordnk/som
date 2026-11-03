@@ -111,7 +111,11 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
     use release_channel::RELEASE_CHANNEL_NAME;
     use std::os::unix::net::UnixDatagram;
 
-    let sock_path = paths::data_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL_NAME));
+    // A socket is not a file Som keeps (only settings and logs are): the
+    // user's runtime dir, else tmp with the user's name in it.
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let user = std::env::var("USER").unwrap_or_default();
+    let sock_path = runtime_dir.join(format!("som-{user}-{}.sock", *RELEASE_CHANNEL_NAME));
     if let Err(e) = UnixDatagram::unbound()?.connect(&sock_path)
         && e.kind() == std::io::ErrorKind::ConnectionRefused
     {

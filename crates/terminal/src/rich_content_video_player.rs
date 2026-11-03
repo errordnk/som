@@ -69,6 +69,79 @@ use gpui::RenderImage;
 use image::Frame;
 use smallvec::SmallVec;
 
+/// The embedded decode-only FFmpeg DLLs (`assets/ffmpeg/windows-amd/*.dll.zst`).
+#[cfg(target_os = "windows")]
+const FFMPEG_DLLS: [&str; 5] = ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"];
+
+/// The folder in tmp holding FFmpeg's DLLs, put there and on this process's
+/// DLL search path by the first [`ffmpeg_ready`]; `None` if that failed.
+///
+/// Som carries the DLLs inside its binary and writes them to
+/// `%TEMP%\som-ffmpeg-<content hash>` (temporary, memory-cached files - see
+/// `somsrv::tmp_files`), never into Som's own folders and never next to the
+/// running `.exe`, and only when a video is first opened: Som's start does
+/// not pay for a feature it may not use. Both binaries are linked with
+/// `/DELAYLOAD` for them (`crates/zed/build.rs`, `crates/somsrp/build.rs`), so
+/// nothing loads them before [`ffmpeg_ready`] has said they are there.
+#[cfg(target_os = "windows")]
+static FFMPEG_EXTRACTED: std::sync::LazyLock<Option<std::path::PathBuf>> = std::sync::LazyLock::new(|| {
+    use windows::Win32::System::LibraryLoader::{AddDllDirectory, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories};
+    let dir = extract_ffmpeg()?;
+    // `AddDllDirectory` counts only once the process has opted into this
+    // search order (som.exe already has; somsrp has not)
+    if let Err(err) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } {
+        log::error!("SetDefaultDllDirectories failed: {err:#} - the ffmpeg folder may not be honored");
+    }
+    if unsafe { AddDllDirectory(&windows::core::HSTRING::from(dir.as_os_str())) }.is_null() {
+        log::error!("AddDllDirectory({dir:?}) failed - video playback will be unavailable");
+        return None;
+    }
+    Some(dir)
+});
+
+/// Whether FFmpeg can be called now. Must be asked before the first FFmpeg
+/// call of every playback or probe: the first time it puts the DLLs in tmp
+/// (~0.1 s); later it checks they are still there (tmp may have been cleaned
+/// while Som ran) and writes them again if not. Calling FFmpeg without them
+/// would kill the process (a delay-loaded DLL that cannot be found raises an
+/// exception).
+pub fn ffmpeg_ready() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(dir) = FFMPEG_EXTRACTED.as_ref() else { return false };
+        FFMPEG_DLLS.iter().all(|name| dir.join(name).is_file()) || extract_ffmpeg().is_some()
+    }
+    #[cfg(not(target_os = "windows"))]
+    true
+}
+
+/// Writes every FFmpeg DLL into its folder in tmp unless it is there byte
+/// for byte; returns the folder.
+#[cfg(target_os = "windows")]
+fn extract_ffmpeg() -> Option<std::path::PathBuf> {
+    use gpui::AssetSource;
+    let mut files = Vec::new();
+    for name in FFMPEG_DLLS {
+        let asset_path = format!("ffmpeg/windows-amd/{name}.zst");
+        let Some(compressed) = assets::Assets.load(&asset_path).ok().flatten() else {
+            log::error!("missing embedded asset {asset_path:?} - video playback will be unavailable");
+            return None;
+        };
+        files.push((name, compressed));
+    }
+    let embedded: Vec<&[u8]> = files.iter().map(|(_, compressed)| compressed.as_ref()).collect();
+    let dir = somsrv::tmp_files::folder(&std::env::temp_dir(), "som-ffmpeg", &embedded);
+    for (name, compressed) in &files {
+        let written = assets::decompress_zst(compressed)
+            .and_then(|bytes| somsrv::tmp_files::write_unless_same(&dir.join(name), &bytes));
+        if let Err(err) = written {
+            log::error!("{name}: {err:#} - video playback will be unavailable");
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 /// D3D11VA hardware-accelerated video decode setup — `ffmpeg-next`'s safe
 /// wrapper has NO `hwaccel`/`hw_device_ctx` API at all (confirmed via
 /// grep of its source), so this is unavoidably raw FFI against
@@ -84,91 +157,6 @@ use smallvec::SmallVec;
 /// entirely; until then, this alone already removes decode's CPU cost
 /// (the dominant cost for H264/HEVC), which `sws_scale`'s own CPU cost
 /// does not share.
-/// Extracts the embedded decode-only FFmpeg shared libs (avcodec/avformat/
-/// avutil/swresample/swscale) to `paths::data_dir().join("ffmpeg")` (an
-/// installed runtime dependency, not configuration — see `paths::data_dir`'s
-/// own doc comment) on first run and adds that directory to the process's
-/// DLL search path, so `ffmpeg-next`'s
-/// FFI calls resolve them without requiring a system FFmpeg install.
-///
-/// Shared between `som.exe` (which needs this for its own embedded-video
-/// playback) and `somsrp.exe` (a separate, short-lived process that links
-/// `ffmpeg-next`/`ffmpeg-sys-next` directly to probe a video file's real
-/// dimensions before printing its placeholder grid — see `somsrp`'s own
-/// `video_metadata`) — each is an independent OS process with its own DLL
-/// search path, so both must call this, not just `som.exe`. Idempotent:
-/// safe to call from both, and safe to call even if the other process
-/// already extracted the files (byte-for-byte comparison skips a
-/// redundant write, `AddDllDirectory` is a per-process call regardless of
-/// what's already on disk).
-///
-/// The DLLs are NOT copied next to the running `.exe`: both binaries are linked
-/// with `/DELAYLOAD` for them (`crates/zed/build.rs`, `crates/somsrp/build.rs`),
-/// so the loader looks for each one at its first use, which is after this
-/// function has put `ffmpeg_dir` on the search path. (They used to be copied
-/// there, from before the delay-loading existed; a `somsrp.exe` run from a
-/// directory in the user's PATH then left five DLLs in it, outside the
-/// directories Som writes to.)
-#[cfg(target_os = "windows")]
-pub fn ensure_ffmpeg_extracted_and_wired() {
-    use gpui::AssetSource;
-    use windows::Win32::System::LibraryLoader::{
-        AddDllDirectory, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
-    };
-    use windows::core::HSTRING;
-
-    if let Err(err) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } {
-        log::error!("SetDefaultDllDirectories failed: {err:#} — ffmpeg extraction dir may not be honored");
-    }
-
-    let ffmpeg_dir = paths::data_dir().join("ffmpeg");
-    for file_name in
-        ["avcodec-63.dll", "avformat-63.dll", "avutil-61.dll", "swresample-7.dll", "swscale-10.dll"]
-    {
-        let target = ffmpeg_dir.join(file_name);
-        // Embedded as `.dll.zst` (see `assets::Assets`'s own doc comment
-        // on the ffmpeg `#[include]` block for why) — one zstd-decompress
-        // pass turns it back into the real DLL bytes before it's ever
-        // written to disk. Decompressed unconditionally (not gated behind
-        // `target.is_file()`) so the byte-for-byte comparison below can
-        // catch a stale on-disk copy from an OLDER build whose embedded
-        // FFmpeg trim differs (e.g. missing audio decoders) — an earlier
-        // version of this function skipped extraction outright whenever
-        // ANY file already existed at `target`, which silently kept a
-        // stale DLL in place across every later upgrade until someone
-        // manually deleted the data-dir copy — confirmed live as
-        // video audio staying silent for an entire debugging session
-        // despite the newly built DLL correctly containing the needed
-        // decoders, because the STALE one on disk was still the one
-        // actually being loaded.
-        let asset_path = format!("ffmpeg/windows-amd/{file_name}.zst");
-        let Some(compressed) = assets::Assets.load(&asset_path).ok().flatten() else {
-            log::error!("missing embedded asset {asset_path:?} — video playback will be unavailable");
-            continue;
-        };
-        let bytes = match assets::decompress_zst(&compressed) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                log::error!("failed to decompress {asset_path:?}: {err:#} — video playback will be unavailable");
-                continue;
-            },
-        };
-        let config_copy_current = std::fs::read(&target).is_ok_and(|existing| existing == bytes);
-        if !config_copy_current {
-            if let Err(err) = std::fs::create_dir_all(&ffmpeg_dir) {
-                log::error!("failed to create {ffmpeg_dir:?}: {err:#}");
-            } else if let Err(err) = std::fs::write(&target, &bytes) {
-                log::error!("failed to write {target:?}: {err:#}");
-            }
-        }
-
-    }
-
-    if unsafe { AddDllDirectory(&HSTRING::from(ffmpeg_dir.as_os_str())) }.is_null() {
-        log::error!("AddDllDirectory({ffmpeg_dir:?}) failed — video playback may be unavailable");
-    }
-}
-
 #[cfg(windows)]
 mod hwaccel {
     /// Attempts to create a D3D11VA hardware device context and attach it
@@ -848,6 +836,9 @@ fn run_decode_loop(
 ) {
     use ffmpeg_next as ffmpeg;
 
+    if !ffmpeg_ready() {
+        return;
+    }
     let _ = ffmpeg::init();
 
     // Wait for the sender's own file extension to arrive (part of the
@@ -2483,6 +2474,19 @@ mod tests {
     /// fixture file directly (not through `RichContentVideoPlayer`) so
     /// the interrupt closure's `true`/`false` transition is fully
     /// controlled from the test itself.
+    /// FFmpeg's DLLs go to tmp (AGENTS.md: Som keeps only settings and logs
+    /// on disk), all of them, when FFmpeg is first needed.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ffmpeg_dlls_are_put_in_tmp() {
+        assert!(ffmpeg_ready());
+        let dir = FFMPEG_EXTRACTED.as_ref().unwrap();
+        assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
+        for name in FFMPEG_DLLS {
+            assert!(dir.join(name).is_file(), "{name}");
+        }
+    }
+
     #[test]
     fn read_next_packet_distinguishes_interrupted_from_real_eof() {
         let path = test_fixture_path("sample_1920x1080.mkv");
@@ -2490,6 +2494,7 @@ mod tests {
             eprintln!("skipping: {} not present", path.display());
             return;
         }
+        assert!(ffmpeg_ready(), "the embedded FFmpeg DLLs could not be put in tmp");
         let _ = ffmpeg_next::init();
 
         let file = std::fs::File::open(&path).expect("opening fixture");
@@ -2759,6 +2764,7 @@ mod tests {
             eprintln!("skipping: {} not present", path.display());
             return;
         }
+        assert!(ffmpeg_ready(), "the embedded FFmpeg DLLs could not be put in tmp");
         let _ = ffmpeg_next::init();
         // `ffmpeg_next::format::input` needs a registered protocol
         // handler for plain file paths, which this build's statically-

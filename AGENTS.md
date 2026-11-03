@@ -134,18 +134,52 @@ cargo check -p som 2>&1 | tail -20
 файл, НЕ репозиторий: путь зависит от машины, в checked-in `.cargo/config.toml` его прописывать
 нельзя — сломает машины без этого SDK). На свежем mac с согласованными Xcode/CLT ничего не нужно.
 
-## On-disk layout (client machine) — `crates/paths/src/paths.rs`
+## On-disk layout (client machine) — `crates/paths/src/paths.rs` (HARD RULES)
 
-Three separate directories, never mixed:
+Som keeps exactly two things on disk, and nothing else:
 
 - **`config_dir()`** — `~/.config/som` on Windows/Linux/FreeBSD (`%APPDATA%\Som`-style
   path is NOT used; Som deliberately uses `~/.config` on Windows too). **JSON only**:
   `settings.json`, `db.json`, themes. Nothing binary ever goes here.
-- **`data_dir()`** — `~/.local/share/som` on Windows (matches the Linux/FreeBSD XDG
-  `$XDG_DATA_HOME/som` convention one category over; macOS uses `~/Library/Application
-  Support/Som`). Runtime-extracted **binary artifacts**: embedded FFmpeg DLLs
-  (`ensure_ffmpeg_extracted_and_wired`, `crates/terminal/src/rich_content_video_player.rs`)
-  extract here, under `data_dir().join("ffmpeg")`.
+- **`logs_dir()`** — `~/.local/state/som/logs` on Windows (`state_dir().join("logs")`,
+  the XDG category Linux/FreeBSD use via `dirs::state_dir()`).
+
+These two are the only folders `main` creates. Everything else Som needs at run
+time is either kept in memory or written to the system tmp:
+
+| What | Where | How |
+|---|---|---|
+| fonts | memory only | decompressed from the binary into `add_fonts` (`load_embedded_fonts`, `assets.rs`) |
+| ConPTY (`conpty.dll`, `OpenConsole.exe`) | `%TEMP%\som-conpty-<hash>` | `somsrv::conpty::wire()`, before every pseudoconsole (see below) |
+| FFmpeg DLLs | `%TEMP%\som-ffmpeg-<hash>` | `ffmpeg_ready()` before every FFmpeg use: the first one (the first video) writes them, never Som's start |
+| rich content (images, video, audio, markdown) | memory | `somsrv`'s transport (`SRP_PROTOCOL.md`); no media cache |
+| sockets | `\\.\pipe\somsrv`; on Unix `/tmp/somsrv-<uid>.sock` and the CLI socket in `$XDG_RUNTIME_DIR` (else tmp) | |
+
+The tmp folders are named after the content's hash (`somsrv::tmp_files`): a Som
+with other files uses another folder, a running one keeps its own. Files are
+written with `FILE_ATTRIBUTE_TEMPORARY` (Windows keeps them in its memory cache),
+compared byte for byte the first time a process uses them, and written again
+whenever they are missing - tmp may be cleaned while Som runs. They must be real
+files: Windows loads a DLL and starts an exe only by path.
+
+**Why tmp and not a folder of ours:** everything listed is already inside the
+binary, so a kept copy is only redundant state that can go stale (a stale FFmpeg
+DLL in `~/.local/share/som/ffmpeg` once kept video silent through a whole
+debugging session) or be swapped for something else. A content-named folder in
+tmp cannot be stale, and is checked before use.
+
+**Never:** extract, cache or download anything into `~/.config/som`,
+`~/.local/share/som` (`data_dir()`, left only for inherited Zed code - Som writes
+nothing there), `~/.cache/som`, beside `som.exe`/`somsrv.exe`/`somsrp.exe`, or
+any other persistent folder; never unpack at Som's start something only a
+later feature needs - unpack it where that feature is first used (FFmpeg: the
+first video, not start-up, not a background thread at start-up). A new kind of
+file follows the table above or is added to it here, with its reason.
+
+History (2026-11-03): ConPTY used to be extracted to `~/.local/share/som/conpty`
+(and `somsrv` used none of it), FFmpeg to `~/.local/share/som/ffmpeg` at every
+start, and `main` created an empty `~/.cache/som`. All three are gone; do not
+bring them back.
 
 ## Windows defaults, and the one ConPTY exception (HARD RULES)
 
@@ -167,10 +201,11 @@ so its ConPTY must pass them too.
   through the embedded `somsrv`. Nothing is installed, nothing is shipped beside
   an exe, nothing is downloaded at build time.
 - `somsrv::conpty::wire()` runs right before EVERY `tty::new` on Windows (Som's
-  window in `crates/terminal`, `somsrv`'s sessions in `session.rs`). It writes
-  the pair to `%TEMP%\som-conpty-<content hash>\` as temporary (memory-cached)
-  files, compares them byte for byte, rewrites anything that is not ours, and
-  hands the folder to the `alacritty` fork's `set_conpty_dir`.
+  window in `crates/terminal`, `somsrv`'s sessions in `session.rs`). The first
+  call of a process writes the pair to `%TEMP%\som-conpty-<content hash>\`,
+  compares it byte for byte and rewrites anything that is not ours; later calls
+  check the files are still there. It hands the folder to the `alacritty` fork's
+  `set_conpty_dir`.
 - The fork loads `conpty.dll` by FULL PATH from that folder only. If the
   folder is not set or the file is missing, it uses Windows' own ConPTY and
   logs why.
@@ -182,24 +217,29 @@ so its ConPTY must pass them too.
   of ours, not another program's install (on 2026-11-03 `somsrv` was found
   running on Contour Terminal's copy from PATH, and when Contour was removed
   the console silently changed);
-- extract the pair anywhere but `%TEMP%\som-conpty-<hash>`, or skip the
-  byte-for-byte check "because the file is already there";
+- extract the pair anywhere but `%TEMP%\som-conpty-<hash>`;
 - "fix" a ConPTY problem by switching to Windows' own conhost: it breaks SRP.
   Change the pinned version instead (see the update note in `conpty.rs`).
 
-`somsrv`'s test `no_other_code_loads_conpty_by_name` fails if any other source
-in the workspace mentions `conpty.dll`.
-- **`state_dir()`**/**`logs_dir()`** — `~/.local/state/som` on Windows (same XDG category
-  Linux/FreeBSD already uses via `dirs::state_dir()`). Logs (`logs_dir()` = `state_dir()
-  .join("logs")`) and other transient application state live here — never under `data_dir()`.
+### Guard tests (run on every `cargo test`; never weaken them to make a change pass)
 
-`temp_dir()` (`~/.cache/som`) is separate again — genuinely disposable scratch space,
-currently unused for anything persistent (no media cache; `somsrv`'s rich-content
-transport is fully in-memory, see `SRP_PROTOCOL.md`).
+- `somsrv` `conpty::tests::no_other_code_loads_conpty_by_name`: only
+  `crates/somsrv/src/conpty.rs` may name `conpty.dll`.
+- `somsrv` `conpty::tests::nothing_is_kept_outside_settings_and_logs`: no code
+  outside `crates/paths` uses `paths::data_dir()`/`hang_traces_dir()`, and
+  `paths::temp_dir()` only as `fs`'s atomic-write fallback.
+- `somsrv` `conpty::tests::the_files_are_written_once_and_rewritten_when_changed`:
+  a file in the ConPTY folder that is not ours is replaced.
+- `terminal` `rich_content_video_player::tests::ffmpeg_dlls_are_put_in_tmp`:
+  FFmpeg's DLLs land in tmp, all five.
 
-When adding a new on-disk artifact, pick the category by what it actually is — a JSON
-settings file, a downloaded/extracted binary, or transient log/state data — don't default
-to `config_dir()` just because it's the most commonly referenced one.
+### Real-process tests on a machine with a live Som
+
+The relay of a test build calls `somsrv::daemon::replace_if_stale`, which stops
+any older daemon on the machine - and every session the user has in it (this
+happened on 2026-11-03). On a machine where the user's Som or `somsrv` runs,
+run `cargo test` only with `SOMSRV_KEEP_DAEMON=1` in the environment (or only
+`--lib` unit tests that start no daemon).
 
 ## Typical investigation pattern
 

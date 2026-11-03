@@ -84,15 +84,16 @@ fn main() {
             // are statically IMPORTED by som.exe — `ffmpeg-sys-next`
             // links against their `.lib` import libraries — which means
             // the Windows PE loader normally resolves them before `main`
-            // ever runs, well before `ensure_ffmpeg_extracted_and_wired`
-            // (`crates/zed/src/main.rs`) gets a chance to extract the
-            // embedded copies and call `AddDllDirectory`. Confirmed live:
+            // ever runs, well before `ffmpeg_ready`
+            // (`crates/terminal/src/rich_content_video_player.rs`) gets a
+            // chance to extract the embedded copies and call
+            // `AddDllDirectory`. Confirmed live:
             // without `/DELAYLOAD`, som.exe fails to start at all
             // (STATUS_DLL_NOT_FOUND) on a machine with no system-wide
             // FFmpeg install, even though nothing in `main` had run yet.
             // `/DELAYLOAD` makes the linker generate a thunk that only
-            // resolves each DLL on its FIRST actual call — by which point
-            // `main`'s extraction/search-path setup has already run.
+            // resolves each DLL on its FIRST actual call — which always
+            // comes after `ffmpeg_ready` has put them in place.
             // Requires linking `delayimp.lib` (MSVC's delay-load runtime
             // support) alongside the `/DELAYLOAD` flags themselves.
             for dll in

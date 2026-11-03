@@ -235,11 +235,27 @@ so its ConPTY must pass them too.
 
 ### Real-process tests on a machine with a live Som
 
-The relay of a test build calls `somsrv::daemon::replace_if_stale`, which stops
-any older daemon on the machine - and every session the user has in it (this
-happened on 2026-11-03). On a machine where the user's Som or `somsrv` runs,
-run `cargo test` only with `SOMSRV_KEEP_DAEMON=1` in the environment (or only
-`--lib` unit tests that start no daemon).
+Tests run against a daemon of their own, never the user's: every test that
+starts `somsrv`/`somsrp` or reaches a daemon calls
+`somsrv::protocol::use_test_daemon()` first (`testing::debug_binary` does it
+for the tests of other crates). It sets `SOMSRV_INSTANCE=test` - pipe
+`\\.\pipe\somsrv-test` (`/tmp/somsrv-<uid>-test.sock`), its own
+single-instance lock, log `somsrv-daemon-test.log` - and
+`SOMSRV_KEEP_DAEMON=1`, inherited by every process the test starts. The
+guard test `every_integration_test_that_reaches_a_daemon_uses_the_test_one`
+(`crates/somsrv/src/protocol.rs`) fails for a file in `crates/somsrv/tests`
+that reaches a daemon without it.
+
+Why (both on 2026-11-03): with one shared address a test build's relay
+stopped the user's older daemon through `replace_if_stale` and every session
+in it; and a test daemon left running was taken by the user's Som for its
+own, so the user's tabs ran with the test's environment (`NO_COLOR=1`: no
+colors in the prompt). Never give a test the user's address back, and never
+start a daemon from a test any other way.
+
+A test that needs a lock or an address no other test shares (such as
+`single_instance`'s own test) uses a name of its own, never the real one: the
+user's daemon may hold it.
 
 ## Typical investigation pattern
 

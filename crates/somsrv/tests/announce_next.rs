@@ -19,6 +19,7 @@ fn track(title: &str, cover: &str) -> NextTrack {
 
 #[test]
 fn the_tags_and_the_next_cover_of_an_announced_track_reach_a_subscriber() {
+    somsrv::protocol::use_test_daemon();
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let connection = somsrv::daemon::connect_or_spawn(std::path::Path::new(env!("CARGO_BIN_EXE_somsrv"))).expect("reaching the daemon");

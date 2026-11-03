@@ -39,7 +39,7 @@
 /// exit, which the OS treats identically for both mechanisms below)
 /// releases it immediately.
 pub fn try_acquire_daemon_lock() -> anyhow::Result<Option<DaemonLockGuard>> {
-    imp::try_acquire()
+    imp::try_acquire(&somsrv::protocol::instance_suffix())
 }
 
 // Held only for its `Drop` impl (releasing the lock on scope exit) — never
@@ -74,7 +74,7 @@ mod imp {
     /// immediately in the `false` branch rather than kept, since this
     /// process didn't win the race and must not act as if it holds the
     /// lock.
-    pub fn try_acquire() -> anyhow::Result<Option<DaemonLockGuard>> {
+    pub fn try_acquire(suffix: &str) -> anyhow::Result<Option<DaemonLockGuard>> {
         // No `Global\` prefix deliberately — that namespace needs
         // `SeCreateGlobalPrivilege`, which isn't guaranteed for every
         // session (e.g. some restricted/service contexts). The default,
@@ -83,7 +83,7 @@ mod imp {
         // scoping either, so a session-local mutex and a session-global
         // pipe name landing in the same practical scope (one interactive
         // user session on this machine) is the right pairing.
-        let name: Vec<u16> = "somsrv-daemon-singleton\0".encode_utf16().collect();
+        let name: Vec<u16> = format!("somsrv-daemon-singleton{suffix}\0").encode_utf16().collect();
         let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
             .map_err(|err| anyhow::anyhow!("CreateMutexW failed: {err}"))?;
         if unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -110,8 +110,8 @@ mod imp {
     /// exit/crash even without an explicit `unlock` — no stale-lock
     /// cleanup needed, unlike a plain "check if a PID file exists"
     /// scheme.
-    pub fn try_acquire() -> anyhow::Result<Option<DaemonLockGuard>> {
-        let path = format!("/tmp/somsrv-{}.lock", unsafe { libc::getuid() });
+    pub fn try_acquire(suffix: &str) -> anyhow::Result<Option<DaemonLockGuard>> {
+        let path = format!("/tmp/somsrv-{}{suffix}.lock", unsafe { libc::getuid() });
         let file = OpenOptions::new().create(true).write(true).open(&path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
@@ -140,6 +140,9 @@ mod tests {
     /// not an approximation.
     #[test]
     fn second_acquire_fails_while_first_guard_is_held() {
+        // A lock of its own: the user's daemon may hold the real one.
+        let suffix = format!("-lock-test-{}", std::process::id());
+        let try_acquire_daemon_lock = || imp::try_acquire(&suffix);
         let first = try_acquire_daemon_lock().expect("first acquire should not error");
         assert!(first.is_some(), "first acquire should win the race");
 

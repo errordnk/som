@@ -52,7 +52,7 @@ fn a_lone_escape_typed_into_the_tab_reaches_the_shell() {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        relay.stdin.as_mut().unwrap().write_all(&[0]).ok();
+        relay.stdin.as_mut().unwrap().write_all(&somsrv::link::end_session_frame()).ok();
         relay.wait().ok();
         done.send(reached).ok();
     });

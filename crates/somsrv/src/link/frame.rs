@@ -74,6 +74,7 @@ const F_MORE: u8 = 2;
 const F_ZSTD: u8 = 4;
 const F_HELLO: u8 = 8;
 const F_RESET: u8 = 16;
+const F_END_SESSION: u8 = 32;
 
 /// What one end says to the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +89,10 @@ pub enum Message {
     Data { channel: u32, bytes: Vec<u8> },
     /// The channel is closed.
     Close { channel: u32 },
+    /// Som -> relay: the user closed the tab; end its session for good. It
+    /// used to be a lone NUL byte typed into the tab, which is also what
+    /// Ctrl+2, Ctrl+Space and Ctrl+@ type: pressing one closed the session.
+    EndSession,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,6 +108,7 @@ pub fn split(message: &Message) -> Vec<Part> {
         Message::Hello => vec![Part { channel: 0, flags: F_HELLO, data: Vec::new() }],
         Message::Reset => vec![Part { channel: 0, flags: F_RESET, data: Vec::new() }],
         Message::Close { channel } => vec![Part { channel: *channel, flags: F_CLOSE, data: Vec::new() }],
+        Message::EndSession => vec![Part { channel: 0, flags: F_END_SESSION, data: Vec::new() }],
         Message::Data { channel, bytes } => {
             let mut flags = 0;
             let mut body = std::borrow::Cow::Borrowed(bytes.as_slice());
@@ -167,6 +173,16 @@ impl Encoder {
         frame.extend_from_slice(end);
         frame
     }
+}
+
+/// The frame that ends a tab's session, as the first frame of a stream (a
+/// relay that has had no frame from Som yet takes it). Som's own end sends
+/// it through [`SrvLink::end_session`](super::SrvLink::end_session), numbered
+/// after the frames it already sent; this is for tests that drive a relay
+/// as Som does.
+pub fn end_session_frame() -> Vec<u8> {
+    let mut encoder = Encoder::new(Framing::Input);
+    split(&Message::EndSession).iter().flat_map(|part| encoder.seal(part)).collect()
 }
 
 fn whiten(seq: u32, bytes: &mut [u8]) {
@@ -262,6 +278,9 @@ impl Decoder {
         if flags & F_HELLO != 0 {
             self.partial.clear();
             return Ok(Some(Message::Hello));
+        }
+        if flags & F_END_SESSION != 0 {
+            return Ok(Some(Message::EndSession));
         }
         if flags & F_CLOSE != 0 {
             self.partial.remove(&channel);
@@ -391,6 +410,7 @@ mod tests {
             Message::Hello,
             Message::Reset,
             Message::Close { channel: 9 },
+            Message::EndSession,
             Message::Data { channel: 3, bytes: b"x".to_vec() },
             Message::Data { channel: 3, bytes: Vec::new() },
             Message::Data { channel: 4, bytes: big },

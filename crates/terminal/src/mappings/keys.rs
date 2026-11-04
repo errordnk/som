@@ -322,6 +322,154 @@ pub fn to_esc_str(
     Some(Cow::Owned(format!("\x1b{shown}")))
 }
 
+/// Windows virtual-key code, set-1 scan code and whether it is an "enhanced"
+/// key (the grey cursor/editing block) for a key named as [`base_key`] names it.
+fn win32_key(name: &str) -> Option<(u16, u16, bool)> {
+    const LETTER_SCANS: [u16; 26] = [
+        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, // a..m
+        0x31, 0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c, // n..z
+    ];
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Some(match c {
+            'a'..='z' => (c.to_ascii_uppercase() as u16, LETTER_SCANS[(c as u8 - b'a') as usize], false),
+            'A'..='Z' => (c as u16, LETTER_SCANS[(c as u8 - b'A') as usize], false),
+            '1'..='9' => (c as u16, (c as u8 - b'1') as u16 + 0x02, false),
+            '0' => (0x30, 0x0b, false),
+            '-' => (0xbd, 0x0c, false),
+            '=' => (0xbb, 0x0d, false),
+            '[' => (0xdb, 0x1a, false),
+            ']' => (0xdd, 0x1b, false),
+            ';' => (0xba, 0x27, false),
+            '\'' => (0xde, 0x28, false),
+            '`' => (0xc0, 0x29, false),
+            '\\' => (0xdc, 0x2b, false),
+            ',' => (0xbc, 0x33, false),
+            '.' => (0xbe, 0x34, false),
+            '/' => (0xbf, 0x35, false),
+            ' ' => (0x20, 0x39, false),
+            _ => return None,
+        });
+    }
+    if let Some(number) = name.strip_prefix('f').and_then(|n| n.parse::<u16>().ok())
+        && (1..=24).contains(&number)
+    {
+        let scan = match number {
+            1..=10 => 0x3a + number,
+            11 => 0x57,
+            12 => 0x58,
+            _ => 0,
+        };
+        return Some((0x6f + number, scan, false));
+    }
+    Some(match name {
+        "backspace" | "back" => (0x08, 0x0e, false),
+        "tab" => (0x09, 0x0f, false),
+        "enter" => (0x0d, 0x1c, false),
+        "escape" => (0x1b, 0x01, false),
+        "space" => (0x20, 0x39, false),
+        "pageup" => (0x21, 0x49, true),
+        "pagedown" => (0x22, 0x51, true),
+        "end" => (0x23, 0x4f, true),
+        "home" => (0x24, 0x47, true),
+        "left" => (0x25, 0x4b, true),
+        "up" => (0x26, 0x48, true),
+        "right" => (0x27, 0x4d, true),
+        "down" => (0x28, 0x50, true),
+        "insert" => (0x2d, 0x52, true),
+        "delete" => (0x2e, 0x53, true),
+        _ => return None,
+    })
+}
+
+/// A key in Windows' win32-input-mode (`CSI ? 9001 h`, which ConPTY asks the
+/// terminal for): `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, once pressed and once
+/// released. ConPTY turns it back into the very INPUT_RECORD a console window
+/// would have produced, so a console program (Far Manager, PSReadLine) sees
+/// Ctrl+1, Ctrl+F12, Ctrl+Shift+Enter... exactly, with nothing lost to a
+/// VT encoding it cannot read back.
+///
+/// `None` for what is typed text (no ctrl/alt on a printable key, and AltGr
+/// characters): the text input sends it as text, which ConPTY makes into the
+/// same key events.
+pub fn to_win32_input(keystroke: &Keystroke) -> Option<String> {
+    const LEFT_ALT_PRESSED: u32 = 0x02;
+    const LEFT_CTRL_PRESSED: u32 = 0x08;
+    const SHIFT_PRESSED: u32 = 0x10;
+    const ENHANCED_KEY: u32 = 0x100;
+
+    if keystroke.modifiers.platform {
+        return None;
+    }
+    let name = base_key(keystroke);
+    let key = name.as_ref();
+    let shift = if keystroke.physical_key.is_some() {
+        shift_held(keystroke, key)
+    } else {
+        keystroke.modifiers.shift
+    };
+    let (alt, ctrl) = (keystroke.modifiers.alt, keystroke.modifiers.control);
+    // AltGr arrives as ctrl+alt and produces text.
+    if ctrl && alt && keystroke.key_char.is_some() {
+        return None;
+    }
+    let (vk, scan, enhanced) = win32_key(key)?;
+    let mut chars = key.chars();
+    let printable = matches!((chars.next(), chars.next()), (Some(_), None)) || key == "space";
+    if printable && !ctrl && !alt {
+        return None;
+    }
+
+    let unicode: u32 = match key {
+        "enter" if ctrl => 0x0a,
+        "enter" => 0x0d,
+        "tab" => 0x09,
+        "escape" => 0x1b,
+        "backspace" | "back" if ctrl => 0x7f,
+        "backspace" | "back" => 0x08,
+        "space" => 0x20,
+        _ if !printable => 0,
+        _ if ctrl => {
+            // what Windows' own keyboard layer makes of ctrl + this key
+            let c = key.chars().next().map_or('\0', |c| c.to_ascii_lowercase());
+            match c {
+                'a'..='z' => c as u32 - 'a' as u32 + 1,
+                '[' => 0x1b,
+                '\\' => 0x1c,
+                ']' => 0x1d,
+                '6' if shift => 0x1e,
+                '-' if shift => 0x1f,
+                _ => 0,
+            }
+        },
+        // alt + a character key: the character the layout types on it
+        _ => match keystroke.key_char.as_deref().and_then(|text| text.chars().next()) {
+            Some(c) => c as u32,
+            None => {
+                let c = keystroke.key.chars().next().unwrap_or('\0');
+                if shift { c.to_uppercase().next().unwrap_or(c) as u32 } else { c as u32 }
+            },
+        },
+    };
+
+    let mut state = 0;
+    if shift {
+        state |= SHIFT_PRESSED;
+    }
+    if alt {
+        state |= LEFT_ALT_PRESSED;
+    }
+    if ctrl {
+        state |= LEFT_CTRL_PRESSED;
+    }
+    if enhanced {
+        state |= ENHANCED_KEY;
+    }
+    // A UTF-16 unit: a character outside the BMP has no single key event.
+    let unicode = if unicode > 0xffff { 0 } else { unicode };
+    Some(format!("\x1b[{vk};{scan};{unicode};1;{state};1_\x1b[{vk};{scan};{unicode};0;{state};1_"))
+}
+
 ///   Code     Modifiers
 /// ---------+---------------------------
 ///    2     | Shift
@@ -565,6 +713,108 @@ mod test {
         assert_eq!(esc("alt-escape").as_deref(), Some("\x1b\x1b"));
         assert_eq!(esc("ctrl-tab").as_deref(), Some("\x1b[9;5u"));
         assert_eq!(esc("ctrl-alt-shift-a").as_deref(), Some("\x1b\x01"));
+    }
+
+    fn win32(source: &str) -> Option<String> {
+        to_win32_input(&Keystroke::parse(source).unwrap())
+    }
+
+    /// `CSI Vk;Sc;Uc;1;Cs;1 _` and the same released.
+    fn pressed(vk: u16, scan: u16, unicode: u32, state: u32) -> Option<String> {
+        Some(format!("\x1b[{vk};{scan};{unicode};1;{state};1_\x1b[{vk};{scan};{unicode};0;{state};1_"))
+    }
+
+    #[test]
+    fn win32_input_carries_the_keys_far_manager_switches_views_with() {
+        // Ctrl+1..4: Brief/Medium/Full/Wide. In VT they were CSI u, NUL, ESC
+        // and FS; here they are the keys themselves.
+        assert_eq!(win32("ctrl-1"), pressed(0x31, 0x02, 0, 0x08));
+        assert_eq!(win32("ctrl-2"), pressed(0x32, 0x03, 0, 0x08));
+        assert_eq!(win32("ctrl-3"), pressed(0x33, 0x04, 0, 0x08));
+        assert_eq!(win32("ctrl-4"), pressed(0x34, 0x05, 0, 0x08));
+        // Ctrl+F12: the sort menu; Shift+F4, Alt+F7 alike
+        assert_eq!(win32("ctrl-f12"), pressed(0x7b, 0x58, 0, 0x08));
+        assert_eq!(win32("shift-f4"), pressed(0x73, 0x3e, 0, 0x10));
+        assert_eq!(win32("alt-f7"), pressed(0x76, 0x41, 0, 0x02));
+        assert_eq!(win32("f1"), pressed(0x70, 0x3b, 0, 0));
+    }
+
+    #[test]
+    fn win32_input_characters_are_what_a_console_window_gives() {
+        assert_eq!(win32("ctrl-a"), pressed(0x41, 0x1e, 1, 0x08));
+        assert_eq!(win32("ctrl-c"), pressed(0x43, 0x2e, 3, 0x08));
+        assert_eq!(win32("ctrl-shift-a"), pressed(0x41, 0x1e, 1, 0x18));
+        assert_eq!(win32("ctrl-]"), pressed(0xdd, 0x1b, 0x1d, 0x08));
+        assert_eq!(win32("ctrl-space"), pressed(0x20, 0x39, 0x20, 0x08));
+        assert_eq!(win32("enter"), pressed(0x0d, 0x1c, 0x0d, 0));
+        assert_eq!(win32("ctrl-enter"), pressed(0x0d, 0x1c, 0x0a, 0x08));
+        assert_eq!(win32("shift-enter"), pressed(0x0d, 0x1c, 0x0d, 0x10));
+        assert_eq!(win32("backspace"), pressed(0x08, 0x0e, 0x08, 0));
+        assert_eq!(win32("escape"), pressed(0x1b, 0x01, 0x1b, 0));
+        assert_eq!(win32("shift-tab"), pressed(0x09, 0x0f, 0x09, 0x10));
+        assert_eq!(win32("alt-a"), pressed(0x41, 0x1e, 'a' as u32, 0x02));
+        // the grey block is "enhanced"
+        assert_eq!(win32("up"), pressed(0x26, 0x48, 0, 0x100));
+        assert_eq!(win32("ctrl-pageup"), pressed(0x21, 0x49, 0, 0x108));
+        assert_eq!(win32("shift-delete"), pressed(0x2e, 0x53, 0, 0x110));
+    }
+
+    #[test]
+    fn win32_input_leaves_typed_text_to_the_text_input() {
+        assert_eq!(win32("a"), None);
+        assert_eq!(win32("shift-a"), None);
+        assert_eq!(win32("space"), None);
+        assert_eq!(win32("1"), None);
+        // the Win key has no console encoding
+        assert_eq!(win32("cmd-a"), None);
+        // AltGr text
+        let altgr = Keystroke {
+            modifiers: Modifiers { control: true, alt: true, ..Default::default() },
+            key: "q".to_string(),
+            key_char: Some("@".to_string()),
+            physical_key: Some(0x14),
+            ..Default::default()
+        };
+        assert_eq!(to_win32_input(&altgr), None);
+    }
+
+    #[test]
+    fn win32_input_is_by_physical_key_under_any_layout() {
+        // Russian layout: Ctrl+"с" is Ctrl+C, Alt+"ф" is Alt+A with "ф" typed
+        let ctrl_c = Keystroke {
+            modifiers: Modifiers { control: true, ..Default::default() },
+            key: "с".to_string(),
+            key_char: None,
+            physical_key: Some(0x06),
+            ..Default::default()
+        };
+        assert_eq!(to_win32_input(&ctrl_c), pressed(0x43, 0x2e, 3, 0x08));
+        let alt_a = Keystroke {
+            modifiers: Modifiers { alt: true, ..Default::default() },
+            key: "ф".to_string(),
+            key_char: Some("ф".to_string()),
+            physical_key: Some(0x04),
+            ..Default::default()
+        };
+        assert_eq!(to_win32_input(&alt_a), pressed(0x41, 0x1e, 'ф' as u32, 0x02));
+    }
+
+    #[test]
+    fn every_key_with_a_modifier_has_a_win32_input_encoding() {
+        let mods = ["ctrl", "alt", "ctrl-shift", "alt-shift", "ctrl-alt", "ctrl-alt-shift"];
+        let mut keys: Vec<String> = ('a'..='z').map(|c| c.to_string()).collect();
+        keys.extend(('0'..='9').map(|c| c.to_string()));
+        keys.extend(["-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "`"].map(String::from));
+        keys.extend(
+            ["space", "enter", "tab", "escape", "backspace", "delete", "insert", "home", "end", "pageup", "pagedown", "up", "down", "left", "right"]
+                .map(String::from),
+        );
+        keys.extend((1..=12).map(|i| format!("f{i}")));
+        for key in &keys {
+            for m in mods {
+                assert!(win32(&format!("{m}-{key}")).is_some(), "{m}-{key} sends nothing");
+            }
+        }
     }
 
     #[test]

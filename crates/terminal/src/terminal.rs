@@ -85,7 +85,10 @@ use gpui::{
     Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
 };
 
-use crate::mappings::{colors::to_alac_rgb, keys::to_esc_str};
+use crate::mappings::{
+    colors::to_alac_rgb,
+    keys::{to_esc_str, to_win32_input},
+};
 
 actions!(
     terminal,
@@ -538,6 +541,7 @@ impl TerminalBuilder {
             vi_mode_enabled: false,
             is_remote_terminal: false,
             is_tmux_relay_shell: false,
+            windows_console: false,
             startup_device_attributes_answered: false,
             srv_link: None,
             last_mouse_move_time: Instant::now(),
@@ -908,6 +912,7 @@ impl TerminalBuilder {
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 is_tmux_relay_shell,
+                windows_console: runs_in_windows_console(&shell),
                 startup_device_attributes_answered: false,
                 srv_link,
                 last_mouse_move_time: Instant::now(),
@@ -1373,6 +1378,11 @@ pub struct Terminal {
     /// whatever the real client program (e.g. `yazi`) is currently
     /// rendering.
     is_tmux_relay_shell: bool,
+    /// The program of this tab reads a Windows console (anything local on
+    /// Windows; not `ssh`/`wsl`, whose far end is a Unix pty): keys go to it
+    /// in win32-input-mode while ConPTY asks for that. See
+    /// [`runs_in_windows_console`].
+    windows_console: bool,
     /// Whether the device-attributes query Windows ConPTY sends when it starts has been
     /// answered. ConPTY holds back ALL output of the program inside it (a `somsrv`
     /// relay, `ssh`, `wsl`) until it hears the answer, or gives up after about five
@@ -2503,6 +2513,13 @@ impl Terminal {
     /// connection is up. Always false for a tab that has no link.
     pub fn srp_link_ready(&self) -> bool {
         self.srv_link.as_ref().is_some_and(|link| link.is_ready())
+    }
+
+    /// Asks the relay of this remote tab to end its session for good (the
+    /// tab is closed). `false` when there is no link to ask through, or its
+    /// relay has not said it speaks the link.
+    pub fn end_remote_session(&self) -> bool {
+        self.srv_link.as_ref().is_some_and(|link| link.end_session())
     }
 
     pub fn set_cursor_shape(&mut self, cursor_shape: CursorShape) {
@@ -6021,7 +6038,12 @@ impl Terminal {
         }
 
         // Keep default terminal behavior
-        let esc = to_esc_str(keystroke, &self.last_content.mode, option_as_meta);
+        let mode = &self.last_content.mode;
+        let esc = if self.windows_console && mode.contains(TermMode::WIN32_INPUT) {
+            to_win32_input(keystroke).map(Cow::Owned).or_else(|| to_esc_str(keystroke, mode, option_as_meta))
+        } else {
+            to_esc_str(keystroke, mode, option_as_meta)
+        };
         if let Some(esc) = esc {
             match esc {
                 Cow::Borrowed(string) => self.input(string.as_bytes()),
@@ -7181,6 +7203,24 @@ mod far_title_tests {
         assert!(!is_far_title("notes - Far away.txt - micro"));
         assert!(!is_far_title(""));
     }
+}
+
+/// Whether `shell` runs in a Windows console that keys reach as console
+/// input records: every tab on Windows except `ssh`/`wsl` ones, whose
+/// program hands the keys on to a Unix pty as VT text. A `win` tab's
+/// `somsrv` relay counts: it passes the keys on to its session's ConPTY as
+/// win32-input sequences.
+pub fn runs_in_windows_console(shell: &Shell) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let program = match shell {
+        Shell::Program(program) => program.as_str(),
+        Shell::WithArguments { program, .. } => program.as_str(),
+        Shell::System => return true,
+    };
+    let name = std::path::Path::new(program).file_stem().map(|stem| stem.to_string_lossy().to_lowercase());
+    !matches!(name.as_deref(), Some("ssh" | "wsl"))
 }
 
 /// Windows' classic console colors (conhost's legacy palette) in ANSI order:

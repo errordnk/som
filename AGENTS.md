@@ -233,6 +233,24 @@ so its ConPTY must pass them too.
 - `terminal` `rich_content_video_player::tests::ffmpeg_dlls_are_put_in_tmp`:
   FFmpeg's DLLs land in tmp, all five.
 
+### Keys in Windows tabs: win32-input-mode
+
+ConPTY asks the terminal for win32-input-mode (`CSI ? 9001 h`) first thing
+(the `alacritty` fork keeps it as `TermMode::WIN32_INPUT`). In a tab whose
+program reads a Windows console (`terminal::runs_in_windows_console`: every
+local tab, not `ssh`/`wsl`), Som then sends every key that is not typed text
+as `CSI Vk;Sc;Uc;Kd;Cs;Rc _` (`mappings::keys::to_win32_input`), and the
+program gets the exact INPUT_RECORD. VT cannot carry these: Ctrl+1 was CSI u
+(Far typed `[49;5u`), Ctrl+2 a NUL. A `win` tab has two ConPTYs; the local
+relay asks its own console for the mode too (`relay.rs`), so it reads the
+keys as win32-input sequences and hands them on unchanged.
+
+The "tab closed" signal from Som to a relay is the link's `EndSession`
+frame (`SrvLink::end_session`), never a byte a key can type: it used to be a
+lone NUL, and Ctrl+2/Ctrl+Space/Ctrl+@ ended the session with its shell
+(2026-11-04). Tests: `crates/somsrv/tests/win32_input.rs`,
+`relay_sessions.rs` (`a_nul_typed_into_the_tab_does_not_end_its_session`).
+
 ### Real-process tests on a machine with a live Som
 
 Tests run against a daemon of their own, never the user's: every test that

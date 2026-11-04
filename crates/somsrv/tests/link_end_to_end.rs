@@ -90,9 +90,9 @@ impl Tab {
         channel
     }
 
-    /// The tab is closed: a NUL byte is the relay's signal.
+    /// The tab is closed: Som tells the relay through the link.
     fn close(mut self) {
-        self.stdin.lock().unwrap().write_all(&[0]).unwrap();
+        assert!(self.link.end_session(), "the link takes the end of the session");
         self.relay.wait().unwrap();
     }
 }

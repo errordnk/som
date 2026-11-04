@@ -23,6 +23,10 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// DECSET 9001, Windows' win32-input-mode (see `run`).
+#[cfg(windows)]
+const WIN32_INPUT_MODE_ON: &[u8] = b"[?9001h";
+
 /// How many consecutive identical readings of `term_size::current_size()`
 /// are required before treating it as "settled" (see `settled_initial_size`'s
 /// doc comment) — 2 is enough to reject a single stale reading, without
@@ -143,6 +147,9 @@ pub fn run(
     // whether to keep this session around after this RELAY disconnects),
     // not because this RELAY itself has a choice to make.
     let tmux = true;
+    // No sshd in between (see `protocol::ssh_client_id`).
+    #[cfg(windows)]
+    let is_local = client_id.is_none();
     // See `term_size::enable_raw_input_mode`'s doc comment — without this,
     // Windows's OWN console input layer (`ReadConsoleW`, underneath this
     // process's `std::io::stdin()`) line-buffers and locally echoes every
@@ -264,6 +271,18 @@ pub fn run(
     );
     if let Err(err) = hub.announce() {
         log::warn!("cannot announce the link to Som: {err:#}");
+    }
+    // A local relay on Windows reads its keys from Som's ConPTY and hands
+    // them on to its session's ConPTY. In win32-input-mode (asked for here,
+    // as a console program may) its console gives it every key as
+    // `CSI Vk;Sc;Uc;Kd;Cs;Rc _` instead of the VT text it would make of it,
+    // and the session's ConPTY turns that back into the exact INPUT_RECORD:
+    // Far Manager sees Ctrl+1, Ctrl+F12... (in VT, Ctrl+1 is a plain "1").
+    // Typed text still comes as text. Not under sshd: Som's frames of the
+    // link come in typed, and their GS markers would come as Ctrl+] keys.
+    #[cfg(windows)]
+    if is_local && let Err(err) = output.write_shell(WIN32_INPUT_MODE_ON) {
+        log::warn!("cannot ask the console for win32-input-mode: {err}");
     }
 
     let reader_connection = connection.clone();
@@ -423,24 +442,25 @@ pub fn run(
         typed.clear();
         frames.clear();
         extractor.feed(&buf[..read], &mut typed, &mut frames);
-        for body in &frames {
-            hub.on_frame(body);
-        }
-        if typed.is_empty() {
-            continue;
-        }
-        // A lone NUL byte is `TerminalView::on_removed`'s explicit "the user
-        // closed this tab, kill the real shell for good" signal — see that
+        // The link's `EndSession` frame is `TerminalView::on_removed`'s "the
+        // user closed this tab, end the real shell for good" - see that
         // function's doc comment for why this can't just be Som killing the
         // RELAY process directly (indistinguishable, on Windows especially,
         // from Som's own app-quit killing the SAME RELAY process the SAME
-        // way, which must NOT kill the HOLDER). A real keyboard/paste never
-        // produces a bare `\0` on its own, so this is unambiguous — checked
-        // BEFORE the CRLF filter/forwarding below since it's a control
-        // signal, not shell input to relay.
-        if typed.contains(&0u8) {
+        // way, which must NOT kill the HOLDER). It used to be a lone NUL
+        // byte, which is also what Ctrl+2, Ctrl+Space and Ctrl+@ type:
+        // pressing one ended the session (2026-11-04). A NUL is a key now,
+        // passed on like any other.
+        let mut end_session = false;
+        for body in &frames {
+            end_session |= hub.on_frame(body);
+        }
+        if end_session {
             send(&connection, &writer, &RelayInput::Close).ok();
             break;
+        }
+        if typed.is_empty() {
+            continue;
         }
         // The CR-induced-LF filter below exists solely for Windows' double
         // ConPTY normalization (see this loop's doc comment above) — macOS

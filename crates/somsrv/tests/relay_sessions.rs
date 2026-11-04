@@ -60,11 +60,12 @@ impl Relay {
         self.child.wait().expect("the relay is reaped");
     }
 
-    /// What Som does when the user closes the tab: one NUL byte.
+    /// What Som does when the user closes the tab: the link's `EndSession`
+    /// frame.
     fn close_tab(&mut self) {
         let stdin = self.child.stdin.as_mut().expect("piped stdin");
-        stdin.write_all(&[0u8]).expect("the NUL reaches the relay");
-        stdin.flush().expect("the NUL is flushed");
+        stdin.write_all(&somsrv::link::end_session_frame()).expect("the frame reaches the relay");
+        stdin.flush().expect("the frame is flushed");
     }
 }
 
@@ -159,6 +160,28 @@ fn closing_the_tab_ends_its_session_and_removes_it_from_the_daemon() {
 
     let mut relay = Relay::start(&pane_id);
     wait_until("the session to be registered", || sessions_for(&pane_id) == 1);
+
+    relay.close_tab();
+    wait_until("the closed tab's session to leave the daemon's registry", || sessions_for(&pane_id) == 0);
+}
+
+/// Ctrl+2, Ctrl+Space and Ctrl+@ type a NUL byte. It used to be the relay's
+/// "the tab is closed" signal, so pressing one ended the session with its
+/// shell (2026-11-04); it is a key like any other now.
+#[test]
+fn a_nul_typed_into_the_tab_does_not_end_its_session() {
+    let pane_id = unique_pane_id("nul");
+    let _sessions = Sessions(vec![pane_id.clone()]);
+
+    let mut relay = Relay::start(&pane_id);
+    wait_until("the session to be registered", || sessions_for(&pane_id) == 1);
+
+    let stdin = relay.child.stdin.as_mut().expect("piped stdin");
+    stdin.write_all(&[0u8]).expect("the NUL reaches the relay");
+    stdin.flush().expect("the NUL is flushed");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(relay.child.try_wait().expect("the relay can be polled").is_none(), "a typed NUL ended the relay");
+    assert_eq!(sessions_for(&pane_id), 1, "a typed NUL ended the session");
 
     relay.close_tab();
     wait_until("the closed tab's session to leave the daemon's registry", || sessions_for(&pane_id) == 0);

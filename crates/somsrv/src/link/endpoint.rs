@@ -97,6 +97,8 @@ impl SrvLink {
             Ok(Some(Message::Close { channel })) => {
                 self.state.lock().unwrap_or_else(|p| p.into_inner()).channels.remove(&channel);
             },
+            // only Som sends it
+            Ok(Some(Message::EndSession)) => {},
             Err(broken) => self.recover(broken),
         }
     }
@@ -114,6 +116,22 @@ impl SrvLink {
 
     fn drop_channels(&self) {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).channels.clear();
+    }
+
+    /// Tells the relay the tab is closed: it ends the session for good.
+    /// `false` when the relay has not said it speaks the link (an older one,
+    /// which takes a lone NUL byte for this, or one not started yet).
+    pub fn end_session(&self) -> bool {
+        if !self.is_ready() {
+            return false;
+        }
+        match self.out.send_message(&Message::EndSession) {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!("cannot tell the relay to end the session: {err:#}");
+                false
+            },
+        }
     }
 
     /// A new connection to the daemon of the remote machine.
@@ -185,9 +203,12 @@ impl LinkHub {
     }
 
     /// Takes in the body of a frame the extractor found in the pty input.
-    pub fn on_frame(self: &Arc<Self>, body: &[u8]) {
+    /// `true` when Som asked to end the tab's session
+    /// ([`Message::EndSession`]).
+    pub fn on_frame(self: &Arc<Self>, body: &[u8]) -> bool {
         let decoded = self.decoder.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).decode(body);
         match decoded {
+            Ok(Some(Message::EndSession)) => return true,
             Ok(None) | Ok(Some(Message::Hello)) => {},
             Ok(Some(Message::Reset)) => self.close_all(),
             Ok(Some(Message::Data { channel, bytes })) => self.deliver(channel, &bytes),
@@ -206,6 +227,7 @@ impl LinkHub {
                 }
             },
         }
+        false
     }
 
     fn close_all(&self) {

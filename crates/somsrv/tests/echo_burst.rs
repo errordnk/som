@@ -48,8 +48,8 @@ fn identical_chunks_in_quick_succession_all_reach_the_relays_output() {
             std::thread::sleep(Duration::from_millis(50));
         }
         let got = count(&seen.lock().unwrap());
-        // The tab is closed (a NUL byte is the relay's signal), which ends the shell too.
-        relay.stdin.as_mut().unwrap().write_all(&[0]).ok();
+        // The tab is closed (the link's `EndSession` frame), which ends the shell too.
+        relay.stdin.as_mut().unwrap().write_all(&somsrv::link::end_session_frame()).ok();
         relay.wait().ok();
         done.send(got).ok();
     });

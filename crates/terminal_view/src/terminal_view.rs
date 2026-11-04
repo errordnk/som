@@ -1474,6 +1474,15 @@ impl Item for TerminalView {
         if crate::terminal_panel::rebuild_tmux_shell_with_fresh_pane_id(&shell).is_none() {
             return;
         }
+        // The link's frame is queued for the pty's I/O thread like typed
+        // input; the sleep gives that thread the moment it needs to write it
+        // before `Terminal::drop` (see the NUL path below).
+        if self.terminal().read(cx).end_remote_session() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            return;
+        }
+        // A relay from before the link's `EndSession` (or one that has not
+        // said it speaks the link yet) takes a lone NUL byte for this.
         self.terminal().update(cx, |terminal, _cx| {
             terminal.input(vec![0u8]);
         });

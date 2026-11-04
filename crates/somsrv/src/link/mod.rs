@@ -14,5 +14,5 @@ mod mux;
 mod vt;
 
 pub use endpoint::{LinkChannel, LinkHub, SendRaw, SrvLink};
-pub use frame::{Extractor, Framing, end_session_frame};
+pub use frame::{Extractor, Framing, end_session_frame, escape_typed};
 pub use mux::PtyOutput;

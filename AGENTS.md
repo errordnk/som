@@ -251,6 +251,12 @@ lone NUL, and Ctrl+2/Ctrl+Space/Ctrl+@ ended the session with its shell
 (2026-11-04). Tests: `crates/somsrv/tests/win32_input.rs`,
 `relay_sessions.rs` (`a_nul_typed_into_the_tab_does_not_end_its_session`).
 
+A relay takes link frames (`GS <base64> GS`) out of everything typed, so a
+typed GS (Ctrl+], Ctrl+5) would start a frame and swallow the keys after it.
+`Terminal::input` doubles it (`somsrv::link::escape_typed`) for every relay
+tab that is not a Windows console one; the relay's `Extractor` passes an empty
+frame `GS GS` on as one GS (`a_typed_gs_reaches_the_shell_and_takes_no_keys_along`).
+
 ### Real-process tests on a machine with a live Som
 
 Tests run against a daemon of their own, never the user's: every test that

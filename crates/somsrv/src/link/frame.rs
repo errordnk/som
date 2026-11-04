@@ -28,7 +28,8 @@ use std::collections::HashMap;
 /// - `Output` (relay -> Som, into the output of the shell): `ESC _ SRV ; <base64>
 ///   ESC \`, an APC string, which a terminal that does not know it ignores.
 /// - `Input` (Som -> relay, into what the user types): `GS <base64> GS`. Nothing
-///   a person types is a GS (Ctrl+]), and - unlike an ESC - it begins nothing
+///   a person types reaches it as a lone GS (a typed one is doubled, see
+///   [`escape_typed`]), and - unlike an ESC - it begins nothing
 ///   else, so there is nothing to hold back and nothing to guess when a chunk
 ///   ends: the Escape key passes at once, and a frame cut in two by a pause on
 ///   the way (ssh, a ConPTY) is still one frame. An ESC-led frame there once let
@@ -53,6 +54,24 @@ impl Framing {
             Self::Input => b"\x1d",
         }
     }
+}
+
+/// What the user types into a tab whose relay takes `Input` frames out of
+/// it, made safe for that: a GS (Ctrl+], Ctrl+5 in a terminal) would start a
+/// frame and take the keys after it along, so it goes as `GS GS` - a frame
+/// with nothing in it, which the [`Extractor`] passes on as the one GS.
+pub fn escape_typed(typed: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !typed.contains(&0x1d) {
+        return std::borrow::Cow::Borrowed(typed);
+    }
+    let mut escaped = Vec::with_capacity(typed.len() + 2);
+    for &byte in typed {
+        escaped.push(byte);
+        if byte == 0x1d {
+            escaped.push(byte);
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
 }
 
 /// The most message bytes one frame carries.
@@ -367,6 +386,8 @@ impl Extractor {
                 }
             },
             Scan::Body(mut body) => match byte {
+                // `GS GS` is a GS the user typed (Ctrl+], Ctrl+5), see [`escape_typed`].
+                _ if byte == end[0] && end.len() == 1 && body.is_empty() => passed.push(byte),
                 _ if byte == end[0] && end.len() == 1 => bodies.push(body),
                 _ if byte == end[0] => self.scan = Scan::BodyEnding(body),
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if body.len() < MAX_BODY_LEN => {
@@ -564,6 +585,28 @@ mod tests {
         }
         let mut decoder = Decoder::default();
         assert_eq!(decoder.decode(body_of(&frame)).unwrap(), Some(Message::Data { channel: 5, bytes: b"request".to_vec() }));
+    }
+
+    #[test]
+    fn a_typed_gs_reaches_the_shell_and_takes_no_keys_along() {
+        let mut encoder = Encoder::new(Framing::Input);
+        let frame = encoder.seal(&split(&Message::Data { channel: 5, bytes: b"request".to_vec() })[0]);
+        // Ctrl+] then `quit`, a frame, Ctrl+] twice, Enter - as Som writes it.
+        let mut stream = escape_typed(b"quit").into_owned();
+        stream.extend_from_slice(&frame);
+        stream.extend_from_slice(&escape_typed(b"
+"));
+        for cut in 0..=stream.len() {
+            let (head, tail) = stream.split_at(cut);
+            let mut extractor = Extractor::new(Framing::Input);
+            let (mut passed, mut bodies) = (Vec::new(), Vec::new());
+            extractor.feed(head, &mut passed, &mut bodies);
+            extractor.feed(tail, &mut passed, &mut bodies);
+            assert_eq!(passed, b"quit
+", "cut at {cut}");
+            assert_eq!(bodies, vec![body_of(&frame).to_vec()], "cut at {cut}");
+        }
+        assert!(matches!(escape_typed(b"ls -l"), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

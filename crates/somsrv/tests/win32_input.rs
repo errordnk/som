@@ -185,6 +185,23 @@ fn a_vt_reader_in_win32_input_mode_gets_the_keys_as_win32_input_and_text_as_text
     tab.wait_for("V dir", Duration::from_secs(10));
 }
 
+/// Whether the test daemon has a session for the pane; a failed listing is
+/// asked again, it says nothing either way.
+fn has_session(pane_id: &str) -> bool {
+    let mut tries = 0;
+    loop {
+        match somsrv::admin::list_sessions(None) {
+            Ok(sessions) => return sessions.iter().any(|session| session.pane_id == pane_id),
+            Err(err) if tries < 50 => {
+                tries += 1;
+                eprintln!("list_sessions failed ({err:#}), asking again");
+                std::thread::sleep(Duration::from_millis(100));
+            },
+            Err(err) => panic!("the daemon does not list its sessions: {err:#}"),
+        }
+    }
+}
+
 /// The whole way of a `win` tab: Som's ConPTY, the relay in it, the
 /// session's ConPTY in the daemon, the program in that.
 #[test]
@@ -207,14 +224,13 @@ fn a_win_tab_hands_far_manager_its_view_keys_and_ctrl_2_does_not_end_the_session
     // a NUL typed in VT (Ctrl+2, Ctrl+Space before win32-input-mode) is a key too
     tab.press(b"\x00");
     tab.wait_for("K vk=50 ch=0 cs=24", Duration::from_secs(10));
-    let sessions = somsrv::admin::list_sessions(None).unwrap_or_default();
-    assert!(sessions.iter().any(|session| session.pane_id == pane_id), "the session ended");
+    assert!(has_session(&pane_id), "the session ended");
 
     // Closing a local tab is asking the daemon, as `TerminalView::on_removed`
     // does (the link's frames go to remote tabs only).
     somsrv::admin::kill_session(None, pane_id.clone()).expect("the daemon ends the session");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while somsrv::admin::list_sessions(None).unwrap_or_default().iter().any(|session| session.pane_id == pane_id) {
+    while has_session(&pane_id) {
         assert!(Instant::now() < deadline, "closing the tab did not end its session");
         std::thread::sleep(Duration::from_millis(100));
     }

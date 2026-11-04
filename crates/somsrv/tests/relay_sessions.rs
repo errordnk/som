@@ -93,10 +93,22 @@ impl Drop for Sessions {
 
 /// How many sessions the daemon holds for `pane_id` (it is down, or not up
 /// yet: none).
+/// A failed `list_sessions` (the daemon busy with the other tests' relays)
+/// is asked again: it says nothing about the session, and taken as "none"
+/// it failed tests whose session was there all along.
 fn sessions_for(pane_id: &str) -> usize {
-    somsrv::admin::list_sessions(None)
-        .map(|sessions| sessions.iter().filter(|session| session.pane_id == pane_id).count())
-        .unwrap_or(0)
+    let mut tries = 0;
+    loop {
+        match somsrv::admin::list_sessions(None) {
+            Ok(sessions) => return sessions.iter().filter(|session| session.pane_id == pane_id).count(),
+            Err(err) if tries < 50 => {
+                tries += 1;
+                eprintln!("list_sessions failed ({err:#}), asking again");
+                std::thread::sleep(Duration::from_millis(100));
+            },
+            Err(err) => panic!("the daemon does not list its sessions: {err:#}"),
+        }
+    }
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {

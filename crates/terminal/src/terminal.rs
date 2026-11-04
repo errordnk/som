@@ -5931,6 +5931,14 @@ impl Terminal {
         #[cfg(any(test, feature = "test-support"))]
         self.input_log.push(input.to_vec());
 
+        // A relay takes its link's frames out of what is typed: a typed GS
+        // must not look like one. A Windows console tab is not: its relay
+        // reads keys, a GS there reaches it as the Ctrl+] key.
+        if self.is_tmux_relay_shell && !self.windows_console && input.contains(&0x1d) {
+            let escaped = somsrv::link::escape_typed(&input).into_owned();
+            self.write_user_input_to_pty(escaped);
+            return;
+        }
         self.write_user_input_to_pty(input);
     }
 

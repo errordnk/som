@@ -87,7 +87,7 @@ use gpui::{
 
 use crate::mappings::{
     colors::to_alac_rgb,
-    keys::{to_esc_str, to_win32_input},
+    keys::{to_esc_str, to_win32_input, win32_modifier_changes},
 };
 
 actions!(
@@ -542,6 +542,7 @@ impl TerminalBuilder {
             is_remote_terminal: false,
             is_tmux_relay_shell: false,
             windows_console: false,
+            win32_modifiers: Modifiers::default(),
             startup_device_attributes_answered: false,
             srv_link: None,
             last_mouse_move_time: Instant::now(),
@@ -913,6 +914,7 @@ impl TerminalBuilder {
                 is_remote_terminal,
                 is_tmux_relay_shell,
                 windows_console: runs_in_windows_console(&shell),
+                win32_modifiers: Modifiers::default(),
                 startup_device_attributes_answered: false,
                 srv_link,
                 last_mouse_move_time: Instant::now(),
@@ -1383,6 +1385,9 @@ pub struct Terminal {
     /// in win32-input-mode while ConPTY asks for that. See
     /// [`runs_in_windows_console`].
     windows_console: bool,
+    /// Shift/Ctrl/Alt as the console program last heard of them in
+    /// win32-input-mode, to send it their own presses and releases.
+    win32_modifiers: Modifiers,
     /// Whether the device-attributes query Windows ConPTY sends when it starts has been
     /// answered. ConPTY holds back ALL output of the program inside it (a `somsrv`
     /// relay, `ssh`, `wsl`) until it hears the answer, or gives up after about five
@@ -6078,6 +6083,15 @@ impl Terminal {
         {
             self.refresh_hovered_word(window);
         }
+        // A console program hears Shift, Ctrl and Alt on their own, as in a
+        // console window: Far Manager's key bar shows what they do.
+        if self.windows_console && self.last_content.mode.contains(TermMode::WIN32_INPUT) {
+            let changes = win32_modifier_changes(&self.win32_modifiers, modifiers);
+            if !changes.is_empty() {
+                self.input(changes.into_bytes());
+            }
+        }
+        self.win32_modifiers = *modifiers;
         cx.notify();
     }
 

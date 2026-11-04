@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 /// The mappings defined in this file where created from reading the alacritty source
 use alacritty_terminal::term::TermMode;
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
 
 /// The key that was pressed, independent of the keyboard layout: the USB HID
 /// usage reported by the platform (`Keystroke.physical_key`) when there is
@@ -470,6 +470,38 @@ pub fn to_win32_input(keystroke: &Keystroke) -> Option<String> {
     Some(format!("\x1b[{vk};{scan};{unicode};1;{state};1_\x1b[{vk};{scan};{unicode};0;{state};1_"))
 }
 
+/// Shift, Ctrl and Alt pressed or released on their own, in win32-input-mode:
+/// the key events a console window gives a program for them (VK_SHIFT,
+/// VK_CONTROL, VK_MENU), each with the modifier state after it, as Windows
+/// Terminal sends them. Empty when none of the three changed.
+pub fn win32_modifier_changes(old: &Modifiers, new: &Modifiers) -> String {
+    const LEFT_ALT_PRESSED: u32 = 0x02;
+    const LEFT_CTRL_PRESSED: u32 = 0x08;
+    const SHIFT_PRESSED: u32 = 0x10;
+    let keys = [
+        (old.shift, new.shift, 0x10, 0x2a, SHIFT_PRESSED),
+        (old.control, new.control, 0x11, 0x1d, LEFT_CTRL_PRESSED),
+        (old.alt, new.alt, 0x12, 0x38, LEFT_ALT_PRESSED),
+    ];
+    let mut state: u32 = keys.iter().filter(|key| key.0).map(|key| key.4).sum();
+    let mut out = String::new();
+    // releases first, then presses, as the keys go
+    for pressing in [false, true] {
+        for &(was, is, vk, scan, bit) in &keys {
+            if was == is || is != pressing {
+                continue;
+            }
+            if is {
+                state |= bit;
+            } else {
+                state &= !bit;
+            }
+            out.push_str(&format!("\x1b[{vk};{scan};0;{};{state};1_", u8::from(is)));
+        }
+    }
+    out
+}
+
 ///   Code     Modifiers
 /// ---------+---------------------------
 ///    2     | Shift
@@ -872,5 +904,18 @@ mod test {
             8,
             modifier_code(&Keystroke::parse("shift-ctrl-alt-a").unwrap())
         );
+    }
+
+    #[test]
+    fn win32_input_tells_shift_ctrl_alt_on_their_own() {
+        let none = Modifiers::default();
+        let ctrl = Modifiers { control: true, ..Default::default() };
+        let ctrl_shift = Modifiers { control: true, shift: true, ..Default::default() };
+        let alt = Modifiers { alt: true, ..Default::default() };
+        assert_eq!(win32_modifier_changes(&none, &ctrl), "\x1b[17;29;0;1;8;1_");
+        assert_eq!(win32_modifier_changes(&ctrl, &ctrl_shift), "\x1b[16;42;0;1;24;1_");
+        assert_eq!(win32_modifier_changes(&ctrl_shift, &none), "\x1b[16;42;0;0;8;1_\x1b[17;29;0;0;0;1_");
+        assert_eq!(win32_modifier_changes(&ctrl, &alt), "\x1b[17;29;0;0;0;1_\x1b[18;56;0;1;2;1_");
+        assert_eq!(win32_modifier_changes(&alt, &alt), "");
     }
 }

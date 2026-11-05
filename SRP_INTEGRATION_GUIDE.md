@@ -9,10 +9,14 @@ design history and decision log instead, see `SRP_PROTOCOL.md` in this
 repository — this document is the external-facing spec extracted from
 that journal, aimed at someone who has never seen Som's source before.
 
-The reference implementation this guide walks through lives in
+The reference implementations this guide walks through are two:
 [`errordnk/yazi`](https://github.com/errordnk/yazi), a fork of the
-[yazi](https://github.com/sxyazi/yazi) terminal file manager, specifically
-`yazi-adapter/src/drivers/srp/`.
+[yazi](https://github.com/sxyazi/yazi) terminal file manager (specifically
+`yazi-adapter/src/drivers/srp/`), and
+[`errordnk/farsh`](https://github.com/errordnk/farsh), a shell with a
+Far-style file manager built in, whose F3 viewer and Ctrl+Q quick view
+support everything `somsrp` does (see "Worked example: farsh" at the end —
+the better starting point if your application draws its own cell grid).
 
 ## Why a protocol integration, not just "print an image"
 
@@ -629,3 +633,84 @@ through `srp/srv_channel.rs`) and the geometry/detection pieces — follow
 this guide's `somsrv` sections for the wire protocol itself, and treat
 `srp/mod.rs` as a worked example of wiring video/audio through it
 end-to-end, not just images.
+
+## Worked example: farsh (full reference support)
+
+[`errordnk/farsh`](https://github.com/errordnk/farsh) (Rust: `portable-pty`,
+`vt100` and its own cell grid with a diff flush) is a shell with a Far
+Manager-style file manager built in. Its F3 viewer and its Ctrl+Q quick view
+show, inside Som, **every content type `somsrp` shows**, and the code is
+written to be read: the SRP part is `src/srp/`, the cell-grid side is
+`src/grid.rs`, the two callers are `src/viewer.rs` and `src/qview.rs`.
+`src/srp/` does not use the rest of farsh at all (`Grid::place` calls into
+its `placeholder.rs`, not the other way round), so it can be lifted out.
+
+What it covers, and where:
+
+| Content | How farsh shows it | Where |
+|---|---|---|
+| PNG, JPEG, GIF | header probe (`image` crate, no decode), whole file as `PutChunk`s, connection closed | `srp/mod.rs` (`send_image`, `image_metadata`) |
+| Audio (mp3, flac, ogg, oga) | `symphonia` header probe and tags, `AnnounceTrack` (`len: 0`), first 256 KiB, a second connection registered with `RegisterRangeResponder` answers `RequestByteRange` from the open file, `StopPlayback` when the viewer closes | `srp/audio.rs`, `srp/play.rs` (`play_file`) |
+| Video (mp4, mkv, avi) | like audio, zeros as metadata (as `somsrp` off Windows), the last 4 MiB sent with the first 256 KiB; `a`/`s` plus a digit restarts it with that audio/subtitle stream | `srp/play.rs`, `srp/mod.rs` (`Streams`, `video_metadata`) |
+| `.m3u`/`.m3u8` | one placement per entry (new ids each), `n`/`p` and the widget's buttons (`PlaylistStep`), `http(s)` entries fetched by the daemon (`FetchResource`) | `srp/play.rs` (`run_list`, `play_url`) |
+| `.cue` | parser ported from `somsrp`, `AnnounceCue` with the track list, cover lookup | `srp/cue.rs`, `srp/play.rs` |
+| Internet radio, Yandex Music's wave | `RadioTracks` batches, `RadioFeedback`, `RadioLike`, `AnnounceRadioState`, `RadioControl` from the widget's icons, history kept in the client | `srp/radio.rs` |
+| Markdown | whole file with `base_dir`, a grower connection (`RegisterMarkdownGrower`) hears `GrowMarkdownRows`, the viewer scrolls through the placement's rows | `srp/play.rs` (`run_markdown`), `viewer.rs` |
+
+### What a TUI that owns a cell grid has to do
+
+A file manager or pager that draws every cell itself (rather than printing
+lines) is the case the yazi driver does not cover, and these are the points
+farsh had to settle:
+
+- **The placement is cells of your own screen.** `Grid::place(col, row, width,
+  height, ids)` fills a rectangle with `U+10EEEE` plus the row and column
+  marks (the 297-entry table in `srp/placeholder.rs`), foreground = the
+  session id as RGB. The file id travels in the **underline color**
+  (`SGR 58;2;r;g;b`), so farsh's `Cell` has a `ul` field and its diff flush
+  emits `58` and treats it as part of the style: a placement is redrawn only
+  when something in it changed, like any other cell. Many cell models cannot
+  carry an underline color yet; that is the first thing to add.
+- **No cell-size query.** farsh never sends `CSI 16 t`: it gives Som the whole
+  rectangle it has (the viewer's area, a panel) and Som fits the picture into
+  it with its proportions kept. The sizing section above is for programs that
+  print a picture inline and must pick a size themselves.
+- **Place first, send second.** The viewer draws the placement on its first
+  paint and starts the transfer in a thread at the same time; closing the
+  viewer cancels it. A quick view waits 150 ms on a file before it reads or
+  sends it, so that moving the cursor over a directory does not start a
+  transfer for every file.
+- **One placement per track.** A list gives each track new ids; the viewer
+  reads them from state shared with the transfer thread and redraws when it
+  changes (a generation counter, so no key press is needed).
+- **Only connect to a daemon that runs.** farsh lives inside a Som session,
+  and a new `somsrv` ends every session, so it never starts or replaces the
+  daemon (the yazi driver's "spawn if missing" would be wrong here). Without
+  a daemon the placement shows a failure line instead of cells.
+- **Detection.** `SOM_WINDOW_ID` (or `FARSH_SRP=1` to force it). It does not
+  survive `ssh` from a foreign terminal, and nothing else tells a client that
+  Som is the terminal.
+- **Tests without the user's daemon.** `somsrv` takes `SOMSRV_INSTANCE=<name>`
+  (its own pipe/socket); farsh's ignored tests run against such a daemon. Be
+  warned that a test daemon made from the user's own build uses the same
+  linked streaming-service account as the user's daemon, so radio must not be
+  tested against it.
+
+### Things seen live that you will meet too
+
+- Som paints a Markdown document over everything below its first cell, not
+  only over its own cells: in a small panel the text covers the panel's frame.
+  farsh gives a document the whole screen in F3 and accepts the overlap in
+  the quick view. The last rows of a long document are reached by scrolling
+  the window past the rows Som asked for.
+- Opening a placement in the quick view starts audio and video at once; there
+  is no way for a client to show a player that waits.
+- A list's widget buttons send `PlaylistStep` only for a list; for a CUE sheet
+  that is one file cut into tracks, Som seeks inside the file itself.
+
+The full list of what would make SRP easier for clients like this — a
+dependency-free client crate, a lighter handshake, binary `PutChunk` payloads,
+a file id that does not need the underline color, a capability query instead
+of an environment variable, a way to release a placement — with what was
+verified and what is only a hypothesis, is `docs/srp-findings.md` in the farsh
+repository.

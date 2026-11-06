@@ -27,7 +27,7 @@
 //! push stream takes to report the seek target as readable).
 
 use somsrv::pipe::PipeConnection;
-use somsrv::protocol::{ConnectionKind, ContentMetadata, ContentType, HandshakeInfo, SrvRequest, SrvResponse, VideoCodec};
+use somsrv::protocol::{ConnectionKind, ContentMetadata, ContentType, SrvRequest, SrvResponse, VideoCodec};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,7 @@ fn connect_and_handshake(daemon_binary: &std::path::Path) -> PipeConnection {
     somsrv::protocol::use_test_daemon();
     let connection = somsrv::daemon::connect_or_spawn(daemon_binary).expect("connecting to somsrv daemon");
     ConnectionKind::Srv.write_to(&connection).expect("writing connection kind");
-    let payload = serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap();
+    let payload = serde_json::to_vec(&SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap();
     connection.write_message(&payload).expect("sending handshake");
     let message = connection.read_message().expect("reading handshake reply");
     match serde_json::from_slice::<SrvResponse>(&message).unwrap() {

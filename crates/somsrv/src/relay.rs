@@ -18,7 +18,7 @@ use alacritty_terminal::term::{Config, Term};
 use anyhow::Context as _;
 use somsrv::link::{Extractor, Framing, LinkHub, PtyOutput};
 use somsrv::pipe::PipeConnection;
-use somsrv::protocol::{ConnectionKind, HandshakeInfo, HolderOutput, RelayInput};
+use somsrv::protocol::{ConnectionKind, HolderOutput, RelayInput};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -193,7 +193,7 @@ pub fn run(
     // child processes under the shell) — deliberately NOT bolted on here
     // half-finished; the handshake EXCHANGE is the prerequisite this adds,
     // the DECISION is future work.
-    send(&connection, &writer, &RelayInput::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &writer, &RelayInput::Handshake(somsrv::protocol::current_handshake()))?;
     match read_holder_message(&connection)? {
         HolderOutput::Handshake(info) => {
             log::info!(

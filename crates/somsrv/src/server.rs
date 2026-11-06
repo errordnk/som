@@ -19,7 +19,7 @@ use crate::bounds::SessionBounds;
 use crate::session::Session;
 use crate::srv_cache::SrvCache;
 use somsrv::pipe::{self, PipeConnection};
-use somsrv::protocol::{ConnectionKind, HandshakeInfo, HolderOutput, RelayInput, SessionInfo, SrvRequest, SrvResponse, daemon_socket_path};
+use somsrv::protocol::{ConnectionKind, HolderOutput, RelayInput, SessionInfo, SrvRequest, SrvResponse, daemon_socket_path};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -294,7 +294,7 @@ fn handle_relay(connection: PipeConnection, registry: &SessionRegistry) -> anyho
         "relay handshake: version={:?} os={:?} arch={:?}",
         relay_info.version, relay_info.os, relay_info.arch
     );
-    send(&connection, &writer, &HolderOutput::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &writer, &HolderOutput::Handshake(somsrv::protocol::current_handshake()))?;
 
     // Register SECOND — identifies which session this connection belongs
     // to now that a single daemon serves every pane on this machine (see
@@ -443,7 +443,7 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
         }
         other => anyhow::bail!("expected Handshake as the first message from an srv client, got {other:?}"),
     }
-    send_srv(&connection, &writer, &SrvResponse::Handshake(HandshakeInfo::current()))?;
+    send_srv(&connection, &writer, &SrvResponse::Handshake(somsrv::protocol::current_handshake()))?;
 
     // Tracks whether THIS connection has already registered itself as the
     // sender route for a given key — see the `PutChunk` arm below. A

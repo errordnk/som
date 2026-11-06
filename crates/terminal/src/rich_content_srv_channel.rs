@@ -26,7 +26,7 @@
 
 use crate::rich_content_transport::{ContentMetadata, ContentType};
 use somsrv::link::{LinkChannel, SrvLink};
-use somsrv::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
+use somsrv::protocol::{ConnectionKind, SrvRequest, SrvResponse};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1182,7 +1182,7 @@ fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvCon
         },
     };
     connection.write_message(&[ConnectionKind::Srv as u8])?;
-    send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &SrvRequest::Handshake(somsrv::protocol::current_handshake()))?;
     let message = connection.read_message()?;
     match serde_json::from_slice::<SrvResponse>(&message)? {
         SrvResponse::Handshake(_) => Ok(connection),

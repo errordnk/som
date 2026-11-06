@@ -140,6 +140,12 @@ yourself.
 
 ### Wire protocol
 
+A Rust client takes all of this from the `srp_client` crate
+(`crates/srp_client`: `protocol`, `pipe`, `placeholder`, `channel::SrvChannel`,
+`cue`), the same definitions `somsrv` uses, as a git dependency pinned to a
+rev of this repository. It depends on nothing of Som's or Zed's (serde,
+anyhow, log and the OS bindings).
+
 Length-prefixed JSON frames over the pipe/socket connection (no text-safe
 encoding needed at all — this is a raw local IPC channel, not a PTY, so
 none of the ConPTY-codepage concerns apply here).
@@ -642,8 +648,11 @@ Manager-style file manager built in. Its F3 viewer and its Ctrl+Q quick view
 show, inside Som, **every content type `somsrp` shows**, and the code is
 written to be read: the SRP part is `src/srp/`, the cell-grid side is
 `src/grid.rs`, the two callers are `src/viewer.rs` and `src/qview.rs`.
-`src/srp/` does not use the rest of farsh at all (`Grid::place` calls into
-its `placeholder.rs`, not the other way round), so it can be lifted out.
+The protocol itself is not in farsh: it takes the `srp_client` crate of this
+repository (`crates/srp_client`, a git dependency pinned to a rev) — the
+message types `somsrv` itself uses, the pipe/socket framing, the placeholder
+marks, `SrvChannel` and the `.cue` parser, with no Som/Zed crate behind them.
+Any Rust client should do the same instead of copying them.
 
 What it covers, and where:
 
@@ -651,9 +660,9 @@ What it covers, and where:
 |---|---|---|
 | PNG, JPEG, GIF | header probe (`image` crate, no decode), whole file as `PutChunk`s, connection closed | `srp/mod.rs` (`send_image`, `image_metadata`) |
 | Audio (mp3, flac, ogg, oga) | `symphonia` header probe and tags, `AnnounceTrack` (`len: 0`), first 256 KiB, a second connection registered with `RegisterRangeResponder` answers `RequestByteRange` from the open file, `StopPlayback` when the viewer closes | `srp/audio.rs`, `srp/play.rs` (`play_file`) |
-| Video (mp4, mkv, avi) | like audio, zeros as metadata (as `somsrp` off Windows), the last 4 MiB sent with the first 256 KiB; `a`/`s` plus a digit restarts it with that audio/subtitle stream | `srp/play.rs`, `srp/mod.rs` (`Streams`, `video_metadata`) |
+| Video (mp4, mkv, avi) | like audio, zeros as metadata (as `somsrp` off Windows), the last 4 MiB sent with the first 256 KiB; `a`/`s` restart it with the next audio/subtitle stream, listed with FFmpeg on Windows (by number elsewhere) | `srp/play.rs`, `srp/streams.rs`, `srp/mod.rs` (`Streams`, `video_metadata`) |
 | `.m3u`/`.m3u8` | one placement per entry (new ids each), `n`/`p` and the widget's buttons (`PlaylistStep`), `http(s)` entries fetched by the daemon (`FetchResource`) | `srp/play.rs` (`run_list`, `play_url`) |
-| `.cue` | parser ported from `somsrp`, `AnnounceCue` with the track list, cover lookup | `srp/cue.rs`, `srp/play.rs` |
+| `.cue` | `srp_client::cue` (the parser `somsrp` uses), `AnnounceCue` with the track list, cover lookup | `srp/play.rs` |
 | Internet radio, Yandex Music's wave | `RadioTracks` batches, `RadioFeedback`, `RadioLike`, `AnnounceRadioState`, `RadioControl` from the widget's icons, history kept in the client | `srp/radio.rs` |
 | Markdown | whole file with `base_dir`, a grower connection (`RegisterMarkdownGrower`) hears `GrowMarkdownRows`, the viewer scrolls through the placement's rows | `srp/play.rs` (`run_markdown`), `viewer.rs` |
 
@@ -665,7 +674,7 @@ farsh had to settle:
 
 - **The placement is cells of your own screen.** `Grid::place(col, row, width,
   height, ids)` fills a rectangle with `U+10EEEE` plus the row and column
-  marks (the 297-entry table in `srp/placeholder.rs`), foreground = the
+  marks (`srp_client::placeholder::cell_text`), foreground = the
   session id as RGB. The file id travels in the **underline color**
   (`SGR 58;2;r;g;b`), so farsh's `Cell` has a `ul` field and its diff flush
   emits `58` and treats it as part of the style: a placement is redrawn only
@@ -687,6 +696,11 @@ farsh had to settle:
   and a new `somsrv` ends every session, so it never starts or replaces the
   daemon (the yazi driver's "spawn if missing" would be wrong here). Without
   a daemon the placement shows a failure line instead of cells.
+- **A preview takes no keys.** Som gives space and the arrows to a player
+  widget only when its placement spans the terminal's whole width (`somsrp`,
+  farsh's F3). A narrower one is a preview inside the program's own screen
+  (farsh's quick view, yazi): the keys stay the program's, and the widget is
+  used with the mouse (Som takes a click on it before the PTY sees it).
 - **Detection.** `SOM_WINDOW_ID` (or `FARSH_SRP=1` to force it). It does not
   survive `ssh` from a foreign terminal, and nothing else tells a client that
   Som is the terminal.

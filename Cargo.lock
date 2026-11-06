@@ -7342,6 +7342,7 @@ dependencies = [
  "libc",
  "serde_json",
  "somsrv",
+ "srp_client",
  "symphonia",
  "terminal",
  "windows 0.61.3",
@@ -7372,6 +7373,7 @@ dependencies = [
  "serde_json_lenient",
  "sha2",
  "smol",
+ "srp_client",
  "sysinfo 0.37.2",
  "tempfile",
  "ureq",
@@ -7406,6 +7408,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.0",
+]
+
+[[package]]
+name = "srp_client"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "chardetng",
+ "encoding_rs",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -8009,6 +8025,7 @@ dependencies = [
  "settings",
  "smallvec",
  "somsrv",
+ "srp_client",
  "symphonia",
  "sysinfo 0.37.2",
  "task",

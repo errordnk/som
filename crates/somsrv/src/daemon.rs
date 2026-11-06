@@ -177,10 +177,10 @@ fn replace_if_stale_at(socket_path: &str, daemon_binary: &Path) -> anyhow::Resul
 
 /// The handshake of the daemon on `socket_path`, if one answers; never starts one.
 fn probe_running_daemon(socket_path: &str) -> Option<crate::protocol::HandshakeInfo> {
-    use crate::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse};
+    use crate::protocol::{ConnectionKind, SrvRequest, SrvResponse};
     let connection = PipeConnection::connect(socket_path).ok()?;
     ConnectionKind::Srv.write_to(&connection).ok()?;
-    connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).ok()?).ok()?;
+    connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(crate::protocol::current_handshake())).ok()?).ok()?;
     match serde_json::from_slice::<SrvResponse>(&connection.read_message().ok()?).ok()? {
         SrvResponse::Handshake(info) => Some(info),
         _ => None,
@@ -266,7 +266,7 @@ mod tests {
             ConnectionKind::read_from(&connection).expect("the connection kind");
             let request = serde_json::from_slice::<SrvRequest>(&connection.read_message().expect("the handshake")).expect("a request");
             assert!(matches!(request, SrvRequest::Handshake(_)));
-            let info = HandshakeInfo { build_id, pid, ..HandshakeInfo::current() };
+            let info = HandshakeInfo { build_id, pid, ..crate::protocol::current_handshake() };
             connection.write_message(&serde_json::to_vec(&SrvResponse::Handshake(info)).unwrap()).expect("answering");
             served.send(()).ok();
         });

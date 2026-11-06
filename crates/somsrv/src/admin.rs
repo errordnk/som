@@ -9,12 +9,12 @@
 //! connection over SSH from Som's own side for something this simple.
 
 use crate::pipe::PipeConnection;
-use crate::protocol::{ConnectionKind, HandshakeInfo, SrvRequest, SrvResponse, daemon_socket_path};
+use crate::protocol::{ConnectionKind, SrvRequest, SrvResponse, daemon_socket_path};
 
 fn connect_and_handshake() -> anyhow::Result<PipeConnection> {
     let connection = PipeConnection::connect(&daemon_socket_path())?;
     ConnectionKind::Srv.write_to(&connection)?;
-    send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &SrvRequest::Handshake(crate::protocol::current_handshake()))?;
     match read(&connection)? {
         SrvResponse::Handshake(_) => Ok(connection),
         other => anyhow::bail!("expected Handshake as the first response from somsrv, got {other:?}"),

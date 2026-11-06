@@ -35,6 +35,7 @@ members = [
     "crates/settings_macros",
     "crates/somkey",
     "crates/somsrv",
+    "crates/srp_client",
     "crates/sum_tree",
     "crates/syntax_theme",
     "crates/terminal",
@@ -114,6 +115,7 @@ settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
 somsrv = { path = "crates/somsrv" }
+srp_client = { path = "crates/srp_client" }
 sum_tree = { path = "crates/sum_tree" }
 syntax_theme = { path = "crates/syntax_theme" }
 task = { path = "crates/task" }

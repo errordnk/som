@@ -10,7 +10,7 @@ pub mod conpty;
 pub mod tmp_files;
 pub mod daemon;
 pub mod link;
-pub mod pipe;
+pub use srp_client::pipe;
 pub mod protocol;
 pub mod service_link;
 #[cfg(feature = "test-support")]

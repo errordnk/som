@@ -56,6 +56,7 @@ paths.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+srp_client.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
 smol.workspace = true

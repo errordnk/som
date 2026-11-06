@@ -2390,6 +2390,14 @@ fn stream_file_impl(
     // `rich_content_placements()` never see a placement at all for a GIF
     // small enough to finish streaming near-instantly.
     let (session_id, file_id) = ids;
+    // Som may see the grid in the middle of the stream: the first chunk it gets
+    // is then from the middle, and it asks for the whole file from the start.
+    // That request has to reach something that answers it - the streaming
+    // connection below is only written to - so a responder is registered first,
+    // as for audio/video (an 8 MB GIF showed nothing without it; 2026-11-06).
+    let file = std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?));
+    let (responder_stop, _ended, _responder) =
+        spawn_byte_range_responder_from_disk(file, content_type, metadata.clone(), ids, bytes.len() as u64)?;
     clear_screen_and_home_cursor();
     print_placeholder_grid(session_id, file_id, width_px, height_px)?;
     stream_bytes(&channel, &bytes, content_type, metadata, ids)?;
@@ -2407,6 +2415,8 @@ fn stream_file_impl(
     while !CTRL_C_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // The responder's thread is parked in a read; the process ends right after.
+    responder_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

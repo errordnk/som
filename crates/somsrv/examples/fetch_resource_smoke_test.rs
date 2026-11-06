@@ -38,7 +38,7 @@ fn connect_and_handshake() -> anyhow::Result<PipeConnection> {
     let binary_path = daemon::binary_path_next_to_current_exe()?;
     let connection = daemon::connect_or_spawn(&binary_path)?;
     ConnectionKind::Srv.write_to(&connection)?;
-    send(&connection, &SrvRequest::Handshake(HandshakeInfo::current()))?;
+    send(&connection, &SrvRequest::Handshake(somsrv::protocol::current_handshake()))?;
     match read(&connection)? {
         SrvResponse::Handshake(_) => Ok(connection),
         other => anyhow::bail!("expected Handshake as the first response from somsrv, got {other:?}"),

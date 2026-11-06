@@ -2952,7 +2952,7 @@ mod tmux_shell_wrapping_tests {
             .expect("the freshly-deployed ~/.local/bin/somsrv should be executable and runnable");
         let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
-        assert_eq!(info.version, somsrv::protocol::HandshakeInfo::current().version);
+        assert_eq!(info.version, somsrv::protocol::current_handshake().version);
     }
 
     /// Real SSH round-trip: confirms `ensure_remote_binary_deployed` is a

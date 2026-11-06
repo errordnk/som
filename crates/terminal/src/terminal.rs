@@ -2,7 +2,7 @@ pub mod mappings;
 
 pub use alacritty_terminal;
 
-pub mod kitty_graphics_placeholder;
+pub use srp_client::placeholder as kitty_graphics_placeholder;
 mod pty_info;
 pub mod rich_content_audio_player;
 pub mod rich_content_audio_widget;
@@ -4361,9 +4361,21 @@ impl Terminal {
     /// play/pause, left/up step to the previous track, right/down to the
     /// next. `false` when no widget is painted or it has no such control
     /// (no previous/next for a lone file), so the key goes on to the
-    /// terminal as usual.
+    /// terminal as usual. Only a widget whose placement spans the whole
+    /// width of the terminal takes keys: a smaller one is a preview inside a
+    /// program's own screen (farsh's quick view, yazi), where space and the
+    /// arrows belong to that program; such a widget is used with the mouse.
     pub fn handle_audio_widget_key(&mut self, key: &str) -> bool {
+        let terminal_bounds = self.last_content.terminal_bounds;
+        let spans_the_width = |id: &(u32, u32)| {
+            self.rich_content_placement_bounds(id.0, id.1).is_some_and(|placement| {
+                placement.size.width + terminal_bounds.cell_width >= terminal_bounds.bounds.size.width
+            })
+        };
         let target = self.audio_widget_bounds.borrow().iter().find_map(|(id, bounds)| {
+            if !spans_the_width(id) {
+                return None;
+            }
             let available = match key {
                 "space" => bounds.cover.is_some(),
                 // A CUE sheet's buttons may be disabled at its ends, but
@@ -7541,7 +7553,7 @@ mod tests {
         data.extend_from_slice("# a document of the other machine\n".repeat(500).as_bytes());
         let player = std::sync::Arc::new(somsrv::daemon::connect_or_spawn(&somsrv_binary).unwrap());
         somsrv::protocol::ConnectionKind::Srv.write_to(&player).unwrap();
-        player.write_message(&serde_json::to_vec(&somsrv::protocol::SrvRequest::Handshake(somsrv::protocol::HandshakeInfo::current())).unwrap()).unwrap();
+        player.write_message(&serde_json::to_vec(&somsrv::protocol::SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap()).unwrap();
         player.read_message().unwrap();
         let announce = {
             let (player, data) = (player.clone(), data.clone());
@@ -7652,6 +7664,44 @@ mod tests {
         drop(terminal);
         assert!(saw_video, "somsrp run alone in a directory never showed the video: FFmpeg was not found");
         assert!(leftovers.is_empty(), "somsrp left DLLs next to itself: {leftovers:?}");
+    }
+
+    #[gpui::test]
+    async fn only_a_widget_across_the_whole_width_takes_keys(cx: &mut TestAppContext) {
+        // farsh's quick view (and yazi) show a player inside their own screen:
+        // space and the arrows there are the program's, the widget is used with
+        // the mouse. A widget across the terminal (somsrp, farsh's F3) takes them.
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+        window.update_window_entity(&terminal, |terminal, window, cx| {
+            terminal.set_size(TerminalBounds::new(
+                px(10.),
+                px(9.),
+                Bounds { origin: Point::default(), size: Size { width: px(900.), height: px(300.) } },
+            ));
+            terminal.sync(window, cx);
+        });
+        let widget = |x: f32, width: f32| {
+            let cover = Bounds { origin: Point { x: px(x), y: px(10.) }, size: Size { width: px(20.), height: px(20.) } };
+            let placement = Bounds { origin: Point { x: px(x), y: px(0.) }, size: Size { width: px(width), height: px(100.) } };
+            (rich_content_audio_widget::AudioWidgetBounds { cover: Some(cover), prev: None, next: None, bar: None, like: None, wave: None }, placement)
+        };
+        window.update_window_entity(&terminal, |terminal, _, _| {
+            let (bounds, placement) = widget(459., 432.);
+            terminal.record_rich_content_placement_bounds(1, 1, placement);
+            terminal.record_audio_widget_bounds(1, 1, bounds);
+            assert!(!terminal.handle_audio_widget_key("space"), "a preview in half the screen leaves space to the program");
+
+            terminal.clear_audio_widget_bounds();
+            let (bounds, placement) = widget(0., 900.);
+            terminal.record_rich_content_placement_bounds(2, 2, placement);
+            terminal.record_audio_widget_bounds(2, 2, bounds);
+            assert!(terminal.handle_audio_widget_key("space"), "a widget across the terminal takes space");
+        });
     }
 
     #[gpui::test]

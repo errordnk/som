@@ -14,7 +14,7 @@
 //! depended on that machinery, see those functions' own doc comments —
 //! and stays on the PTY, since it's how Som learns a placement exists at
 //! all before any payload bytes arrive.
-mod cue;
+use srp_client::cue;
 mod raw_mode;
 mod srv_channel;
 
@@ -576,16 +576,8 @@ fn query_cell_count_uncached() -> Option<(u32, u32)> {
     Some((cols, lines))
 }
 
-/// Foreground carries session_id, underline color carries file_id — same
-/// split Kitty's own encoding uses for (image_id, placement_id), mirrored
-/// from `crates/terminal/src/terminal.rs`'s private `id_to_rgb` (kept as a
-/// small local duplicate rather than a cross-crate `pub` export — this is
-/// the only other call site, and the encoding is a stable, documented part
-/// of the wire format, not an implementation detail worth coupling crates
-/// over).
-fn id_to_rgb(id: u32) -> (u8, u8, u8) {
-    (((id >> 16) & 0xFF) as u8, ((id >> 8) & 0xFF) as u8, (id & 0xFF) as u8)
-}
+// Foreground carries session_id, underline color carries file_id.
+use srp_client::placeholder::id_to_rgb;
 
 /// Prints the Unicode-placeholder grid for a `(session_id, file_id)`
 /// placement directly to this process's own stdout — i.e. through the
@@ -907,7 +899,7 @@ struct PlaylistEntry {
 /// fatal.
 fn announce_track(ids: SrpIds, position: &PlaylistPosition, tags: Option<somsrv::protocol::TrackTags>) {
     let (session_id, file_id) = ids;
-    let result = srv_channel::SrvChannel::connect().and_then(|channel| {
+    let result = srv_channel::connect().and_then(|channel| {
         channel.announce_track(
             session_id,
             file_id,
@@ -929,7 +921,7 @@ fn announce_track(ids: SrpIds, position: &PlaylistPosition, tags: Option<somsrv:
 /// Announces a CUE sheet's track list for `ids` to Som (via `somsrv`).
 fn announce_cue(ids: SrpIds, sheet: &somsrv::protocol::CueSheet) {
     let (session_id, file_id) = ids;
-    let result = srv_channel::SrvChannel::connect()
+    let result = srv_channel::connect()
         .and_then(|channel| channel.announce_cue(session_id, file_id, sheet.clone()));
     if let Err(err) = result {
         eprint!("somsrp: could not announce the track list: {err}
@@ -1162,7 +1154,7 @@ fn spawn_byte_range_responder_from_disk(
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (session_id, file_id) = ids;
-    let channel = std::sync::Arc::new(srv_channel::SrvChannel::connect()?);
+    let channel = std::sync::Arc::new(srv_channel::connect()?);
     channel.register_range_responder(session_id, file_id)?;
 
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -1237,7 +1229,7 @@ fn spawn_markdown_grower(
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (session_id, file_id) = ids;
-    let channel = srv_channel::SrvChannel::connect()?;
+    let channel = srv_channel::connect()?;
     channel.register_markdown_grower(session_id, file_id)?;
 
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -1418,7 +1410,7 @@ fn stream_file_from_disk(
 /// widget disappears, so it is reported, not fatal.
 fn stop_playback_best_effort(ids: SrpIds) {
     let (session_id, file_id) = ids;
-    let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.stop_playback(session_id, file_id));
+    let result = srv_channel::connect().and_then(|channel| channel.stop_playback(session_id, file_id));
     if let Err(err) = result {
         eprint!("somsrp: could not stop previous track: {err}\r\n");
     }
@@ -1526,7 +1518,7 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
     // the whole download nothing else can be asked of it - it is only
     // read from, to learn that the fetch FAILED (the daemon answers a
     // failed fetch here too, not just to Som's progress subscription).
-    let channel = Arc::new(srv_channel::SrvChannel::connect()?);
+    let channel = Arc::new(srv_channel::connect()?);
 
     clear_screen_and_home_cursor();
     // Content-type-agnostic footprint: the full terminal, same as every
@@ -1542,7 +1534,7 @@ fn stream_url(url: &str, playlist: &PlaylistPosition) -> Result<(), String> {
     // daemon knows this key is fetch-sourced and does not forward them
     // here) - the fetched bytes are somsrv's own, not this process's.
     let ended = Arc::new(AtomicBool::new(false));
-    let responder = Arc::new(srv_channel::SrvChannel::connect()?);
+    let responder = Arc::new(srv_channel::connect()?);
     responder.register_range_responder(session_id, file_id)?;
     {
         let ended = ended.clone();
@@ -1728,7 +1720,7 @@ fn announce_radio_state(ids: SrpIds) {
     let track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
     let label = RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     let result =
-        srv_channel::SrvChannel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label));
+        srv_channel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label));
     if let Err(err) = result {
         eprint!("somsrp: could not announce the radio state: {err}\r\n");
     }
@@ -1747,7 +1739,7 @@ fn handle_radio_control(ids: SrpIds, control: somsrv::protocol::RadioControl) {
             };
             if let Some((service, track_id, liked)) = change {
                 LIKE_CHOICES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((track_id.clone(), liked));
-                let result = srv_channel::SrvChannel::connect().and_then(|channel| channel.radio_like(service, &track_id, liked));
+                let result = srv_channel::connect().and_then(|channel| channel.radio_like(service, &track_id, liked));
                 if let Err(err) = result {
                     eprint!("somsrp: could not send the like: {err}\r\n");
                 }
@@ -1829,7 +1821,7 @@ fn radio_feedback(
     played_seconds: f32,
 ) {
     let track_id = entry.map(|entry| entry.track.id.as_str()).unwrap_or("");
-    let result = srv_channel::SrvChannel::connect()
+    let result = srv_channel::connect()
         .and_then(|channel| channel.radio_feedback(service, station, batch_id, event, track_id, played_seconds));
     if let Err(err) = result {
         eprint!("somsrp: could not report to the radio: {err}\r\n");
@@ -1839,7 +1831,7 @@ fn radio_feedback(
 /// The next batch of `station` after the track `queue`, as entries.
 fn fetch_radio_entries(service: &'static str, station: &str, queue: Option<&str>) -> Result<Vec<RadioEntry>, String> {
     let (batch_id, tracks) =
-        srv_channel::SrvChannel::connect()?.radio_tracks(service, station, queue).map_err(|reason| format!("{station}: {reason}"))?;
+        srv_channel::connect()?.radio_tracks(service, station, queue).map_err(|reason| format!("{station}: {reason}"))?;
     Ok(tracks.into_iter().map(|track| RadioEntry { track, batch_id: batch_id.clone(), station: station.to_string() }).collect())
 }
 
@@ -2168,7 +2160,7 @@ fn stream_file_impl(
     // transfer — see `srv_channel::SrvChannel`'s own doc comment for why
     // this fails hard (not a silent fallback to the old PTY transport,
     // which no longer exists) if the daemon isn't reachable.
-    let channel = srv_channel::SrvChannel::connect()?;
+    let channel = srv_channel::connect()?;
 
     if content_type == ContentType::Audio {
         let (sample_rate, channels, bits_per_sample, duration_ms) = audio_metadata(path)?;

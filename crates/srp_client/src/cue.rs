@@ -4,7 +4,7 @@
 //! Som is told about, and the `find_*` helpers locate the audio file and
 //! the album picture next to the sheet.
 
-use somsrv::protocol::{CueSheet, CueTrack};
+use crate::protocol::{CueSheet, CueTrack};
 use std::path::{Path, PathBuf};
 
 /// A CUE sheet frame is 1/75 of a second.

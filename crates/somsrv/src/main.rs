@@ -98,7 +98,7 @@ fn parse_args() -> Args {
             // preamble) so the caller (a plain `ssh host ... --version`)
             // can parse stdout directly without scraping a log file.
             "--version" => {
-                println!("{}", serde_json::to_string(&somsrv::protocol::HandshakeInfo::current()).unwrap());
+                println!("{}", serde_json::to_string(&somsrv::protocol::current_handshake()).unwrap());
                 std::process::exit(0);
             }
             // Self-contained admin subcommands — connect to the daemon

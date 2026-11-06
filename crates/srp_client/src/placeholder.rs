@@ -77,6 +77,22 @@ pub const ROWCOLUMN_DIACRITICS: [char; 297] = [
     '\u{1D242}', '\u{1D243}', '\u{1D244}',
 ];
 
+/// A placement is at most this many rows and columns: one diacritic each.
+pub const MAX_CELLS: u32 = ROWCOLUMN_DIACRITICS.len() as u32;
+
+/// An id as the 24-bit RGB color that carries it: the foreground color of a
+/// placeholder cell carries the session id, its underline color (`SGR 58`)
+/// the file id.
+pub fn id_to_rgb(id: u32) -> (u8, u8, u8) {
+    (((id >> 16) & 0xFF) as u8, ((id >> 8) & 0xFF) as u8, (id & 0xFF) as u8)
+}
+
+/// The text of the cell at (`row`, `column`) of a placement, or `None` past
+/// [`MAX_CELLS`].
+pub fn cell_text(row: u32, column: u32) -> Option<String> {
+    encode_cell(row, column).map(|chars| chars.iter().collect())
+}
+
 /// Encode a (row, column) offset within a placement as a diacritic pair
 /// appended to [`PLACEHOLDER_CHAR`]: row first, then column, matching the
 /// order every other implementation of this spec uses (Kitty itself, plus

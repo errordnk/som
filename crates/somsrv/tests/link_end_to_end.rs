@@ -6,7 +6,7 @@
 
 use somsrv::link::{Extractor, LinkChannel, SrvLink};
 use somsrv::pipe::PipeConnection;
-use somsrv::protocol::{ConnectionKind, ContentMetadata, ContentType, HandshakeInfo, SrvRequest, SrvResponse};
+use somsrv::protocol::{ConnectionKind, ContentMetadata, ContentType, SrvRequest, SrvResponse};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,7 +84,7 @@ impl Tab {
     fn channel(&self) -> LinkChannel {
         let channel = self.link.open_channel().expect("opening a channel");
         channel.write_message(&[ConnectionKind::Srv as u8]).unwrap();
-        channel.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();
+        channel.write_message(&serde_json::to_vec(&SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap()).unwrap();
         let reply = channel.read_message().expect("the handshake reply through the link");
         assert!(matches!(serde_json::from_slice::<SrvResponse>(&reply).unwrap(), SrvResponse::Handshake(_)));
         channel
@@ -101,7 +101,7 @@ fn player() -> PipeConnection {
     somsrv::protocol::use_test_daemon();
     let connection = somsrv::daemon::connect_or_spawn(std::path::Path::new(env!("CARGO_BIN_EXE_somsrv"))).expect("reaching the daemon");
     ConnectionKind::Srv.write_to(&connection).unwrap();
-    connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();
+    connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap()).unwrap();
     connection.read_message().unwrap();
     connection
 }

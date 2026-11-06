@@ -3,7 +3,7 @@
 //! and passes the next track on in `NowPlayingInfo::next`, so Som can have its
 //! cover ready before it starts.
 
-use somsrv::protocol::{ConnectionKind, HandshakeInfo, NextTrack, NowPlayingInfo, SrvRequest, SrvResponse};
+use somsrv::protocol::{ConnectionKind, NextTrack, NowPlayingInfo, SrvRequest, SrvResponse};
 use std::time::{Duration, Instant};
 
 fn track(title: &str, cover: &str) -> NextTrack {
@@ -24,7 +24,7 @@ fn the_tags_and_the_next_cover_of_an_announced_track_reach_a_subscriber() {
     std::thread::spawn(move || {
         let connection = somsrv::daemon::connect_or_spawn(std::path::Path::new(env!("CARGO_BIN_EXE_somsrv"))).expect("reaching the daemon");
         ConnectionKind::Srv.write_to(&connection).unwrap();
-        connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(HandshakeInfo::current())).unwrap()).unwrap();
+        connection.write_message(&serde_json::to_vec(&SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap()).unwrap();
         connection.read_message().unwrap();
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;

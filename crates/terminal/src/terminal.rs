@@ -9320,6 +9320,85 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_picture_subscribed_to_in_the_middle_of_its_stream_is_shown(cx: &mut TestAppContext) {
+        // Som sees a placement's cells when it next polls, which may be in the
+        // middle of somsrp's stream: the first chunk it gets is then from the
+        // middle, and it asks for the whole file from the start. That request
+        // went to somsrp's streaming connection, which nobody reads for a
+        // picture, and was never answered: an 8 MB GIF showed nothing
+        // (2026-11-06). The picture here (noise, ~9 MB as PNG) is larger than
+        // the daemon's trailing window too, so only somsrp can answer.
+        cx.executor().allow_parking();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noise.png");
+        {
+            use rand::RngCore as _;
+            let (width, height) = (2000u32, 1500u32);
+            let mut pixels = vec![0u8; (width * height * 3) as usize];
+            rand::rng().fill_bytes(&mut pixels);
+            image::RgbImage::from_raw(width, height, pixels).unwrap().save(&path).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 8 * 1024 * 1024, "the picture must be larger than the daemon's window");
+
+        let somsrp_path = somsrv::testing::debug_binary("somsrp");
+        let (completion_tx, _completion_rx) = async_channel::unbounded();
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    None,
+                    task::Shell::WithArguments {
+                        program: somsrp_path.to_string_lossy().into_owned(),
+                        args: vec![path.to_string_lossy().into_owned()],
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    Some(0),
+                    false,
+                    0,
+                    Some(completion_tx),
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+
+        // Wait for the cells without letting Som subscribe, then let the
+        // stream run on for a while: the subscription comes after it began.
+        let mut cells_seen = false;
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            cells_seen = terminal.update(cx, |terminal, _| {
+                terminal.term.lock().renderable_content().display_iter.any(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR)
+            });
+            if cells_seen {
+                break;
+            }
+        }
+        assert!(cells_seen, "somsrp never printed its placeholder grid");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let mut shown = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
+            if !terminal.update(cx, |term, _| term.rich_content_placements()).is_empty() {
+                shown = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(shown, "a picture whose first chunk Som saw was from the middle never became a placement");
+    }
+
+    #[gpui::test]
     async fn test_embedded_image_fetch_fires_exactly_once_across_many_paints(cx: &mut TestAppContext) {
         // `layout_markdown` re-runs on every single paint pass and would
         // re-discover the same embedded image every time — this is the

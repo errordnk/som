@@ -719,10 +719,14 @@ pub enum SrvRequest {
     /// same key (see `SrvCache::notify_stop_playback`) as `SrvResponse::
     /// StopPlayback` — in practice that's Som's own long-lived progress-
     /// listener connection, the same one `SrvResponse::Progress` already
-    /// arrives on. Silently a no-op if nobody is subscribed (e.g. Som
-    /// already tore the player down itself, or never opened one for this
-    /// id at all) — same "already gone, nothing to do" tolerance every
-    /// other best-effort message in this protocol already has.
+    /// arrives on. A no-op if nobody is subscribed AND nobody subscribes
+    /// later - but the stop is REMEMBERED (a bounded number of keys) and told
+    /// to a subscriber that comes after it: Som subscribes a few milliseconds
+    /// after it sees a placement's cells, and a player that moves on at once
+    /// (farsh's quick view following a cursor, yazi's preview) sends this
+    /// in that gap; without the memory the next subscriber played the file to
+    /// the end with nothing left to stop it, and hopping over five tracks left
+    /// five playing (2026-11-07).
     StopPlayback { session_id: u32, file_id: u32 },
     /// Sent by `somsrp` playing a CUE sheet: the track list of the one
     /// audio file behind `(session_id, file_id)`. `somsrv` stores it and

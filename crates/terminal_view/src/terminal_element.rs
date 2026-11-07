@@ -1775,7 +1775,58 @@ pub fn is_blank(cell: &IndexedCell) -> bool {
 /// dark rectangle in an otherwise light UI (see `project_srp_audio_and_
 /// md_browser_roadmap`'s "Planned: theme-aware widget redesign" note).
 fn rich_content_widget_bg(cx: &App) -> gpui::Rgba {
-    cx.theme().colors().terminal_background.into()
+    WIDGET_BG_OF_PLACEHOLDERS.with(|bg| bg.get()).unwrap_or_else(|| cx.theme().colors().terminal_background.into())
+}
+
+thread_local! {
+    /// The background the placeholder cells of the placements on screen are
+    /// drawn with, while a frame's rich content is painted (`None`: they
+    /// have the terminal's own). A program that shows a widget in a region
+    /// of its own colors (farsh's viewer on the file panel's blue) gets the
+    /// widget on that background, not on the theme's.
+    static WIDGET_BG_OF_PLACEHOLDERS: std::cell::Cell<Option<gpui::Rgba>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets [`WIDGET_BG_OF_PLACEHOLDERS`] for a frame and clears it after.
+struct PlaceholderBgScope;
+
+impl PlaceholderBgScope {
+    fn new(bg: Option<gpui::Rgba>) -> Self {
+        WIDGET_BG_OF_PLACEHOLDERS.with(|cell| cell.set(bg));
+        Self
+    }
+}
+
+impl Drop for PlaceholderBgScope {
+    fn drop(&mut self) {
+        WIDGET_BG_OF_PLACEHOLDERS.with(|cell| cell.set(None));
+    }
+}
+
+/// The explicit (true color) background of the first placeholder cell on
+/// screen: what the program painted its placement's rectangle with.
+fn placeholder_cells_bg(cells: &[IndexedCell]) -> Option<gpui::Rgba> {
+    cells
+        .iter()
+        .find(|indexed| indexed.cell.c == kitty_graphics_placeholder::PLACEHOLDER_CHAR && matches!(indexed.cell.bg, AnsiColor::Spec(_)))
+        .and_then(|indexed| match indexed.cell.bg {
+            AnsiColor::Spec(rgb) => Some(gpui::rgba(u32::from_be_bytes([rgb.r, rgb.g, rgb.b, 0xff]))),
+            _ => None,
+        })
+}
+
+/// `fg` when it can be read on `bg`, else black or white, whichever contrasts
+/// (a widget on a background of the program's choosing, not the theme's).
+fn readable_on(bg: gpui::Rgba, fg: gpui::Hsla) -> gpui::Hsla {
+    let luma = |c: gpui::Rgba| 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+    let fg_rgba: gpui::Rgba = fg.into();
+    if (luma(bg) - luma(fg_rgba)).abs() >= 0.4 {
+        fg
+    } else if luma(bg) > 0.5 {
+        gpui::black()
+    } else {
+        gpui::white()
+    }
 }
 
 /// Shrink-to-fit-but-never-enlarge, aspect-ratio-preserving placement of
@@ -1943,6 +1994,9 @@ fn paint_rich_content_placements(
     let cell_width = layout.dimensions.cell_width;
     let line_height = layout.dimensions.line_height;
     let mut any_animating = false;
+    // Widgets (audio, video, markdown) and letterboxes are on the
+    // background their placeholder cells have, when they have one.
+    let _bg_scope = PlaceholderBgScope::new(placeholder_cells_bg(&terminal.read(cx).last_content().cells));
 
     // Everything needed from `terminal` is collected as OWNED data in
     // this narrowly scoped `update` call — the borrow it takes on
@@ -2937,8 +2991,8 @@ fn paint_rich_content_markdown_widget(
     // rather than a fixed dark-theme-only color — a markdown document
     // read in a light theme was otherwise unreadably dark-on-dark.
     let theme_colors = cx.theme().colors();
-    let widget_bg: gpui::Rgba = theme_colors.terminal_background.into();
-    let text_color: gpui::Hsla = theme_colors.terminal_foreground;
+    let widget_bg: gpui::Rgba = rich_content_widget_bg(cx);
+    let text_color: gpui::Hsla = readable_on(widget_bg, theme_colors.terminal_foreground);
     let link_color = gpui::rgba(0x89b4faff).into();
     let quote_bar_color = gpui::rgba(0x585b70ff);
 
@@ -4308,6 +4362,39 @@ pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_widget_takes_the_background_of_its_placeholder_cells() {
+        use terminal::IndexedCell;
+        use terminal::alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use terminal::alacritty_terminal::term::cell::Cell;
+        use terminal::alacritty_terminal::vte::ansi::{Color as Ansi, NamedColor, Rgb};
+
+        let cell = |c: char, bg: Ansi, column: usize| {
+            let mut cell = Cell::default();
+            cell.c = c;
+            cell.bg = bg;
+            IndexedCell { point: AlacPoint::new(Line(0), Column(column)), cell }
+        };
+        let blue = Ansi::Spec(Rgb { r: 0, g: 0, b: 128 });
+        let placeholder = kitty_graphics_placeholder::PLACEHOLDER_CHAR;
+        // a blue letter is not a placement; the first placeholder cell with a true color decides
+        let cells = [cell('a', blue, 0), cell(placeholder, Ansi::Named(NamedColor::Background), 1), cell(placeholder, blue, 2)];
+        let bg = placeholder_cells_bg(&cells).expect("a placeholder cell with a true color");
+        assert_eq!((bg.r, bg.g, bg.b), (0.0, 0.0, 128.0 / 255.0));
+        // a placement on the terminal's own background has none: the theme's goes
+        assert!(placeholder_cells_bg(&[cell(placeholder, Ansi::Named(NamedColor::Background), 0)]).is_none());
+        assert!(placeholder_cells_bg(&[]).is_none());
+    }
+
+    #[test]
+    fn text_on_a_programs_background_is_readable() {
+        let blue = gpui::rgba(0x000080ff);
+        // light text stays on blue; dark text on blue becomes white; light on light becomes black
+        assert_eq!(readable_on(blue, gpui::white()), gpui::white());
+        assert_eq!(readable_on(blue, gpui::black()), gpui::white());
+        assert_eq!(readable_on(gpui::rgba(0xf0f0f0ff), gpui::rgba(0xe0e0e0ff).into()), gpui::black());
+    }
+
     use super::*;
     use gpui::{AbsoluteLength, Hsla, font};
     use ui::utils::apca_contrast;

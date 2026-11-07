@@ -99,6 +99,11 @@ type ProgressSender = Arc<dyn Fn(SrvResponse) -> anyhow::Result<()> + Send + Syn
 /// subscribers can independently want to observe.
 type SenderRoute = Arc<dyn Fn(SrvRequest) -> anyhow::Result<()> + Send + Sync>;
 
+/// How many placements stopped by `StopPlayback` are remembered (see
+/// `Inner::stopped`): a stop is for a placement that was on screen a moment
+/// ago, so a few thousand is long enough for any subscriber that is late.
+const STOPPED_KEYS_REMEMBERED: usize = 4096;
+
 #[derive(Default)]
 struct Inner {
     entries: HashMap<CacheKey, CacheEntry>,
@@ -142,6 +147,16 @@ struct Inner {
     /// `is_fetch_cancelled`. Without this an endless radio stream would
     /// keep downloading forever once nobody is listening.
     cancelled_fetches: std::collections::HashSet<CacheKey>,
+    /// Placements a player told to stop (`notify_stop_playback`), oldest first
+    /// (bounded by [`STOPPED_KEYS_REMEMBERED`]), and as a set to look up. The push
+    /// goes only to those subscribed at that moment, and a subscriber comes a
+    /// few milliseconds after the placement's cells are seen: a player that
+    /// moves on at once (farsh's quick view following a cursor) stopped it in
+    /// that gap, the next subscriber played the file to the end, and hopping over
+    /// five tracks left five playing. A subscriber is told of the stop that
+    /// came before it.
+    stopped: std::collections::HashSet<CacheKey>,
+    stopped_order: std::collections::VecDeque<CacheKey>,
     /// Latest "now playing" for a radio stream (`set_now_playing`),
     /// replayed to a subscriber that arrives later.
     now_playing: HashMap<CacheKey, somsrv::protocol::NowPlayingInfo>,
@@ -356,6 +371,10 @@ impl SrvCache {
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
         }
+        // the stop that came before this subscriber (see `Inner::stopped`)
+        if inner.stopped.contains(&key) {
+            let _ = send(SrvResponse::StopPlayback { session_id, file_id });
+        }
         inner.subscribers.entry(key).or_default().push(send);
     }
 
@@ -512,7 +531,16 @@ impl SrvCache {
     /// has.
     pub fn notify_stop_playback(&self, session_id: u32, file_id: u32) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.cancelled_fetches.insert((session_id, file_id));
+        let key = (session_id, file_id);
+        inner.cancelled_fetches.insert(key);
+        if inner.stopped.insert(key) {
+            inner.stopped_order.push_back(key);
+            if inner.stopped_order.len() > STOPPED_KEYS_REMEMBERED
+                && let Some(oldest) = inner.stopped_order.pop_front()
+            {
+                inner.stopped.remove(&oldest);
+            }
+        }
         if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
             for subscriber in subscribers {
                 let _ = subscriber(SrvResponse::StopPlayback { session_id, file_id });
@@ -528,6 +556,10 @@ impl SrvCache {
         let key = (session_id, file_id);
         inner.fetched_keys.insert(key);
         inner.cancelled_fetches.remove(&key);
+        // a new use of the key is not born stopped
+        if inner.stopped.remove(&key) {
+            inner.stopped_order.retain(|stopped| *stopped != key);
+        }
     }
 
     /// `true` once playback of `(session_id, file_id)` ended/stopped or
@@ -1048,6 +1080,81 @@ mod tests {
         assert_eq!(chunk_data, b"hello world");
     }
 
+    #[test]
+    fn a_stop_that_came_before_the_subscriber_still_reaches_it() {
+        // Som subscribes to a placement a few milliseconds after it sees its
+        // cells; a player that moves on at once (farsh's quick view following a
+        // cursor, yazi's preview) sends StopPlayback in that gap. The push went
+        // to nobody, the subscriber that came next played the file to the end
+        // with nothing left to stop it: hop over five tracks and five played at
+        // once (2026-11-07).
+        let cache = SrvCache::new();
+        cache.put_chunk(1, 2, 0, b"hello", 5, ContentType::Audio, test_metadata());
+        cache.notify_stop_playback(1, 2);
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed.iter().any(|r| matches!(r, SrvResponse::StopPlayback { session_id: 1, file_id: 2 })),
+            "the late subscriber must be told the placement was stopped: {observed:?}"
+        );
+
+        // another key is not stopped by it
+        let other = Arc::new(Mutex::new(Vec::new()));
+        {
+            let other = other.clone();
+            cache.subscribe(3, 4, Arc::new(move |response| {
+                other.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        assert!(other.lock().unwrap().iter().all(|r| !matches!(r, SrvResponse::StopPlayback { .. })));
+    }
+
+    #[test]
+    fn a_fetch_started_again_under_a_stopped_key_is_not_born_stopped() {
+        let cache = SrvCache::new();
+        cache.notify_stop_playback(1, 2);
+        cache.begin_fetch(1, 2);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        assert!(observed.lock().unwrap().iter().all(|r| !matches!(r, SrvResponse::StopPlayback { .. })));
+    }
+
+    #[test]
+    fn the_stopped_keys_are_remembered_only_up_to_a_bound() {
+        let cache = SrvCache::new();
+        for n in 0..(STOPPED_KEYS_REMEMBERED as u32 + 10) {
+            cache.notify_stop_playback(n, 0);
+        }
+        let told = |key: u32| {
+            let observed = Arc::new(Mutex::new(false));
+            let seen = observed.clone();
+            cache.subscribe(key, 0, Arc::new(move |response| {
+                if matches!(response, SrvResponse::StopPlayback { .. }) {
+                    *seen.lock().unwrap() = true;
+                }
+                Ok(())
+            }));
+            let result = *observed.lock().unwrap();
+            result
+        };
+        assert!(!told(0), "the oldest is forgotten");
+        assert!(told(STOPPED_KEYS_REMEMBERED as u32 + 9), "the newest is remembered");
+    }
     #[test]
     fn route_byte_range_request_serves_from_recent_bytes_for_image_gif_markdown_too() {
         // `recent_bytes` covers EVERY content type identically now (not

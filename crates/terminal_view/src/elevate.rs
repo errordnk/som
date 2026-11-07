@@ -78,6 +78,13 @@ pub fn launch_elevated_window(profile_name: &str) -> Result<ElevatedLaunch> {
 
     let exe = std::env::current_exe().context("locating the running Som executable")?;
     let params = format!("--admin-profile {}", quote_windows_arg(profile_name));
+    // Runs on a worker thread (see `open_admin_window`); the shell wants COM
+    // initialised on the calling thread, apartment-threaded.
+    unsafe {
+        use util::ResultExt as _;
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok().log_err();
+    }
     let result = unsafe {
         ShellExecuteW(None, w!("runas"), &HSTRING::from(exe.as_os_str()), &HSTRING::from(params), None, SW_SHOWNORMAL)
     };

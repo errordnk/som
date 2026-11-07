@@ -70,7 +70,7 @@ impl TerminalPanel {
                 == RemoteKind::Local
             && crate::elevate::needs_elevated_window(true)
         {
-            Self::open_admin_window(workspace, &profile.name.clone(), cx);
+            Self::open_admin_window(&profile.name.clone(), cx);
             return;
         }
         let (profile_shell, tab_icon) = tab_name.as_deref()
@@ -181,18 +181,41 @@ impl TerminalPanel {
     /// Launches the elevated Som window for an `admin` profile. A declined
     /// UAC prompt is the user's own choice, so it's only logged; a real
     /// launch failure is surfaced as a toast.
-    fn open_admin_window(workspace: &mut Workspace, profile_name: &str, cx: &mut Context<Workspace>) {
+    fn open_admin_window(profile_name: &str, cx: &mut Context<Workspace>) {
         use crate::elevate::{ElevatedLaunch, launch_elevated_window};
+        // Never launch from inside this handler: `ShellExecuteW(runas)` runs
+        // a message loop while the UAC consent starts, and that re-enters
+        // gpui's window callbacks while they are borrowed ("RefCell already
+        // borrowed", then a fail-fast abort of the whole Som). A background
+        // thread has its own queue, so the window is not touched.
+        let name = profile_name.to_owned();
+        cx.spawn(async move |workspace, cx| {
+            let launch_name = name.clone();
+            let result = cx.background_spawn(async move { launch_elevated_window(&launch_name) }).await;
+            let err = match result {
+                Ok(ElevatedLaunch::Started) => return,
+                Ok(ElevatedLaunch::Cancelled) => {
+                    log::info!("UAC prompt declined for admin profile {name:?}");
+                    return;
+                }
+                Err(err) => err,
+            };
+            workspace
+                .update(cx, |workspace, cx| Self::show_admin_window_error(workspace, &name, &err, cx))
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// Toast for a real failure to start the elevated window.
+    fn show_admin_window_error(
+        workspace: &mut Workspace,
+        profile_name: &str,
+        err: &anyhow::Error,
+        cx: &mut Context<Workspace>,
+    ) {
         use workspace::notifications::{
             NotificationId, NotificationScope, NotificationSeverity, simple_message_notification::MessageNotification,
-        };
-        let err = match launch_elevated_window(profile_name) {
-            Ok(ElevatedLaunch::Started) => return,
-            Ok(ElevatedLaunch::Cancelled) => {
-                log::info!("UAC prompt declined for admin profile {profile_name:?}");
-                return;
-            }
-            Err(err) => err,
         };
         log::error!("failed to open admin window for profile {profile_name:?}: {err:#}");
         let msg = format!("Som: could not open {profile_name:?} as administrator: {err:#}");

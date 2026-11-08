@@ -2025,6 +2025,7 @@ fn paint_rich_content_placements(
         let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
         luminance > 0.5
     };
+    let mut row_bands: std::collections::HashMap<(u32, u32), (u32, u32)> = std::collections::HashMap::new();
     let (origins, placements, audio_placements, markdown_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
         terminal.update(cx, |terminal, _cx| {
         // For each (session_id, file_id) group, remember the grid position
@@ -2069,6 +2070,10 @@ fn paint_rich_content_placements(
             origin: (i32, i32),
             max_column: u32,
             max_row: u32,
+            /// The first row of the placement that has a cell on screen: with
+            /// the last, the band of rows a program (farsh's viewer window)
+            /// really covers with placeholder cells.
+            min_row: u32,
         }
         let mut seen: Vec<Seen> = Vec::new();
         let mut last_seen: usize = 0;
@@ -2108,17 +2113,19 @@ fn paint_rich_content_placements(
                 // top-left corner), so the first cell seen for an id wins.
                 let origin_line = indexed_cell.point.line.0 - row as i32;
                 let origin_column = indexed_cell.point.column.0 as i32 - cell_col_in_image as i32;
-                seen.push(Seen { key, origin: (origin_line, origin_column), max_column: 0, max_row: 0 });
+                seen.push(Seen { key, origin: (origin_line, origin_column), max_column: 0, max_row: 0, min_row: row });
                 seen.len() - 1
             };
             last_seen = index;
             let entry = &mut seen[index];
             entry.max_column = entry.max_column.max(cell_col_in_image);
             entry.max_row = entry.max_row.max(row);
+            entry.min_row = entry.min_row.min(row);
         }
         for entry in seen {
             let (session_id, file_id) = entry.key;
             origins.insert(entry.key, entry.origin);
+            row_bands.insert(entry.key, (entry.min_row, entry.max_row));
             // The placement's real column count can't be recomputed from
             // the image's own pixel size at paint time (see `Terminal::
             // record_rich_content_max_column_seen`'s doc comment): the
@@ -2245,7 +2252,19 @@ fn paint_rich_content_placements(
             let mut embedded_controls_bounds: Vec<(String, Bounds<Pixels>, Option<Bounds<Pixels>>)> = Vec::new();
             let mut any_nested_loading = false;
             let sel_range = terminal.read(cx).selection_line_range().map(|(start, end)| (start.0, end.0));
-            if let Some(bounds) = paint_rich_content_markdown_widget(
+            // the document is clipped to the rectangle its placeholder cells cover (a
+            // heading is taller than a row: without the clip it would run over what
+            // is around a window of the document)
+            let clip = row_bands.get(&(session_id, file_id)).map(|&(first, last)| {
+                let top = origin.y + (geometry.origin_line + layout.display_offset as i32 + first as i32) as f32 * layout.dimensions.line_height;
+                Bounds::new(
+                    point(origin.x, top),
+                    gpui::size(layout.dimensions.num_columns() as f32 * layout.dimensions.cell_width, layout.dimensions.line_height * (last - first + 1) as f32),
+                )
+            });
+            let painted = match clip {
+                Some(bounds) => window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    paint_rich_content_markdown_widget(
                 &rendered_text,
                 Some(width_columns - 1),
                 scroll_offset,
@@ -2261,9 +2280,33 @@ fn paint_rich_content_placements(
                 (session_id, file_id),
                 &mut any_nested_loading,
                 sel_range,
+                row_bands.get(&(session_id, file_id)).copied(),
+                window,
+                    cx,
+                )
+                }),
+                None => paint_rich_content_markdown_widget(
+                &rendered_text,
+                Some(width_columns - 1),
+                scroll_offset,
+                origin,
+                geometry.origin_line,
+                geometry.origin_column,
+                layout,
+                &embedded,
+                &mut discovered,
+                &mut embedded_controls_bounds,
+                &mut real_row_count,
+                terminal,
+                (session_id, file_id),
+                &mut any_nested_loading,
+                sel_range,
+                row_bands.get(&(session_id, file_id)).copied(),
                 window,
                 cx,
-            ) {
+            ),
+            };
+            if let Some(bounds) = painted {
                 terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
             }
             any_markdown_embedded_image_loading |= any_nested_loading;
@@ -2972,6 +3015,11 @@ fn paint_rich_content_markdown_widget(
     // its own opaque `widget_bg` over the placeholder cells underneath,
     // covering whatever selection tint `layout_grid` already drew there.
     selection_line_range: Option<(i32, i32)>,
+    // The first and last row of the placement that have placeholder cells on
+    // screen: the document is painted in those and no further (a program
+    // that shows a window of it, scrolled, covers only some of its rows;
+    // painting the rest would run over whatever is around the window).
+    row_band: Option<(u32, u32)>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Bounds<Pixels>> {
@@ -3058,8 +3106,9 @@ fn paint_rich_content_markdown_widget(
     // The rows of the FULL placement (0..placement_rows) that fall
     // within the visible screen (0..num_lines) right now — clamped on
     // both ends, since either edge (or both) can be off-screen.
-    let first_visible_row = (-display_line).max(0);
-    let last_visible_row = (num_lines - display_line).min(placement_rows);
+    let (band_first, band_last) = row_band.map_or((0, i32::MAX), |(first, last)| (first as i32, last as i32 + 1));
+    let first_visible_row = (-display_line).max(0).max(band_first);
+    let last_visible_row = (num_lines - display_line).min(placement_rows).min(band_last);
     if first_visible_row >= last_visible_row {
         return None;
     }

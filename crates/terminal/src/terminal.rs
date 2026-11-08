@@ -4611,11 +4611,20 @@ impl Terminal {
             // shared helper for the same borrow-conflict reason audio's
             // copy is inlined: `players` (`rich_content_video_players`)
             // is already mutably borrowed above.
+            // A video whose source is gone for good is never reopened (the same
+            // set as audio's: the keys never collide): without it the next
+            // paint found the bytes still cached and played the clip again from
+            // the start, over whatever the preview showed after it.
+            if self.rich_content_audio_dead.borrow().contains(&key) {
+                continue;
+            }
             if let Some(srv_state) = self.rich_content_srv_progress.borrow().get(&key)
                 && srv_state.take_stop_playback_requested()
             {
                 players.remove(&key);
                 self.rich_content_video_progress.borrow_mut().remove(&key);
+                self.rich_content_audio_dead.borrow_mut().insert(key);
+                continue;
             }
             let contiguous_len = self.rich_content_cache.contiguous_len(session_id, file_id);
             let total_size = self.rich_content_cache.total_size(session_id, file_id);

@@ -157,8 +157,7 @@ impl<R: Read> Read for CtrReader<R> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Account {
     pub token: Option<String>,
-    /// `music.yandex.proxy`: an address of the user's own proxy, or `true` for the gost Som starts.
-    pub proxy: somsrv::gost_proxy::Proxy,
+    pub proxy: Option<String>,
 }
 
 /// `music.yandex.token` / `music.yandex.proxy` of a settings document.
@@ -174,8 +173,7 @@ pub fn account_from_settings(settings: &str) -> Account {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
     };
-    let yandex = value.pointer("/music/yandex").cloned().unwrap_or(serde_json::Value::Null);
-    Account { token: field("token"), proxy: somsrv::gost_proxy::settings_from(&yandex) }
+    Account { token: field("token"), proxy: field("proxy") }
 }
 
 fn load_account() -> anyhow::Result<Account> {
@@ -202,16 +200,15 @@ fn signed_in_agent() -> anyhow::Result<(String, ureq::Agent)> {
     let token = account
         .token
         .ok_or_else(|| anyhow::anyhow!("no Yandex Music token: set music.yandex.token in settings.json"))?;
-    Ok((token, agent(&account.proxy)?))
+    Ok((token, agent(account.proxy.as_deref())?))
 }
 
-fn agent(proxy: &somsrv::gost_proxy::Proxy) -> anyhow::Result<ureq::Agent> {
+fn agent(proxy: Option<&str>) -> anyhow::Result<ureq::Agent> {
     // A refusal carries the service's own explanation in its body, which
     // `api_get` reports - so a status is not turned into an error here.
     let mut builder = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(10))).http_status_as_error(false);
-    // the user's proxy, or the gost this process starts (`music.yandex.proxy: true`)
-    if let Some(proxy) = somsrv::gost_proxy::proxy_url(proxy)? {
-        builder = builder.proxy(Some(ureq::Proxy::new(&proxy)?));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(Some(ureq::Proxy::new(proxy)?));
     }
     Ok(ureq::Agent::new_with_config(builder.build()))
 }
@@ -637,9 +634,7 @@ mod tests {
         }"#;
         let account = account_from_settings(settings);
         assert_eq!(account.token.as_deref(), Some("y0_abc"));
-        assert_eq!(account.proxy, somsrv::gost_proxy::Proxy::None);
+        assert_eq!(account.proxy, None);
         assert_eq!(account_from_settings("not json"), Account::default());
-        let account = account_from_settings(r#"{"music": {"yandex": {"token": "t", "proxy": true}}}"#);
-        assert_eq!(account.proxy, somsrv::gost_proxy::Proxy::Gost);
     }
 }

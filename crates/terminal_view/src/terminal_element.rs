@@ -2477,6 +2477,7 @@ fn paint_rich_content_placements(
                     );
                     any_animating |= *is_playing;
                     let picture_bounds = Bounds::new(picture_position, picture_size);
+                    terminal.read(cx).record_rich_content_picture_bounds(session_id, file_id, picture_bounds);
                     if *is_stopped {
                         // The stopped-state stand-in (`dna.png`, roughly
                         // square) has its OWN aspect ratio, unrelated to

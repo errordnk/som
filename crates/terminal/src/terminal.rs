@@ -600,6 +600,7 @@ impl TerminalBuilder {
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_source_ranges: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_picture_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -972,6 +973,7 @@ impl TerminalBuilder {
             markdown_base_dirs: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_source_ranges: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_placement_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_picture_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1672,6 +1674,10 @@ pub struct Terminal {
     /// `Terminal::mouse_down`'s click-interception check so a click can
     /// be tested against a placement's bounds outside of a paint pass.
     rich_content_placement_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// A video's picture (above its controls row): a click on it plays or
+    /// pauses, as a click on an audio widget's cover does. Written every
+    /// paint like `rich_content_placement_bounds`.
+    rich_content_picture_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
     /// One markdown placement's raw source text plus, for every row of
     /// its most recent `layout_markdown_with_nested` output, the byte
     /// range in that text the row's content came from (`None` for a row
@@ -4806,6 +4812,15 @@ impl Terminal {
     /// view since its bounds were last recorded (stale-but-absent is
     /// treated the same as never-existed — a click can't land on
     /// something that isn't currently on screen).
+    pub fn record_rich_content_picture_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
+        self.rich_content_picture_bounds.borrow_mut().insert((session_id, file_id), bounds);
+    }
+
+    /// The video placement whose picture `position` is on, if any.
+    fn video_picture_at(&self, position: gpui::Point<Pixels>) -> Option<(u32, u32)> {
+        self.rich_content_picture_bounds.borrow().iter().find(|(_, bounds)| bounds.contains(&position)).map(|(&key, _)| key)
+    }
+
     pub fn rich_content_placement_bounds(&self, session_id: u32, file_id: u32) -> Option<Bounds<Pixels>> {
         self.rich_content_placement_bounds.borrow().get(&(session_id, file_id)).copied()
     }
@@ -4925,6 +4940,15 @@ impl Terminal {
     fn handle_rich_content_click(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) -> bool {
         log::trace!("handle_rich_content_click: position={position:?}");
         if self.handle_audio_widget_click(position) {
+            return true;
+        }
+        // a click on a video's picture plays or pauses it
+        #[cfg(target_os = "windows")]
+        if let Some((session_id, file_id)) = self.video_picture_at(position)
+            && self.rich_content_video_players.borrow().contains_key(&(session_id, file_id))
+            && !self.rich_content_placement_bounds(session_id, file_id).is_some_and(|controls| controls.contains(&position))
+        {
+            self.toggle_rich_content_video_playback(session_id, file_id);
             return true;
         }
         let cell_width = self.last_content.terminal_bounds.cell_width;
@@ -7710,6 +7734,23 @@ mod tests {
             terminal.record_rich_content_placement_bounds(2, 2, placement);
             terminal.record_audio_widget_bounds(2, 2, bounds);
             assert!(terminal.handle_audio_widget_key("space"), "a widget across the terminal takes space");
+        });
+    }
+
+    #[gpui::test]
+    async fn a_click_is_on_a_videos_picture_only_inside_its_bounds(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let terminal = window.new(|cx| {
+            TerminalBuilder::new_display_only(CursorShape::default(), AlternateScroll::On, None, 0, cx.background_executor(), PathStyle::local())
+                .unwrap()
+                .subscribe(cx)
+        });
+        window.update_window_entity(&terminal, |terminal, _, _| {
+            let picture = Bounds { origin: Point { x: px(10.), y: px(20.) }, size: Size { width: px(400.), height: px(200.) } };
+            terminal.record_rich_content_picture_bounds(3, 4, picture);
+            assert_eq!(terminal.video_picture_at(Point { x: px(100.), y: px(100.) }), Some((3, 4)));
+            assert_eq!(terminal.video_picture_at(Point { x: px(100.), y: px(250.) }), None, "the controls row below is not the picture");
+            assert_eq!(terminal.video_picture_at(Point { x: px(5.), y: px(100.) }), None);
         });
     }
 

@@ -9,6 +9,7 @@ pub mod conpty;
 #[cfg(windows)]
 pub mod tmp_files;
 pub mod daemon;
+pub mod gost_proxy;
 pub mod link;
 pub use srp_client::pipe;
 pub mod protocol;

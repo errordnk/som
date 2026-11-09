@@ -1,4 +1,4 @@
-//! A local proxy for Yandex Music that `somsrv` starts itself.
+//! A local proxy for Yandex Music that Som starts.
 //!
 //! Behind a VPN the service is closed (451 from Yandex's side), and the VPN
 //! client can let a program round it, but a program as a whole: everything
@@ -7,14 +7,14 @@
 //! user excludes from the VPN once (on Windows: its `gost.exe` in the VPN
 //! client's list of programs that bypass it).
 //!
-//! `music.yandex.proxy: true` in `settings.json` asks for it: the first request
-//! to Yandex starts `gost -L socks5://127.0.0.1:<port>` (`music.yandex.gost_port`,
-//! 1080 by default; `music.yandex.gost` is the path of the program, else
-//! `gost` of `PATH`, or `%USERPROFILE%\bin\gost.exe` on Windows), and the
-//! requests use that proxy. Something already listening on the port is used as
-//! it is (gost the user started, one an earlier `somsrv` left), and a gost
-//! started here ends with `somsrv` (a job object on Windows, a parent-death
-//! signal on Linux).
+//! `music.yandex.proxy: true` in `settings.json` asks for it, and Som
+//! ([`sync`]) owns it: it starts `gost -L socks5://127.0.0.1:<port>`
+//! (`music.yandex.gost_port`, 1080 by default; `music.yandex.gost` is the path of
+//! the program, else `gost` in `~/.local/bin`, else of `PATH`)
+//! when it starts or the setting becomes true, ends it when the setting
+//! stops being true, and it ends with Som (a job object on Windows, a
+//! parent-death signal on Linux). Something already listening on the port is used
+//! as it is (gost the user started). `somsrv` only uses the proxy ([`proxy_url`]).
 //!
 //! `music.yandex.proxy` as a string is the address of a proxy of the user's own
 //! and is used as it is.
@@ -33,7 +33,7 @@ pub enum Proxy {
     None,
     /// A proxy of the user's: `socks5://host:port`, `http://...`.
     Url(String),
-    /// `true`: gost, started by `somsrv`.
+    /// `true`: gost, started by Som.
     Gost,
 }
 
@@ -72,12 +72,10 @@ pub fn find_gost(configured: Option<&str>, candidates: &[PathBuf]) -> Option<Pat
 
 fn default_candidates() -> Vec<PathBuf> {
     let name = if cfg!(windows) { "gost.exe" } else { "gost" };
-    let mut found: Vec<PathBuf> = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).collect()).unwrap_or_default();
-    if cfg!(windows)
-        && let Some(home) = std::env::var_os("USERPROFILE")
-    {
-        found.push(Path::new(&home).join("bin").join(name));
-    }
+    // where all the programs of ours live comes first, then PATH
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let mut found: Vec<PathBuf> = home.iter().map(|home| Path::new(home).join(".local").join("bin").join(name)).collect();
+    found.extend(std::env::var_os("PATH").map(|path| std::env::split_paths(&path).map(|dir| dir.join(name)).collect::<Vec<_>>()).unwrap_or_default());
     found
 }
 
@@ -93,20 +91,18 @@ fn listening(port: u16) -> bool {
     TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
-/// Makes sure something listens on `port`: if not, `start` is run and the port waited for (up to 5 s).
-fn ensure_listening(port: u16, start: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    if listening(port) {
-        return Ok(());
-    }
-    start()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
+/// Whether something listens on `port` within `seconds` (a proxy Som is just starting).
+fn wait_for_port(port: u16, seconds: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
         if listening(port) {
-            return Ok(());
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    anyhow::bail!("gost was started but nothing listens on 127.0.0.1:{port}")
 }
 
 /// The gost this process started: it ends with the process.
@@ -177,18 +173,50 @@ fn bind_to_this_process(child: &std::process::Child) {
     }
 }
 
-/// The proxy URL for the requests of `settings`, starting gost when it asks for it.
+/// Ends the gost this process started, if any.
+pub fn stop() {
+    let mut guard = STARTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        log::info!("Yandex Music: gost ended");
+    }
+}
+
+/// What Som does with the settings, at start and whenever they change: `proxy: true` starts
+/// gost (unless something listens on its port already), anything else ends the gost this
+/// process started. Does not wait for the port.
+pub fn sync(settings: &Settings) {
+    if settings.proxy != Proxy::Gost {
+        stop();
+        return;
+    }
+    let port = settings.port.unwrap_or(DEFAULT_PORT);
+    if listening(port) {
+        return;
+    }
+    let Some(program) = find_gost(settings.gost.as_deref(), &default_candidates()) else {
+        log::error!("music.yandex.proxy is true, but gost is not found: put it in ~/.local/bin or set music.yandex.gost");
+        return;
+    };
+    if let Err(error) = start_gost(&program, &listen_arg(port, settings.interface.as_deref())) {
+        log::error!("Yandex Music: {error}");
+    }
+}
+
+/// The proxy URL for the requests of `settings`. gost is Som's to start ([`sync`]); here it is only
+/// waited for a moment, in case Som is just starting it.
 pub fn proxy_url(settings: &Settings) -> anyhow::Result<Option<String>> {
     match &settings.proxy {
         Proxy::None => Ok(None),
         Proxy::Url(url) => Ok(Some(url.clone())),
         Proxy::Gost => {
             let port = settings.port.unwrap_or(DEFAULT_PORT);
-            ensure_listening(port, || {
-                let program = find_gost(settings.gost.as_deref(), &default_candidates())
-                    .ok_or_else(|| anyhow::anyhow!("music.yandex.proxy is true, but gost is not found: put it in PATH (Windows: %USERPROFILE%\\bin) or set music.yandex.gost"))?;
-                start_gost(&program, &listen_arg(port, settings.interface.as_deref()))
-            })?;
+            if !wait_for_port(port, 3) {
+                anyhow::bail!(
+                    "music.yandex.proxy is true, but nothing listens on 127.0.0.1:{port}: Som starts gost (it must be in ~/.local/bin or PATH, or music.yandex.gost is its path) when it starts or the setting changes"
+                );
+            }
             Ok(Some(format!("socks5://127.0.0.1:{port}")))
         }
     }
@@ -232,54 +260,62 @@ mod tests {
     }
 
     #[test]
-    fn something_already_listening_is_used_and_gost_is_not_started() {
+    fn something_already_listening_is_found_and_a_free_port_is_not() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        ensure_listening(port, || anyhow::bail!("must not be started")).unwrap();
+        assert!(wait_for_port(port, 1));
+        drop(listener);
+        assert!(!wait_for_port(port, 0));
     }
 
     #[test]
-    fn a_port_nothing_listens_on_starts_gost_and_waits_for_it() {
+    fn a_proxy_that_is_not_there_is_an_error_that_says_who_starts_it() {
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
-        let mut started = None;
-        // the "gost" opens the port a little later
-        let result = ensure_listening(port, || {
-            started = Some(std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-                std::thread::sleep(Duration::from_secs(2));
-                drop(listener);
-            }));
-            Ok(())
-        });
-        assert!(result.is_ok(), "{result:?}");
-        started.unwrap().join().unwrap();
-        // and a start that fails is the error
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = free.local_addr().unwrap().port();
-        drop(free);
-        assert!(ensure_listening(port, || anyhow::bail!("no gost")).unwrap_err().to_string().contains("no gost"));
+        let settings = Settings { proxy: Proxy::Gost, port: Some(port), ..Settings::default() };
+        let error = proxy_url(&settings).unwrap_err().to_string();
+        assert!(error.contains("Som starts gost"), "{error}");
+        // a proxy that is there is the address; the user's own proxy is as given
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert_eq!(proxy_url(&settings).unwrap(), Some(format!("socks5://127.0.0.1:{port}")));
+        drop(listener);
+        let own = Settings { proxy: Proxy::Url("socks5://10.0.0.1:1".into()), ..Settings::default() };
+        assert_eq!(proxy_url(&own).unwrap().as_deref(), Some("socks5://10.0.0.1:1"));
+        assert_eq!(proxy_url(&Settings::default()).unwrap(), None);
     }
 
-    /// Needs gost: `cargo test -p somsrv real_gost -- --ignored`. The process that started it is
-    /// this test's: when it ends, gost must be gone too (checked by hand: no gost.exe left).
+    #[test]
+    fn sync_with_no_gost_to_find_starts_nothing_and_stopping_nothing_is_fine() {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        sync(&Settings { proxy: Proxy::Gost, gost: Some("definitely/not/there/gost".into()), port: Some(port), interface: None });
+        assert!(!listening(port));
+        sync(&Settings::default());
+        stop();
+    }
+
+    /// Needs gost: `cargo test -p somsrv real_gost -- --ignored`. The proxy is started by `sync`, ended by it
+    /// when the setting is no longer true, and would end with this process (checked by hand: no gost.exe left).
     #[test]
     #[ignore]
-    fn real_gost_is_started_listens_and_ends_with_the_process() {
-        let settings = Settings { proxy: Proxy::Gost, port: Some(1085), ..Settings::default() };
-        let url = proxy_url(&settings).unwrap().unwrap();
-        assert_eq!(url, "socks5://127.0.0.1:1085");
-        assert!(listening(1085));
-        // a second ask finds it listening and starts nothing
-        assert_eq!(proxy_url(&settings).unwrap().unwrap(), url);
-    }
-
-    #[test]
-    fn without_a_gost_the_error_says_where_to_put_it() {
-        let settings = Settings { proxy: Proxy::Gost, gost: Some("definitely/not/there/gost".into()), port: Some(1), interface: None };
-        let error = proxy_url(&settings).unwrap_err().to_string();
-        assert!(error.contains("music.yandex.gost"), "{error}");
+    fn real_gost_is_started_and_ended_by_the_settings() {
+        let port = 1085;
+        let on = Settings { proxy: Proxy::Gost, port: Some(port), ..Settings::default() };
+        sync(&on);
+        assert!(wait_for_port(port, 5), "gost listens");
+        assert_eq!(proxy_url(&on).unwrap().as_deref(), Some("socks5://127.0.0.1:1085"));
+        // asked again: nothing more is started (the port is taken, gost would fail to bind)
+        sync(&on);
+        assert!(listening(port));
+        // the setting turned off: gost ends
+        sync(&Settings::default());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!listening(port), "gost is gone");
+        // and on again
+        sync(&on);
+        assert!(wait_for_port(port, 5));
+        // left running: it must end with this process
     }
 }

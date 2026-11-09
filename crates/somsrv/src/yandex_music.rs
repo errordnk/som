@@ -157,8 +157,8 @@ impl<R: Read> Read for CtrReader<R> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Account {
     pub token: Option<String>,
-    /// `music.yandex.proxy` (an address, or `true` for the gost somsrv starts) and its gost settings.
-    pub proxy: somsrv::gost_proxy::Settings,
+    /// `music.yandex.proxy`: an address of the user's own proxy, or `true` for the gost Som starts.
+    pub proxy: somsrv::gost_proxy::Proxy,
 }
 
 /// `music.yandex.token` / `music.yandex.proxy` of a settings document.
@@ -205,7 +205,7 @@ fn signed_in_agent() -> anyhow::Result<(String, ureq::Agent)> {
     Ok((token, agent(&account.proxy)?))
 }
 
-fn agent(proxy: &somsrv::gost_proxy::Settings) -> anyhow::Result<ureq::Agent> {
+fn agent(proxy: &somsrv::gost_proxy::Proxy) -> anyhow::Result<ureq::Agent> {
     // A refusal carries the service's own explanation in its body, which
     // `api_get` reports - so a status is not turned into an error here.
     let mut builder = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(10))).http_status_as_error(false);
@@ -637,9 +637,9 @@ mod tests {
         }"#;
         let account = account_from_settings(settings);
         assert_eq!(account.token.as_deref(), Some("y0_abc"));
-        assert_eq!(account.proxy.proxy, somsrv::gost_proxy::Proxy::None);
+        assert_eq!(account.proxy, somsrv::gost_proxy::Proxy::None);
         assert_eq!(account_from_settings("not json"), Account::default());
         let account = account_from_settings(r#"{"music": {"yandex": {"token": "t", "proxy": true}}}"#);
-        assert_eq!(account.proxy.proxy, somsrv::gost_proxy::Proxy::Gost);
+        assert_eq!(account.proxy, somsrv::gost_proxy::Proxy::Gost);
     }
 }

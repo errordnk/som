@@ -38,14 +38,6 @@ pub struct SomConfig {
     pub log: LogConfig,
     pub tabs: Vec<TabProfile>,
     pub keys: IndexMap<String, String>,
-    pub music: MusicConfig,
-}
-
-/// `music` of settings.json: somsrv reads the token itself; Som owns the proxy (gost) for Yandex Music.
-#[derive(Deserialize, Default)]
-#[serde(default)]
-pub struct MusicConfig {
-    pub yandex: serde_json::Value,
 }
 
 #[derive(Deserialize, Default)]
@@ -424,8 +416,6 @@ impl SomConfig {
     }
 
     pub fn apply_settings(&self, cx: &mut App) {
-        // `music.yandex.proxy: true` starts gost, anything else ends the one started here (and it ends with Som)
-        somsrv::gost_proxy::sync(&somsrv::gost_proxy::settings_from(&self.music.yandex));
         let mut parts: Vec<String> = Vec::new();
         let mut terminal_parts: Vec<String> = Vec::new();
 

@@ -7301,6 +7301,7 @@ dependencies = [
  "serde_json",
  "session",
  "settings",
+ "somsrv",
  "terminal",
  "terminal_view",
  "theme",

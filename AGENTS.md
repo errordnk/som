@@ -96,6 +96,21 @@ assets          — bundled fonts, icons
 7. **Never use** `unwrap()` — use `?` or `.log_err()`.
 8. **Never silently discard errors** with `let _ =`.
 
+## Documentation and the site (som.sarnet.ru)
+
+- Four documents are kept in step (a change to a fact goes into ALL of them, then they are re-read against each other): `README.md` and `MANUAL.md` (English, for GitHub), `site/index.html` (Russian landing) and `site/manual.html` (Russian manual, HTML, not markdown).
+- **The site is served from the `vpn` host** (146.103.40.167, the `vpn` tab profile; user `dnk`). nginx (`/etc/nginx/sites-available/sarnet.ru`) serves `som.sarnet.ru` from `/home/dnk/som/site` there: a plain copy of this repo's `site/` folder, NOT a git clone, no build step. Nothing is published by `git push`.
+- **Updating it** (only when the developer asks; commit the docs first): back up the served files outside the web root, copy `index.html` and `manual.html` with `scp`, compare `sha256sum` on both sides and check the result with `curl`:
+
+  ```
+  ssh 146.103.40.167 'mkdir -p ~/site-backup-$(date +%Y%m%d) && cp -p /home/dnk/som/site/*.html ~/site-backup-$(date +%Y%m%d)/'
+  scp site/index.html site/manual.html 146.103.40.167:/home/dnk/som/site/
+  curl -s https://som.sarnet.ru/ | grep -o 'v0\.[0-9]*\.[0-9]*'     # the version badge must match
+  ```
+
+  `site/img/` changes rarely: compare `sha256sum img/*` on both sides first and copy only what differs.
+- Before this was written down the site had been left at v0.5.0 for months, while the repo was at v0.8.0 - after documentation changes, say that the site is not updated until it is.
+
 ## Cargo check command
 
 ```bash

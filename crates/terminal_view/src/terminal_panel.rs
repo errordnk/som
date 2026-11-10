@@ -1968,13 +1968,14 @@ fn deploy_lock_for_host(host_args: &[String]) -> std::sync::Arc<std::sync::Mutex
 /// to date): the next tab to such a host does not ask again.
 static CURRENT_HOSTS: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
 
-/// Whether the `somsrv` on a host has to be replaced: it is, when it is older
-/// than the build embedded in this Som - or when it is not there, or is a build
-/// from before builds carried an id. Builds are compared by the time they were
-/// made (`somsrv::protocol::BUILD_ID`), nothing else: no file times, so no
-/// clocks of two machines to disagree.
+/// Whether the `somsrv` on a host has to be replaced: it is, when it is any other
+/// build than the one embedded in this Som (older or newer) - or when it is not
+/// there, or is a build from before builds carried an id. The host must run exactly
+/// the `somsrv` this Som carries: that is the rule, not "at least as new". Builds
+/// are compared by the time they were made (`somsrv::protocol::BUILD_ID`), nothing
+/// else: no file times, so no clocks of two machines to disagree.
 fn somsrv_needs_update(installed_build_id: Option<u64>, embedded_build_id: u64) -> bool {
-    installed_build_id.is_none_or(|installed| installed < embedded_build_id)
+    installed_build_id != Some(embedded_build_id)
 }
 
 /// What the `somsrv` installed on the far side reports about itself
@@ -1992,7 +1993,7 @@ fn installed_somsrv_info(host_args: &[String], remote_kind: RemoteKind) -> Optio
 /// at `~/.local/bin/somsrv` at once. Called before a tab to that host opens, so
 /// the relay the tab starts is already the new build - and a relay of a newer
 /// build than the daemon running there replaces the daemon on connecting
-/// (`somsrv::daemon::replace_if_stale`): the old daemon is stopped, whoever is
+/// (`somsrv::daemon::replace_if_different`): the old daemon is stopped, whoever is
 /// connected to it and whatever sessions it holds, and a new one is started.
 /// Nothing is staged and nothing waits: no `.new`, no marker.
 ///
@@ -2815,12 +2816,12 @@ mod tmux_shell_wrapping_tests {
     }
 
     #[test]
-    fn a_host_is_updated_only_when_its_somsrv_is_older_than_the_embedded_one() {
+    fn a_host_is_updated_whenever_its_somsrv_is_not_exactly_the_embedded_one() {
         assert!(somsrv_needs_update(None, 1_700_000_000), "nothing installed");
         assert!(somsrv_needs_update(Some(0), 1_700_000_000), "a build from before builds had ids");
         assert!(somsrv_needs_update(Some(1_699_999_999), 1_700_000_000), "older");
         assert!(!somsrv_needs_update(Some(1_700_000_000), 1_700_000_000), "the same build");
-        assert!(!somsrv_needs_update(Some(1_800_000_000), 1_700_000_000), "a newer one is never replaced by an older Som's");
+        assert!(somsrv_needs_update(Some(1_800_000_000), 1_700_000_000), "a newer one too: the host runs what this Som carries");
     }
 
     #[test]

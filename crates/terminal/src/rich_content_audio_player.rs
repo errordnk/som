@@ -81,8 +81,21 @@ struct GrowingSrvStream {
     stop: Arc<AtomicBool>,
     position: u64,
     request_byte_range: Option<RequestByteRange>,
-    last_requested_position: Option<u64>,
+    /// When the current stuck read began, and when a range was last asked for during it: see
+    /// [`STUCK_GRACE`] and [`STUCK_RETRY`].
+    stuck_since: Option<std::time::Instant>,
+    last_requested_at: Option<std::time::Instant>,
 }
+
+/// How long a read waits for the bytes that are on their way before it asks for them. A subscriber
+/// that comes after a track was downloaded is sent all of it, in order, as soon as it subscribes
+/// (`SrvCache::subscribe`), and a format probe may read the end of the file first (the tags of an
+/// MP3); asking at once emptied the buffer the in-order bytes were arriving in, and the player then
+/// waited for ever for a request that had been answered into a buffer that was gone.
+const STUCK_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// How often a read that is still stuck asks again (once was not enough: an answer can be lost).
+const STUCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl std::io::Read for GrowingSrvStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -94,7 +107,8 @@ impl std::io::Read for GrowingSrvStream {
             if n > 0 {
                 self.position += n as u64;
                 self.srv_state.advance_consumed_up_to(self.position);
-                self.last_requested_position = None;
+                self.stuck_since = None;
+                self.last_requested_at = None;
                 return Ok(n);
             }
             let total_size = self.srv_state.total_size();
@@ -115,14 +129,17 @@ impl std::io::Read for GrowingSrvStream {
             // because it arrived before this reader ever subscribed (see
             // this struct's own doc comment) — both cases look identical
             // from here, and both are fixed the same way: ask for it.
-            // Deduped by `last_requested_position` so a stuck read
-            // doesn't resend the same request on every retry-sleep tick.
+            // Not at once (the bytes may be on their way in order), and again while it stays
+            // stuck, not once only.
+            let now = std::time::Instant::now();
+            let since = *self.stuck_since.get_or_insert(now);
             if let Some(request_byte_range) = self.request_byte_range.as_ref()
-                && self.last_requested_position != Some(self.position)
+                && now.duration_since(since) >= STUCK_GRACE
+                && self.last_requested_at.is_none_or(|at| now.duration_since(at) >= STUCK_RETRY)
             {
                 self.srv_state.reset_buffer_for_seek(self.position);
                 request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
-                self.last_requested_position = Some(self.position);
+                self.last_requested_at = Some(now);
             }
             std::thread::sleep(DECODE_RETRY_INTERVAL);
         }
@@ -365,7 +382,8 @@ fn run_decode_loop(
             stop: stop.clone(),
             position: 0,
             request_byte_range: request_byte_range.clone(),
-            last_requested_position: None,
+            stuck_since: None,
+            last_requested_at: None,
         };
         let mss = MediaSourceStream::new(Box::new(stream), Default::default());
         match symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())

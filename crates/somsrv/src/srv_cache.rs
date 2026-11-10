@@ -45,6 +45,15 @@ use std::sync::{Arc, Mutex};
 /// `ON_DEMAND_RANGE_LEN` (4MB) with room to spare.
 const RECENT_BYTES_WINDOW: usize = 8 * 1024 * 1024;
 
+/// What a resource `somsrv` fetched itself keeps in memory (a track), whole: a player that makes the next
+/// track ready ahead has it downloaded before Som ever subscribes, and the subscriber is then sent all of
+/// it at once (`SrvCache::subscribe`), not left to ask for it piece by piece. Bigger than this is a
+/// stream (a radio): only the trailing `RECENT_BYTES_WINDOW`.
+const FETCHED_RETAIN: usize = 64 * 1024 * 1024;
+
+/// The size of the pieces a late subscriber is sent a kept resource in.
+const FETCHED_REPLAY_PIECE: usize = 256 * 1024;
+
 /// `(session_id, file_id)` — same key shape `RichContentCache` uses.
 type CacheKey = (u32, u32);
 
@@ -210,6 +219,7 @@ impl SrvCache {
     ) {
         let key = (session_id, file_id);
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fetched_key = inner.fetched_keys.contains(&key);
 
         inner.entries.entry(key).or_insert_with(|| CacheEntry {
             contiguous_len: 0,
@@ -225,6 +235,7 @@ impl SrvCache {
         entry.total_size = total_size;
         entry.content_type = content_type;
         entry.metadata = metadata.clone();
+        let fetched = fetched_key;
         {
             // Only track a chunk that lands contiguously at (or behind)
             // this window's own tail — an out-of-order chunk landing
@@ -245,8 +256,9 @@ impl SrvCache {
                 *window_start = offset;
                 window.extend(data.iter().copied());
             }
-            if window.len() > RECENT_BYTES_WINDOW {
-                let drop_count = window.len() - RECENT_BYTES_WINDOW;
+            let keep = if fetched { FETCHED_RETAIN } else { RECENT_BYTES_WINDOW };
+            if window.len() > keep {
+                let drop_count = window.len() - keep;
                 window.drain(..drop_count);
                 *window_start += drop_count as u64;
             }
@@ -346,18 +358,44 @@ impl SrvCache {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         if let Some(entry) = inner.entries.get(&key) {
-            let _ = send(SrvResponse::Progress {
-                session_id,
-                file_id,
-                contiguous_len: entry.contiguous_len,
-                tail_available_from: entry.tail_available_from,
-                pending_ranges: entry.pending_ranges.clone(),
-                total_size: entry.total_size,
-                content_type: entry.content_type,
-                metadata: entry.metadata.clone(),
-                chunk_offset: 0,
-                chunk_data: Vec::new(),
-            });
+            let (window_start, window) = &entry.recent_bytes;
+            if inner.fetched_keys.contains(&key) && *window_start == 0 && !window.is_empty() {
+                // A resource `somsrv` fetched itself, and kept whole, is sent in full to a subscriber that comes
+                // late (a track made ready ahead is downloaded before Som sees its placement). The watermark
+                // grows with the bytes, piece by piece: a snapshot that said "all of it is there" before the
+                // bytes arrived let the player open on an empty buffer ("probe reach EOF at 0 bytes": no sound).
+                // Chunks that arrive while it is being fetched follow, in order: the subscriber is added under
+                // this same lock.
+                let bytes: Vec<u8> = window.iter().copied().collect();
+                for (index, piece) in bytes.chunks(FETCHED_REPLAY_PIECE).enumerate() {
+                    let offset = index * FETCHED_REPLAY_PIECE;
+                    let _ = send(SrvResponse::Progress {
+                        session_id,
+                        file_id,
+                        contiguous_len: ((offset + piece.len()) as u64).min(entry.contiguous_len),
+                        tail_available_from: entry.tail_available_from,
+                        pending_ranges: entry.pending_ranges.clone(),
+                        total_size: entry.total_size,
+                        content_type: entry.content_type,
+                        metadata: entry.metadata.clone(),
+                        chunk_offset: offset as u64,
+                        chunk_data: piece.to_vec(),
+                    });
+                }
+            } else {
+                let _ = send(SrvResponse::Progress {
+                    session_id,
+                    file_id,
+                    contiguous_len: entry.contiguous_len,
+                    tail_available_from: entry.tail_available_from,
+                    pending_ranges: entry.pending_ranges.clone(),
+                    total_size: entry.total_size,
+                    content_type: entry.content_type,
+                    metadata: entry.metadata.clone(),
+                    chunk_offset: 0,
+                    chunk_data: Vec::new(),
+                });
+            }
         }
         if let Some(info) = inner.now_playing.get(&key) {
             let _ = send(SrvResponse::NowPlaying(info.clone()));
@@ -533,6 +571,12 @@ impl SrvCache {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         inner.cancelled_fetches.insert(key);
+        // a stopped placement is never played again: what was kept of it (a whole track) is let go
+        if inner.fetched_keys.contains(&key)
+            && let Some(entry) = inner.entries.get_mut(&key)
+        {
+            entry.recent_bytes = (0, VecDeque::new());
+        }
         if inner.stopped.insert(key) {
             inner.stopped_order.push_back(key);
             if inner.stopped_order.len() > STOPPED_KEYS_REMEMBERED
@@ -1078,6 +1122,73 @@ mod tests {
         };
         assert_eq!(*chunk_offset, 0);
         assert_eq!(chunk_data, b"hello world");
+    }
+
+    #[test]
+    fn a_fetched_resource_is_sent_whole_to_a_subscriber_that_comes_after_it_was_downloaded() {
+        // A track made ready ahead is fetched (and gone from the fetch's connection) before Som subscribes:
+        // the bytes must come with the subscription, in order, not by Som asking for ranges.
+        let cache = SrvCache::new();
+        cache.begin_fetch(1, 2);
+        let track: Vec<u8> = (0..(FETCHED_REPLAY_PIECE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+        for (index, piece) in track.chunks(64 * 1024).enumerate() {
+            cache.put_chunk(1, 2, (index * 64 * 1024) as u64, piece, track.len() as u64, ContentType::Audio, ContentMetadata::Audio {
+                sample_rate: 0,
+                channels: 0,
+                bits_per_sample: 0,
+                duration_ms: 0,
+                extension: String::new(),
+            });
+        }
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = observed.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                observed.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        let mut received = Vec::new();
+        for response in observed.lock().unwrap().iter() {
+            if let SrvResponse::Progress { chunk_offset, chunk_data, total_size, contiguous_len, .. } = response {
+                assert_eq!(*total_size, track.len() as u64);
+                if !chunk_data.is_empty() {
+                    assert_eq!(*chunk_offset, received.len() as u64, "in order, without a gap");
+                    received.extend_from_slice(chunk_data);
+                }
+                assert!(*contiguous_len <= received.len() as u64, "the watermark never runs ahead of the bytes that came");
+            }
+        }
+        assert_eq!(received, track, "the whole track reached the late subscriber");
+        // a resource that was not fetched by somsrv (a sender's) is not replayed: its sender is asked
+        let other = SrvCache::new();
+        other.put_chunk(3, 4, 0, b"abc", 3, ContentType::Gif, test_metadata());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            other.subscribe(3, 4, Arc::new(move |response| {
+                seen.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        assert!(seen.lock().unwrap().iter().all(|r| !matches!(r, SrvResponse::Progress { chunk_data, .. } if !chunk_data.is_empty())));
+    }
+
+    #[test]
+    fn a_stopped_fetched_resource_lets_go_of_the_bytes_that_were_kept() {
+        let cache = SrvCache::new();
+        cache.begin_fetch(1, 2);
+        cache.put_chunk(1, 2, 0, &vec![7u8; 1000], 1000, ContentType::Audio, ContentMetadata::Audio { sample_rate: 0, channels: 0, bits_per_sample: 0, duration_ms: 0, extension: String::new() });
+        cache.notify_stop_playback(1, 2);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            cache.subscribe(1, 2, Arc::new(move |response| {
+                seen.lock().unwrap().push(response);
+                Ok(())
+            }));
+        }
+        assert!(seen.lock().unwrap().iter().all(|r| !matches!(r, SrvResponse::Progress { chunk_data, .. } if !chunk_data.is_empty())), "nothing of it is sent any more");
     }
 
     #[test]

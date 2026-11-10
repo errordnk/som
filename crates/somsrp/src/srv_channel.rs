@@ -4,25 +4,12 @@
 //! that ships next to `somsrv`.
 
 pub use srp_client::channel::{Incoming, SrvChannel};
-use somsrv::protocol::daemon_socket_path;
 
-/// Connects to the local daemon, starting it (next to this executable) when
-/// none runs. Fails hard rather than falling back to anything: a missing
-/// daemon is a setup problem worth seeing.
+/// Connects to the local daemon: the one Som runs (the `somsrv` inside Som, taken out at its start). somsrp
+/// starts none and replaces none: which `somsrv` runs is Som's to decide, and nothing is installed next to
+/// somsrp for it to find.
 pub fn connect() -> Result<SrvChannel, String> {
-    let daemon_binary = somsrv::daemon::binary_path_next_to_current_exe().map_err(|err| {
-        format!(
-            "{err:#}
-             (somsrv should be deployed next to somsrp's own executable —              check `~/.local/bin/somsrv` exists and is executable)"
-        )
-    })?;
-    // A daemon older than the somsrv next to this somsrp is replaced first.
-    if let Err(err) = somsrv::daemon::replace_if_stale(&daemon_binary) {
-        eprintln!("somsrp: could not check whether the running somsrv is current: {err:#}");
-    }
-    let connection = somsrv::daemon::connect_or_spawn(&daemon_binary)
-        .map_err(|err| format!("failed to connect to the somsrv daemon at {:?}: {err:#}", daemon_socket_path()))?;
-    SrvChannel::over(connection, somsrv::protocol::current_handshake())
+    SrvChannel::connect().map_err(|err| format!("{err} (somsrp does not start a somsrv: Som runs one, start Som)"))
 }
 
 pub fn to_srv_content_type(content_type: terminal::rich_content_transport::ContentType) -> somsrv::protocol::ContentType {

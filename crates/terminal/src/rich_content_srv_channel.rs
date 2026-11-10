@@ -798,17 +798,68 @@ impl alacritty_terminal::event_loop::StreamFilter for LinkFilter {
     }
 }
 
-/// Stops the daemon of this machine when it is an older build than the `somsrv`
-/// next to Som (and with it everything it holds): the next connection starts one
-/// from the new file. Som calls it once at startup - a rebuilt or updated Som
-/// would otherwise go on talking to whatever daemon an earlier run left behind.
-pub fn replace_stale_local_daemon() {
-    match somsrv::daemon::binary_path_next_to_current_exe().and_then(|binary| somsrv::daemon::replace_if_stale(&binary)) {
-        Ok(true) => log::info!("replaced an older somsrv daemon with the build next to Som"),
-        Ok(false) => {},
-        Err(err) => log::warn!("could not check whether the somsrv daemon is current: {err:#}"),
+/// Gets the local `somsrv` ready, at every start of Som: the one inside Som (`assets/srv/<platform>/`)
+/// is taken out into the temporary folder (`som-somsrv-<build id>`; a copy that is already there and
+/// is the same bytes is used as it is, else it is written), it becomes the `somsrv` every client of
+/// Som starts (`somsrv::daemon::set_binary_override`), and a daemon of any other build running on this
+/// machine is stopped - with the sessions it holds - so that the next connection starts one from the
+/// new file. No `somsrv` is installed next to Som, and a daemon left over from a different Som never
+/// outlives the start of this one.
+pub fn prepare_local_daemon() {
+    match stage_embedded_daemon().and_then(|binary| {
+        somsrv::daemon::set_binary_override(binary.clone());
+        let replaced = somsrv::daemon::replace_if_different(&binary)?;
+        Ok((binary, replaced))
+    }) {
+        Ok((binary, replaced)) => {
+            if replaced {
+                log::info!("replaced the somsrv daemon here with the build inside Som");
+            }
+            remove_other_staged_daemons(&binary);
+        },
+        Err(err) => log::warn!("could not prepare the somsrv inside Som: {err:#}"),
     }
 }
+
+/// `<temp>/som-somsrv-<build id>/somsrv(.exe)`, written from the embedded copy unless it is there already.
+fn stage_embedded_daemon() -> anyhow::Result<std::path::PathBuf> {
+    let (os, arch) = somsrv::protocol::current_platform();
+    let exe_suffix = if matches!(os, somsrv::protocol::Os::Windows) { ".exe" } else { "" };
+    let asset_path = format!("srv/{}/somsrv{exe_suffix}", somsrv::protocol::platform_dir_name(os, arch));
+    let embedded = assets::Assets::get(&asset_path).ok_or_else(|| anyhow::anyhow!("no somsrv is embedded for this platform ({asset_path})"))?;
+    let bytes: &[u8] = embedded.data.as_ref();
+    let build_id = somsrv::protocol::build_id_in(bytes).ok_or_else(|| anyhow::anyhow!("the somsrv embedded in this Som carries no build id"))?;
+    let write_into = |dir: std::path::PathBuf| -> anyhow::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(format!("somsrv{exe_suffix}"));
+        if std::fs::read(&file).is_ok_and(|existing| existing == bytes) {
+            return Ok(file);
+        }
+        std::fs::write(&file, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(file)
+    };
+    let dir = std::env::temp_dir().join(format!("som-somsrv-{build_id}"));
+    // a file there that cannot be replaced (it differs and a process holds it) is not in the way: another folder
+    write_into(dir.clone()).or_else(|_| write_into(std::env::temp_dir().join(format!("som-somsrv-{build_id}-{}", std::process::id()))))
+}
+
+/// Takes away the folders of other builds from earlier starts, as far as they can be (a daemon that still runs
+/// from one keeps its file).
+fn remove_other_staged_daemons(current: &std::path::Path) {
+    let (Some(keep), Ok(entries)) = (current.parent(), std::fs::read_dir(std::env::temp_dir())) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path != keep && entry.file_name().to_string_lossy().starts_with("som-somsrv-") {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 
 /// One connection to whichever daemon `(session_id, file_id)` belongs to.
 enum SrvConnection {

@@ -48,6 +48,9 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// failure mode is itself intentional, see its own doc comment — this
 /// fixes the actual missing-binary bug, not the tolerance for it).
 pub fn binary_path_next_to_current_exe() -> anyhow::Result<PathBuf> {
+    if let Some(path) = binary_override() {
+        return Ok(path);
+    }
     let exe_dir = std::env::current_exe()
         .map_err(|err| anyhow::anyhow!("failed to determine this process's own executable path: {err}"))?
         .parent()
@@ -61,6 +64,19 @@ pub fn binary_path_next_to_current_exe() -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!("{binary_name} not found next to this process's own executable at {exe_dir:?} (or its parent)")
+}
+
+static BINARY_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn binary_override() -> Option<PathBuf> {
+    BINARY_OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+/// Makes `path` the `somsrv` that [`binary_path_next_to_current_exe`] answers with, whatever is (or
+/// is not) next to this process's executable. Som uses it for the `somsrv` it carries inside itself,
+/// taken out into the temporary folder at every start: no `somsrv` is installed next to Som.
+pub fn set_binary_override(path: PathBuf) {
+    *BINARY_OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
 }
 
 /// Tries to connect to the daemon's fixed socket first; if nothing's
@@ -150,6 +166,17 @@ pub fn replace_if_stale(daemon_binary: &Path) -> anyhow::Result<bool> {
     replace_if_stale_at(&daemon_socket_path(), daemon_binary)
 }
 
+/// Like [`replace_if_stale`], but a daemon of ANY other build than `daemon_binary`'s is stopped, newer
+/// as well as older: for the one client that carries its own `somsrv` and wants the machine to run
+/// exactly that (Som, whose `somsrv` is the one inside it). Several clients with their own builds
+/// must not use it: they would stop each other's daemons in turn.
+pub fn replace_if_different(daemon_binary: &Path) -> anyhow::Result<bool> {
+    if std::env::var_os(KEEP_RUNNING_DAEMON_ENV).is_some() {
+        return Ok(false);
+    }
+    replace_where(&daemon_socket_path(), daemon_binary, |running, expected| running != expected)
+}
+
 /// When this environment variable is set, a running daemon is never replaced
 /// by [`replace_if_stale`], whatever build it is. For whoever runs several
 /// builds side by side (tests, a developer): the clients of the newest would
@@ -157,10 +184,14 @@ pub fn replace_if_stale(daemon_binary: &Path) -> anyhow::Result<bool> {
 pub const KEEP_RUNNING_DAEMON_ENV: &str = "SOMSRV_KEEP_DAEMON";
 
 fn replace_if_stale_at(socket_path: &str, daemon_binary: &Path) -> anyhow::Result<bool> {
+    replace_where(socket_path, daemon_binary, |running, expected| running < expected)
+}
+
+fn replace_where(socket_path: &str, daemon_binary: &Path, replace: impl Fn(u64, u64) -> bool) -> anyhow::Result<bool> {
     let bytes = std::fs::read(daemon_binary).with_context(|| format!("cannot read {daemon_binary:?}"))?;
     let Some(expected) = crate::protocol::build_id_in(&bytes) else { return Ok(false) };
     let Some(running) = probe_running_daemon(socket_path) else { return Ok(false) };
-    if running.build_id >= expected {
+    if !replace(running.build_id, expected) {
         return Ok(false);
     }
     log::info!("the daemon here is build {} and {daemon_binary:?} is build {expected}: replacing it", running.build_id);
@@ -326,6 +357,32 @@ mod tests {
             daemon.kill().unwrap();
             daemon.wait().ok();
         }
+    }
+
+    #[test]
+    fn a_daemon_of_a_different_build_is_stopped_whether_older_or_newer_and_one_of_the_same_build_is_not() {
+        let scratch = tempfile::tempdir().unwrap();
+        for (running_build, stopped) in [(1_000, true), (3_000, true), (2_000, false)] {
+            let socket = unique_socket(scratch.path(), &format!("different-{running_build}"));
+            let mut daemon = sleeper();
+            let served = fake_daemon(&socket, running_build, daemon.id());
+            let replaced = replace_where(&socket, &binary_of_build(scratch.path(), 2_000), |running, expected| running != expected).expect("checking");
+            served.recv_timeout(Duration::from_secs(20)).expect("the fake daemon was never asked");
+            assert_eq!(replaced, stopped, "running build {running_build}");
+            assert_eq!(daemon.try_wait().unwrap().is_some(), stopped, "running build {running_build}");
+            daemon.kill().ok();
+            daemon.wait().ok();
+        }
+    }
+
+    #[test]
+    fn the_binary_that_was_set_is_the_one_found_before_anything_next_to_the_executable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let chosen = scratch.path().join("chosen-somsrv");
+        std::fs::write(&chosen, b"x").unwrap();
+        set_binary_override(chosen.clone());
+        assert_eq!(binary_path_next_to_current_exe().unwrap(), chosen);
+        *BINARY_OVERRIDE.lock().unwrap() = None;
     }
 
     #[test]

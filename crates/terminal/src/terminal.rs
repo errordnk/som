@@ -4173,7 +4173,7 @@ impl Terminal {
             finite_track: finite && cue_view.is_none() && duration > std::time::Duration::ZERO,
             radio: state
                 .radio_state()
-                .map(|(liked, track_wave, wave_label)| rich_content_audio_widget::RadioIcons { liked, track_wave, wave_label }),
+                .map(|(liked, track_wave, wave_label, station)| rich_content_audio_widget::RadioIcons { liked, track_wave, wave_label, station }),
             // A CUE sheet and a list that does not wrap end at their ends.
             can_prev: match (&cue_view, playlist, state.playlist_looping()) {
                 (Some((.., index)), ..) => *index > 0,
@@ -4326,6 +4326,8 @@ impl Terminal {
             Next,
             Like,
             Wave,
+            PrevStation,
+            NextStation,
             Bar(Bounds<Pixels>),
         }
         let hit = self.audio_widget_bounds.borrow().iter().find_map(|(key, bounds)| {
@@ -4339,6 +4341,10 @@ impl Terminal {
                 Hit::Like
             } else if bounds.wave.is_some_and(|r| r.contains(&position)) {
                 Hit::Wave
+            } else if bounds.station_prev.is_some_and(|r| r.contains(&position)) {
+                Hit::PrevStation
+            } else if bounds.station_next.is_some_and(|r| r.contains(&position)) {
+                Hit::NextStation
             } else if let Some(bar) = bounds.bar.filter(|r| r.contains(&position)) {
                 Hit::Bar(bar)
             } else {
@@ -4355,6 +4361,12 @@ impl Terminal {
             Hit::Next => self.step_audio_track((session_id, file_id), 1),
             Hit::Like => rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::ToggleLike),
             Hit::Wave => rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::ToggleTrackWave),
+            Hit::PrevStation => {
+                rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::PreviousStation)
+            },
+            Hit::NextStation => {
+                rich_content_srv_channel::radio_control(session_id, file_id, somsrv::protocol::RadioControl::NextStation)
+            },
             Hit::Bar(bar) => {
                 if bar.size.width > Pixels::ZERO {
                     let fraction = ((position.x - bar.origin.x) / bar.size.width).clamp(0.0, 1.0);
@@ -7730,7 +7742,7 @@ mod tests {
         let widget = |x: f32, width: f32| {
             let cover = Bounds { origin: Point { x: px(x), y: px(10.) }, size: Size { width: px(20.), height: px(20.) } };
             let placement = Bounds { origin: Point { x: px(x), y: px(0.) }, size: Size { width: px(width), height: px(100.) } };
-            (rich_content_audio_widget::AudioWidgetBounds { cover: Some(cover), prev: None, next: None, bar: None, like: None, wave: None }, placement)
+            (rich_content_audio_widget::AudioWidgetBounds { cover: Some(cover), prev: None, next: None, bar: None, like: None, wave: None, station_prev: None, station_next: None }, placement)
         };
         window.update_window_entity(&terminal, |terminal, _, _| {
             let (bounds, placement) = widget(459., 432.);

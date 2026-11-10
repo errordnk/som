@@ -160,8 +160,9 @@ impl SrvChannel {
         liked: bool,
         track_wave: bool,
         wave_label: Option<String>,
+        station: Option<crate::protocol::RadioStation>,
     ) -> Result<(), String> {
-        self.send(&SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave, wave_label })
+        self.send(&SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave, wave_label, station })
     }
 
     pub fn stop_playback(&self, session_id: u32, file_id: u32) -> Result<(), String> {

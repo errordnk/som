@@ -4109,7 +4109,7 @@ fn paint_now_playing_audio_in_box(
     let mut right = left + side;
     if station.is_some() {
         // A multi-station radio: a double chevron at each edge switches the station.
-        let (chevron_left, chevron_right) = if has_nerd { ("\u{f013d}", "\u{f013e}") } else { ("<<", ">>") };
+        let (chevron_left, chevron_right) = if has_nerd { ("\u{f100}", "\u{f101}") } else { ("<<", ">>") };
         let previous = shape(chevron_left, text_color, window);
         let following = shape(chevron_right, text_color, window);
         let previous_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));

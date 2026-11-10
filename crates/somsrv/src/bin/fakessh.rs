@@ -1,13 +1,13 @@
 //! A stand-in for `ssh`, for the tests that run a remote tab without a remote
-//! machine: it drops everything up to and including `~/.local/bin/somsrv` (the
+//! machine: it drops everything up to and including `/tmp/som-somsrv/somsrv` (the
 //! options, the host, the path of the far side's binary) and runs the `somsrv`
 //! named by `FAKESSH_SOMSRV` with the rest, as the far side's shell would, with
 //! the same stdio.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(at) = args.iter().position(|arg| arg == "~/.local/bin/somsrv") else {
-        eprintln!("fakessh: no ~/.local/bin/somsrv in {args:?}");
+    let Some(at) = args.iter().position(|arg| arg == "/tmp/som-somsrv/somsrv") else {
+        eprintln!("fakessh: no /tmp/som-somsrv/somsrv in {args:?}");
         std::process::exit(2);
     };
     let Ok(somsrv) = std::env::var("FAKESSH_SOMSRV") else {

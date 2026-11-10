@@ -35,13 +35,13 @@ fn main() {
     let profile = "smoke-test-close-resize";
     let pane_id = format!("{}", uuid::Uuid::new_v4());
 
-    println!("spawning LOCAL relay: {exe:?} {profile} {pane_id} ssh {host} ~/.local/bin/somsrv {profile} <remote-pane-id> $SHELL --cursor-shape block");
+    println!("spawning LOCAL relay: {exe:?} {profile} {pane_id} ssh {host} /tmp/som-somsrv/somsrv {profile} <remote-pane-id> $SHELL --cursor-shape block");
     let mut child = Command::new(&exe)
         .arg(profile)
         .arg(&pane_id)
         .arg("ssh")
         .arg(&host)
-        .arg("~/.local/bin/somsrv")
+        .arg("/tmp/som-somsrv/somsrv")
         .arg(profile)
         .arg(&pane_id)
         .arg("$SHELL")

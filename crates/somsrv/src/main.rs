@@ -238,7 +238,7 @@ fn main() {
         // future/manual named-flag invocation. The REAL source, for an
         // SSH `tmux: true` profile, is this RELAY process's OWN
         // `$SSH_CLIENT` (set by sshd, since the RELAY itself is what
-        // `ssh host ~/.local/bin/somsrv ...` spawned) — read here,
+        // `ssh host /tmp/som-somsrv/somsrv ...` spawned) — read here,
         // mirroring what the old per-pane HOLDER spawn used to do via
         // `ssh_client_id()` before this process ever becomes a RELAY.
         // `None` for a local/WSL RELAY (no sshd involved, so no

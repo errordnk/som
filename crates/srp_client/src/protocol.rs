@@ -84,7 +84,7 @@ pub fn instance_suffix() -> String {
 ///
 /// Only ever meaningful for an SSH `tmux: true` profile's RELAY (which
 /// really does run ON the remote host, spawned via `ssh host
-/// ~/.local/bin/somsrv ...` — see `wrap_remote_command_args`) — `None`
+/// /tmp/som-somsrv/somsrv ...` — see `wrap_remote_command_args`) — `None`
 /// for a local or WSL RELAY, neither of which goes through sshd and so has
 /// no `$SSH_CLIENT` to read; `kill_orphaned_holders` only ever runs for
 /// `RemoteKind::Ssh` anyway, so those callers simply never pass `--client-

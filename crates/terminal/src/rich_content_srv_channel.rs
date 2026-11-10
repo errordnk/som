@@ -762,7 +762,7 @@ static ROUTES: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u32), A
 
 /// What a tab's `ssh`/`wsl` command names the `somsrv` on the far side by; see
 /// `terminal_view::terminal_panel::wrap_remote_command_args`.
-const REMOTE_SOMSRV: &str = "~/.local/bin/somsrv";
+const REMOTE_SOMSRV: &str = "/tmp/som-somsrv/somsrv";
 
 /// Whether a tab with this shell runs a `somsrv` relay on another machine
 /// (over ssh or in WSL): the machine whose daemon holds what a `somsrp` there

@@ -1578,7 +1578,7 @@ fn wrap_remote_command_args(
     if let RemoteKind::Ssh = remote_kind {
         wrapped_args.insert(0, "-tt".to_string());
     }
-    wrapped_args.push("~/.local/bin/somsrv".to_string());
+    wrapped_args.push("/tmp/som-somsrv/somsrv".to_string());
     wrapped_args.push(profile_name.to_string());
     wrapped_args.push(pane_id.to_string());
     wrapped_args.push("$SHELL".to_string());
@@ -1594,7 +1594,7 @@ fn wrap_remote_command_args(
     // A plain (non-tmux) SSH profile gets this for free — Som runs a bare
     // `ssh host` with no explicit command, which makes sshd start a REAL
     // login shell itself (that's also what prints the MOTD banner). A
-    // `tmux: true` profile's `ssh host ~/.local/bin/somsrv ...` is an
+    // `tmux: true` profile's `ssh host /tmp/som-somsrv/somsrv ...` is an
     // EXPLICIT remote command, which sshd never treats as a login session
     // for — so `$SHELL` was starting as a plain non-login shell, silently
     // skipping `.bash_profile`/`.profile` (only `.bashrc` still ran) and
@@ -1722,7 +1722,7 @@ pub fn rebuild_tmux_shell_with_pane_id(shell: &Shell, pane_id: String) -> Option
             ))
         }
         RemoteKind::Ssh | RemoteKind::Wsl => {
-            // wrap_remote_command_args: [...host_args, "~/.local/bin/somsrv", profile, pane_id, "$SHELL", ...]
+            // wrap_remote_command_args: [...host_args, "/tmp/som-somsrv/somsrv", profile, pane_id, "$SHELL", ...]
             let server_pos = args.iter().position(|a| a.contains("somsrv"))?;
             let pane_id_pos = server_pos + 2;
             if pane_id_pos >= args.len() {
@@ -1740,7 +1740,7 @@ pub fn rebuild_tmux_shell_with_pane_id(shell: &Shell, pane_id: String) -> Option
 
 /// Builds the argv for running `remote_program` on the far side of an
 /// `ssh`/`wsl` profile's OWN connection args — e.g. for `ssh 192.168.50.5`
-/// this gives `["192.168.50.5", "~/.local/bin/somsrv", "--version"]`,
+/// this gives `["192.168.50.5", "/tmp/som-somsrv/somsrv", "--version"]`,
 /// which `ssh` hands to a shell on the far end exactly like the real relay
 /// invocation does (`wrap_remote_command_args`). Shared by the deploy-check
 /// path so it builds the SAME kind of command line, not a parallel one that
@@ -1809,7 +1809,7 @@ fn close_unplaced_remote_sessions(host_args: &[String], remote_kind: RemoteKind,
     };
     let this_client_id = this_client_id.as_str();
 
-    let list_script = format!("~/.local/bin/somsrv --list-sessions {}", shell_quote(this_client_id));
+    let list_script = format!("/tmp/som-somsrv/somsrv --list-sessions {}", shell_quote(this_client_id));
     let quoted_list_script = shell_quote(&list_script);
     let list_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_list_script]);
     let sessions_json = match run_remote_command(remote_kind, &list_probe) {
@@ -1833,7 +1833,7 @@ fn close_unplaced_remote_sessions(host_args: &[String], remote_kind: RemoteKind,
     }
     log::info!("closing {} somsrv session(s) on {host_args:?} no restored pane took: {unplaced:?}", unplaced.len());
     for pane_id in unplaced {
-        let kill_script = format!("~/.local/bin/somsrv --kill-session {} {}", shell_quote(this_client_id), shell_quote(pane_id));
+        let kill_script = format!("/tmp/som-somsrv/somsrv --kill-session {} {}", shell_quote(this_client_id), shell_quote(pane_id));
         let quoted_kill_script = shell_quote(&kill_script);
         let kill_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_kill_script]);
         if let Err(err) = run_remote_command(remote_kind, &kill_probe) {
@@ -1982,7 +1982,7 @@ fn somsrv_needs_update(installed_build_id: Option<u64>, embedded_build_id: u64) 
 /// (`somsrv --version`: the same `HandshakeInfo` the daemon answers a handshake
 /// with), or `None` when there is none, or it cannot be run.
 fn installed_somsrv_info(host_args: &[String], remote_kind: RemoteKind) -> Option<somsrv::protocol::HandshakeInfo> {
-    let probe = wrap_remote_probe_args(host_args, "~/.local/bin/somsrv", &["--version"]);
+    let probe = wrap_remote_probe_args(host_args, "/tmp/som-somsrv/somsrv", &["--version"]);
     let output = run_remote_command(remote_kind, &probe).ok()?;
     // A login shell may print its own lines first.
     output.lines().filter(|line| line.trim_start().starts_with('{')).find_map(|line| serde_json::from_str(line.trim()).ok())
@@ -1990,7 +1990,7 @@ fn installed_somsrv_info(host_args: &[String], remote_kind: RemoteKind) -> Optio
 
 /// Makes the `somsrv` on the far side of an `ssh`/`wsl` profile the one embedded
 /// in this Som, when that is newer: the new file is uploaded and put in place
-/// at `~/.local/bin/somsrv` at once. Called before a tab to that host opens, so
+/// at `/tmp/som-somsrv/somsrv` at once. Called before a tab to that host opens, so
 /// the relay the tab starts is already the new build - and a relay of a newer
 /// build than the daemon running there replaces the daemon on connecting
 /// (`somsrv::daemon::replace_if_different`): the old daemon is stopped, whoever is
@@ -2025,14 +2025,15 @@ fn ensure_remote_binary_deployed(host_args: &[String], remote_kind: RemoteKind, 
 
     let staged_binary = stage_embedded_somsrv_to_temp_file(os, arch)?;
     let result = (|| -> anyhow::Result<()> {
-        // A fresh host has no `~/.local/bin`; scp does not create directories.
-        let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "~/.local/bin"]);
-        run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create ~/.local/bin on {host_args:?}"))?;
-        upload_to_remote(remote_kind, host_args, &staged_binary, "~/.local/bin/somsrv.upload")
+        // scp does not create directories; `/tmp` is cleared by the host now and then, so
+        // the directory is made every time.
+        let mkdir_probe = wrap_remote_probe_args(host_args, "mkdir", &["-p", "/tmp/som-somsrv"]);
+        run_remote_command(remote_kind, &mkdir_probe).with_context(|| format!("failed to create /tmp/som-somsrv on {host_args:?}"))?;
+        upload_to_remote(remote_kind, host_args, &staged_binary, "/tmp/som-somsrv/somsrv.upload")
             .with_context(|| format!("failed to upload somsrv to {host_args:?}"))?;
         // Executable first, then renamed onto the live file in one step: nothing ever
         // sees a half-written or non-executable `somsrv`.
-        let put_in_place = shell_quote("chmod +x ~/.local/bin/somsrv.upload && mv -f ~/.local/bin/somsrv.upload ~/.local/bin/somsrv");
+        let put_in_place = shell_quote("chmod +x /tmp/som-somsrv/somsrv.upload && mv -f /tmp/som-somsrv/somsrv.upload /tmp/som-somsrv/somsrv");
         let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &put_in_place]);
         run_remote_command(remote_kind, &probe).with_context(|| format!("failed to put somsrv in place on {host_args:?}"))?;
         Ok(())
@@ -2145,15 +2146,15 @@ fn read_this_client_id(host_args: &[String], remote_kind: RemoteKind) -> Option<
 /// than the real Windows OpenSSH client (`%WINDIR%\System32\OpenSSH\`) —
 /// Git for Windows puts its own `usr\bin` ahead of `System32\OpenSSH` in
 /// `PATH` by default. That MSYS build silently rewrites any argument
-/// that LOOKS like a POSIX path (`~/.local/bin/somsrv`) into a Windows
-/// path (`/c/Users/<user>/.local/bin/somsrv`) BEFORE it ever reaches the
+/// that LOOKS like a POSIX path (`/tmp/som-somsrv/somsrv`) into a Windows
+/// path (`C:/Program Files/Git/tmp/som-somsrv/somsrv`) BEFORE it ever reaches the
 /// remote host — the same automatic argv path-conversion MSYS2 programs
 /// apply to make Unix-style paths work when calling native Windows
 /// tools, applied here to an argument that was never meant to be
 /// translated at all, since it's meant for the REMOTE machine's own
 /// shell to expand, not this one. Confirmed live (2026-09-15) as the
 /// root cause of a real deploy failure: `chmod +x ~/.local/bin/somsrv`
-/// arrived on the remote host as `chmod +x /c/Users/dnk/.local/bin/
+/// (the path then) arrived on the remote host as `chmod +x /c/Users/dnk/.local/bin/
 /// somsrv` — a path that only makes sense on the LOCAL Windows machine,
 /// so `chmod` correctly reported it as not found. The real Windows
 /// OpenSSH client (confirmed live, same repro, same host) does not do
@@ -2244,7 +2245,7 @@ fn run_remote_command(remote_kind: RemoteKind, args: &[String]) -> anyhow::Resul
     // binary at all) — only the `ssh` case needs `windows_openssh_
     // binary`'s explicit resolution, see that function's own doc comment
     // for why: Git for Windows' `ssh.exe` silently rewrites POSIX-looking
-    // arguments (`~/.local/bin/somsrv`) into Windows paths before they
+    // arguments (`/tmp/som-somsrv/somsrv`) into Windows paths before they
     // ever reach the remote host, which real Windows OpenSSH does not do.
     let program = match remote_kind {
         RemoteKind::Ssh => windows_openssh_binary("ssh"),
@@ -2427,7 +2428,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(
             args,
             vec![
-                "-tt", "192.168.50.5", "~/.local/bin/somsrv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
+                "-tt", "192.168.50.5", "/tmp/som-somsrv/somsrv", "pi5", "pane-uuid-4", "$SHELL", "--cursor-shape", "block",
                 "--", "-l"
             ]
         );
@@ -2449,7 +2450,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(
             args,
             vec![
-                "--cd", "~", "~/.local/bin/somsrv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
+                "--cd", "~", "/tmp/som-somsrv/somsrv", "wsl", "pane-uuid-5", "$SHELL", "--cursor-shape", "bar",
                 "--scrollback", "5000", "--", "-l"
             ]
         );
@@ -2459,10 +2460,10 @@ mod tmux_shell_wrapping_tests {
     fn builds_a_version_probe_using_the_same_host_args_as_the_real_invocation() {
         let args = wrap_remote_probe_args(
             &["192.168.50.5".to_string()],
-            "~/.local/bin/somsrv",
+            "/tmp/som-somsrv/somsrv",
             &["--version"],
         );
-        assert_eq!(args, vec!["192.168.50.5", "~/.local/bin/somsrv", "--version"]);
+        assert_eq!(args, vec!["192.168.50.5", "/tmp/som-somsrv/somsrv", "--version"]);
     }
 
     fn session(profile_name: &str, pane_id: &str, client_id: &str) -> somsrv::protocol::SessionInfo {
@@ -2585,7 +2586,7 @@ mod tmux_shell_wrapping_tests {
         assert_eq!(program, "ssh");
         assert_eq!(args[0], "-tt");
         assert_eq!(args[1], "192.168.50.5");
-        assert_eq!(args[2], "~/.local/bin/somsrv");
+        assert_eq!(args[2], "/tmp/som-somsrv/somsrv");
         assert_eq!(args[3], "pi5"); // profile unchanged
         assert_ne!(args[4], "original-pane-id"); // pane_id replaced
         assert_eq!(args[4], fresh_pane_id); // and matches the returned pane_id
@@ -2971,9 +2972,9 @@ mod tmux_shell_wrapping_tests {
             .expect("first-ever deploy to a directory-less host should succeed, not fail on a missing ~/.local/bin");
         assert!(staged, "a host with nothing deployed yet must report that a deploy happened");
 
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
+        let version_probe = wrap_remote_probe_args(&host_args, "/tmp/som-somsrv/somsrv", &["--version"]);
         let output = run_remote_command(RemoteKind::Ssh, &version_probe)
-            .expect("the freshly-deployed ~/.local/bin/somsrv should be executable and runnable");
+            .expect("the freshly-deployed /tmp/som-somsrv/somsrv should be executable and runnable");
         let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
         assert_eq!(info.version, somsrv::protocol::current_handshake().version);
@@ -3014,9 +3015,9 @@ mod tmux_shell_wrapping_tests {
     fn test_deploy_is_a_no_op_when_already_current() {
         let host_args = integration_test_ssh_host();
 
-        let version_probe = wrap_remote_probe_args(&host_args, "~/.local/bin/somsrv", &["--version"]);
+        let version_probe = wrap_remote_probe_args(&host_args, "/tmp/som-somsrv/somsrv", &["--version"]);
         let output = run_remote_command(RemoteKind::Ssh, &version_probe)
-            .expect("remote must already have SOME somsrv at ~/.local/bin/somsrv for this test's precondition");
+            .expect("remote must already have SOME somsrv at /tmp/som-somsrv/somsrv for this test's precondition");
         let info: somsrv::protocol::HandshakeInfo =
             serde_json::from_str(output.trim()).expect("--version should print valid HandshakeInfo JSON");
         assert!(
@@ -3024,7 +3025,7 @@ mod tmux_shell_wrapping_tests {
             "test precondition not met: deploy a build that carries an id to the test host first (see doc comment)"
         );
 
-        let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "~/.local/bin/somsrv"]);
+        let mtime_probe = wrap_remote_probe_args(&host_args, "stat", &["-c", "%Y", "/tmp/som-somsrv/somsrv"]);
         let mtime_before = run_remote_command(RemoteKind::Ssh, &mtime_probe).expect("stat should succeed");
 
         ensure_remote_binary_deployed(&host_args, RemoteKind::Ssh, workspace::RemoteOs::Lnx).expect("no-op deploy should still report success");
@@ -3051,7 +3052,7 @@ mod tmux_shell_wrapping_tests {
     ///
     /// `#[ignore]`d by default — same reachability requirement as the
     /// deploy tests above, plus a working `somsrv` binary already at
-    /// `~/.local/bin/somsrv`. Run explicitly with:
+    /// `/tmp/som-somsrv/somsrv`. Run explicitly with:
     /// `cargo test -p terminal_view test_close_unplaced_remote_sessions_only_closes_the_unplaced -- --ignored --nocapture`
 
     /// Spawns a real RELAY (`somsrv <profile> <pane-id> <program>`,
@@ -3063,7 +3064,7 @@ mod tmux_shell_wrapping_tests {
     /// exercising the REAL registration path end to end rather than
     /// reaching into the daemon's registry directly.
     fn spawn_test_relay(host_args: &[String], pane_id: &str) {
-        let spawn_script = format!("nohup ~/.local/bin/somsrv test-orphan-cleanup {pane_id} /bin/sh >/dev/null 2>&1 &");
+        let spawn_script = format!("nohup /tmp/som-somsrv/somsrv test-orphan-cleanup {pane_id} /bin/sh >/dev/null 2>&1 &");
         let quoted_spawn_script = shell_quote(&spawn_script);
         let spawn_probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted_spawn_script]);
         run_remote_command(RemoteKind::Ssh, &spawn_probe).expect("failed to spawn a test relay");
@@ -3075,7 +3076,7 @@ mod tmux_shell_wrapping_tests {
     /// session identity lives in the daemon's registry, not in any
     /// process's argv.
     fn session_exists(host_args: &[String], client_id: &str, pane_id: &str) -> bool {
-        let list_script = format!("~/.local/bin/somsrv --list-sessions {}", shell_quote(client_id));
+        let list_script = format!("/tmp/som-somsrv/somsrv --list-sessions {}", shell_quote(client_id));
         let quoted = shell_quote(&list_script);
         let probe = wrap_remote_probe_args(host_args, "sh", &["-lc", &quoted]);
         let output = run_remote_command(RemoteKind::Ssh, &probe).expect("list-sessions probe should succeed");
@@ -3131,7 +3132,7 @@ mod tmux_shell_wrapping_tests {
         // production `--kill-session` call, NOT `somsrv::admin::
         // kill_session` (which would talk to a daemon on THIS machine,
         // not the remote one under test).
-        let cleanup_script = format!("~/.local/bin/somsrv --kill-session {} {}", shell_quote(&client_id), shell_quote(&live_pane_id));
+        let cleanup_script = format!("/tmp/som-somsrv/somsrv --kill-session {} {}", shell_quote(&client_id), shell_quote(&live_pane_id));
         let quoted_cleanup_script = shell_quote(&cleanup_script);
         let cleanup_probe = wrap_remote_probe_args(&host_args, "sh", &["-lc", &quoted_cleanup_script]);
         run_remote_command(RemoteKind::Ssh, &cleanup_probe).ok();

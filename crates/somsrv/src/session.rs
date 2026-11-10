@@ -529,7 +529,7 @@ impl Session {
 /// no explicit remote command) gets the MOTD banner for free — sshd itself
 /// prints it, via PAM's `pam_motd`, as part of ITS OWN login sequence,
 /// before ever handing control to a shell. A `tmux: true` SSH profile's
-/// `ssh host ~/.local/bin/somsrv ...` is an EXPLICIT remote command
+/// `ssh host /tmp/som-somsrv/somsrv ...` is an EXPLICIT remote command
 /// though, and sshd never runs the login/PAM-motd sequence for those —
 /// confirmed by direct comparison against the same host (`ssh host echo
 /// hi` -> no MOTD at all; bare `ssh host` -> full MOTD) — so by the time
@@ -605,7 +605,7 @@ mod tests {
     /// profiles never showed the system MOTD banner a plain (non-tmux)
     /// SSH profile gets for free, because sshd only runs its own
     /// `pam_motd` login sequence for a bare `ssh host` (no explicit
-    /// remote command) — `ssh host ~/.local/bin/somsrv ...` IS an
+    /// remote command) — `ssh host /tmp/som-somsrv/somsrv ...` IS an
     /// explicit command, so sshd never prints it no matter what
     /// `somsrv` does after the fact. `motd_wrapped_command` reproduces
     /// the same content sshd's own `pam_motd` would have (`run-parts

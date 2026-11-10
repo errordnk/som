@@ -1720,7 +1720,7 @@ fn announce_radio_state(ids: SrpIds) {
     let track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
     let label = RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     let result =
-        srv_channel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label));
+        srv_channel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label, None));
     if let Err(err) = result {
         eprint!("somsrp: could not announce the radio state: {err}\r\n");
     }
@@ -1764,6 +1764,8 @@ fn handle_radio_control(ids: SrpIds, control: somsrv::protocol::RadioControl) {
                 }
             }
         },
+        // somsrp's radio has one station (Yandex's); farsh plays Radio Paradise's three.
+        somsrv::protocol::RadioControl::PreviousStation | somsrv::protocol::RadioControl::NextStation => {},
     }
     announce_radio_state(ids);
 }

@@ -13,6 +13,7 @@ mod http_fetch;
 mod icy;
 mod lua;
 mod now_playing;
+mod radio_paradise;
 mod redraw;
 mod relay;
 mod server;

@@ -47,6 +47,7 @@ pub trait StreamingService: Sync {
 pub fn by_id(id: &str) -> Option<&'static dyn StreamingService> {
     match id {
         somsrv::service_link::yandex::ID => Some(&crate::yandex_music::YandexMusic),
+        crate::radio_paradise::ID => Some(&crate::radio_paradise::RadioParadise),
         _ => None,
     }
 }

@@ -179,7 +179,7 @@ struct Inner {
     cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
     /// `(liked, track_wave, wave_label)` the radio widget shows for a key
     /// (`set_radio_state`).
-    radio_states: HashMap<CacheKey, (bool, bool, Option<String>)>,
+    radio_states: HashMap<CacheKey, (bool, bool, Option<String>, Option<somsrv::protocol::RadioStation>)>,
 }
 
 /// Shared, thread-safe handle — cloned into every `Srv`-kind connection
@@ -403,8 +403,8 @@ impl SrvCache {
         if let Some((index, len, title, looping)) = inner.playlists.get(&key).cloned() {
             let _ = send(SrvResponse::Playlist { session_id, file_id, index, len, title, looping });
         }
-        if let Some((liked, track_wave, wave_label)) = inner.radio_states.get(&key).cloned() {
-            let _ = send(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label });
+        if let Some((liked, track_wave, wave_label, station)) = inner.radio_states.get(&key).cloned() {
+            let _ = send(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label, station });
         }
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
@@ -495,15 +495,23 @@ impl SrvCache {
 
     /// Records what the radio icons show for `(session_id, file_id)` and
     /// pushes it to the key's subscribers.
-    pub fn set_radio_state(&self, session_id: u32, file_id: u32, liked: bool, track_wave: bool, wave_label: Option<String>) {
+    pub fn set_radio_state(
+        &self,
+        session_id: u32,
+        file_id: u32,
+        liked: bool,
+        track_wave: bool,
+        wave_label: Option<String>,
+        station: Option<somsrv::protocol::RadioStation>,
+    ) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         if let Some(subscribers) = inner.subscribers.get(&key) {
             for subscriber in subscribers {
-                let _ = subscriber(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label: wave_label.clone() });
+                let _ = subscriber(SrvResponse::RadioState { session_id, file_id, liked, track_wave, wave_label: wave_label.clone(), station: station.clone() });
             }
         }
-        inner.radio_states.insert(key, (liked, track_wave, wave_label));
+        inner.radio_states.insert(key, (liked, track_wave, wave_label, station));
     }
 
     /// Forwards a click on a radio icon to the key's registered range
@@ -1566,7 +1574,7 @@ mod tests {
     #[test]
     fn radio_state_is_pushed_and_replayed() {
         let cache = SrvCache::new();
-        cache.set_radio_state(1, 2, true, false, None);
+        cache.set_radio_state(1, 2, true, false, None, None);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
@@ -1576,12 +1584,29 @@ mod tests {
             }
             Ok(())
         }));
-        cache.set_radio_state(1, 2, true, true, Some("Artist - Song, 1999".to_string()));
+        cache.set_radio_state(1, 2, true, true, Some("Artist - Song, 1999".to_string()), None);
 
         assert_eq!(
             *seen.lock().unwrap(),
             vec![(true, false, None), (true, true, Some("Artist - Song, 1999".to_string()))],
             "a late subscriber learns the state, then every change"
         );
+    }
+
+    #[test]
+    fn the_station_of_a_radio_is_pushed_and_replayed() {
+        let cache = SrvCache::new();
+        let station = somsrv::protocol::RadioStation { name: "Mellow Mix".to_string(), icon: "moon".to_string() };
+        cache.set_radio_state(3, 4, false, false, None, Some(station.clone()));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        cache.subscribe(3, 4, Arc::new(move |response| {
+            if let SrvResponse::RadioState { station, .. } = response {
+                sink.lock().unwrap().push(station);
+            }
+            Ok(())
+        }));
+        assert_eq!(*seen.lock().unwrap(), vec![Some(station)], "a late subscriber learns the station");
     }
 }

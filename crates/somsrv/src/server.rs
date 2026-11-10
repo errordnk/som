@@ -607,8 +607,8 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
             SrvRequest::RadioControl { session_id, file_id, control } => {
                 cache.route_radio_control(session_id, file_id, control);
             }
-            SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave, wave_label } => {
-                cache.set_radio_state(session_id, file_id, liked, track_wave, wave_label);
+            SrvRequest::AnnounceRadioState { session_id, file_id, liked, track_wave, wave_label, station } => {
+                cache.set_radio_state(session_id, file_id, liked, track_wave, wave_label, station);
             }
             SrvRequest::PlaylistStep { session_id, file_id, delta } => {
                 cache.route_playlist_step(session_id, file_id, delta);

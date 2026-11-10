@@ -80,6 +80,9 @@ pub struct RadioIcons {
     /// While it is: the track it was built from ("artist - title, year"),
     /// for the running line.
     pub wave_label: Option<String>,
+    /// A radio with several stations: the one playing. Then the like and wave
+    /// icons give way to two double chevrons that switch the station.
+    pub station: Option<somsrv::protocol::RadioStation>,
 }
 
 /// Where the widget's clickable parts were painted this frame.
@@ -95,6 +98,9 @@ pub struct AudioWidgetBounds {
     pub like: Option<Bounds<Pixels>>,
     /// The icon that switches to the radio built from the playing track.
     pub wave: Option<Bounds<Pixels>>,
+    /// The double chevrons of a multi-station radio, at the edges of the controls row.
+    pub station_prev: Option<Bounds<Pixels>>,
+    pub station_next: Option<Bounds<Pixels>>,
 }
 
 /// `(duration, elapsed)` of a station's current track, `remaining_ms`

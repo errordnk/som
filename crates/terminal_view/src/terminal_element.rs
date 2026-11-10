@@ -3967,6 +3967,12 @@ fn paint_now_playing_audio_in_box(
     // One line: the track's title first, then artist, album and year - and,
     // in a branch, the track its wave is built from.
     let mut info_parts = Vec::new();
+    // A multi-station radio names its station first, with the station's picture.
+    let station = np.radio.as_ref().and_then(|radio| radio.station.as_ref());
+    if let Some(station) = station {
+        let glyph = station_glyph(&station.icon, |glyph| window.text_system().has_glyph_for_char(resolved_font_id, glyph), has_nerd);
+        info_parts.push(format!("{glyph} {}", station.name));
+    }
     if !np.title.is_empty() {
         info_parts.push(format!("{nf_note} {}", np.title));
     }
@@ -4101,12 +4107,30 @@ fn paint_now_playing_audio_in_box(
 
     let mut x = left;
     let mut right = left + side;
+    if station.is_some() {
+        // A multi-station radio: a double chevron at each edge switches the station.
+        let (chevron_left, chevron_right) = if has_nerd { ("\u{f013d}", "\u{f013e}") } else { ("<<", ">>") };
+        let previous = shape(chevron_left, text_color, window);
+        let following = shape(chevron_right, text_color, window);
+        let previous_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));
+        let following_slot = Bounds::new(point(left + side - slot, y), gpui::size(slot, line_height));
+        previous
+            .paint(point(previous_slot.origin.x + (slot - previous.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
+        following
+            .paint(point(following_slot.origin.x + (slot - following.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
+            .log_err();
+        widget_bounds.station_prev = Some(previous_slot);
+        widget_bounds.station_next = Some(following_slot);
+        x += slot + cell_width;
+        right -= slot + cell_width;
+    }
     if has_playlist {
         // A disabled button is dimmed and takes no clicks.
         let prev = shape(nf_prev, if np.can_prev { text_color } else { dim_color }, window);
         let next = shape(nf_next, if np.can_next { text_color } else { dim_color }, window);
-        let prev_slot = Bounds::new(point(left, y), gpui::size(slot, line_height));
-        let next_slot = Bounds::new(point(left + side - slot, y), gpui::size(slot, line_height));
+        let prev_slot = Bounds::new(point(x, y), gpui::size(slot, line_height));
+        let next_slot = Bounds::new(point(right - slot, y), gpui::size(slot, line_height));
         prev.paint(point(prev_slot.origin.x + (slot - prev.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
             .log_err();
         next.paint(point(next_slot.origin.x + (slot - next.width) / 2.0, y), line_height, gpui::TextAlign::Left, None, window, cx)
@@ -4116,7 +4140,7 @@ fn paint_now_playing_audio_in_box(
         x += slot + cell_width;
         right -= slot + cell_width;
     }
-    if let Some(radio) = &np.radio {
+    if let Some(radio) = np.radio.as_ref().filter(|radio| radio.station.is_none()) {
         // A radio's icons flank the clock: the wave of the playing track
         // (dim until switched on, red while it is the radio being played)
         // after previous, the like (filled and red when liked) before next.
@@ -4172,6 +4196,28 @@ fn paint_now_playing_audio_in_box(
     let clock = is_playing.then(|| until_next_second(elapsed));
     let repaint_after = [marquee_wake, loading, clock].into_iter().flatten().min();
     (widget_bounds, repaint_after)
+}
+
+/// The glyph that goes before a station's name in the running line: what its
+/// `icon` names (`globe`, `moon`, `guitar`), from the Nerd Font when it has it,
+/// else a plain symbol.
+fn station_glyph(icon: &str, has_glyph: impl Fn(char) -> bool, has_nerd: bool) -> String {
+    let candidates: &[char] = match icon {
+        "globe" => &['\u{f01e7}', '\u{f0ac}'],
+        "moon" => &['\u{f0594}', '\u{f186}'],
+        "guitar" => &['\u{f02c4}', '\u{ef4e}'],
+        _ => &['\u{f0387}'],
+    };
+    let plain = match icon {
+        "globe" => "@",
+        "moon" => "(",
+        "guitar" => "#",
+        _ => "*",
+    };
+    if has_nerd && let Some(glyph) = candidates.iter().copied().find(|glyph| has_glyph(*glyph)) {
+        return glyph.to_string();
+    }
+    plain.to_string()
 }
 
 /// The time left as the difference of whole seconds: `duration` and

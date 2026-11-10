@@ -764,7 +764,22 @@ pub enum SrvRequest {
         track_wave: bool,
         #[serde(default)]
         wave_label: Option<String>,
+        /// The station of a radio with several (Radio Paradise's): the
+        /// widget shows its name and icon in the running line and two
+        /// double chevrons that switch the station, and no like / wave icons.
+        #[serde(default)]
+        station: Option<RadioStation>,
     },
+}
+
+/// The station a multi-station radio is playing, as the widget shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RadioStation {
+    /// "Main Mix"
+    pub name: String,
+    /// What picture goes before the name: "globe", "moon" or "guitar" (the
+    /// widget picks a glyph of its own for it; an unknown one gets a note).
+    pub icon: String,
 }
 
 /// What a click on an icon of the radio widget asks for.
@@ -775,6 +790,10 @@ pub enum RadioControl {
     /// Switch between the radio the session started with and the radio
     /// built from the track that is playing.
     ToggleTrackWave,
+    /// The double chevron on the left: the previous station.
+    PreviousStation,
+    /// The double chevron on the right: the next station.
+    NextStation,
 }
 
 /// What a listener did to a track of a radio.
@@ -941,6 +960,8 @@ pub enum SrvResponse {
         track_wave: bool,
         #[serde(default)]
         wave_label: Option<String>,
+        #[serde(default)]
+        station: Option<RadioStation>,
     },
     /// Pushed to every `SubscribeProgress` subscriber of the key whenever
     /// `somsrv` learns what an internet-radio stream it is fetching is

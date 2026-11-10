@@ -154,7 +154,7 @@ Credentials for the music services Som plays from. Today that is Yandex Music's 
 
 ```json
 "music": {
-  "yandex": { "token": "y0_...", "proxy": "http://host:3128" }
+  "yandex": { "token": "y0__...", "proxy": "http://host:3128" }
 }
 ```
 
@@ -180,14 +180,14 @@ Som has no sign-in screen of its own: it uses a token that Yandex issues to its 
 4. The browser is sent on to `music.yandex.ru`, and the token is in the address you land on, after the `#`:
 
    ```
-   https://music.yandex.ru/#access_token=y0_AgAAAA...&token_type=bearer&expires_in=31536000
+   https://music.yandex.ru/#access_token=y0__AgAAAA...&token_type=bearer&expires_in=31536000
    ```
 
-   Copy what stands between `access_token=` and the next `&` (it starts with `y0_`).
+   Copy what stands between `access_token=` and the next `&` (it starts with `y0__`).
 5. Put it into `settings.json`:
 
    ```json
-   "music": { "yandex": { "token": "y0_AgAAAA..." } }
+   "music": { "yandex": { "token": "y0__AgAAAA..." } }
    ```
 
 6. Start My Wave: make an `.m3u` file with the line `yandex` in it and run `somsrp wave.m3u` (see [Audio, internet radio and playlists](#audio-internet-radio-and-playlists)).

@@ -448,7 +448,7 @@
     <h3 class="doc-sub" id="music"><code>music</code></h3>
     <p>Учётные данные музыкальных сервисов, из которых играет Som. Сейчас это только «Моя волна» Яндекс Музыки (см. <a href="#audio-radio">Аудио, интернет-радио и плейлисты</a>).</p>
 <pre class="code-window mono">"music": {
-  "yandex": { "token": "y0_...", "proxy": "http://host:3128" }
+  "yandex": { "token": "y0__...", "proxy": "http://host:3128" }
 }</pre>
     <div class="doc-table-wrap">
       <table class="doc-table">
@@ -465,10 +465,10 @@
         <pre class="code-window mono">https://oauth.yandex.ru/authorize?response_type=token&amp;client_id=23cabbbdc6cd418abb4b39c32c41195d</pre></li>
       <li>Яндекс может показать страницу с названием приложения (Яндекс Музыка) и кнопкой «Разрешить»: это ваше согласие, что приложение получит доступ к аккаунту, нажмите её. Если вы уже соглашались раньше, Яндекс может пропустить эту страницу и сразу перенаправить вас дальше; тогда здесь ничего делать не нужно.</li>
       <li>Браузер перенаправит вас на <code>music.yandex.ru</code>, а токен окажется в адресе, на который вы попали, после <code>#</code>:
-        <pre class="code-window mono">https://music.yandex.ru/#access_token=y0_AgAAAA...&amp;token_type=bearer&amp;expires_in=31536000</pre>
-        Скопируйте то, что стоит между <code>access_token=</code> и следующим <code>&amp;</code> (начинается с <code>y0_</code>).</li>
+        <pre class="code-window mono">https://music.yandex.ru/#access_token=y0__AgAAAA...&amp;token_type=bearer&amp;expires_in=31536000</pre>
+        Скопируйте то, что стоит между <code>access_token=</code> и следующим <code>&amp;</code> (начинается с <code>y0__</code>).</li>
       <li>Вставьте его в <code>settings.json</code>:
-        <pre class="code-window mono">"music": { "yandex": { "token": "y0_AgAAAA..." } }</pre></li>
+        <pre class="code-window mono">"music": { "yandex": { "token": "y0__AgAAAA..." } }</pre></li>
       <li>Запустите «Мою волну»: сделайте файл <code>.m3u</code> со строкой <code>yandex</code> и выполните <code>somsrp wave.m3u</code> (см. <a href="#audio-radio">Аудио, интернет-радио и плейлисты</a>).</li>
     </ol>
     <p>Токен действует около года (<code>expires_in</code> выше — в секундах): когда «Моя волна» перестанет запускаться, получите новый тем же способом. Он открывает <strong>весь аккаунт Яндекса</strong> тому, у кого оказался, поэтому держите <code>settings.json</code> в тайне и не публикуйте токен. Токен такого вида даёт MP3 192 кбит/с независимо от подписки. Приложение, которое вы зарегистрируете сами на <code>oauth.yandex.ru</code>, для Яндекс Музыки не подходит.</p>

@@ -1476,7 +1476,7 @@ pub struct Terminal {
     audio_covers: std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioCover>>,
     /// The cover of the track a station announced as next, fetched while
     /// the current one plays so it is ready the moment that track starts.
-    audio_next_covers: std::cell::RefCell<std::collections::HashMap<(u32, u32), rich_content_audio_widget::AudioCover>>,
+    audio_next_covers: std::cell::RefCell<std::collections::HashMap<String, rich_content_audio_widget::AudioCover>>,
     /// Decoded covers no longer shown; the paint path (the only place
     /// with an `App`) releases their GPU copies.
     audio_cover_drops: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>>,
@@ -4082,33 +4082,27 @@ impl Terminal {
         if let Some(url) = &wanted
             && !covers.contains_key(&key)
         {
-            // The picture fetched ahead, if this is that track.
-            let cover = match upcoming.remove(&key) {
-                Some(ahead) if ahead.url() == url => ahead,
-                other => {
-                    if let Some(image) = other.and_then(|ahead| ahead.finish()) {
-                        self.audio_cover_drops.borrow_mut().push(image);
-                    }
-                    rich_content_audio_widget::AudioCover::start(url)
-                },
+            // The picture fetched ahead, if this is that track. It is kept by its address, not by the
+            // placement it was announced on: a radio's next track is a placement of its own.
+            let cover = match upcoming.remove(url.as_str()) {
+                Some(ahead) => ahead,
+                None => rich_content_audio_widget::AudioCover::start(url),
             };
             covers.insert(key, cover);
         }
         // Fetch the announced next track's picture now, not when it starts.
-        let ahead_stale = match (&announced_cover, upcoming.get(&key)) {
-            (Some(url), Some(ahead)) => ahead.url() != url,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if ahead_stale && let Some(old) = upcoming.remove(&key) {
-            if let Some(image) = old.finish() {
+        let stale: Vec<String> = upcoming.keys().filter(|url| announced_cover.as_deref() != Some(url.as_str())).cloned().collect();
+        for url in stale {
+            if let Some(old) = upcoming.remove(&url)
+                && let Some(image) = old.finish()
+            {
                 self.audio_cover_drops.borrow_mut().push(image);
             }
         }
         if let Some(url) = &announced_cover
             && wanted.as_ref() != Some(url)
         {
-            let ahead = upcoming.entry(key).or_insert_with(|| rich_content_audio_widget::AudioCover::start(url));
+            let ahead = upcoming.entry(url.clone()).or_insert_with(|| rich_content_audio_widget::AudioCover::start(url));
             // Advances the download and decode while the current one plays.
             ahead.image();
         }
@@ -4280,11 +4274,7 @@ impl Terminal {
         {
             self.audio_cover_drops.borrow_mut().push(image);
         }
-        if let Some(cover) = self.audio_next_covers.borrow_mut().remove(&key)
-            && let Some(image) = cover.finish()
-        {
-            self.audio_cover_drops.borrow_mut().push(image);
-        }
+        // `audio_next_covers` stays: it is the next track's, which is about to be a placement of its own
         self.audio_widget_bounds.borrow_mut().remove(&key);
         self.audio_timelines.borrow_mut().remove(&key);
         self.audio_displayed_remaining.borrow_mut().remove(&key);

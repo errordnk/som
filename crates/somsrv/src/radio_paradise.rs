@@ -192,6 +192,22 @@ mod tests {
         assert_eq!(http.1.borrow().len(), 2);
     }
 
+    /// Against the real service: `cargo test -p somsrv --bin somsrv -- --ignored radio_paradise_live`.
+    #[test]
+    #[ignore]
+    fn radio_paradise_live() {
+        for (station, _) in STATIONS {
+            let (_, first) = radio_tracks(&UreqHttp::new(), station, None).expect("the first batch");
+            assert!(!first.is_empty(), "{station}");
+            let last = first.last().unwrap();
+            let (_, next) = radio_tracks(&UreqHttp::new(), station, Some(&last.id)).expect("the batch after it");
+            assert!(!next.is_empty(), "{station}");
+            assert_ne!(first[0].id, next[0].id);
+            eprintln!("{station}: {} then {}; first = {} {}", first.len(), next.len(), first[0].title, first[0].target);
+            assert!(UreqHttp::new().exists(&first[0].target), "{}", first[0].target);
+        }
+    }
+
     #[test]
     fn an_unknown_station_is_an_error() {
         let http = Fake(Vec::new(), RefCell::new(Vec::new()));

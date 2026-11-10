@@ -123,7 +123,7 @@ An ordered array of tab profiles. The bare `NewTab` action (`Ctrl+Shift+=`/`Cmd+
 | `srp` | bool | `true` | Rich content (images, video, audio and markdown from `somsrp`) over this profile's own connection - for `ssh` and `wsl` profiles the files shown are the remote machine's. On for every profile; set `false` to opt out. With nothing listening on the far end the tab falls back to a plain connection after a few seconds. |
 | `lua` | bool | `true` | Lua scripting over `somsrv` for this profile. On for every profile; set `false` to opt out. |
 | `bypassVpn` | bool | `false` | `ssh` profiles on macOS/Linux: every `ssh`/`scp` of this profile — the tab itself, the `somsrv` deploy and its session probes — is bound (`-o BindInterface=…`) to the interface of the system's `default` route (Wi-Fi/LAN), so it goes around a VPN that took over traffic with its own routes. The interface is looked up whenever a tab opens. Needs the VPN's kill switch off and a default route scoped to that interface (macOS: `route -n get -ifscope en1 default` must find one). Ignored for local and `wsl` profiles and on Windows. |
-| `admin` | bool | `false` | Local shells only (ignored for `ssh`/`wsl` profiles): open this profile in a new Som window running as administrator/root — UAC on Windows, an admin-password dialog via `osascript` on macOS, `pkexec` (polkit) on Linux. Declining the prompt opens nothing. The elevated window holds just this one tab, reads your normal `settings.json`, and does not save or restore the session. |
+| `admin` | bool | `false` | Local shells only (ignored for `ssh`/`wsl` profiles): open this profile in a new Som window running as administrator/root — UAC on Windows, an admin-password dialog via `osascript` on macOS, `pkexec` (polkit) on Linux. Declining the prompt opens nothing. The elevated window holds just this one tab, reads your normal `settings.json`, and does not save or restore the session. **On Windows give such a profile `"tmux": false, "srp": false, "lua": false`** (e.g. `{ "name": "adm", "shell": "pwsh.exe", "admin": true, "tmux": false, "srp": false, "lua": false }`): then the shell is a plain PTY of the elevated window and runs as administrator. With any of the three on, the tab goes through the `somsrv` daemon, which is the normal window's one and not elevated, so the shell would run without administrator rights. |
 | `default` | bool | `false` | Marks this profile as the one the `+` button/bare `NewTab` action opens, instead of `tabs[0]`. At most one profile may set this — `settings.json` fails to parse (falls back to built-in defaults, with an "Invalid settings.json" banner) if more than one does. |
 
 **`ssh` on Windows.** A bare `ssh` (or `ssh.exe`) in a profile's `shell` is run as `%WINDIR%\System32\OpenSSH\ssh.exe`, the Windows OpenSSH client - the same one Windows Terminal runs - and not as whatever `PATH` finds first. Git for Windows puts its own MSYS build of `ssh` ahead of it, and under ConPTY that build is several times slower: holding an arrow key in micro or mc over `ssh` left a backlog of seconds and skipped 1-6 lines per frame, while the Windows client shows every line. `tmux`/`srp` tabs already used the Windows client. A `shell` that names the program by path (`"C:\Program Files\Git\usr\bin\ssh.exe" host`) is left as written, and on a machine without `System32\OpenSSH` the bare name is resolved through `PATH` as before.
@@ -160,10 +160,39 @@ Credentials for the music services Som plays from. Today that is Yandex Music's 
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
-| `yandex.token` | string | none | The account's OAuth token. Open `https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d` in a browser, sign in, and copy the `access_token` value from the address you are sent to (it is valid for about a year). It gives access to the whole Yandex account, so keep `settings.json` private. |
-| `yandex.proxy` | string | none | An `http://` or `socks5://` proxy that only the requests to Yandex Music go through - for a network the service refuses (it answers some countries with HTTP 451). |
+| `yandex.token` | string | none | The account's OAuth token (valid for about a year); how to get it is described right below. It gives access to the whole Yandex account, so keep `settings.json` private. |
+| `yandex.proxy` | string | none | An `http://` or `socks5://` proxy that only the requests to Yandex Music go through - for a network the service refuses (it answers some countries with HTTP 451). Behind a proxy the requests use IPv4 addresses only. Som does not start the proxy: it must already be running. |
 
 The settings are read by `somsrv` on the machine `somsrp` runs on.
+
+#### Getting a Yandex Music token
+
+Som has no sign-in screen of its own: it uses a token that Yandex issues to its own Yandex Music application, and you take it from Yandex's authorization page by hand, once.
+
+1. In a browser, sign in to the Yandex account that has Yandex Music (My Wave builds on that account's tastes).
+2. Open this address:
+
+   ```
+   https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d
+   ```
+
+3. Yandex may show a page with the name of the application (Yandex Music) and an *Allow* button: that is your consent that the application gets access to the account, so click it. If you have agreed before, Yandex may skip the page and send you on at once; then there is nothing to do here.
+4. The browser is sent on to `music.yandex.ru`, and the token is in the address you land on, after the `#`:
+
+   ```
+   https://music.yandex.ru/#access_token=y0_AgAAAA...&token_type=bearer&expires_in=31536000
+   ```
+
+   Copy what stands between `access_token=` and the next `&` (it starts with `y0_`).
+5. Put it into `settings.json`:
+
+   ```json
+   "music": { "yandex": { "token": "y0_AgAAAA..." } }
+   ```
+
+6. Start My Wave: make an `.m3u` file with the line `yandex` in it and run `somsrp wave.m3u` (see [Audio, internet radio and playlists](#audio-internet-radio-and-playlists)).
+
+The token is valid for about a year (`expires_in` above is in seconds): when My Wave stops starting, get a new one the same way. It opens the **whole Yandex account** to whoever has it, so keep `settings.json` private and never post the token. A token of this kind gives MP3 at 192 kbit/s whatever the subscription is. An application you register yourself on `oauth.yandex.ru` does not work for Yandex Music.
 
 ---
 
@@ -267,7 +296,7 @@ When Som starts, it doesn't wait for slow connections before showing you the win
 Every tab profile routes its terminal through a small companion process (`somsrv`) instead of a plain PTY (`"tmux": false` opts a profile out):
 
 - **Local shells:** a detached process holds the real shell and PTY; it keeps running even if Som is closed, so reopening Som reconnects to the exact same session (scrollback, running programs, and all) instead of starting over.
-- **Remote shells (`ssh`/`wsl`):** the same mechanism runs on the far end — Som deploys a small pre-built `somsrv` binary to `~/.local/bin/` on the remote host (only re-copying it when the version is out of date) and the remote shell runs inside it. This means a flaky connection or closing Som doesn't kill your remote session; reconnecting picks the same shell back up. The pre-built binary itself comes bundled inside Som (Windows, macOS, Linux amd64 and Linux arm64 such as a Raspberry Pi 5). Which one gets deployed is chosen by the profile's `"os"` field: `"win"`, `"mac"`, `"lnx"` (the default) or `"lnx-arm"`.
+- **Remote shells (`ssh`/`wsl`):** the same mechanism runs on the far end — Som deploys a small pre-built `somsrv` binary to `/tmp/som-somsrv/somsrv` on the remote host (nothing is installed in `~/.local/bin`; it is replaced whenever it is not exactly the build bundled in Som, older or newer) and the remote shell runs inside it. This means a flaky connection or closing Som doesn't kill your remote session; reconnecting picks the same shell back up. The pre-built binary itself comes bundled inside Som (Windows, macOS, Linux amd64 and Linux arm64 such as a Raspberry Pi 5). Which one gets deployed is chosen by the profile's `"os"` field: `"win"`, `"mac"`, `"lnx"` (the default) or `"lnx-arm"`.
 - Each tmux-backed pane gets its own persistent session, identified by a UUID — this is transparent to you, but it's what's saved in `db.json` to make reattachment possible. Splitting a tab gives the new pane its own independent session, not a shared one.
 - **Closing a pane or a tab ends its session** (locally and on the remote host). Quitting Som, a crash or a dropped connection keeps it, to be picked up on the next launch.
 - **No leftover sessions.** On launch, each daemon — this machine's and that of every host a restored tab runs on — hands over all the sessions it holds for you from this computer; Som gives each one back to the pane with its UUID and closes every session no pane took. Over SSH "you from this computer" is your user on the host plus this computer's address, so sessions another machine has on the same host are left alone; inside WSL it is every session its daemon holds (only Windows can reach it). A host with no tab open is not checked, and a host that is slow or unreachable doesn't hold up the launch.
@@ -292,6 +321,18 @@ somsrp https://stream.radioparadise.com/world-etc-flac
 somsrp list.m3u
 ```
 
+**Yandex Music and Radio Paradise are started from a tiny `.m3u` file.** Neither has a file or a URL of its own, so you make a playlist whose only line contains the service's name:
+
+```
+echo yandex > wave.m3u      # Yandex Music: My Wave (needs the token in settings.json, see music)
+echo paradise > radio.m3u   # Radio Paradise: Main Mix, Mellow, Rock
+
+somsrp wave.m3u
+somsrp radio.m3u
+```
+
+The line is matched without regard to case and anything around the name will do (`Radio Paradise`, or a link to one of Radio Paradise's streams); a line that names both services starts Yandex Music. Any other `.m3u` is an ordinary playlist.
+
 A playing track gets a "now playing" widget: one line with the track title (after a note icon), artist, album and year, the cover, and under it one row: previous, time played, progress bar, time left, next. The bar and the time left appear only when the track's length is known. A line that doesn't fit scrolls sideways; clicking the cover (or `Space`) pauses and resumes.
 
 - **Playlists.** Every track of an `.m3u` playlist has previous/next buttons on both sides of the bar (keys `p` / `n` work too; so do `Left`/`Up` for previous and `Right`/`Down` for next, and `Space` toggles play/pause); the list plays in a circle, and a playlist of one entry is simply looped. A lone file or URL has no buttons and plays once. `#EXTINF` titles are shown. `q`, `Esc` or `Ctrl+C` quits.
@@ -299,14 +340,13 @@ A playing track gets a "now playing" widget: one line with the track title (afte
 - **Radio.** A stream whose server name contains `radioparadise` gets the full widget: tags, time left in the track and the cover come from the station's own API. Every other station plays as a continuous stream: the artist and title come from the stream's own metadata (ICY, where the station sends it; the playlist title is shown until then), the album and cover are looked up by track (Deezer, then iTunes) with the DNA stand-in only if nothing is found, and the time shown is the time elapsed since it started - there is no time left, as a live stream has no known length.
 - **Yandex Music: My Wave.** The one thing Som plays from Yandex Music is the endless radio the service builds from your tastes. Start it from an `.m3u` file with a single line that contains `yandex` (any text will do, e.g. just `yandex`), with the account's token in `settings.json` (see [`music`](#music)):
 
-- **Radio Paradise: Main Mix, Mellow, Rock.** An `.m3u` file with a single line that contains `paradise` (`paradise`, `Radio Paradise` or a link to one of its streams; the radio always starts on the Main Mix and the other stations are a click of a chevron away; a link to any other station plays as a plain stream) plays Radio Paradise as an endless radio of its songs in FLAC, through `farsh` (`F3` on the file). The widget's row is: a double chevron, previous, time played, progress bar, time left, next, a double chevron. The chevrons at the edges switch to the previous / next station (Main Mix, Mellow, Rock, round); *next* skips to the next song at once and *previous* goes back along what was played on this station. The running line starts with the station's icon and name. There is no like and no wave on this radio.
-
   ```
   somsrp wave.m3u
   ```
 
   The widget's row is: previous, the wave-of-this-track icon, time played, progress bar, time left, the like, next. *Next* goes to the next track of the wave and never runs out; *previous* goes back along what was already played in this session (the service keeps no such history, `somsrp` does) and is dimmed on the first track; the bar can be clicked to seek. The **wave icon** is dim while you listen to My Wave (the main line) and red while a branch plays, like a liked heart. Click it and the radio branches off the track that is playing, like a branch off the main line: at once, a new track of the wave built from it starts (the track you were hearing is cut, as by *next*), and what My Wave had queued waits. Click it again and the branch is dropped: the track that is playing plays out and the tracks after it are My Wave's own queue again. While a branch plays, the widget's running line also names the track it was built from (artist - title, year). Click twice within one track (off, then on) and a new branch is made from the track you are hearing, with a new track of it starting at once - a wave of a wave. The **heart** shows whether the track is liked (filled and red when it is); a click likes it or takes the like back. Likes, finished tracks and skips are sent to Yandex Music and are what reshapes your wave. The tags and the cover of the next track are fetched while the current one plays (the next batch of the wave is asked for in good time too), so they are on screen the moment it starts. Nothing else of the service is played - no podcasts, collections, albums or audiobooks. A track is played at the quality the account's token is allowed, which for such tokens is MP3 192 kbit/s.
-- **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in.
+- **Radio Paradise: Main Mix, Mellow, Rock.** An `.m3u` file with a single line that contains `paradise` (`paradise`, `Radio Paradise` or a link to one of its streams; the radio always starts on the Main Mix and the other stations are a click of a chevron away; a link to any other station plays as a plain stream) plays Radio Paradise as an endless radio of its songs in FLAC, through `somsrp` or `farsh` (`F3` on the file). The widget's row is: a double chevron, previous, time played, progress bar, time left, next, a double chevron. The chevrons at the edges switch to the previous / next station (Main Mix, Mellow, Rock, round); *next* skips to the next song at once and *previous* goes back along what was played on this station. The running line starts with the station's icon and name. There is no like and no wave on this radio.
+- **Covers.** Looked up without any keys: the station's own picture, MusicBrainz / Cover Art Archive, Deezer, iTunes (a new release goes to Deezer and iTunes first). Nothing found, or no answer within 8 seconds: the DNA stand-in. The cover of the next track of a playlist or a radio is fetched while the current one plays, so it is there as soon as the track changes.
 
 - **Images are represented as real grid text.** Each streamed image becomes a block of Unicode placeholder cells printed into the terminal's own scrollback, so the terminal's normal scroll/clear/history handling positions and hides the image correctly with no special-casing needed — clearing the screen hides the image, and scrolling moves it exactly like any other line of output.
 - **Images keep their aspect ratio.** Som fits the decoded image inside the cell-grid footprint the sender described rather than stretching it to fill it.

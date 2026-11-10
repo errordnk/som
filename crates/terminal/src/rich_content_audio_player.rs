@@ -692,6 +692,9 @@ pub struct RichContentAudioPlayer {
     /// The default device whose stream failed to open last, so a failure is
     /// reported once rather than twice a second.
     follow_failed_for: Option<cpal::DeviceId>,
+    /// When this player was opened: a player that is not making sound long after is reported
+    /// (`Self::diagnostics`).
+    opened_at: std::time::Instant,
     /// Signals the background decode thread to stop — set on `Drop` so
     /// the thread doesn't keep polling a cache file that no longer has
     /// a live player watching it. Not joined (same reasoning `somsrp`'s
@@ -778,6 +781,7 @@ impl RichContentAudioPlayer {
             device_id: None,
             device_checked_at: std::time::Instant::now(),
             follow_failed_for: None,
+            opened_at: std::time::Instant::now(),
             decode_stop,
             position_frames,
             playing: Arc::new(AtomicBool::new(false)),
@@ -1009,6 +1013,25 @@ impl RichContentAudioPlayer {
         // only measure of "the end".
         let total_frames = if duration_ms == 0 { self.decoded_frames() } else { self.total_frames_for(duration_ms) };
         total_frames > 0 && self.position_frames.load(Ordering::Acquire) >= total_frames
+    }
+
+    /// How long ago this player was opened.
+    pub fn age(&self) -> std::time::Duration {
+        self.opened_at.elapsed()
+    }
+
+    /// What is known of why a player may not be making sound, for a log line.
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "age={:?} stream_open={} playing={} sample_rate={} decoded_frames={} playhead_frames={} decode_finished={}",
+            self.age(),
+            self.is_ready(),
+            self.is_playing(),
+            self.sample_rate(),
+            self.decoded_frames_total(),
+            self.playhead_frames(),
+            self.shared.decode_finished.load(Ordering::Acquire),
+        )
     }
 
     /// Where playback is, in frames from the start of the stream.

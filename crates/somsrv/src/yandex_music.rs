@@ -208,20 +208,9 @@ fn agent(proxy: Option<&str>) -> anyhow::Result<ureq::Agent> {
     // `api_get` reports - so a status is not turned into an error here.
     let mut builder = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(10))).http_status_as_error(false);
     if let Some(proxy) = proxy {
-        builder = builder.proxy(Some(ureq::Proxy::new(&names_resolved_by_the_proxy(proxy))?));
+        builder = builder.proxy(Some(ureq::Proxy::new(proxy)?));
     }
     Ok(ureq::Agent::new_with_config(builder.build()))
-}
-
-/// `socks5://` makes the client look the service's host up itself (ureq: the proxy is sent an
-/// address), through the system's DNS, which behind a VPN can take seconds for every new host (the
-/// tracks come from hosts that change); `socks5h://` sends the name and the proxy looks it up. A proxy
-/// is there for the service to be reached the proxy's way, its names included, so `socks5` is `socks5h`.
-fn names_resolved_by_the_proxy(proxy: &str) -> String {
-    match proxy.get(..9) {
-        Some(scheme) if scheme.eq_ignore_ascii_case("socks5://") => format!("socks5h://{}", &proxy[9..]),
-        _ => proxy.to_string(),
-    }
 }
 
 fn api_get(agent: &ureq::Agent, token: &str, what: &str, url: &str) -> anyhow::Result<String> {
@@ -635,15 +624,6 @@ mod tests {
         assert!(message.contains("music.yandex.token"), "{message}");
         assert!(message.contains("machine that somsrp runs on"), "{message}");
         assert!(message.contains("definitely/not/there/settings.json"), "{message}");
-    }
-
-    #[test]
-    fn a_socks5_proxy_looks_the_names_up_itself() {
-        assert_eq!(names_resolved_by_the_proxy("socks5://127.0.0.1:1080"), "socks5h://127.0.0.1:1080");
-        assert_eq!(names_resolved_by_the_proxy("SOCKS5://u:p@h:1"), "socks5h://u:p@h:1");
-        for as_given in ["socks5h://h:1", "http://h:8080", "socks4://h:1", "x"] {
-            assert_eq!(names_resolved_by_the_proxy(as_given), as_given);
-        }
     }
 
     #[test]

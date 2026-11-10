@@ -1659,6 +1659,24 @@ fn stream_cue(path: &str) -> Result<(), String> {
 /// between the runner and the thread that hears the clicks.
 static RADIO_TRACK_WAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Radio Paradise: one radio of several stations, which the widget's double chevrons
+/// switch (the same as `farsh`'s: the two programs show the same widget).
+const PARADISE: &str = "paradise";
+
+/// Its stations: the service's own name of each, how the widget names it, and the
+/// picture it gets in the running line.
+const PARADISE_STATIONS: [(&str, &str, &str); 3] = [("main-mix", "Main Mix", "globe"), ("mellow", "Mellow", "moon"), ("rock", "Rock", "guitar")];
+
+/// The step that goes to another station: forward like a "next", but not a skip.
+const STATION_JUMP: i32 = 3;
+
+/// Whether the radio has several stations, which one is playing (an index of
+/// `PARADISE_STATIONS`), and the move the chevrons asked for (-1 or 1) that the
+/// runner has not taken yet.
+static RADIO_MULTI_STATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RADIO_STATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RADIO_STATION_STEP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// What the last click on the wave icon asks of the radio. A branch is
 /// entered at once (the click cuts the track playing, as a "next" does, and
 /// the first track of the new wave plays); going back to main waits for the
@@ -1719,8 +1737,12 @@ fn announce_radio_state(ids: SrpIds) {
     let liked = CURRENT_RADIO_TRACK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().is_some_and(|track| track.liked);
     let track_wave = RADIO_TRACK_WAVE.load(std::sync::atomic::Ordering::Acquire);
     let label = RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let station = RADIO_MULTI_STATION.load(std::sync::atomic::Ordering::Acquire).then(|| {
+        let (_, name, icon) = PARADISE_STATIONS[RADIO_STATION.load(std::sync::atomic::Ordering::Acquire) % PARADISE_STATIONS.len()];
+        somsrv::protocol::RadioStation { name: name.to_string(), icon: icon.to_string() }
+    });
     let result =
-        srv_channel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label, None));
+        srv_channel::connect().and_then(|channel| channel.announce_radio_state(session_id, file_id, liked, track_wave, label, station));
     if let Err(err) = result {
         eprint!("somsrp: could not announce the radio state: {err}\r\n");
     }
@@ -1764,8 +1786,14 @@ fn handle_radio_control(ids: SrpIds, control: somsrv::protocol::RadioControl) {
                 }
             }
         },
-        // somsrp's radio has one station (Yandex's); farsh plays Radio Paradise's three.
-        somsrv::protocol::RadioControl::PreviousStation | somsrv::protocol::RadioControl::NextStation => {},
+        somsrv::protocol::RadioControl::PreviousStation | somsrv::protocol::RadioControl::NextStation => {
+            if RADIO_MULTI_STATION.load(std::sync::atomic::Ordering::Acquire) {
+                let step = if control == somsrv::protocol::RadioControl::NextStation { 1 } else { -1 };
+                RADIO_STATION_STEP.store(step, std::sync::atomic::Ordering::Release);
+                // the click ends the track: it was not rejected, the station was changed
+                PLAYLIST_STEP.store(STATION_JUMP, std::sync::atomic::Ordering::Release);
+            }
+        },
     }
     announce_radio_state(ids);
 }
@@ -1781,13 +1809,30 @@ fn names_yandex(line: &str) -> bool {
 /// its own, so it cannot share a playlist with other entries (`Err`); a
 /// playlist without a radio line is `Ok(None)`.
 fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, String)>, String> {
-    if !entries.iter().any(|entry| names_yandex(&entry.target)) {
+    let yandex = entries.iter().any(|entry| names_yandex(&entry.target));
+    let paradise = entries.iter().find(|entry| names_paradise(&entry.target));
+    if !yandex && paradise.is_none() {
         return Ok(None);
     }
     if entries.len() > 1 {
         return Err("a radio plays on its own, it cannot share a playlist with other entries".to_string());
     }
-    Ok(Some((somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string())))
+    match paradise {
+        Some(entry) if !yandex => Ok(Some((PARADISE, paradise_station(&entry.target).to_string()))),
+        _ => Ok(Some((somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string()))),
+    }
+}
+
+/// A playlist line that names Radio Paradise at all (its name or its stream link):
+/// it stands for the radio of its stations.
+fn names_paradise(line: &str) -> bool {
+    line.to_ascii_lowercase().contains("paradise")
+}
+
+/// The station a Radio Paradise line starts from: the one it names (`mellow`, `rock`), else the Main Mix.
+fn paradise_station(line: &str) -> &'static str {
+    let line = line.to_ascii_lowercase();
+    PARADISE_STATIONS.iter().skip(1).find(|(slug, ..)| line.contains(slug)).map_or(PARADISE_STATIONS[0].0, |(slug, ..)| slug)
 }
 
 /// A track of the radio being played, with the batch it came in (the
@@ -1901,6 +1946,13 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
 
     PLAYLIST_MODE.store(true, std::sync::atomic::Ordering::Release);
     RADIO_TRACK_WAVE.store(false, std::sync::atomic::Ordering::Release);
+    RADIO_MULTI_STATION.store(service == PARADISE, std::sync::atomic::Ordering::Release);
+    RADIO_STATION_STEP.store(0, std::sync::atomic::Ordering::Release);
+    let mut station = station.to_string();
+    if let Some(index) = PARADISE_STATIONS.iter().position(|(slug, ..)| *slug == station) {
+        RADIO_STATION.store(index, std::sync::atomic::Ordering::Release);
+    }
+    let station = &mut station;
     *RADIO_WAVE_REQUEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     *RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let mut played = fetch_radio_entries(service, station, None)?;
@@ -1978,6 +2030,29 @@ fn stream_radio(service: &'static str, station: &str) -> Result<(), String> {
             cursor = cursor.saturating_sub(1);
             continue;
         }
+        // The chevrons: another station, its queue from its start (a station that gives nothing is stayed on).
+        if step == STATION_JUMP {
+            let moved = RADIO_STATION_STEP.swap(0, std::sync::atomic::Ordering::AcqRel);
+            if moved != 0 {
+                let was = RADIO_STATION.load(std::sync::atomic::Ordering::Acquire);
+                let count = PARADISE_STATIONS.len();
+                let index = (was + if moved > 0 { 1 } else { count - 1 }) % count;
+                match fetch_radio_entries(service, PARADISE_STATIONS[index].0, None) {
+                    Ok(tracks) if !tracks.is_empty() => {
+                        RADIO_STATION.store(index, std::sync::atomic::Ordering::Release);
+                        *station = PARADISE_STATIONS[index].0.to_string();
+                        in_branch = false;
+                        main_queue.clear();
+                        *RADIO_WAVE_LABEL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        radio_feedback(service, None, &tracks[0].station, &tracks[0].batch_id, RadioEvent::RadioStarted, 0.0);
+                        played = tracks;
+                        cursor = 0;
+                        continue;
+                    },
+                    _ => {},
+                }
+            }
+        }
         // The wave icon was clicked (see [`apply_wave_request`]): a branch
         // asked for plays at once (the click ended the track), going back to
         // main waits for here, the end of the track that played out.
@@ -2039,7 +2114,7 @@ fn parse_m3u(text: &str, base_dir: Option<&std::path::Path>) -> Vec<PlaylistEntr
             continue;
         }
         // A line naming the radio service is not a file name either.
-        let is_url = line.starts_with("http://") || line.starts_with("https://") || names_yandex(line);
+        let is_url = line.starts_with("http://") || line.starts_with("https://") || names_yandex(line) || names_paradise(line);
         let path = std::path::Path::new(line);
         let target = match (is_url, path.is_absolute(), base_dir) {
             (false, false, Some(base_dir)) => base_dir.join(path).to_string_lossy().into_owned(),
@@ -2759,5 +2834,22 @@ yandex:wave
         assert_eq!(radio_in_playlist(&[entry("yandex:track:38526")]), my_wave);
         assert_eq!(radio_in_playlist(&[entry("https://stream.example/a.mp3")]), Ok(None));
         assert!(radio_in_playlist(&[entry("yandex:wave"), entry("https://stream.example/a.mp3")]).is_err());
+    }
+
+    #[test]
+    fn a_playlist_line_naming_paradise_is_its_radio_from_the_station_it_names() {
+        let entry = |target: &str| PlaylistEntry { target: target.to_string(), title: None, cue: None };
+        let main = Ok(Some(("paradise", "main-mix".to_string())));
+        assert_eq!(radio_in_playlist(&[entry("paradise")]), main);
+        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/flacm")]), main);
+        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/mellow-flac")]), Ok(Some(("paradise", "mellow".to_string()))));
+        assert_eq!(radio_in_playlist(&[entry("Radio Paradise Rock")]), Ok(Some(("paradise", "rock".to_string()))));
+        assert!(radio_in_playlist(&[entry("paradise"), entry("https://stream.example/a.mp3")]).is_err());
+        // Yandex wins a line that names both
+        assert_eq!(radio_in_playlist(&[entry("yandex paradise")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));
+        // a bare `paradise` line is not a file name
+        let entries = parse_m3u("paradise
+", Some(std::path::Path::new("/music")));
+        assert_eq!(entries[0].target, "paradise");
     }
 }

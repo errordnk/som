@@ -817,7 +817,7 @@ impl TerminalBuilder {
 
             // Detects a `somsrv`-wrapped profile by shape — either a
             // remote (`ssh`/`wsl`) profile, where `wrap_remote_command_
-            // args` always inserts the literal `~/.local/bin/somsrv`
+            // args` always inserts the literal `/tmp/som-somsrv/somsrv`
             // argument (the same key `rebuild_tmux_shell_with_fresh_pane_
             // id` uses), or a LOCAL `tmux: true` profile, where `tmux_
             // wrapped_shell`'s `RemoteKind::Local` branch makes `somsrv
@@ -7547,7 +7547,7 @@ mod tests {
         cx.executor().allow_parking();
 
         // The stand-in for ssh (named `ssh`, as the tab's command is): it drops
-        // `-tt <host> ~/.local/bin/somsrv` and runs the relay with the rest.
+        // `-tt <host> /tmp/som-somsrv/somsrv` and runs the relay with the rest.
         let somsrv_binary = somsrv::testing::debug_binary("somsrv");
         let scratch = tempfile::tempdir().unwrap();
         let fake_ssh = scratch.path().join(if cfg!(windows) { "ssh.exe" } else { "ssh" });
@@ -7560,7 +7560,7 @@ mod tests {
         let (terminal, _completion) = build_test_terminal_with_arguments(
             cx,
             fake_ssh.to_string_lossy().into_owned(),
-            ["-tt", "me@host", "~/.local/bin/somsrv", "Profile", pane_id.as_str(), shell].map(String::from).to_vec(),
+            ["-tt", "me@host", "/tmp/som-somsrv/somsrv", "Profile", pane_id.as_str(), shell].map(String::from).to_vec(),
         )
         .await;
 
@@ -10873,7 +10873,7 @@ mod tests {
     /// code and assuming).
     ///
     /// `#[ignore]`d by default: needs a real, reachable SSH host with
-    /// `~/.local/bin/somsrv` already built there (this test does
+    /// `/tmp/som-somsrv/somsrv` already built there (this test does
     /// NOT deploy it — see `ensure_remote_binary_deployed` in
     /// `terminal_panel.rs` for that, which is Som's own production path, not
     /// this test's job) and its log files live on THAT machine, not
@@ -10887,7 +10887,7 @@ mod tests {
         cx.executor().allow_parking();
 
         // Overridable via env var so this same test can be pointed at any
-        // reachable SSH host with `~/.local/bin/somsrv` already built
+        // reachable SSH host with `/tmp/som-somsrv/somsrv` already built
         // there (Mac, deb, pi5, ...) without editing this file each time —
         // defaults to `localhost` (a local sshd, e.g. WSL2's own on this
         // dev machine) so the test suite doesn't depend on a specific
@@ -10898,7 +10898,7 @@ mod tests {
 
         // Mirrors `wrap_remote_command_args`'s exact argv shape: the ssh
         // host/flags first, then the remote-side command appended after —
-        // `ssh <host> ~/.local/bin/somsrv <profile> <pane-id>
+        // `ssh <host> /tmp/som-somsrv/somsrv <profile> <pane-id>
         // $SHELL --cursor-shape ...`, letting the remote login shell expand
         // `$SHELL` to whatever the remote user's default shell is.
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
@@ -10906,7 +10906,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/somsrv".to_string(),
+                "/tmp/som-somsrv/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "$SHELL".to_string(),
@@ -11037,7 +11037,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/somsrv".to_string(),
+                "/tmp/som-somsrv/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "bash".to_string(),
@@ -11123,7 +11123,7 @@ mod tests {
     /// failure as a headless test gets.
     ///
     /// `#[ignore]`d by default: needs WSL installed with
-    /// `~/.local/bin/somsrv` already built there, and `htop`
+    /// `/tmp/som-somsrv/somsrv` already built there, and `htop`
     /// installed inside that WSL distro. Run explicitly with:
     /// `cargo test -p terminal test_wsl_htop_f2_opens_setup_screen -- --ignored --nocapture`
     #[cfg(target_os = "windows")]
@@ -11147,7 +11147,7 @@ mod tests {
                 "--cd".to_string(),
                 "~".to_string(),
                 "--".to_string(),
-                "~/.local/bin/somsrv".to_string(),
+                "/tmp/som-somsrv/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "htop".to_string(),
@@ -11220,7 +11220,7 @@ mod tests {
             "ssh".to_string(),
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/somsrv".to_string(),
+                "/tmp/som-somsrv/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "htop".to_string(),
@@ -11303,7 +11303,7 @@ mod tests {
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
             "ssh".to_string(),
-            vec![ssh_host.clone(), "~/.local/bin/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+            vec![ssh_host.clone(), "/tmp/som-somsrv/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
         )
         .await;
 
@@ -11419,7 +11419,7 @@ mod tests {
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
             "ssh".to_string(),
-            vec![ssh_host.clone(), "~/.local/bin/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
+            vec![ssh_host.clone(), "/tmp/som-somsrv/somsrv".to_string(), profile_name.to_string(), pane_id.clone(), "bash".to_string()],
         )
         .await;
 
@@ -11522,7 +11522,7 @@ mod tests {
         let args = || {
             vec![
                 ssh_host.clone(),
-                "~/.local/bin/somsrv".to_string(),
+                "/tmp/som-somsrv/somsrv".to_string(),
                 profile_name.to_string(),
                 pane_id.clone(),
                 "$SHELL".to_string(),

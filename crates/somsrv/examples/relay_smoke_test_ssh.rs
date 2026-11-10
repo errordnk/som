@@ -7,7 +7,7 @@
 //!
 //! Reproduces EXACTLY what `terminal_panel.rs`'s `wrap_remote_command_args`
 //! builds for a real `tmux: true` SSH profile: the LOCAL `somsrv.exe`'s
-//! HOLDER spawns `ssh <host> ~/.local/bin/somsrv <profile> <pane-id>
+//! HOLDER spawns `ssh <host> /tmp/som-somsrv/somsrv <profile> <pane-id>
 //! $SHELL --cursor-shape block` as its real PTY child — that remote
 //! `somsrv` then becomes ITS OWN local HOLDER/RELAY pair on the far side
 //! (a Unix-socket pipe there), spawning the user's real login shell. This
@@ -15,7 +15,7 @@
 //! directly, no real SSH hop) don't cover — the actual double-hop wire
 //! path a real Som window uses for a real `tmux: true` remote profile.
 //!
-//! Requires: `~/.local/bin/somsrv` already deployed and runnable on the
+//! Requires: `/tmp/som-somsrv/somsrv` already deployed and runnable on the
 //! target host (see `terminal_panel.rs`'s `ensure_remote_binary_deployed`
 //! for the real auto-deploy this bypasses — this test assumes it's already
 //! done, to keep this test itself fast and deploy-failure-agnostic).
@@ -41,13 +41,13 @@ fn main() {
 
     // Exactly what `wrap_remote_command_args` builds for a real `tmux: true`
     // SSH profile — see that function's doc comment.
-    println!("spawning LOCAL relay: {exe:?} {profile} {pane_id} ssh {host} ~/.local/bin/somsrv {profile} <remote-pane-id> $SHELL --cursor-shape block");
+    println!("spawning LOCAL relay: {exe:?} {profile} {pane_id} ssh {host} /tmp/som-somsrv/somsrv {profile} <remote-pane-id> $SHELL --cursor-shape block");
     let mut child = Command::new(&exe)
         .arg(profile)
         .arg(&pane_id)
         .arg("ssh")
         .arg(&host)
-        .arg("~/.local/bin/somsrv")
+        .arg("/tmp/som-somsrv/somsrv")
         .arg(profile)
         .arg(&pane_id)
         .arg("$SHELL")

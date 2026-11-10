@@ -299,6 +299,8 @@ A playing track gets a "now playing" widget: one line with the track title (afte
 - **Radio.** A stream whose server name contains `radioparadise` gets the full widget: tags, time left in the track and the cover come from the station's own API. Every other station plays as a continuous stream: the artist and title come from the stream's own metadata (ICY, where the station sends it; the playlist title is shown until then), the album and cover are looked up by track (Deezer, then iTunes) with the DNA stand-in only if nothing is found, and the time shown is the time elapsed since it started - there is no time left, as a live stream has no known length.
 - **Yandex Music: My Wave.** The one thing Som plays from Yandex Music is the endless radio the service builds from your tastes. Start it from an `.m3u` file with a single line that contains `yandex` (any text will do, e.g. just `yandex`), with the account's token in `settings.json` (see [`music`](#music)):
 
+- **Radio Paradise: Main Mix, Mellow, Rock.** An `.m3u` file with a single line that contains `paradise` (a name or the stream link; a line that also contains `mellow` or `rock` starts that station, otherwise Main Mix) plays Radio Paradise as an endless radio of its songs in FLAC, through `farsh` (`F3` on the file). The widget's row is: a double chevron, previous, time played, progress bar, time left, next, a double chevron. The chevrons at the edges switch to the previous / next station (Main Mix, Mellow, Rock, round); *next* skips to the next song at once and *previous* goes back along what was played on this station. The running line starts with the station's icon and name. There is no like and no wave on this radio.
+
   ```
   somsrp wave.m3u
   ```

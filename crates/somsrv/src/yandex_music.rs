@@ -204,13 +204,20 @@ fn signed_in_agent() -> anyhow::Result<(String, ureq::Agent)> {
 }
 
 fn agent(proxy: Option<&str>) -> anyhow::Result<ureq::Agent> {
+    Ok(ureq::Agent::new_with_config(agent_config(proxy)?))
+}
+
+fn agent_config(proxy: Option<&str>) -> anyhow::Result<ureq::config::Config> {
     // A refusal carries the service's own explanation in its body, which
     // `api_get` reports - so a status is not turned into an error here.
     let mut builder = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(10))).http_status_as_error(false);
     if let Some(proxy) = proxy {
-        builder = builder.proxy(Some(ureq::Proxy::new(proxy)?));
+        // The service has IPv6 addresses (`api.music.yandex.net` has an AAAA), and a socks5 proxy is
+        // given the address looked up here, the first being IPv6: from a proxy that has no IPv6
+        // route it hangs until the connect timeout ("timeout: connect"), every request. The IPv4 one works.
+        builder = builder.proxy(Some(ureq::Proxy::new(proxy)?)).ip_family(ureq::config::IpFamily::Ipv4Only);
     }
-    Ok(ureq::Agent::new_with_config(builder.build()))
+    Ok(builder.build())
 }
 
 fn api_get(agent: &ureq::Agent, token: &str, what: &str, url: &str) -> anyhow::Result<String> {
@@ -624,6 +631,16 @@ mod tests {
         assert!(message.contains("music.yandex.token"), "{message}");
         assert!(message.contains("machine that somsrp runs on"), "{message}");
         assert!(message.contains("definitely/not/there/settings.json"), "{message}");
+    }
+
+    #[test]
+    fn behind_a_proxy_only_ipv4_addresses_are_used_without_one_the_system_chooses() {
+        let with = agent_config(Some("socks5://127.0.0.1:1080")).unwrap();
+        assert_eq!(with.ip_family(), ureq::config::IpFamily::Ipv4Only);
+        assert!(with.proxy().is_some());
+        let without = agent_config(None).unwrap();
+        assert_eq!(without.ip_family(), ureq::config::IpFamily::Any);
+        assert!(without.proxy().is_none());
     }
 
     #[test]

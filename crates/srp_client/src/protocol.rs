@@ -920,6 +920,11 @@ pub enum SrvResponse {
     /// of this today (a markdown widget showing "failed to load"), which
     /// has no need to branch on failure kind.
     FetchFailed { session_id: u32, file_id: u32, reason: String },
+    /// Sent on the connection of a `SrvRequest::FetchResource` that succeeded, once
+    /// the whole of the resource is in the daemon's cache: a player that makes a
+    /// track ready ahead (farsh's radio) knows it can start at once. A failure is
+    /// `FetchFailed` instead.
+    FetchDone { session_id: u32, file_id: u32 },
     /// Answers `SrvRequest::RadioTracks`: the next tracks of the radio and
     /// the id of the batch they came in.
     RadioTracks { batch_id: String, tracks: Vec<RadioTrack> },

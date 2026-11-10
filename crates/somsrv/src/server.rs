@@ -619,16 +619,19 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                 }
             }
             SrvRequest::FetchResource { session_id, file_id, target, base_dir } => {
-                if let Err(err) = crate::http_fetch::fetch_and_stream(cache, session_id, file_id, &target, base_dir.as_deref()) {
-                    log::warn!("fetch for ({session_id:08x}, {file_id:08x}) target {target:?} failed: {err:#}");
-                    // Broadcast to every SubscribeProgress subscriber, not
-                    // just this one-shot connection — see
-                    // `SrvCache::notify_fetch_failed`'s own doc comment.
-                    // The direct `send_srv` reply below is kept too: it
-                    // costs nothing, and a hypothetical caller that DOES
-                    // hold this connection open still gets its answer.
-                    cache.notify_fetch_failed(session_id, file_id, err.to_string());
-                    send_srv(&connection, &writer, &SrvResponse::FetchFailed { session_id, file_id, reason: err.to_string() })?;
+                match crate::http_fetch::fetch_and_stream(cache, session_id, file_id, &target, base_dir.as_deref()) {
+                    Ok(()) => send_srv(&connection, &writer, &SrvResponse::FetchDone { session_id, file_id })?,
+                    Err(err) => {
+                        log::warn!("fetch for ({session_id:08x}, {file_id:08x}) target {target:?} failed: {err:#}");
+                        // Broadcast to every SubscribeProgress subscriber, not
+                        // just this one-shot connection — see
+                        // `SrvCache::notify_fetch_failed`'s own doc comment.
+                        // The direct `send_srv` reply below is kept too: it
+                        // costs nothing, and a hypothetical caller that DOES
+                        // hold this connection open still gets its answer.
+                        cache.notify_fetch_failed(session_id, file_id, err.to_string());
+                        send_srv(&connection, &writer, &SrvResponse::FetchFailed { session_id, file_id, reason: err.to_string() })?;
+                    }
                 }
             }
             }

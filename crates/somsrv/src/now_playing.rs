@@ -86,6 +86,11 @@ pub fn station_for_url(url: &str) -> Option<Station> {
         return None;
     }
     let path = path.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    // The songs of the radio (blocks, promos) are files of that server under `audio/`: each is
+    // a track of its own, whose tags the radio announces, not the live broadcast.
+    if path.starts_with("audio/") {
+        return None;
+    }
     // The stream name starts with the mix: `mellow-flac`, `rock-320`,
     // `global-flac`/`world-etc-flac`, `beyond-flac`; the main mix has
     // none (`flac`, `320`, `aac-128`).
@@ -749,6 +754,8 @@ mod tests {
         assert_eq!(chan("http://stream.radioparadise.com/rock-192?x=1"), Some(2));
         assert_eq!(chan("https://stream.radioparadise.com/beyond-flac"), Some(4));
         assert_eq!(chan("https://stream.radioparadise.com/flac"), Some(0));
+        // a song of the radio is a file, not the broadcast
+        assert_eq!(chan("https://audio.radioparadise.stream/audio/blocks/1/x/1334/4/g/1334-3.flac"), None);
         assert_eq!(chan("https://stream.radioparadise.com/flacm"), Some(0));
         assert_eq!(chan("https://stream.radioparadise.com/world-etc-flacm"), Some(3));
         assert_eq!(station_for_url("https://example.com/world-etc-flac"), None);

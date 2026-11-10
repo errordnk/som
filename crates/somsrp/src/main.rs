@@ -1818,21 +1818,17 @@ fn radio_in_playlist(entries: &[PlaylistEntry]) -> Result<Option<(&'static str, 
         return Err("a radio plays on its own, it cannot share a playlist with other entries".to_string());
     }
     match paradise {
-        Some(entry) if !yandex => Ok(Some((PARADISE, paradise_station(&entry.target).to_string()))),
+        Some(_) if !yandex => Ok(Some((PARADISE, PARADISE_STATIONS[0].0.to_string()))),
         _ => Ok(Some((somsrv::service_link::yandex::ID, somsrv::service_link::yandex::MY_WAVE.to_string()))),
     }
 }
 
-/// A playlist line that names Radio Paradise at all (its name or its stream link):
-/// it stands for the radio of its stations.
+/// A playlist line that names Radio Paradise (`paradise`, `Radio Paradise`): it stands for the
+/// radio of its stations, which always starts on the Main Mix. A real link (a stream of the
+/// station, for one) is not such a line: it plays as the stream it is.
 fn names_paradise(line: &str) -> bool {
-    line.to_ascii_lowercase().contains("paradise")
-}
-
-/// The station a Radio Paradise line starts from: the one it names (`mellow`, `rock`), else the Main Mix.
-fn paradise_station(line: &str) -> &'static str {
     let line = line.to_ascii_lowercase();
-    PARADISE_STATIONS.iter().skip(1).find(|(slug, ..)| line.contains(slug)).map_or(PARADISE_STATIONS[0].0, |(slug, ..)| slug)
+    line.contains("paradise") && !line.starts_with("http://") && !line.starts_with("https://")
 }
 
 /// A track of the radio being played, with the batch it came in (the
@@ -2837,13 +2833,14 @@ yandex:wave
     }
 
     #[test]
-    fn a_playlist_line_naming_paradise_is_its_radio_from_the_station_it_names() {
+    fn a_playlist_line_naming_paradise_is_its_radio_starting_on_the_main_mix() {
         let entry = |target: &str| PlaylistEntry { target: target.to_string(), title: None, cue: None };
         let main = Ok(Some(("paradise", "main-mix".to_string())));
         assert_eq!(radio_in_playlist(&[entry("paradise")]), main);
-        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/flacm")]), main);
-        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/mellow-flac")]), Ok(Some(("paradise", "mellow".to_string()))));
-        assert_eq!(radio_in_playlist(&[entry("Radio Paradise Rock")]), Ok(Some(("paradise", "rock".to_string()))));
+        assert_eq!(radio_in_playlist(&[entry("Radio Paradise Rock")]), main);
+        // a real link to a station is that stream, not the radio
+        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/mellow-flac")]), Ok(None));
+        assert_eq!(radio_in_playlist(&[entry("https://stream.radioparadise.com/flacm")]), Ok(None));
         assert!(radio_in_playlist(&[entry("paradise"), entry("https://stream.example/a.mp3")]).is_err());
         // Yandex wins a line that names both
         assert_eq!(radio_in_playlist(&[entry("yandex paradise")]), Ok(Some(("yandex", "user:onyourwave".to_string()))));

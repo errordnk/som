@@ -569,6 +569,7 @@ impl TerminalBuilder {
             rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_next_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            audio_silence_reported: std::cell::RefCell::new(std::collections::HashSet::new()),
             audio_cover_drops: std::cell::RefCell::new(Vec::new()),
             audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -942,6 +943,7 @@ impl TerminalBuilder {
                 rich_content_audio_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_next_covers: std::cell::RefCell::new(std::collections::HashMap::new()),
+                audio_silence_reported: std::cell::RefCell::new(std::collections::HashSet::new()),
                 audio_cover_drops: std::cell::RefCell::new(Vec::new()),
                 audio_widget_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 audio_timelines: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1477,6 +1479,8 @@ pub struct Terminal {
     /// The cover of the track a station announced as next, fetched while
     /// the current one plays so it is ready the moment that track starts.
     audio_next_covers: std::cell::RefCell<std::collections::HashMap<String, rich_content_audio_widget::AudioCover>>,
+    /// Placements whose player was reported (once) for not making sound: see `rich_content_audio_placements`.
+    audio_silence_reported: std::cell::RefCell<std::collections::HashSet<(u32, u32)>>,
     /// Decoded covers no longer shown; the paint path (the only place
     /// with an `App`) releases their GPU copies.
     audio_cover_drops: std::cell::RefCell<Vec<std::sync::Arc<gpui::RenderImage>>>,
@@ -3129,7 +3133,22 @@ impl Terminal {
             // confirmed live to hang the whole window). A no-op once
             // already open.
             player.poll_ready();
+            // A player that makes no sound is reported, once, with what is known of it: it was seen once after the
+            // radio went on to its next track by itself (a new widget, its info, a running bar, no sound, and
+            // no seeking), and the cause was not found; this is how the next time tells.
+            if player.age() > std::time::Duration::from_secs(3)
+                && (!player.is_ready() || (player.is_playing() && player.playhead_frames() == 0))
+                && self.audio_silence_reported.borrow_mut().insert(key)
+            {
+                log::error!(
+                    "audio placement {session_id:#x}:{file_id:#x} makes no sound: {}; cache contiguous_len={contiguous_len} total_size={total_size}",
+                    player.diagnostics()
+                );
+            }
             if player.failed() {
+                if self.audio_silence_reported.borrow_mut().insert(key) {
+                    log::error!("audio placement {session_id:#x}:{file_id:#x} failed (decode ended without a stream): {}; cache contiguous_len={contiguous_len} total_size={total_size}", player.diagnostics());
+                }
                 players.remove(&key);
                 self.rich_content_audio_progress.borrow_mut().remove(&key);
                 continue;

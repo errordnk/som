@@ -1,6 +1,8 @@
 # Плагины Som и плагин Claude: дизайн
 
-Статус: **черновик, ничего не реализовано** (2026-11-12). Заменяет `CLAUDE_PANE_DESIGN.md`.
+Статус (2026-11-12): **сторона `somsrv` реализована** — протокол §5 (`srp_client::plugin`, варианты
+`SrvRequest`/`SrvResponse`), движок и Lua API §6 (`crates/somsrv/src/plugin/`), с тестами. Сторона Som
+(`PluginView`, загрузка `~/.config/som/plugins`, ответы на `som.*`) и плагин Claude — не начаты.
 
 Механизма плагинов в Som пока нет. Этот документ проектирует его с нуля, а Claude Code — первый плагин,
 на котором механизм проверяется.
@@ -106,20 +108,19 @@ kind рисуется как `text` с пометкой — старый Som с 
 
 ```rust
 // Som → somsrv
-PluginStart { instance: Uuid, plugin: String, version: String, manifest: serde_json::Value,
-              sources: Vec<(String, String)>, cwd: PathBuf, config: serde_json::Value,
-              state: Option<serde_json::Value> }
-PluginAttach { instance: Uuid }                  // → PluginView(Snapshot) и дальше поток операций
-PluginEvent { instance: Uuid, event: ViewEvent } // Action / Submit / Interrupt / Toggle / Command / Complete
-PluginSomReply { instance: Uuid, request: u64, result: serde_json::Value } // ответ на PluginSomRequest
-PluginStop { instance: Uuid }
+PluginStart { instance: String, manifest: serde_json::Value, sources: Vec<(String, String)>,
+              cwd: String, config: serde_json::Value, state: Option<serde_json::Value> }
+PluginAttach { instance: String }                  // → PluginView(Snapshot) и дальше поток операций
+PluginEvent { instance: String, event: ViewEvent } // Action / Submit / Interrupt / Toggle / Command
+PluginSomReply { instance: String, request: u64, reply: SomReply } // Ok(Value) | Err(String)
+PluginStop { instance: String }
 ListPlugins
 
 // somsrv → Som
-PluginView { instance: Uuid, op: ViewOp }
-PluginSomRequest { instance: Uuid, request: u64, call: SomCall } // som.* (§6.9)
-PluginState { instance: Uuid, state: serde_json::Value }         // state.save (§6.8) → db.json
-PluginExited { instance: Uuid, error: Option<String> }
+PluginView { instance: String, op: ViewOp }
+PluginSomRequest { instance: String, request: u64, call: SomCall } // som.* (§6.9)
+PluginState { instance: String, state: serde_json::Value }         // state.save (§6.8) → db.json
+PluginExited { instance: String, error: Option<String> }
 Plugins(Vec<PluginInfo>)                          // instance, plugin, version, cwd, title, status
 ```
 
@@ -128,7 +129,7 @@ Plugins(Vec<PluginInfo>)                          // instance, plugin, version, 
   с результатом или ошибкой (`denied`, `unsupported`). Если Som не подключён, `somsrv` сразу отвечает
   плагину `detached`, ничего не отправляя.
 
-- `instance` выдаёт Som (UUID, как у tmux-сессий).
+- `instance` выдаёт Som (UUID строкой, как у tmux-сессий). Имя и версия плагина — из `manifest`.
 - `sources` — все `.lua` плагина (имя модуля → текст); `require` внутри VM ищет только в них.
 - `config` — секция плагина из `settings.json` Som (§8).
 - `state` — последнее `PluginState` этого экземпляра из `db.json` (при перезапуске после гибели демона).

@@ -110,7 +110,7 @@ fn idle_action(idle_for: std::time::Duration, holds_sessions: bool) -> IdleActio
 /// to 0 for a moment between two unrelated connections all the time (a `somsrp`
 /// finishing as a new one dials in), and acting on that instant would kill the
 /// daemon out from under a legitimate reconnect.
-fn spawn_idle_watcher(registry: SessionRegistry) {
+fn spawn_idle_watcher(registry: SessionRegistry, plugins: crate::plugin::PluginHost) {
     std::thread::spawn(move || {
         let mut idle_since: Option<std::time::Instant> = None;
         loop {
@@ -120,7 +120,10 @@ fn spawn_idle_watcher(registry: SessionRegistry) {
                 continue;
             }
             let idle_for = idle_since.get_or_insert_with(std::time::Instant::now).elapsed();
-            let holds_sessions = !registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty();
+            // A running plugin instance is held like a session: its
+            // processes (a `claude` mid-task) outlive every connection.
+            let holds_sessions =
+                !registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty() || !plugins.is_empty();
             match idle_action(idle_for, holds_sessions) {
                 IdleAction::Wait => {},
                 IdleAction::Shutdown => {
@@ -166,12 +169,13 @@ type SessionRegistry = Arc<Mutex<HashMap<SessionKey, Arc<RegisteredSession>>>>;
 pub fn run() -> anyhow::Result<()> {
     let registry: SessionRegistry = Arc::new(Mutex::new(HashMap::new()));
     let cache = SrvCache::new();
+    let plugins = crate::plugin::PluginHost::new();
 
     let socket_path = daemon_socket_path();
     let listener = pipe::bind(&socket_path)?;
     log::info!("somsrv daemon listening on {socket_path:?}");
 
-    spawn_idle_watcher(registry.clone());
+    spawn_idle_watcher(registry.clone(), plugins.clone());
 
     loop {
         let connection = match pipe::accept_on(&listener) {
@@ -185,6 +189,7 @@ pub fn run() -> anyhow::Result<()> {
 
         let registry = registry.clone();
         let cache = cache.clone();
+        let plugins = plugins.clone();
         std::thread::spawn(move || {
             let _connection_guard = ConnectionGuard::new();
             let kind = match ConnectionKind::read_from(&connection) {
@@ -199,7 +204,7 @@ pub fn run() -> anyhow::Result<()> {
                     log::info!("relay connected");
                     handle_relay(connection, &registry)
                 }
-                ConnectionKind::Srv => handle_srv_request(connection, &registry, &cache),
+                ConnectionKind::Srv => handle_srv_request(connection, &registry, &cache, &plugins),
             };
             if let Err(err) = result {
                 log::warn!("{kind:?} connection ended: {err:#}");
@@ -433,9 +438,22 @@ fn read_loop(connection: &PipeConnection, session: &Session) -> anyhow::Result<R
 /// a Som progress connection sends exactly one `SubscribeProgress` then
 /// waits; an admin connection sends one `ListSessions`/`KillSession` and
 /// disconnects) — each request is handled independently as it arrives.
-fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, cache: &SrvCache) -> anyhow::Result<()> {
+fn handle_srv_request(
+    connection: PipeConnection,
+    registry: &SessionRegistry,
+    cache: &SrvCache,
+    plugins: &crate::plugin::PluginHost,
+) -> anyhow::Result<()> {
     let connection = Arc::new(connection);
     let writer = Arc::new(Mutex::new(()));
+    // Which plugin instances this connection is attached to, for when it goes.
+    static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let plugin_sink: crate::plugin::Sink = {
+        let connection = connection.clone();
+        let writer = writer.clone();
+        Arc::new(move |message| send_srv(&connection, &writer, message))
+    };
 
     match read_srv_message(&connection)? {
         SrvRequest::Handshake(info) => {
@@ -634,6 +652,36 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
                     }
                 }
             }
+            SrvRequest::PluginStart { instance, manifest, sources, cwd, config, state } => {
+                let request = crate::plugin::StartRequest { manifest, sources, cwd, config, state };
+                if let Err(err) = plugins.start(&instance, request, connection_id, plugin_sink.clone()) {
+                    log::warn!("starting plugin instance {instance} failed: {err:#}");
+                    send_srv(&connection, &writer, &SrvResponse::PluginExited { instance, error: Some(format!("{err:#}")) })?;
+                }
+            }
+            SrvRequest::PluginAttach { instance } => {
+                if let Err(err) = plugins.attach(&instance, connection_id, plugin_sink.clone()) {
+                    send_srv(&connection, &writer, &SrvResponse::PluginExited { instance, error: Some(format!("{err:#}")) })?;
+                }
+            }
+            SrvRequest::PluginEvent { instance, event } => {
+                if let Err(err) = plugins.event(&instance, event) {
+                    log::info!("plugin event dropped: {err:#}");
+                }
+            }
+            SrvRequest::PluginSomReply { instance, request, reply } => {
+                if let Err(err) = plugins.som_reply(&instance, request, reply) {
+                    log::info!("plugin reply dropped: {err:#}");
+                }
+            }
+            SrvRequest::PluginStop { instance } => {
+                if let Err(err) = plugins.stop(&instance) {
+                    log::info!("stopping a plugin instance: {err:#}");
+                }
+            }
+            SrvRequest::ListPlugins => {
+                send_srv(&connection, &writer, &SrvResponse::Plugins(plugins.list()))?;
+            }
             }
         }
     })();
@@ -654,6 +702,7 @@ fn handle_srv_request(connection: PipeConnection, registry: &SessionRegistry, ca
     for (session_id, file_id) in range_responder_keys {
         cache.notify_stop_playback(session_id, file_id);
     }
+    plugins.detach_connection(connection_id);
 
     result
 }

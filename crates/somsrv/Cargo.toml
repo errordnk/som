@@ -51,7 +51,7 @@ hex.workspace = true
 hmac = "0.12"
 http.workspace = true
 log.workspace = true
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
 paths.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true

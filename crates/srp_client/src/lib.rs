@@ -16,4 +16,5 @@ pub mod channel;
 pub mod cue;
 pub mod pipe;
 pub mod placeholder;
+pub mod plugin;
 pub mod protocol;

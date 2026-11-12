@@ -770,6 +770,31 @@ pub enum SrvRequest {
         #[serde(default)]
         station: Option<RadioStation>,
     },
+    /// Starts a plugin instance (`PLUGINS_DESIGN.md`) and attaches this
+    /// connection to it, as `PluginAttach` does. `instance` is a UUID Som
+    /// gives; starting an instance that already runs only attaches.
+    /// `manifest` is the plugin's `plugin.json`; `sources` are its Lua files
+    /// (path relative to the plugin's folder, text); `config` is the plugin's
+    /// section of Som's settings; `state` is what the instance last saved
+    /// (`state.save`), when Som restarts it after the daemon went away.
+    PluginStart {
+        instance: String,
+        manifest: serde_json::Value,
+        sources: Vec<(String, String)>,
+        cwd: String,
+        config: serde_json::Value,
+        state: Option<serde_json::Value>,
+    },
+    /// Makes this connection the one the instance's view and `som.*` calls go
+    /// to: answered with `SrvResponse::PluginView(Snapshot)`, then every
+    /// change. A connection attached before is detached.
+    PluginAttach { instance: String },
+    PluginEvent { instance: String, event: crate::plugin::ViewEvent },
+    /// Som's answer to `SrvResponse::PluginSomRequest`.
+    PluginSomReply { instance: String, request: u64, reply: crate::plugin::SomReply },
+    PluginStop { instance: String },
+    /// Answered with `SrvResponse::Plugins`.
+    ListPlugins,
 }
 
 /// The station a multi-station radio is playing, as the widget shows it.
@@ -990,6 +1015,17 @@ pub enum SrvResponse {
     /// - see `SrvRequest::AnnounceCue`. Also replayed to a late
     /// subscriber.
     CueSheet { session_id: u32, file_id: u32, sheet: CueSheet },
+    /// A change to the view of an instance this connection is attached to.
+    PluginView { instance: String, op: crate::plugin::ViewOp },
+    /// A `som.*` call of the plugin; Som answers with
+    /// `SrvRequest::PluginSomReply` carrying the same `request`.
+    PluginSomRequest { instance: String, request: u64, call: crate::plugin::SomCall },
+    /// What the instance saved (`state.save`): Som keeps it in `db.json` and
+    /// passes it back in `PluginStart` if it has to start the instance again.
+    PluginState { instance: String, state: serde_json::Value },
+    /// The instance ended (stopped, or its plugin failed to load: `error`).
+    PluginExited { instance: String, error: Option<String> },
+    Plugins(Vec<crate::plugin::PluginInfo>),
 }
 
 /// The track list of a CUE sheet, as the player needs it: one audio file

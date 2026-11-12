@@ -57,19 +57,25 @@ fn open_plugin(workspace: &mut Workspace, action: &OpenPlugin, window: &mut Wind
     };
     // The active tab decides the machine: its link reaches that machine's
     // daemon; a local tab has none and uses this machine's.
-    let (link, cwd) = workspace
+    // A remote tab's cwd is not known here: its daemon reads it from the
+    // shell of the tab's session (`pane_id`).
+    let (link, cwd, pane_id) = workspace
         .active_item(cx)
         .and_then(|item| item.downcast::<TerminalView>())
         .map(|view| {
             let terminal = view.read(cx).terminal().read(cx);
-            (terminal.srv_link(), terminal.working_directory())
+            (
+                terminal.srv_link(),
+                terminal.working_directory(),
+                terminal_view::terminal_panel::tmux_pane_id(terminal.shell()),
+            )
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let cwd = cwd.map(|cwd| cwd.to_string_lossy().into_owned()).unwrap_or_default();
     let config = cx
         .try_global::<PluginConfigs>()
         .and_then(|configs| configs.0.get(&action.name).cloned())
         .unwrap_or_else(|| serde_json::json!({}));
-    let view = cx.new(|cx| PluginView::new(plugin, link, cwd, config, window, cx));
+    let view = cx.new(|cx| PluginView::new(plugin, link, cwd, pane_id, config, window, cx));
     workspace.add_item_to_main_pane(Box::new(view), None, window, cx);
 }

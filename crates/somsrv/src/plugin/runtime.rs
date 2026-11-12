@@ -81,6 +81,9 @@ struct Inner {
     procs: HashMap<u64, Proc>,
     next_proc: u64,
     timers: HashMap<String, Timer>,
+    /// The environment of the user's login shell, read at the first
+    /// `proc.spawn` (`None` until then; `Some(None)` if it could not be read).
+    login_env: Option<Option<HashMap<String, String>>>,
 }
 
 struct Timer {
@@ -104,7 +107,7 @@ impl Runtime {
             StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE,
             LuaOptions::default(),
         )?;
-        let inner = Arc::new(Mutex::new(Inner { procs: HashMap::new(), next_proc: 0, timers: HashMap::new() }));
+        let inner = Arc::new(Mutex::new(Inner { procs: HashMap::new(), next_proc: 0, timers: HashMap::new(), login_env: None }));
         let runtime = Self {
             lua,
             instance,
@@ -516,7 +519,11 @@ impl Runtime {
                     inner.next_proc += 1;
                     inner.next_proc
                 };
-                let started = start_process(&instance, id, &program, &args, &cwd, &env, lines)
+                let base_env = {
+                    let mut inner = lock(&inner);
+                    inner.login_env.get_or_insert_with(login_environment).clone()
+                };
+                let started = start_process(&instance, id, &program, &args, &cwd, base_env.as_ref(), &env, lines)
                     .map_err(|err| mlua::Error::runtime(format!("starting {program:?}: {err:#}")))?;
                 let handle = lua.create_userdata(ProcHandle { id, pid: started.pid, inner: inner.clone() })?;
                 lock(&inner).procs.insert(id, Proc { child: started.child, stdin: started.stdin, handle: handle.clone() });
@@ -679,10 +686,16 @@ fn start_process(
     program: &str,
     args: &[String],
     cwd: &str,
+    base_env: Option<&HashMap<String, String>>,
     env: &HashMap<String, String>,
     lines: bool,
 ) -> anyhow::Result<Started> {
     let mut command = Command::new(program);
+    // The login shell's environment, when there is one, in place of the
+    // daemon's: its PATH also decides where `program` is found.
+    if let Some(base_env) = base_env {
+        command.env_clear().envs(base_env);
+    }
     command.args(args).current_dir(cwd).envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -748,6 +761,75 @@ fn start_process(
     });
 
     Ok(Started { child, stdin, pid })
+}
+
+/// The environment a login shell of the user has (`$SHELL -l`), or `None`
+/// where there is no such thing to ask (Windows: the daemon already runs
+/// with the user's environment) or it could not be read.
+///
+/// Why: on a remote host the daemon is started by a relay that ssh runs as
+/// a plain command, not a login session, so its PATH lacks what the
+/// user's profile adds (`~/.local/bin`, where `claude` is installed).
+fn login_environment() -> Option<HashMap<String, String>> {
+    if cfg!(windows) {
+        return None;
+    }
+    match read_login_environment() {
+        Ok(env) => Some(env),
+        Err(err) => {
+            log::warn!("plugin processes get the daemon's environment: the login shell's could not be read: {err:#}");
+            None
+        }
+    }
+}
+
+/// Printed before the environment, so whatever the profile prints first is skipped.
+const ENV_MARKER: &str = "__SOM_PLUGIN_ENV__";
+
+fn read_login_environment() -> anyhow::Result<HashMap<String, String>> {
+    let shell = std::env::var("SHELL").ok().filter(|shell| !shell.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    let script = format!("printf '\n{ENV_MARKER}\n'; env -0 2>/dev/null || env");
+    let mut child = Command::new(&shell)
+        .args(["-l", "-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() > deadline {
+            child.kill()?;
+            anyhow::bail!("{shell} -l did not finish in 10 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))??;
+    parse_environment(&output).ok_or_else(|| anyhow::anyhow!("{shell} -l printed no environment"))
+}
+
+/// The variables after the last marker line: NUL-separated (`env -0`), or
+/// one per line where `env -0` is missing.
+fn parse_environment(output: &[u8]) -> Option<HashMap<String, String>> {
+    let marker = format!("\n{ENV_MARKER}\n");
+    let text = String::from_utf8_lossy(output);
+    let start = text.rfind(&marker)? + marker.len();
+    let body = &text[start..];
+    let separator = if body.contains('\0') { '\0' } else { '\n' };
+    let env: HashMap<String, String> = body
+        .split(separator)
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(name, _)| !name.is_empty() && !name.contains(char::is_whitespace))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    env.contains_key("PATH").then_some(env)
 }
 
 fn forward_chunks(mut stream: impl Read, sender: &mpsc::Sender<Event>, id: u64, wrap: fn(Vec<u8>) -> ProcEvent) {
@@ -829,3 +911,30 @@ som = {
 }
 __som_api = nil
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_after_the_marker_is_read_and_profile_noise_skipped() {
+        let output = format!("Welcome to deb!\nLast login: today\n\n{ENV_MARKER}\nPATH=/home/u/.local/bin:/usr/bin\0HOME=/home/u\0MULTI=a\nb\0");
+        let env = parse_environment(output.as_bytes()).expect("an environment");
+        assert_eq!(env["PATH"], "/home/u/.local/bin:/usr/bin");
+        assert_eq!(env["MULTI"], "a\nb");
+        assert_eq!(env["HOME"], "/home/u");
+    }
+
+    #[test]
+    fn without_env_0_one_variable_per_line() {
+        let output = format!("\n{ENV_MARKER}\nPATH=/usr/bin\nHOME=/home/u\n");
+        let env = parse_environment(output.as_bytes()).expect("an environment");
+        assert_eq!(env["HOME"], "/home/u");
+    }
+
+    #[test]
+    fn no_marker_or_no_path_is_no_environment() {
+        assert!(parse_environment(b"just a motd\n").is_none());
+        assert!(parse_environment(format!("\n{ENV_MARKER}\nHOME=/x\0").as_bytes()).is_none());
+    }
+}

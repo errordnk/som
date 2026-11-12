@@ -37,6 +37,7 @@ impl PluginClient {
         instance: String,
         plugin: &Plugin,
         cwd: String,
+        pane_id: Option<String>,
         config: serde_json::Value,
         state: Option<serde_json::Value>,
     ) -> anyhow::Result<(Arc<Self>, async_channel::Receiver<Incoming>)> {
@@ -47,6 +48,7 @@ impl PluginClient {
             manifest: plugin.manifest.clone(),
             sources: plugin.sources.clone(),
             cwd,
+            pane_id,
             config,
             state,
         })?;

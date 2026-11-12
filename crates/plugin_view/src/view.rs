@@ -53,6 +53,7 @@ impl PluginView {
         plugin: Plugin,
         link: Option<Arc<SrvLink>>,
         cwd: String,
+        pane_id: Option<String>,
         config: serde_json::Value,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -63,7 +64,7 @@ impl PluginView {
         let instance = uuid::Uuid::new_v4().to_string();
         let start_plugin = plugin.clone();
         let started = cx.background_spawn(async move {
-            PluginClient::start(link, instance, &start_plugin, cwd, config, None)
+            PluginClient::start(link, instance, &start_plugin, cwd, pane_id, config, None)
         });
         cx.spawn(async move |this, cx| {
             let (client, incoming) = match started.await {

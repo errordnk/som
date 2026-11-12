@@ -395,6 +395,15 @@ impl Session {
         rx
     }
 
+    /// The current directory of the session's shell (`None` once it is gone).
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.pid?;
+        let mut system = sysinfo::System::new();
+        let refresh_kind = sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always);
+        system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh_kind);
+        system.process(pid).and_then(|process| process.cwd()).map(std::path::Path::to_path_buf)
+    }
+
     /// Kills the underlying process for real (used for an explicit
     /// `CloseSession` — as opposed to a client just disconnecting, which
     /// leaves the session alive so it can be re-attached to).

@@ -781,7 +781,12 @@ pub enum SrvRequest {
         instance: String,
         manifest: serde_json::Value,
         sources: Vec<(String, String)>,
+        /// Where the plugin works; empty when Som does not know it (a
+        /// remote tab): then the cwd of the shell of `pane_id`, the
+        /// session this daemon holds for the tab, else the home folder.
         cwd: String,
+        #[serde(default)]
+        pane_id: Option<String>,
         config: serde_json::Value,
         state: Option<serde_json::Value>,
     },

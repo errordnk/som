@@ -433,6 +433,8 @@ fn main() {
         ui_prompt::init(cx);
 
         terminal_view::init(cx);
+        plugin_view::init(cx);
+        plugin_view::set_configs(som_config.plugins.clone(), cx);
 
         // Apply keybindings after all actions are registered
         som_config.apply_keys(cx);

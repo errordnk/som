@@ -861,21 +861,21 @@ fn remove_other_staged_daemons(current: &std::path::Path) {
 }
 
 
-/// One connection to whichever daemon `(session_id, file_id)` belongs to.
-enum SrvConnection {
+/// One connection to a daemon: this machine's, or the one a link reaches.
+pub enum SrvConnection {
     Local(somsrv::pipe::PipeConnection),
     Linked(LinkChannel),
 }
 
 impl SrvConnection {
-    fn read_message(&self) -> anyhow::Result<Vec<u8>> {
+    pub fn read_message(&self) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Local(connection) => connection.read_message(),
             Self::Linked(channel) => channel.read_message(),
         }
     }
 
-    fn write_message(&self, payload: &[u8]) -> anyhow::Result<()> {
+    pub fn write_message(&self, payload: &[u8]) -> anyhow::Result<()> {
         match self {
             Self::Local(connection) => connection.write_message(payload),
             Self::Linked(channel) => channel.write_message(payload),
@@ -1217,6 +1217,12 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
 
 fn connect_and_handshake(session_id: u32, file_id: u32) -> anyhow::Result<SrvConnection> {
     let link = ROUTES.lock().unwrap_or_else(|p| p.into_inner()).get(&(session_id, file_id)).cloned();
+    connect(link)
+}
+
+/// A handshaken `Srv` connection to the daemon `link` reaches (a remote
+/// tab's), or to this machine's (started if it is not running) without one.
+pub fn connect(link: Option<Arc<SrvLink>>) -> anyhow::Result<SrvConnection> {
     let connection = match link {
         // The key was announced on another machine: ask that machine's daemon.
         Some(link) => SrvConnection::Linked(link.open_channel()?),

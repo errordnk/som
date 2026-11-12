@@ -412,6 +412,14 @@ pub fn themes_dir() -> &'static PathBuf {
     THEMES_DIR.get_or_init(|| config_dir().join("themes"))
 }
 
+/// Returns the path to the Lua plugins directory (`PLUGINS_DESIGN.md`): one
+/// folder per plugin, `plugin.json` plus its `*.lua` files. The user puts
+/// them there, as with themes; Som only reads it.
+pub fn plugins_dir() -> &'static PathBuf {
+    static PLUGINS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    PLUGINS_DIR.get_or_init(|| config_dir().join("plugins"))
+}
+
 /// Returns the path to the snippets directory.
 pub fn snippets_dir() -> &'static PathBuf {
     static SNIPPETS_DIR: OnceLock<PathBuf> = OnceLock::new();

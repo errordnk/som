@@ -53,6 +53,75 @@ pub struct Block {
     pub children: Vec<Block>,
 }
 
+impl ViewModel {
+    /// Applies `op`; both sides use this, `somsrv` on its model and Som on
+    /// what it draws. Fails for a block id that is not in the view (a single
+    /// op then changes nothing).
+    pub fn apply(&mut self, op: &ViewOp) -> Result<(), String> {
+        match op {
+            ViewOp::Snapshot(view) => *self = view.clone(),
+            ViewOp::Append { parent, block } => match parent {
+                None => self.blocks.push(block.clone()),
+                Some(parent) => self.block_mut(*parent).ok_or_else(|| format!("no block {parent}"))?.children.push(block.clone()),
+            },
+            ViewOp::Update { id, props } => {
+                let block = self.block_mut(*id).ok_or_else(|| format!("no block {id}"))?;
+                if !block.props.is_object() {
+                    block.props = serde_json::Value::Object(serde_json::Map::new());
+                }
+                if let Some(target) = block.props.as_object_mut() {
+                    for (key, value) in props {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            ViewOp::Remove { id } => {
+                if !remove_block(&mut self.blocks, *id) {
+                    return Err(format!("no block {id}"));
+                }
+            }
+            ViewOp::Clear => self.blocks.clear(),
+            ViewOp::Header(header) => self.header = header.clone(),
+            ViewOp::Input(input) => self.input = input.clone(),
+            ViewOp::ScrollTo { id } => {
+                if self.block_mut(*id).is_none() {
+                    return Err(format!("no block {id}"));
+                }
+            }
+            ViewOp::Batch(ops) => {
+                for op in ops {
+                    self.apply(op)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn block_mut(&mut self, id: BlockId) -> Option<&mut Block> {
+        find_block(&mut self.blocks, id)
+    }
+}
+
+fn find_block(blocks: &mut [Block], id: BlockId) -> Option<&mut Block> {
+    for block in blocks {
+        if block.id == id {
+            return Some(block);
+        }
+        if let Some(found) = find_block(&mut block.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn remove_block(blocks: &mut Vec<Block>, id: BlockId) -> bool {
+    if let Some(index) = blocks.iter().position(|block| block.id == id) {
+        blocks.remove(index);
+        return true;
+    }
+    blocks.iter_mut().any(|block| remove_block(&mut block.children, id))
+}
+
 /// A change to a view, `somsrv` -> Som.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ViewOp {

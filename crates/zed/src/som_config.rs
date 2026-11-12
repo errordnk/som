@@ -38,6 +38,9 @@ pub struct SomConfig {
     pub log: LogConfig,
     pub tabs: Vec<TabProfile>,
     pub keys: IndexMap<String, String>,
+    /// Each plugin's own settings (`PLUGINS_DESIGN.md` section 8), passed to
+    /// it as `ctx.config`; Som does not read them.
+    pub plugins: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -362,6 +365,17 @@ impl SomConfig {
                 ));
                 continue;
             }
+            // "Plugin:<name>" opens that plugin on the machine of the active tab.
+            if let Some(plugin) = action_name.strip_prefix("Plugin:") {
+                // A plugin name is letters, digits, '-' and '_' (the loader
+                // refuses others); anything else is dropped here so it cannot
+                // break the JSON.
+                let plugin: String = plugin.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+                entries.push(format!(
+                    "{{ \"context\": \"Terminal\", \"bindings\": {{ \"{keystroke}\": [\"plugin_view::OpenPlugin\", {{ \"name\": \"{plugin}\" }}] }} }}"
+                ));
+                continue;
+            }
             if let Some((gpui_action, ctx, as_obj)) = som_action_to_gpui(action_name) {
                 let binding = if as_obj {
                     format!("[\"{gpui_action}\", {{ \"persist\": false }}]")
@@ -623,6 +637,7 @@ impl SomConfig {
                         cx.update(|cx| {
                             config.apply_settings(cx);
                             config.apply_keys(cx);
+                            plugin_view::set_configs(config.plugins.clone(), cx);
                             workspace::TabProfiles::set(config.tab_profiles(), cx);
 
                             let padding = config.window.padding.clone().unwrap_or_default();

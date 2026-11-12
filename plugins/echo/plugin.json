@@ -1,0 +1,9 @@
+{
+  "name": "echo",
+  "version": "1",
+  "api": 1,
+  "title": "Echo",
+  "entry": "main.lua",
+  "spawn": ["uname", "hostname"],
+  "permissions": ["clipboard", "notify"]
+}

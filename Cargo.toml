@@ -39,6 +39,7 @@ members = [
     "crates/sum_tree",
     "crates/syntax_theme",
     "crates/terminal",
+    "crates/plugin_view",
     "crates/terminal_view",
     "crates/text",
     "crates/theme",
@@ -121,6 +122,7 @@ syntax_theme = { path = "crates/syntax_theme" }
 task = { path = "crates/task" }
 terminal = { path = "crates/terminal" }
 terminal_view = { path = "crates/terminal_view" }
+plugin_view = { path = "crates/plugin_view" }
 text = { path = "crates/text" }
 theme = { path = "crates/theme" }
 theme_settings = { path = "crates/theme_settings" }

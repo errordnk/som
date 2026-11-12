@@ -5715,6 +5715,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "gpui",
+ "log",
+ "markdown",
+ "paths",
+ "schemars",
+ "serde",
+ "serde_json",
+ "settings",
+ "somsrv",
+ "srp_client",
+ "tempfile",
+ "terminal",
+ "terminal_view",
+ "theme",
+ "theme_settings",
+ "ui",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7314,6 +7340,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "pkg-config",
+ "plugin_view",
  "project",
  "rayon",
  "release_channel",

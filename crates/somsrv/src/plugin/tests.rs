@@ -307,3 +307,27 @@ fn a_plugin_needing_a_newer_api_is_refused() {
     assert!(host.start("x", request, 1, sink).is_err());
     assert!(host.is_empty());
 }
+
+/// The repository's own test plugin (`plugins/echo`), as Som would send it.
+#[test]
+fn the_echo_plugin_starts_and_echoes() {
+    let folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/echo");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("plugin.json")).expect("plugin.json")).expect("json");
+    let main = std::fs::read_to_string(folder.join("main.lua")).expect("main.lua");
+    let mut fixture = start_with(&main, manifest, None);
+    fixture.until_view("the start", |view| view.header.title.as_deref() == Some("Echo") && view.input.enabled);
+
+    fixture.event(ViewEvent::Submit { text: "hi".into() });
+    fixture.until_view("the echo", |view| view.blocks.iter().any(|block| block.kind == "markdown"));
+    let echoed = fixture.view.blocks.iter().find(|block| block.kind == "markdown").expect("markdown");
+    assert_eq!(echoed.props["text"], json!("**#1** you said: hi"));
+    assert!(fixture.view.header.error.is_none(), "{:?}", fixture.view.header.error);
+
+    fixture.event(ViewEvent::Submit { text: "/tick".into() });
+    fixture.until_view("three ticks", |view| fixture_texts(view).iter().any(|text| text == "tick 3"));
+}
+
+fn fixture_texts(view: &ViewModel) -> Vec<String> {
+    view.blocks.iter().filter_map(|block| block.props["text"].as_str().map(str::to_owned)).collect()
+}

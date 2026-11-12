@@ -55,6 +55,7 @@ reqwest_client.workspace = true
 rope.workspace = true
 session.workspace = true
 settings.workspace = true
+plugin_view.workspace = true
 terminal_view.workspace = true
 theme.workspace = true
 theme_settings.workspace = true

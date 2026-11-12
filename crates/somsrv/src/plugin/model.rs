@@ -2,7 +2,7 @@
 //! plugin makes is applied here first, so a Som that attaches later gets the
 //! whole view in one `Snapshot`.
 
-use srp_client::plugin::{Block, BlockId, ViewModel, ViewOp};
+use srp_client::plugin::{BlockId, ViewModel, ViewOp};
 
 #[derive(Debug, Default)]
 pub struct Model {
@@ -16,82 +16,23 @@ impl Model {
         self.next_id
     }
 
-    /// Applies `op`. Fails (and changes nothing) for a block id that is not
-    /// in the view, so a plugin's mistake reaches it as a Lua error.
+    /// Applies `op` (`ViewModel::apply`); a plugin's mistake reaches it as a Lua error.
     pub fn apply(&mut self, op: &ViewOp) -> anyhow::Result<()> {
-        match op {
-            ViewOp::Snapshot(view) => self.view = view.clone(),
-            ViewOp::Append { parent, block } => match parent {
-                None => self.view.blocks.push(block.clone()),
-                Some(parent) => find_mut(&mut self.view.blocks, *parent)
-                    .ok_or_else(|| anyhow::anyhow!("no block {parent}"))?
-                    .children
-                    .push(block.clone()),
-            },
-            ViewOp::Update { id, props } => {
-                let block = find_mut(&mut self.view.blocks, *id).ok_or_else(|| anyhow::anyhow!("no block {id}"))?;
-                if !block.props.is_object() {
-                    block.props = serde_json::Value::Object(serde_json::Map::new());
-                }
-                if let Some(target) = block.props.as_object_mut() {
-                    for (key, value) in props {
-                        target.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-            ViewOp::Remove { id } => {
-                if !remove(&mut self.view.blocks, *id) {
-                    anyhow::bail!("no block {id}");
-                }
-            }
-            ViewOp::Clear => self.view.blocks.clear(),
-            ViewOp::Header(header) => self.view.header = header.clone(),
-            ViewOp::Input(input) => self.view.input = input.clone(),
-            ViewOp::ScrollTo { id } => {
-                if find_mut(&mut self.view.blocks, *id).is_none() {
-                    anyhow::bail!("no block {id}");
-                }
-            }
-            ViewOp::Batch(ops) => {
-                for op in ops {
-                    self.apply(op)?;
-                }
-            }
-        }
-        Ok(())
+        self.view.apply(op).map_err(|err| anyhow::anyhow!(err))
     }
 
     pub fn set_collapsed(&mut self, id: BlockId, collapsed: bool) {
-        if let Some(block) = find_mut(&mut self.view.blocks, id) {
+        if let Some(block) = self.view.block_mut(id) {
             block.collapsed = collapsed;
         }
     }
-}
-
-fn find_mut(blocks: &mut [Block], id: BlockId) -> Option<&mut Block> {
-    for block in blocks {
-        if block.id == id {
-            return Some(block);
-        }
-        if let Some(found) = find_mut(&mut block.children, id) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn remove(blocks: &mut Vec<Block>, id: BlockId) -> bool {
-    if let Some(index) = blocks.iter().position(|block| block.id == id) {
-        blocks.remove(index);
-        return true;
-    }
-    blocks.iter_mut().any(|block| remove(&mut block.children, id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use srp_client::plugin::Block;
 
     fn block(model: &mut Model, kind: &str, props: serde_json::Value) -> Block {
         Block { id: model.next_block_id(), kind: kind.into(), props, collapsed: false, children: Vec::new() }

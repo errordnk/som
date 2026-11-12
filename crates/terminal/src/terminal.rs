@@ -2537,6 +2537,12 @@ impl Terminal {
         self.srv_link.as_ref().is_some_and(|link| link.end_session())
     }
 
+    /// The link to the daemon of this tab's machine, for a remote tab (ssh,
+    /// wsl); `None` for a local one, whose daemon is this machine's.
+    pub fn srv_link(&self) -> Option<Arc<somsrv::link::SrvLink>> {
+        self.srv_link.clone()
+    }
+
     pub fn set_cursor_shape(&mut self, cursor_shape: CursorShape) {
         self.term_config.default_cursor_style = cursor_shape.into();
         self.term.lock().set_options(self.term_config.clone());

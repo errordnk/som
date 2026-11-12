@@ -43,6 +43,10 @@ pub struct Manifest {
     pub permissions: Vec<String>,
 }
 
+fn home_dir() -> String {
+    std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into())
+}
+
 fn default_api() -> u32 {
     1
 }
@@ -93,7 +97,8 @@ impl PluginHost {
         let instance = Arc::new(Instance {
             id: id.to_owned(),
             manifest,
-            cwd: request.cwd,
+            // Som does not know the cwd of a remote tab (yet): the home folder then.
+            cwd: if request.cwd.is_empty() { home_dir() } else { request.cwd },
             events,
             shared: Mutex::new(Shared::default()),
         });

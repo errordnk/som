@@ -93,7 +93,7 @@
 Поле ввода: `enabled`, `placeholder`, `multiline`.
 
 Операции `somsrv → Som`: `Snapshot(model)`, `Append{parent?, block}`, `Update{id, props}`,
-`Remove{id}`, `Header{…}`, `Input{…}`, `Command{…}` (§6).
+`Remove{id}`, `Clear`, `Header{…}`, `Input{…}`, `ScrollTo{id}`, `Batch(Vec<ViewOp>)` (§6.2).
 Операции `Som → somsrv`: `Action{block_id, button_id}`, `Submit{text}`, `Interrupt`, `Toggle{id}`
 (сворачивание запоминается в модели, чтобы пережить переподключение).
 
@@ -106,63 +106,137 @@ kind рисуется как `text` с пометкой — старый Som с 
 
 ```rust
 // Som → somsrv
-PluginStart { instance: Uuid, plugin: String, version: String, sources: Vec<(String, String)>,
-              cwd: PathBuf, config: serde_json::Value }
+PluginStart { instance: Uuid, plugin: String, version: String, manifest: serde_json::Value,
+              sources: Vec<(String, String)>, cwd: PathBuf, config: serde_json::Value,
+              state: Option<serde_json::Value> }
 PluginAttach { instance: Uuid }                  // → PluginView(Snapshot) и дальше поток операций
-PluginEvent { instance: Uuid, event: ViewEvent } // Action / Submit / Interrupt / Toggle
+PluginEvent { instance: Uuid, event: ViewEvent } // Action / Submit / Interrupt / Toggle / Command / Complete
+PluginSomReply { instance: Uuid, request: u64, result: serde_json::Value } // ответ на PluginSomRequest
 PluginStop { instance: Uuid }
 ListPlugins
 
 // somsrv → Som
 PluginView { instance: Uuid, op: ViewOp }
+PluginSomRequest { instance: Uuid, request: u64, call: SomCall } // som.* (§6.9)
+PluginState { instance: Uuid, state: serde_json::Value }         // state.save (§6.8) → db.json
 PluginExited { instance: Uuid, error: Option<String> }
 Plugins(Vec<PluginInfo>)                          // instance, plugin, version, cwd, title, status
 ```
 
+- `SomCall` — `OpenTerminal`/`Notify`/`Preview`/`ClipboardWrite`/`Confirm`/`OpenUrl`/`OpenPlugin`.
+  Som проверяет разрешение по манифесту **сам** (не доверяет `somsrv`) и отвечает `PluginSomReply`
+  с результатом или ошибкой (`denied`, `unsupported`). Если Som не подключён, `somsrv` сразу отвечает
+  плагину `detached`, ничего не отправляя.
+
 - `instance` выдаёт Som (UUID, как у tmux-сессий).
 - `sources` — все `.lua` плагина (имя модуля → текст); `require` внутри VM ищет только в них.
 - `config` — секция плагина из `settings.json` Som (§8).
+- `state` — последнее `PluginState` этого экземпляра из `db.json` (при перезапуске после гибели демона).
 
 ## 6. Lua API плагина
 
-VM создаётся с тем же белым списком stdlib, что сейчас (`TABLE|STRING|MATH|UTF8|COROUTINE`), плюс
-собственный `require` по `sources`. Всё остальное — зарегистрированные Rust-функции, и каждая доступна
-только если её разрешает манифест плагина (§7).
+Весь API — функции Lua-движка в `somsrv`. Он делится на две части:
 
-```lua
--- вид
-ui.header{ title = "Claude", subtitle = cwd, status = "busy" }
-local id = ui.append{ kind = "markdown", props = { text = "…" } }   -- parent = необязательный id группы
-ui.update(id, { text = "…ещё" })
-ui.remove(id)
-ui.input{ enabled = true, multiline = true, placeholder = "Сообщение" }
-ui.command{ open_terminal = { cmd = { "claude", "--resume", sid } } }  -- попросить Som открыть вкладку
+- **Выполняется в `somsrv`:** события, модель панели, процессы, таймеры, данные, состояние, лог. Всё это
+  работает и тогда, когда Som отключён (обрыв ssh, закрытая вкладка).
+- **Пересылается в Som (`som.*`):** просьбы к клиенту. Если Som не подключён, вызов возвращает ошибку
+  `detached`, и плагин сам решает, что делать (например, отложить уведомление до `attach`).
 
--- процессы (только программы из manifest.spawn)
-local p = proc.spawn{ program = "claude", args = { … }, cwd = cwd, env = { … } }
-p:write(line)            -- в stdin, \n добавляется
-p:kill()
+Пометки: **0** — ядро движка (этап 0), **C** — нужно плагину Claude, **П** — позже, по требованию первого
+плагина, которому это понадобится. Пункты П перечислены заранее, чтобы потом не ломать API.
 
--- данные
-json.decode(s) / json.encode(t)
-host.cwd(), host.env(name), host.os()
+### 6.1. События: `plugin.on(event, fn)`
 
--- события: плагин — набор обработчиков, цикл событий ведёт Rust
-plugin.on("start",   function(ctx) … end)
-plugin.on("submit",  function(text) … end)
-plugin.on("action",  function(block_id, button_id) … end)
-plugin.on("interrupt", function() … end)
-plugin.on("line",    function(p, line) … end)     -- строка stdout процесса
-plugin.on("stderr",  function(p, chunk) … end)
-plugin.on("exit",    function(p, code) … end)
-plugin.on("timer",   function(name) … end)        -- timer.after(ms, name)
-plugin.on("stop",    function() … end)
-```
+| Событие | Когда | |
+|---|---|---|
+| `start(ctx)` | запуск экземпляра; `ctx.cwd` (cwd вкладки), `ctx.config` (§8), `ctx.state` (§6.8) | 0 |
+| `stop()` | остановка экземпляра | 0 |
+| `attach()` / `detach()` | Som подключился / отключился | 0 |
+| `submit(text)` | отправлен текст из поля ввода | 0 |
+| `action(block_id, button_id)` | нажата кнопка в блоке | 0 |
+| `interrupt()` | Esc / «Стоп» | 0 |
+| `command(name)` | клавиша или пункт меню из `commands` манифеста | П |
+| `complete(prefix)` → список | подсказки в поле ввода (`@файлы`) | П |
 
-Модель выполнения: один поток на экземпляр, все обработчики выполняются на нём по очереди (очередь
-событий из процессов, от Som и от таймеров). Обработчик, работающий дольше лимита, прерывается
-(`mlua` hook по счётчику инструкций), экземпляр получает ошибку в шапку, но не падает весь `somsrv`.
-Паника/ошибка Lua не роняет демон — это требование к `PluginHost`.
+`attach`/`detach` нужны, чтобы плагин знал, смотрит ли кто-то на панель: например, Claude закончил ход
+при закрытой панели — плагин запоминает это и уведомляет при подключении.
+
+### 6.2. Модель панели: `ui.*`
+
+Модель хранится в `somsrv`. Если Som подключён, изменения уходят ему сразу; при подключении Som получает
+снимок целиком (§3).
+
+| Функция | |
+|---|---|
+| `ui.header{title, subtitle, status}` | 0 |
+| `ui.append{kind, props, parent?}` → id | 0 |
+| `ui.update(id, props)`, `ui.remove(id)`, `ui.clear()` | 0 |
+| `ui.input{enabled, placeholder, multiline}` | 0 |
+| `ui.batch(fn)` — все операции внутри `fn` уходят одним пакетом (стриминг ответа) | 0 |
+| `ui.scroll_to(id)` | C |
+
+### 6.3. Процессы: `proc.*`
+
+Только программы из `spawn` манифеста (§7).
+
+| Функция | |
+|---|---|
+| `proc.spawn{program, args, cwd, env, mode = "lines" \| "bytes"}` → `p` | 0 |
+| `p:write(data)`, `p:close_stdin()`, `p:kill()`, `p.pid` | 0 |
+| события `line(p, s)` (`mode = "lines"`), `stdout(p, bytes)` (`mode = "bytes"`), `stderr(p, chunk)`, `exit(p, code)` | 0 |
+
+PTY в API нет: если нужен терминал, плагин просит Som открыть вкладку (`som.open_terminal`).
+
+### 6.4. Время
+
+`timer.after(ms, name)`, `timer.every(ms, name)`, `timer.cancel(name)`, событие `timer(name)`;
+`time.now()` — **0**.
+
+### 6.5. Данные
+
+`json.encode(t)` / `json.decode(s)` — **0**. Строки, таблицы и `utf8` — из stdlib.
+
+### 6.6. Хост
+
+`host.os()`, `host.name()`, `host.home()`, `host.env(name)` — **0**. cwd вкладки — в `ctx.cwd`.
+
+### 6.7. Лог
+
+`log.info(...)`, `log.warn(...)`, `log.error(...)` — **0**. Пишет в лог `somsrv`; последние строки
+видны в Som в отладочном блоке панели.
+
+### 6.8. Состояние
+
+`state.save(t)` — **C**. Таблица (JSON-совместимая) хранится в памяти `somsrv` и копируется в `db.json` на
+клиенте рядом с записью о панели. После перезапуска демона Som стартует экземпляр заново и передаёт её в
+`ctx.state`. Пример: `claude.lua` сохраняет `sid` для `--resume`. На диск хоста ничего не пишется.
+
+### 6.9. Запросы к Som: `som.*`
+
+| Функция | | Разрешение (§7) |
+|---|---|---|
+| `som.api`, `som.has(name)` — версия API и проверка функции | 0 | — |
+| `som.open_terminal{cmd, cwd}` — терминальная вкладка на том же хосте | C | `terminal` |
+| `som.notify{title, body}` — сообщение в Som, вне фокуса — уведомление ОС | C | `notify` |
+| `som.preview(path)` — показать файл хоста через SRP | C | `preview` |
+| `som.clipboard_write(text)` — буфер обмена клиента | C | `clipboard` |
+| `som.confirm{text, buttons}` → выбор — модальный вопрос | П | — |
+| `som.open_url(url)` — ссылка в браузере клиента | П | `open_url` |
+| `som.open_plugin{name, config}` — открыть панель другого плагина | П | — |
+
+Чтения буфера обмена нет сознательно: удалённому плагину незачем видеть буфер клиента.
+
+### 6.10. Правила движка
+
+- **Один поток и одна очередь событий на экземпляр.** Каждый обработчик выполняется как корутина;
+  функции, ждущие ответа (`som.confirm`), приостанавливают обработчик, а не поток — остальные события
+  тем временем обрабатываются.
+- **Лимит на обработчик** — по счётчику инструкций (`mlua` hook). Зациклившийся плагин получает ошибку
+  в шапку панели; `somsrv` и другие экземпляры работают дальше. Ошибка или паника Lua не роняет демон.
+- **Песочница:** stdlib — `TABLE|STRING|MATH|UTF8|COROUTINE`, без `io`, `os`, `package`; `require`
+  ищет модули только среди файлов плагина.
+- **Позже, отдельными разрешениями:** `fs.read`/`fs.list` с корнями из манифеста, `http.get` поверх
+  существующего `http_fetch.rs`. Файлы и сеть через stdlib не открываем.
 
 ## 7. Манифест и песочница
 
@@ -176,14 +250,19 @@ plugin.on("stop",    function() … end)
   "title": "Claude Code",
   "entry": "main.lua",
   "spawn": ["claude"],
-  "command": { "label": "Claude здесь", "keys": "ctrl-shift-c" }
+  "permissions": ["terminal", "notify", "preview", "clipboard"],
+  "launch": { "label": "Claude здесь", "keys": "ctrl-shift-c" },
+  "commands": []
 }
 ```
 
 - `spawn` — белый список программ для `proc.spawn`; пустой — плагин процессов не запускает.
+- `permissions` — какие `som.*` плагину разрешены (§6.9). Som проверяет их сам при каждом запросе.
 - Файловой системы и сети у плагина нет (нет `io`, `os`, `package`), пока не появится плагин, которому
   это нужно, — тогда добавляется отдельная разрешаемая функция, а не stdlib целиком (как в `SRP_LUA.md`).
-- `command` — пункт, который Som добавляет в палитру/меню терминальной вкладки.
+- `launch` — пункт, который Som добавляет в палитру/меню терминальной вкладки для запуска плагина.
+- `commands` — `[{ name, label, keys }]`: действия внутри открытой панели, приходят событием
+  `command(name)` (§6.1, этап П).
 
 ## 8. Настройки
 
@@ -209,7 +288,7 @@ plugin.on("stop",    function() … end)
 
 | Событие claude | Блоки |
 |---|---|
-| `system`/`init` | шапка: модель, cwd; `sid` запоминается в Lua-состоянии |
+| `system`/`init` | шапка: модель, cwd; `sid` сохраняется через `state.save` |
 | `assistant` → `text` | `markdown` (дописывается `update`, если ход стримится) |
 | `assistant` → `thinking` | свёрнутая `group` «Размышления» с `markdown` внутри |
 | `assistant` → `tool_use` | `group` с названием инструмента: `Bash` → `code`; `Edit`/`MultiEdit` → `diff`; `Write` → `code`; `Read`/`Grep`/`Glob` → одна строка; прочее → `code` с JSON |
@@ -222,7 +301,12 @@ plugin.on("stop",    function() … end)
 `control_response`, блок с кнопками заменяется строкой с решением. `interrupt` → control-запрос
 `interrupt`.
 
-**Переход в TUI:** кнопка в шапке → `p:kill()` и `ui.command{ open_terminal = … --resume sid }`.
+**Переход в TUI:** кнопка в шапке → `p:kill()` и `som.open_terminal{ cmd = { "claude", "--resume", sid } }`.
+
+**Конец хода при закрытой панели** (`detach` был, `attach` не было): `som.notify` вернёт `detached`,
+плагин запоминает флаг и при `attach` показывает уведомление «Claude закончил».
+
+**Пути в выводе** инструментов: кнопка «Показать» → `som.preview(path)` для картинок и markdown.
 
 **Перезапуск демона** (новая сборка `somsrv` убивает старый — так задумано): экземпляры плагинов
 гибнут вместе с ним. Som при следующем подключении видит, что `instance` исчез, и стартует плагин
@@ -257,8 +341,8 @@ Control-часть stream-json документирована не полнос�
 
 | Этап | Что | Готово, когда |
 |---|---|---|
-| 0 | `PluginHost` в `somsrv`: постоянный VM, цикл событий, `ui.*`, `proc.*`, `json`, манифест; протокол §5; `PluginView` с блоками `markdown`/`text`/`code` и однострочным вводом; тестовый плагин `echo` | `echo` работает на deb через ssh-вкладку; обрыв ssh → переподключение показывает тот же вид |
-| 1 | `claude.lua`: разговор без разрешений (`--permission-mode` из настроек), запись потоков для тестов, проверка control-формата | обычный вопрос-ответ с инструментами читается в панели |
+| 0 | `PluginHost` в `somsrv`: постоянный VM, цикл событий на корутинах, лимит инструкций, все функции с пометкой 0 из §6, манифест; протокол §5; `PluginView` с блоками `markdown`/`text`/`code` и однострочным вводом; тестовый плагин `echo` | `echo` работает на deb через ssh-вкладку; обрыв ssh → переподключение показывает тот же вид |
+| 1 | функции с пометкой C из §6 (`state.save`, `som.open_terminal`/`notify`/`preview`/`clipboard_write`, `ui.scroll_to`); `claude.lua`: разговор без разрешений (`--permission-mode` из настроек), запись потоков для тестов, проверка control-формата | обычный вопрос-ответ с инструментами читается в панели |
 | 2 | Блоки `group`/`diff`/`actions`/`kv`; разрешения и прерывание в `claude.lua` | работа в `default`-режиме без TUI |
 | 3 | Многострочное поле ввода | ввод не хуже, чем в TUI |
 | 4 | Переход в TUI, переоткрытие экземпляров при подключении, значки на ярлыках, кликабельные пути | — |

@@ -156,6 +156,13 @@ Som keeps exactly two things on disk, and nothing else:
 - **`config_dir()`** — `~/.config/som` on Windows/Linux/FreeBSD (`%APPDATA%\Som`-style
   path is NOT used; Som deliberately uses `~/.config` on Windows too). **JSON only**:
   `settings.json`, `db.json`, themes. Nothing binary ever goes here.
+  **The one exception: `plugins/<name>/`** — Lua plugins (`plugin.json` +
+  `*.lua`, text only), see `PLUGINS_DESIGN.md`. The user puts them there; Som
+  only reads them (never writes, extracts or downloads into `plugins/`) and
+  sends their source to `somsrv` over the wire — nothing is copied to the
+  remote host's disk. Why on disk and not embedded in the binary: a plugin is
+  edited far more often than Som is rebuilt (the Claude plugin follows the
+  `claude` CLI's protocol), and a rebuild per Lua line is not acceptable.
 - **`logs_dir()`** — `~/.local/state/som/logs` on Windows (`state_dir().join("logs")`,
   the XDG category Linux/FreeBSD use via `dirs::state_dir()`).
 
@@ -183,7 +190,8 @@ DLL in `~/.local/share/som/ffmpeg` once kept video silent through a whole
 debugging session) or be swapped for something else. A content-named folder in
 tmp cannot be stale, and is checked before use.
 
-**Never:** extract, cache or download anything into `~/.config/som`,
+**Never:** extract, cache or download anything into `~/.config/som` (its
+`plugins/` folder included),
 `~/.local/share/som` (`data_dir()`, left only for inherited Zed code - Som writes
 nothing there), `~/.cache/som`, beside `som.exe`/`somsrv.exe`/`somsrp.exe`, or
 any other persistent folder; never unpack at Som's start something only a

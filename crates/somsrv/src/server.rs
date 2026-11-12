@@ -652,7 +652,11 @@ fn handle_srv_request(
                     }
                 }
             }
-            SrvRequest::PluginStart { instance, manifest, sources, cwd, config, state } => {
+            SrvRequest::PluginStart { instance, manifest, sources, cwd, pane_id, config, state } => {
+                let cwd = match pane_id {
+                    Some(pane_id) if cwd.is_empty() => pane_cwd(registry, &pane_id).unwrap_or_default(),
+                    _ => cwd,
+                };
                 let request = crate::plugin::StartRequest { manifest, sources, cwd, config, state };
                 if let Err(err) = plugins.start(&instance, request, connection_id, plugin_sink.clone()) {
                     log::warn!("starting plugin instance {instance} failed: {err:#}");
@@ -705,6 +709,18 @@ fn handle_srv_request(
     plugins.detach_connection(connection_id);
 
     result
+}
+
+/// The cwd of the shell of the session `pane_id` (any client's): where a
+/// plugin opened from that tab works, since Som cannot see a remote cwd.
+fn pane_cwd(registry: &SessionRegistry, pane_id: &str) -> Option<String> {
+    let session = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|((_, id), _)| id == pane_id)
+        .map(|(_, registered)| registered.session.clone())?;
+    session.cwd().map(|cwd| cwd.to_string_lossy().into_owned())
 }
 
 fn read_srv_message(connection: &PipeConnection) -> anyhow::Result<SrvRequest> {

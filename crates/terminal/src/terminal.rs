@@ -5125,18 +5125,10 @@ impl Terminal {
         toast_key: (u32, u32),
         cx: &mut Context<Self>,
     ) {
-        let format = match content_type {
-            rich_content_transport::ContentType::Png => gpui::ImageFormat::Png,
-            rich_content_transport::ContentType::Jpeg => gpui::ImageFormat::Jpeg,
-            rich_content_transport::ContentType::Gif => gpui::ImageFormat::Gif,
-            _ => return,
-        };
-        let bytes = state.bytes_received_so_far();
-        if bytes.is_empty() {
+        let Some(item) = image_clipboard_item(content_type, state.bytes_received_so_far(), &std::env::temp_dir()) else {
             return;
-        }
-        let image = gpui::Image::from_bytes(format, bytes);
-        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        };
+        cx.write_to_clipboard(item);
         self.rich_content_image_copied_at.borrow_mut().insert(toast_key, std::time::Instant::now());
         cx.notify();
     }
@@ -7060,6 +7052,46 @@ impl Terminal {
     }
 }
 
+/// What a click on a picture puts on the clipboard: its own received bytes
+/// (never re-encoded pixels) as a `gpui::Image`. A GIF on Windows also goes
+/// as a file (`CF_HDROP`, `%TEMP%\som-clip-<hash>\som.gif`): Telegram,
+/// Discord and browsers read only PNG/DIB from an image on the clipboard, so
+/// without the file they get the first frame; with it they take the GIF
+/// itself and play it. On macOS/Linux the pasteboard already carries the GIF
+/// bytes under their own type (`com.compuserve.gif`/`image/gif`).
+/// `None` for a non-image content type or before any byte has arrived.
+fn image_clipboard_item(
+    content_type: rich_content_transport::ContentType,
+    bytes: Vec<u8>,
+    #[cfg_attr(not(windows), allow(unused_variables))] tmp: &Path,
+) -> Option<ClipboardItem> {
+    let format = match content_type {
+        rich_content_transport::ContentType::Png => gpui::ImageFormat::Png,
+        rich_content_transport::ContentType::Jpeg => gpui::ImageFormat::Jpeg,
+        rich_content_transport::ContentType::Gif => gpui::ImageFormat::Gif,
+        _ => return None,
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    let gif_file = (format == gpui::ImageFormat::Gif)
+        .then(|| {
+            let path = somsrv::tmp_files::folder(tmp, "som-clip", &[&bytes]).join("som.gif");
+            somsrv::tmp_files::write_unless_same(&path, &bytes)
+                .map(|()| path)
+                .map_err(|error| log::warn!("copy GIF: cannot write the clipboard file: {error:#}"))
+                .ok()
+        })
+        .flatten();
+    let mut item = ClipboardItem::new_image(&gpui::Image::from_bytes(format, bytes));
+    #[cfg(windows)]
+    if let Some(path) = gif_file {
+        item.entries.push(gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(smallvec::smallvec![path])));
+    }
+    Some(item)
+}
+
 // Helper function to convert a grid row to a string
 /// The file name of an embedded media's `dest_url` without its extension - what an
 /// untagged audio file is titled by.
@@ -7421,6 +7453,62 @@ pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
         a: 1.,
     }
     .into()
+}
+
+#[cfg(test)]
+mod image_clipboard_tests {
+    use super::image_clipboard_item;
+    use gpui::{ClipboardEntry, ImageFormat};
+    use crate::rich_content_transport::ContentType;
+
+    fn image_of(entry: &ClipboardEntry) -> (ImageFormat, &[u8]) {
+        match entry {
+            ClipboardEntry::Image(image) => (image.format, image.bytes()),
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn png_and_jpeg_go_as_their_own_bytes_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for (content_type, format) in [(ContentType::Png, ImageFormat::Png), (ContentType::Jpeg, ImageFormat::Jpeg)] {
+            let item = image_clipboard_item(content_type, b"picture".to_vec(), tmp.path()).ok_or_else(|| anyhow::anyhow!("no item"))?;
+            assert_eq!(item.entries.len(), 1);
+            assert_eq!(image_of(&item.entries[0]), (format, &b"picture"[..]));
+        }
+        assert_eq!(std::fs::read_dir(tmp.path())?.count(), 0, "no file for a still picture");
+        Ok(())
+    }
+
+    #[test]
+    fn gif_goes_as_its_own_bytes_and_on_windows_as_a_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let gif = b"GIF89a frames".to_vec();
+        let item = image_clipboard_item(ContentType::Gif, gif.clone(), tmp.path()).ok_or_else(|| anyhow::anyhow!("no item"))?;
+        assert_eq!(image_of(&item.entries[0]), (ImageFormat::Gif, &gif[..]));
+        #[cfg(windows)]
+        {
+            let ClipboardEntry::ExternalPaths(paths) = &item.entries[1] else {
+                anyhow::bail!("expected the GIF file, got {:?}", item.entries[1]);
+            };
+            let path = &paths.paths()[0];
+            assert!(path.starts_with(tmp.path()));
+            assert!(path.parent().and_then(|dir| dir.file_name()).is_some_and(|name| name.to_string_lossy().starts_with("som-clip-")));
+            assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("gif"));
+            assert_eq!(std::fs::read(path)?, gif);
+        }
+        #[cfg(not(windows))]
+        assert_eq!(item.entries.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_to_copy() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        assert!(image_clipboard_item(ContentType::Gif, Vec::new(), tmp.path()).is_none());
+        assert!(image_clipboard_item(ContentType::Video, b"x".to_vec(), tmp.path()).is_none());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

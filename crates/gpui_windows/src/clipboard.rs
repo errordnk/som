@@ -37,6 +37,9 @@ static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
 
+static CLIPBOARD_DROP_EFFECT_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
+
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();
     map.insert(*CLIPBOARD_PNG_FORMAT, ImageFormat::Png);
@@ -78,7 +81,7 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
                 ClipboardEntry::Image(image) => write_image(image)?,
-                ClipboardEntry::ExternalPaths(_) => {}
+                ClipboardEntry::ExternalPaths(paths) => write_files(paths)?,
             }
         }
         Ok(())
@@ -211,6 +214,38 @@ fn write_image(item: &Image) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Files as `CF_HDROP` (what Explorer puts on the clipboard on Ctrl+C): apps
+/// that take a pasted file (Telegram, Discord, browsers' file inputs) read
+/// this, so e.g. an animated GIF arrives as the file itself, not as one frame.
+fn write_files(paths: &ExternalPaths) -> Result<()> {
+    if paths.paths().is_empty() {
+        return Ok(());
+    }
+    set_clipboard_bytes(&drop_files_bytes(paths.paths()), CF_HDROP.0 as u32)?;
+    // DROPEFFECT_COPY: pasting into Explorer copies the file, never moves it.
+    set_clipboard_bytes(&1u32.to_le_bytes(), *CLIPBOARD_DROP_EFFECT_FORMAT)?;
+    Ok(())
+}
+
+/// A `DROPFILES` header followed by the wide, NUL-separated paths and a final
+/// extra NUL — the memory layout `CF_HDROP` expects.
+fn drop_files_bytes(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+    // DROPFILES { pFiles: u32, pt: POINT, fNC: BOOL, fWide: BOOL }
+    const HEADER_LEN: u32 = 20;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&HEADER_LEN.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 12]); // pt.x, pt.y, fNC
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // fWide
+    for path in paths {
+        for unit in path.as_os_str().encode_wide().chain(Some(0)) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes
 }
 
 fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
@@ -384,5 +419,23 @@ impl LockedGlobal {
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
         unsafe { GlobalUnlock(self.global).ok() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_files_bytes;
+
+    #[test]
+    fn drop_files_layout() {
+        let bytes = drop_files_bytes(&[r"C:\t\a.gif".into(), r"C:\b".into()]);
+        assert_eq!(&bytes[0..4], &20u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1u32.to_le_bytes());
+        let wide: Vec<u16> = bytes[20..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let expected: Vec<u16> = "C:\\t\\a.gif\0C:\\b\0\0".encode_utf16().collect();
+        assert_eq!(wide, expected);
     }
 }

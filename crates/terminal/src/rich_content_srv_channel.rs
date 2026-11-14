@@ -991,17 +991,17 @@ fn try_end_playback(session_id: u32, file_id: u32) -> anyhow::Result<()> {
 /// more placeholder-grid rows, continuing this SAME placement's row
 /// numbering — see `SrvRequest::GrowMarkdownRows`'s own doc comment for
 /// the full "why does a markdown placement need this at all" reasoning.
-pub fn request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32) {
+pub fn request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32, total_rows: u32) {
     std::thread::spawn(move || {
-        if let Err(err) = try_request_markdown_growth(session_id, file_id, additional_rows) {
+        if let Err(err) = try_request_markdown_growth(session_id, file_id, additional_rows, total_rows) {
             log::debug!("failed to send somsrv GrowMarkdownRows for {session_id:#x}:{file_id:#x}: {err:#}");
         }
     });
 }
 
-fn try_request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32) -> anyhow::Result<()> {
+fn try_request_markdown_growth(session_id: u32, file_id: u32, additional_rows: u32, total_rows: u32) -> anyhow::Result<()> {
     let connection = connect_and_handshake(session_id, file_id)?;
-    send(&connection, &SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows })?;
+    send(&connection, &SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows, total_rows: Some(total_rows) })?;
     Ok(())
 }
 

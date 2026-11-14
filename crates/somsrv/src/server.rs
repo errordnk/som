@@ -521,8 +521,8 @@ fn handle_srv_request(
             SrvRequest::EndPlayback { session_id, file_id } => {
                 cache.route_end_playback(session_id, file_id);
             }
-            SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows } => {
-                cache.route_grow_markdown_rows(session_id, file_id, additional_rows);
+            SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows, total_rows } => {
+                cache.route_grow_markdown_rows(session_id, file_id, additional_rows, total_rows);
             }
             SrvRequest::RegisterRangeResponder { session_id, file_id } => {
                 range_responder_keys.insert((session_id, file_id));

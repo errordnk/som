@@ -2209,19 +2209,21 @@ fn paint_rich_content_placements(
                 .iter()
                 .filter_map(|(session_id, file_id, rendered_text)| {
                     let geometry = *markdown_geometry.get(&(*session_id, *file_id))?;
-                    let scroll_offset = terminal_ref.rich_content_markdown_scroll_offset(*session_id, *file_id);
                     // Statuses collected up front, same `&self`-only read
                     // `terminal_ref` already allows — `markdown_embedded_
                     // image_states` only touches `RefCell`s, no `&mut`
-                    // needed.
+                    // needed. The Scroll Lock offset is NOT read here —
+                    // `paint_rich_content_markdown_widget` reads it fresh
+                    // and clamps it inside, where the visible band's row
+                    // count (this frame's real clamp maximum) is known.
                     let embedded: std::collections::HashMap<String, terminal::EmbeddedMediaStatus> =
                         terminal_ref.markdown_embedded_media_states((*session_id, *file_id)).into_iter().collect();
-                    Some((*session_id, *file_id, rendered_text.clone(), geometry, scroll_offset, embedded))
+                    Some((*session_id, *file_id, rendered_text.clone(), geometry, embedded))
                 })
                 .collect()
         };
         let mut any_markdown_embedded_image_loading = false;
-        for (session_id, file_id, rendered_text, geometry, scroll_offset, embedded) in markdown_paint_inputs {
+        for (session_id, file_id, rendered_text, geometry, embedded) in markdown_paint_inputs {
             any_markdown_embedded_image_loading |=
                 embedded.values().any(|status| matches!(status, terminal::EmbeddedMediaStatus::Loading));
             any_animating |= embedded
@@ -2267,7 +2269,7 @@ fn paint_rich_content_placements(
                     paint_rich_content_markdown_widget(
                 &rendered_text,
                 Some(width_columns - 1),
-                scroll_offset,
+
                 origin,
                 geometry.origin_line,
                 geometry.origin_column,
@@ -2288,7 +2290,7 @@ fn paint_rich_content_placements(
                 None => paint_rich_content_markdown_widget(
                 &rendered_text,
                 Some(width_columns - 1),
-                scroll_offset,
+
                 origin,
                 geometry.origin_line,
                 geometry.origin_column,
@@ -2753,10 +2755,11 @@ fn paint_copied_toast(picture_bounds: Bounds<Pixels>, layout: &LayoutState, wind
 /// or the placement may extend below the bottom of the screen; only the
 /// on-screen slice gets drawn, everything else is simply not painted
 /// this frame, the same way ordinary terminal scrollback isn't painted
-/// when it's off-screen) and (2) applies `scroll_offset_lines` (the
-/// widget-local Scroll Lock offset — see `Terminal::
-/// rich_content_markdown_scroll_offset`'s own doc comment) as an
-/// independent second offset INTO `rendered_text`, letting the visible
+/// when it's off-screen) and (2) applies the widget-local Scroll Lock
+/// offset — read fresh from `Terminal` INSIDE this function and clamped
+/// there (`Terminal::clamp_markdown_scroll_offset`), where this frame's
+/// real clamp maximum is known — as an independent second offset INTO
+/// `rendered_text`, letting the visible
 /// window move through the document without the underlying placement's
 /// on-screen position (tied to the terminal's own scrollback) changing
 /// at all.
@@ -2973,7 +2976,6 @@ fn resolve_nested_markdown_embeds(
 fn paint_rich_content_markdown_widget(
     rendered_text: &str,
     max_column_seen: Option<u32>,
-    scroll_offset_lines: u32,
     origin: Point<Pixels>,
     origin_line: i32,
     origin_column: i32,
@@ -3114,6 +3116,19 @@ fn paint_rich_content_markdown_widget(
         return None;
     }
     let visible_row_count = last_visible_row - first_visible_row;
+
+    // The band's row count is the other half of the widget's scroll
+    // clamp: recorded for the input path (`markdown_placement_under`),
+    // and the stored Scroll Lock offset itself is read here, clamped to
+    // the new maximum, and used for this paint — a resize or a re-wrap
+    // can shrink the document below an offset already scrolled to, and
+    // without this the widget would keep showing a blank tail past the
+    // document's end until some scroll input corrected it.
+    let scroll_offset_lines = {
+        let terminal = terminal.read(cx);
+        terminal.record_markdown_visible_rows(host.0, host.1, visible_row_count as u32);
+        terminal.clamp_markdown_scroll_offset(host.0, host.1, (laid_out.len() as u32).saturating_sub(visible_row_count as u32))
+    };
 
     let position = point(
         origin.x + origin_column as f32 * cell_width,

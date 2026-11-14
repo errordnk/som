@@ -92,12 +92,12 @@ pub fn instance_suffix() -> String {
 pub fn ssh_client_id() -> Option<String> {
     let raw = std::env::var("SSH_CLIENT").ok()?;
     let ip = raw.split_whitespace().next()?;
-    let user = whoami_unix()?;
+    let user = whoami()?;
     Some(format!("{user}@{ip}"))
 }
 
 #[cfg(unix)]
-fn whoami_unix() -> Option<String> {
+fn whoami() -> Option<String> {
     // SAFETY: `geteuid()` has no failure mode (always returns the calling
     // process's real effective uid) and `getpwuid` on a valid uid returns
     // either a valid pointer into thread-local/static storage libc owns
@@ -113,9 +113,16 @@ fn whoami_unix() -> Option<String> {
     }
 }
 
+/// A Windows RELAY behind Windows' own sshd has `$SSH_CLIENT` set exactly
+/// like a Unix one; `%USERNAME%` is the account sshd logged in. Returning
+/// `None` here made EVERY Windows relay count as local — and one behind a
+/// test's ssh stand-in then flipped its console to win32-input-mode (see
+/// `somsrv::relay`'s `WIN32_INPUT_MODE_ON`), recoding the link frames' GS
+/// markers into `CSI Vk;...;_` key sequences on their way in, killing
+/// Som's channel to that machine's daemon with nothing ever listening.
 #[cfg(not(unix))]
-fn whoami_unix() -> Option<String> {
-    None
+fn whoami() -> Option<String> {
+    std::env::var("USERNAME").ok()
 }
 
 /// Which OS a HOLDER is running on — part of the handshake (see

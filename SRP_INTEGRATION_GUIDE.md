@@ -664,7 +664,7 @@ What it covers, and where:
 | `.m3u`/`.m3u8` | one placement per entry (new ids each), `n`/`p` and the widget's buttons (`PlaylistStep`), `http(s)` entries fetched by the daemon (`FetchResource`) | `srp/play.rs` (`run_list`, `play_url`) |
 | `.cue` | `srp_client::cue` (the parser `somsrp` uses), `AnnounceCue` with the track list, cover lookup | `srp/play.rs` |
 | Internet radio, Yandex Music's wave | `RadioTracks` batches, `RadioFeedback`, `RadioLike`, `AnnounceRadioState`, `RadioControl` from the widget's icons, history kept in the client | `srp/radio.rs` |
-| Markdown | whole file with `base_dir`, a grower connection (`RegisterMarkdownGrower`) hears `GrowMarkdownRows`, the viewer scrolls through the placement's rows | `srp/play.rs` (`run_markdown`), `viewer.rs` |
+| Markdown | whole file with `base_dir`, a grower connection (`RegisterMarkdownGrower`) hears `GrowMarkdownRows` and takes its `total_rows` (the real row count, which can shrink) over the increments, the viewer scrolls through the placement's rows so the last one stops at the bottom | `srp/play.rs` (`run_markdown`), `viewer.rs` |
 
 ### What a TUI that owns a cell grid has to do
 

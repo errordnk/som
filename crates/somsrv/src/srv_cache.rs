@@ -771,11 +771,11 @@ impl SrvCache {
     /// thread. Silently a no-op on a miss, same tolerance every other
     /// best-effort message here has — see `SrvRequest::GrowMarkdownRows`'s
     /// own doc comment.
-    pub fn route_grow_markdown_rows(&self, session_id: u32, file_id: u32, additional_rows: u32) {
+    pub fn route_grow_markdown_rows(&self, session_id: u32, file_id: u32, additional_rows: u32, total_rows: Option<u32>) {
         let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (session_id, file_id);
         if let Some(route) = inner.markdown_grower_routes.get(&key) {
-            let _ = route(SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows });
+            let _ = route(SrvRequest::GrowMarkdownRows { session_id, file_id, additional_rows, total_rows });
         }
     }
 
@@ -905,13 +905,13 @@ mod tests {
             );
         }
 
-        cache.route_grow_markdown_rows(1, 2, 5);
+        cache.route_grow_markdown_rows(1, 2, 5, Some(9));
 
         let observed = observed.lock().unwrap();
         assert_eq!(observed.len(), 1);
         assert!(matches!(
             observed[0],
-            SrvRequest::GrowMarkdownRows { session_id: 1, file_id: 2, additional_rows: 5 }
+            SrvRequest::GrowMarkdownRows { session_id: 1, file_id: 2, additional_rows: 5, total_rows: Some(9) }
         ));
     }
 
@@ -933,7 +933,7 @@ mod tests {
             }));
         }
 
-        cache.route_grow_markdown_rows(1, 2, 5);
+        cache.route_grow_markdown_rows(1, 2, 5, Some(9));
 
         assert!(observed.lock().unwrap().is_empty(), "a range-responder registration must not receive GrowMarkdownRows");
     }
@@ -942,7 +942,7 @@ mod tests {
     fn route_grow_markdown_rows_is_a_silent_no_op_with_no_registered_responder() {
         let cache = SrvCache::new();
         // No `register_range_responder_route` call at all — must not panic or error.
-        cache.route_grow_markdown_rows(99, 99, 3);
+        cache.route_grow_markdown_rows(99, 99, 3, None);
     }
 
     #[test]

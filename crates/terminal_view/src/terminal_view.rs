@@ -521,7 +521,7 @@ impl TerminalView {
         // visible height.
         if !window.scrolllock().on {
             let terminal = self.terminal.read(cx);
-            if let Some((session_id, file_id, line_count)) = terminal.markdown_placement_under(event.position) {
+            if let Some((session_id, file_id, line_count, visible_rows)) = terminal.markdown_placement_under(event.position) {
                 let line_height = terminal.last_content().terminal_bounds.line_height;
                 let y_delta = event.delta.pixel_delta(line_height).y;
                 // Wheel-up (positive y_delta) moves toward the top of the
@@ -529,7 +529,15 @@ impl TerminalView {
                 // own scroll-up-reveals-earlier-content convention.
                 let delta_lines = -(y_delta / line_height).round() as i32;
                 if delta_lines != 0 {
-                    let max_offset = line_count.saturating_sub(1);
+                    // The document's last row stops at the band's BOTTOM
+                    // row (`total - visible`), not at its top (`total - 1`):
+                    // the widget paints `visible` rows of it, so an offset
+                    // past `total - visible` scrolls the document's own end
+                    // up out of the widget and leaves a blank tail below it.
+                    // `visible_rows` is `u32::MAX` before the first paint —
+                    // saturating then yields 0, no scrolling at all, rather
+                    // than an overshoot with an unknown height.
+                    let max_offset = line_count.saturating_sub(visible_rows);
                     terminal.scroll_rich_content_markdown(session_id, file_id, delta_lines, max_offset);
                     cx.notify();
                 }

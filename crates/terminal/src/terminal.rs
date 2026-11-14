@@ -588,6 +588,7 @@ impl TerminalBuilder {
             rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_reserved_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_markdown_visible_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
             #[cfg(target_os = "windows")]
             rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -962,6 +963,7 @@ impl TerminalBuilder {
                 rich_content_markdown_players: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_markdown_scroll_offsets: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_markdown_reserved_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_markdown_visible_rows: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_audio_progress: std::cell::RefCell::new(std::collections::HashMap::new()),
                 #[cfg(target_os = "windows")]
                 rich_content_video_players: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1584,7 +1586,19 @@ pub struct Terminal {
     /// either — only re-sending a growth request for a delta already in
     /// flight would be a real problem, which tracking this eagerly
     /// avoids.
-    rich_content_markdown_reserved_rows: std::cell::RefCell<std::collections::HashMap<(u32, u32), u32>>,
+    rich_content_markdown_reserved_rows: std::cell::RefCell<std::collections::HashMap<(u32, u32), (u32, u32)>>,
+    /// The markdown widget's on-screen row count from the last paint —
+    /// the visible band `paint_rich_content_markdown_widget` actually
+    /// painted (`visible_row_count` there), NOT the document's full row
+    /// count (`rich_content_markdown_reserved_rows` tracks that).
+    /// Written during paint, read during input by
+    /// `markdown_placement_under`, so the Scroll Lock wheel clamp can
+    /// stop the document's last row at the band's BOTTOM row
+    /// (`max_offset = total - visible`) instead of letting it travel all
+    /// the way to the band's top (`total - 1`), which scrolled the
+    /// document's own end up out of the widget and left a blank tail
+    /// below it.
+    rich_content_markdown_visible_rows: std::cell::RefCell<std::collections::HashMap<(u32, u32), u32>>,
     /// One [`rich_content_audio_player::AudioTransferProgress`] per
     /// audio placement, created alongside its `RichContentAudioPlayer`
     /// entry in `rich_content_audio_players` and updated every time
@@ -2056,6 +2070,7 @@ impl Terminal {
                 }
                 self.rich_content_markdown_players.borrow_mut().clear();
                 self.rich_content_markdown_scroll_offsets.borrow_mut().clear();
+                self.rich_content_markdown_visible_rows.borrow_mut().clear();
                 // Tears down every image/GIF/markdown subscription thread
                 // the same way `evict_vanished_image_gif_markdown_
                 // placements` does for the scroll-away case — a real
@@ -2935,6 +2950,7 @@ impl Terminal {
             self.rich_content_markdown_players.borrow_mut().remove(&key);
             self.rich_content_markdown_scroll_offsets.borrow_mut().remove(&key);
             self.rich_content_markdown_reserved_rows.borrow_mut().remove(&key);
+            self.rich_content_markdown_visible_rows.borrow_mut().remove(&key);
             if let Some(state) = self.rich_content_srv_progress.borrow_mut().remove(&key) {
                 // Tears down the background subscription thread. `stop()`
                 // alone only sets a flag this thread checks BEFORE its
@@ -3802,6 +3818,46 @@ impl Terminal {
         self.rich_content_markdown_scroll_offsets.borrow().get(&(session_id, file_id)).copied().unwrap_or(0)
     }
 
+    /// Records the markdown widget's current on-screen row count —
+    /// written by `paint_rich_content_markdown_widget` on every paint,
+    /// the same "written during paint, read during input" split as the
+    /// placement pixel bounds it records alongside.
+    pub fn record_markdown_visible_rows(&self, session_id: u32, file_id: u32, visible_rows: u32) {
+        self.rich_content_markdown_visible_rows.borrow_mut().insert((session_id, file_id), visible_rows);
+    }
+
+    /// The markdown widget's on-screen row count from the last paint —
+    /// `u32::MAX` before the first paint. Defensive only: the wheel
+    /// clamp then allows no scrolling at all rather than overshooting
+    /// (an unknown height clamps `total - visible` to 0), and a
+    /// placement that hasn't painted can't be under the cursor anyway —
+    /// its pixel bounds don't exist yet either.
+    pub fn markdown_visible_rows(&self, session_id: u32, file_id: u32) -> u32 {
+        self.rich_content_markdown_visible_rows
+            .borrow()
+            .get(&(session_id, file_id))
+            .copied()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Clamps the markdown widget's stored Scroll Lock offset down to
+    /// `max_offset` and returns the clamped value. Called by
+    /// `paint_rich_content_markdown_widget` on every paint, the one
+    /// place where both the document's real row count and the visible
+    /// band's height are known: a window resize or a re-wrap (a wider
+    /// window lays the same text into fewer rows) can shrink the
+    /// maximum below an offset already scrolled to, and without this
+    /// the widget would keep painting a blank tail past the document's
+    /// end until some scroll input happened to correct it
+    /// (`scroll_rich_content_markdown` clamps on input, but only when
+    /// input comes).
+    pub fn clamp_markdown_scroll_offset(&self, session_id: u32, file_id: u32, max_offset: u32) -> u32 {
+        let mut offsets = self.rich_content_markdown_scroll_offsets.borrow_mut();
+        let entry = offsets.entry((session_id, file_id)).or_insert(0);
+        *entry = (*entry).min(max_offset);
+        *entry
+    }
+
     /// Scrolls a markdown placement's widget-local view by `delta_lines`
     /// (positive = further into the document, negative = back toward the
     /// top), clamped to `[0, max_offset]`. Called from `TerminalView::
@@ -3842,29 +3898,36 @@ impl Terminal {
     /// no-op once the tracked count already covers `real_row_count` (the
     /// common case on every paint pass after the first that actually
     /// needed to grow).
+    ///
+    /// The real count itself goes along (`total_rows`) whenever it changes,
+    /// also downwards: a client showing a window of the document scrolls by
+    /// it, and the reservation alone only ever grows.
     pub fn ensure_markdown_row_reservation(&self, session_id: u32, file_id: u32, real_row_count: u32, initial_reserved_rows: u32) {
         let key = (session_id, file_id);
         let mut reserved = self.rich_content_markdown_reserved_rows.borrow_mut();
-        let current = *reserved.entry(key).or_insert(initial_reserved_rows);
+        // the total starts unknown (u32::MAX): the first paint always tells it
+        let (current, sent_total) = *reserved.entry(key).or_insert((initial_reserved_rows, u32::MAX));
         let target = real_row_count.min(Self::MARKDOWN_PLACEMENT_ROW_LIMIT);
-        if target <= current {
+        if target == sent_total && target <= current {
             return;
         }
-        let additional_rows = target - current;
-        reserved.insert(key, target);
+        let additional_rows = target.saturating_sub(current);
+        reserved.insert(key, (current.max(target), target));
         drop(reserved);
-        rich_content_srv_channel::request_markdown_growth(session_id, file_id, additional_rows);
+        rich_content_srv_channel::request_markdown_growth(session_id, file_id, additional_rows, target);
     }
 
     /// Finds the markdown placement (if any) whose recorded on-screen
     /// bounds contain `position` (absolute window pixel coordinates,
     /// same space `record_rich_content_placement_bounds` stores — see
     /// `handle_rich_content_click`'s identical lookup pattern for audio/
-    /// video). Returns `(session_id, file_id, total_line_count)` — the
-    /// line count is the widget's own scroll clamp ceiling, needed by
-    /// `TerminalView::scroll_wheel`'s Scroll Lock branch to bound how far
-    /// `scroll_rich_content_markdown` can move.
-    pub fn markdown_placement_under(&self, position: gpui::Point<Pixels>) -> Option<(u32, u32, u32)> {
+    /// video). Returns `(session_id, file_id, total_line_count,
+    /// visible_rows)` — the last two are the widget's own scroll clamp,
+    /// needed by `TerminalView::scroll_wheel`'s Scroll Lock branch to
+    /// bound how far `scroll_rich_content_markdown` can move: the
+    /// document's last row stops at the band's BOTTOM row
+    /// (`total - visible`), not at its top (`total - 1`).
+    pub fn markdown_placement_under(&self, position: gpui::Point<Pixels>) -> Option<(u32, u32, u32, u32)> {
         for (session_id, file_id, bounds) in self.rich_content_placement_bounds_iter() {
             if !self.rich_content_markdown_players.borrow().contains_key(&(session_id, file_id)) {
                 continue;
@@ -3889,8 +3952,9 @@ impl Terminal {
             // nested-markdown cycle's own "⚠ circular markdown embed"
             // warning existing in `laid_out` (confirmed via direct
             // instrumentation) but never being scrollable into view.
-            let line_count = self.rich_content_markdown_reserved_rows.borrow().get(&(session_id, file_id)).copied().unwrap_or(0);
-            return Some((session_id, file_id, line_count));
+            let line_count = self.rich_content_markdown_reserved_rows.borrow().get(&(session_id, file_id)).map_or(0, |&(_, total)| total);
+            let visible_rows = self.markdown_visible_rows(session_id, file_id);
+            return Some((session_id, file_id, line_count, visible_rows));
         }
         None
     }

@@ -1245,8 +1245,10 @@ fn spawn_markdown_grower(
                     session_id,
                     file_id,
                     additional_rows,
+                    ..
                 })) if (session_id, file_id) == ids => {
-                    if write_placeholder_grid_rows_from(session_id, file_id, initial_columns, printed_rows, additional_rows).is_ok() {
+                    // the grid printed inline only grows: a smaller total is nothing to print
+                    if additional_rows > 0 && write_placeholder_grid_rows_from(session_id, file_id, initial_columns, printed_rows, additional_rows).is_ok() {
                         printed_rows += additional_rows;
                     }
                 },

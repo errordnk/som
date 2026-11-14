@@ -587,7 +587,23 @@ pub enum SrvRequest {
     /// reasoning. Silently undeliverable (no-op) if the responder
     /// connection has already closed, same tolerance every other best-
     /// effort message in this protocol already has.
-    GrowMarkdownRows { session_id: u32, file_id: u32, additional_rows: u32 },
+    ///
+    /// `total_rows` is the document's real laid-out row count right now
+    /// (capped at the placeholder table's length). It can go DOWN (a wider
+    /// window wraps the text into fewer rows), and it survives Som
+    /// forgetting how many rows it asked for (a placement that leaves the
+    /// screen and comes back is counted afresh). A client that shows a
+    /// window of the document (farsh's viewer) scrolls by it, so its last
+    /// row lands at the bottom of the window; the increments alone overshoot.
+    /// A message with `additional_rows == 0` only corrects the total.
+    /// `None` from a Som that predates it; ignored by clients that predate it.
+    GrowMarkdownRows {
+        session_id: u32,
+        file_id: u32,
+        additional_rows: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_rows: Option<u32>,
+    },
     /// Sent by a playlist runner (`somsrp` playing an `.m3u`) when it
     /// starts a track: where that track sits in the list, and its
     /// display title from the playlist (`#EXTINF`), if it had one.

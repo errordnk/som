@@ -7823,14 +7823,30 @@ mod tests {
                 break;
             }
         }
-        assert!(received == data, "{} of {} bytes arrived, equal: {}", received.len(), data.len(), received == data);
+        let equal = received == data;
+        let arrived = received.len();
 
         // None of the link reached the terminal's screen.
         let screen = terminal.update(cx, |term, _| term.get_content());
-        assert!(!screen.contains("SRV;") && !screen.contains('\u{1b}'), "a frame of the link reached the screen: {screen:?}");
 
+        // Close the tab the way `TerminalView::on_removed` closes a remote
+        // one — the link's `EndSession` frame — and only then assert: a
+        // panic below would otherwise leave the session alive on the test
+        // daemon, and a daemon holding a session never takes its
+        // one-minute idle exit, so it outlives the run and blocks the
+        // next one's build of its own binary. fakessh sets `$SSH_CLIENT`
+        // for the relay, so the belt-and-suspenders admin kill must name
+        // the client id its session registers under (`<user>@<ip>`, the
+        // same `protocol::ssh_client_id` derivation).
+        terminal.update(cx, |term, _| term.end_remote_session());
+        std::thread::sleep(std::time::Duration::from_millis(300));
         drop(terminal);
-        somsrv::admin::kill_session(None, pane_id).ok();
+        let fake_client = format!("{}@127.0.0.1", std::env::var("USERNAME").unwrap_or_default());
+        somsrv::admin::kill_session(Some(fake_client), pane_id.clone()).ok();
+        somsrv::admin::kill_session(None, pane_id.clone()).ok();
+
+        assert!(equal, "{arrived} of {} bytes arrived, equal: {equal}", data.len());
+        assert!(!screen.contains("SRV;") && !screen.contains('\u{1b}'), "a frame of the link reached the screen: {screen:?}");
     }
 
     /// `somsrp` run from a directory of its own, with no FFmpeg DLLs beside it
@@ -9166,6 +9182,17 @@ mod tests {
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
         let somsrp_path = somsrv::testing::debug_binary("somsrp");
+        // Same daemon pre-start as `test_rich_content_placements_reach_the_
+        // paint_path_via_a_real_process` below: `somsrp` announces to a
+        // daemon it never starts itself, and this test used to pass only
+        // while one happened to be left over from an earlier test.
+        let daemon = somsrv::daemon::connect_or_spawn(&somsrv::testing::debug_binary("somsrv"))
+            .expect("the test daemon is started before somsrp runs");
+        somsrv::protocol::ConnectionKind::Srv.write_to(&daemon).expect("the daemon takes the tag");
+        daemon
+            .write_message(&serde_json::to_vec(&somsrv::protocol::SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap())
+            .expect("the daemon takes the handshake");
+        daemon.read_message().expect("the daemon answers the handshake");
 
         let (terminal, completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -9284,6 +9311,22 @@ mod tests {
         assert!(giphy_path.is_file(), "giphy.gif not found at {giphy_path:?}");
 
         let somsrp_path = somsrv::testing::debug_binary("somsrp");
+        // `somsrp` announces to a daemon it expects to already be running
+        // (it never starts one itself — that is Som's job at startup, see
+        // `prepare_local_daemon`), so the test instance's daemon is
+        // started here first, the same spawn-if-not-running way. Without
+        // this the test only passed while a daemon happened to be left
+        // over from an earlier test: the child `somsrp` lost the race
+        // with the terminal's own lazy subscription-spawned daemon and
+        // exited at once with "no somsrv" (visible on its screen), never
+        // announcing anything.
+        let daemon = somsrv::daemon::connect_or_spawn(&somsrv::testing::debug_binary("somsrv"))
+            .expect("the test daemon is started before somsrp runs");
+        somsrv::protocol::ConnectionKind::Srv.write_to(&daemon).expect("the daemon takes the tag");
+        daemon
+            .write_message(&serde_json::to_vec(&somsrv::protocol::SrvRequest::Handshake(somsrv::protocol::current_handshake())).unwrap())
+            .expect("the daemon takes the handshake");
+        daemon.read_message().expect("the daemon answers the handshake");
 
         let (terminal, _completion_rx) = build_test_terminal_with_arguments(
             cx,
@@ -9295,8 +9338,14 @@ mod tests {
         let mut saw_nonempty_placements = false;
         let mut saw_frame_advance = false;
         let mut first_frame_seen: Option<usize> = None;
+        let mut last_frame_count = 0;
+        // Wall-clock deadline, not a poll count: this test has flaked on a
+        // busy machine as a fixed 15s budget ran out mid-transfer (see the
+        // completeness gate below for why the transfer's length matters to
+        // this test at all).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
 
-        for _ in 0..300 {
+        while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
             cx.run_until_parked();
 
@@ -9316,11 +9365,23 @@ mod tests {
                 // grid cells (see `Terminal::print_rich_content_placeholder_grid`).
                 // Just confirm a real (nonzero) session_id was captured.
                 assert!(session_id > 0, "session_id must be a real, nonzero id");
+                last_frame_count = render_image.frame_count();
 
-                match first_frame_seen {
-                    None => first_frame_seen = Some(current_frame),
-                    Some(first) if current_frame != first => saw_frame_advance = true,
-                    Some(_) => {},
+                // Playback is only judged once the transfer is COMPLETE:
+                // `refresh_or_create` re-creates the player from scratch on
+                // every chunk that advances the decode, which resets
+                // playback to frame 0 — while the transfer is still
+                // streaming, that reset can land between any two polls and
+                // frame 0 is all this test would ever see, busy-machine
+                // transfers stretching past a fixed budget made it fail
+                // exactly that way. The fixture is pinned at 47 frames by
+                // the bench test above.
+                if render_image.frame_count() == 47 {
+                    match first_frame_seen {
+                        None => first_frame_seen = Some(current_frame),
+                        Some(first) if current_frame != first => saw_frame_advance = true,
+                        Some(_) => {},
+                    }
                 }
 
                 if saw_nonempty_placements && saw_frame_advance {
@@ -9329,11 +9390,23 @@ mod tests {
             }
         }
 
-        assert!(saw_nonempty_placements, "rich_content_placements() never returned a placement within the poll budget");
+        assert!(saw_nonempty_placements, "rich_content_placements() never returned a placement within the poll budget — screen: {:?}", terminal.update(cx, |term, _| term.get_content()));
+        assert!(
+            render_frames_arrived(last_frame_count),
+            "the transfer never completed within the budget — last frame count seen: {last_frame_count} of the fixture's 47"
+        );
         assert!(
             saw_frame_advance,
-            "current_frame never advanced across polls — animation playback isn't ticking through the paint-path accessor"
+            "current_frame never advanced across polls after the transfer completed — animation playback isn't ticking through the paint-path accessor"
         );
+    }
+
+    /// Only the fixture's full 47 frames count as "the transfer completed"
+    /// for `test_rich_content_placements_reach_the_paint_path_via_a_real_
+    /// process` — see that test's completeness gate for why playback is
+    /// judged from that moment only.
+    fn render_frames_arrived(frame_count: usize) -> bool {
+        frame_count == 47
     }
 
     #[gpui::test]
@@ -10918,15 +10991,16 @@ mod tests {
     ///
     /// Spawns a REAL `somsrv` RELAY (as this `Terminal`'s own
     /// shell command, exactly like a `tmux: true` profile does), lets it
-    /// spawn its own detached HOLDER, then writes a single NUL byte via
-    /// `Terminal::input` — the same call `on_removed` makes — and asserts
-    /// that the RELAY's own log ends up showing it forwarded
-    /// `RelayInput::Close` to the HOLDER, which is the signal that actually
-    /// kills the real shell process for good (as opposed to the HOLDER
-    /// surviving forever, which was the original bug report).
+    /// spawn its own detached HOLDER, then closes the tab the way
+    /// `on_removed` closes a LOCAL tmux tab — `admin::kill_session` on the
+    /// daemon — and asserts the session leaves the daemon's registry for
+    /// good (as opposed to the HOLDER surviving forever, which was the
+    /// original bug report). The REMOTE path's own close mechanism (the
+    /// link's `EndSession` frame, and a NUL being an ordinary key since
+    /// 2026-11-04) is covered by `somsrv`'s own `relay_sessions` tests.
     #[cfg(target_os = "windows")]
     #[gpui::test]
-    async fn test_nul_byte_signals_tmux_relay_to_close_for_good(cx: &mut TestAppContext) {
+    async fn a_closed_local_tab_frees_its_session_for_good(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 
         let server_path = somsrv::testing::debug_binary("somsrv");
@@ -10974,43 +11048,22 @@ mod tests {
         }
         assert!(holds_session(), "the tab's session was never registered with the daemon");
 
-        terminal.update(cx, |terminal, _cx| {
-            terminal.input(vec![0u8]);
-        });
+        // What `TerminalView::on_removed` does for a LOCAL tmux tab: it
+        // asks the daemon to end the pane's session directly — certain,
+        // and immediate. (The REMOTE path sends the link's `EndSession`
+        // frame instead, and the lone NUL byte this test used to type
+        // became an ordinary key on 2026-11-04: Ctrl+2/Ctrl+Space/Ctrl+@
+        // type one too, and each of them ended the session.)
+        somsrv::admin::kill_session(None, pane_id.clone())
+            .expect("the daemon takes the local tab's close request");
 
-        // Give the async PTY I/O thread time to actually deliver the byte
-        // before killing the RELAY — see `TerminalView::on_removed`'s own
-        // doc comment for why this same delay exists in production code.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(terminal); // triggers Terminal::drop, killing the RELAY process
-
-        // `session.kill()` (server.rs's `remove_session`, called from the
-        // `RelayInput::Close` branch) kills the real shell process and
-        // logs the line asserted on below right after removing the
-        // session from the shared daemon's registry — see
-        // `remove_session`'s doc comment. That log line is the ONLY
-        // unambiguous proof the session actually died for good, as
-        // opposed to merely seeing its one RELAY connection drop (which
-        // also happens on every ordinary disconnect-without-Close, i.e.
-        // the pre-fix buggy behavior this test exists to catch). Poll
-        // (with real sleeps, same reasoning as above) rather than a
-        // single fixed wait since real process teardown time isn't
-        // bounded tightly enough for one guess to be reliable.
-        // NOT `paths::logs_dir()` — under `cfg!(test)`,
-        // `util::paths::home_dir()` is hardcoded to a fake `C:\Users\zed`
-        // fixture home (test isolation, so tests never touch the real
-        // user's actual home directory), but the `somsrv.exe`
-        // child process spawned above is a separate, non-test binary that
-        // has no such override and logs to the REAL home directory. This
-        // test needs to read what that real child process actually wrote,
-        // so it computes the log path the same way `somsrv::main`
-        // does when not built under `cfg!(test)` — via `dirs::home_dir()`
-        // directly. A single `somsrv-daemon.log` shared by every pane on
-        // this machine (not a per-pane HOLDER log — that file stopped
-        // being written once the shared multi-tenant daemon replaced the
-        // old per-pane HOLDER process), so the assertion below also
-        // checks the pane id appears in the matched line, in case some
-        // other test's session close raced onto the same log first.
+        // `kill_session` ends the session, kills the real shell process
+        // it holds, and removes the session from the shared daemon's
+        // registry — the RELAY's connection to that session then ends and
+        // it tears down after it. Poll (with real sleeps, same reasoning
+        // as above) rather than a single fixed wait since real process
+        // teardown time isn't bounded tightly enough for one guess to be
+        // reliable.
         for _ in 0..100 {
             if !holds_session() {
                 break;
@@ -11021,9 +11074,10 @@ mod tests {
         if still_held {
             somsrv::admin::kill_session(None, pane_id.clone()).ok();
         }
+        drop(terminal); // triggers Terminal::drop, killing the RELAY process
         assert!(
             !still_held,
-            "session should have been removed from the shared daemon's registry after the NUL byte              was forwarded as RelayInput::Close - this is the exact bug this test guards against              (a session outliving an explicitly closed tab)"
+            "session should have been removed from the shared daemon's registry by the close - this is the exact bug this test guards against (a session outliving an explicitly closed tab)"
         );
 
         // The relay's own log file is left behind by every run: removed

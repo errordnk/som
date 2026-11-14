@@ -1451,23 +1451,27 @@ impl Item for TerminalView {
     /// naturally skipped then).
     ///
     /// For a tmux-wrapped shell (see `project_som_tmux` memory) specifically,
-    /// writes a single NUL byte into the RELAY's own PTY — `relay.rs`'s main
-    /// stdin loop treats a bare `\0` (never produced by real keyboard input)
-    /// as an explicit "kill the real shell for good" signal
-    /// (`RelayInput::Close`), as opposed to the RELAY process simply being
-    /// killed (`Terminal::drop`'s `TerminateProcess`/`SIGTERM`+`SIGKILL`),
-    /// which is indistinguishable — especially on Windows, where there's no
-    /// way to intercept `TerminateProcess` from inside the RELAY — from Som
-    /// itself quitting, and which must NOT kill the detached HOLDER (the
-    /// entire point of the HOLDER/RELAY split: a `tmux: true` pane's session
-    /// survives Som closing). Without this, every closed tmux tab left its
-    /// HOLDER (and whatever was running inside it, e.g. `htop`) running
-    /// forever — confirmed via `ps aux` showing HOLDER processes for panes
-    /// whose tabs had long since been closed.
+    /// ends the tab's session FOR GOOD — as opposed to the RELAY process
+    /// simply being killed (`Terminal::drop`'s `TerminateProcess`/
+    /// `SIGTERM`+`SIGKILL`), which is indistinguishable — especially on
+    /// Windows, where there's no way to intercept `TerminateProcess` from
+    /// inside the RELAY — from Som itself quitting, and which must NOT kill
+    /// the detached HOLDER (the entire point of the HOLDER/RELAY split: a
+    /// `tmux: true` pane's session survives Som closing). Without this,
+    /// every closed tmux tab left its HOLDER (and whatever was running
+    /// inside it, e.g. `htop`) running forever — confirmed via `ps aux`
+    /// showing HOLDER processes for panes whose tabs had long since been
+    /// closed. A LOCAL tab's session is ended by asking the daemon
+    /// directly; a remote one by the link's `EndSession` frame, retried
+    /// briefly for a relay that hasn't finished saying it speaks the link
+    /// (a lone NUL byte — the pre-link signal, which Ctrl+2/Ctrl+Space/
+    /// Ctrl+@ also type and which became an ordinary key to current relays
+    /// on 2026-11-04 — remains only as the last resort for a relay from
+    /// before the link).
     ///
     /// A plain non-tmux shell's `rebuild_tmux_shell_with_fresh_pane_id`
-    /// returns `None`, so this is a no-op for it — the NUL byte is never
-    /// sent, and closing behaves exactly as before this was added.
+    /// returns `None`, so this is a no-op for it — nothing is ever sent,
+    /// and closing behaves exactly as before this was added.
     fn on_removed(&self, cx: &mut Context<Self>) {
         let shell = self.terminal().read(cx).shell().clone();
         // A session of THIS machine's daemon is closed by asking the daemon
@@ -1484,13 +1488,23 @@ impl Item for TerminalView {
         }
         // The link's frame is queued for the pty's I/O thread like typed
         // input; the sleep gives that thread the moment it needs to write it
-        // before `Terminal::drop` (see the NUL path below).
-        if self.terminal().read(cx).end_remote_session() {
+        // before `Terminal::drop` (see the NUL path below). A relay that
+        // hasn't said it speaks the link yet almost always does within a
+        // moment of starting — retry for a couple of seconds rather than
+        // falling straight through to the NUL below, which since 2026-11-04
+        // is an ordinary key to a current relay (Ctrl+2/Ctrl+Space/Ctrl+@
+        // type one) and closes nothing: the session would then live on
+        // until someone ran `kill-session` by hand.
+        for _ in 0..40 {
+            if self.terminal().read(cx).end_remote_session() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
-            return;
         }
-        // A relay from before the link's `EndSession` (or one that has not
-        // said it speaks the link yet) takes a lone NUL byte for this.
+        // A relay from before the link's `EndSession` takes a lone NUL byte
+        // for this — to a current relay it is only a keypress into a tab
+        // that is closing anyway.
         self.terminal().update(cx, |terminal, _cx| {
             terminal.input(vec![0u8]);
         });

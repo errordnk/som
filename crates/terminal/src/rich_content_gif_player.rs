@@ -30,6 +30,59 @@ pub struct DecodedPrefix {
     /// even if more chunks keep arriving (a client re-sending a file with
     /// itself as content is not this module's problem to guard against).
     pub complete: bool,
+    /// How many bytes of the input the decoder actually READ before it
+    /// stopped — the truncation point. NOT necessarily the whole input,
+    /// and not the caller's watermark: a caller whose buffer doesn't
+    /// begin at the file's start (a mid-stream re-anchor) hands over
+    /// bytes with no valid GIF header, and one re-anchored to 0 by a
+    /// catch-up reply may hold far less than the transfer's watermark
+    /// claims. A caller tracking "decoded through" by the WATERMARK
+    /// instead of this count believed it had decoded bytes it never saw
+    /// and never re-decoded (observed live: a player stuck on 9 frames
+    /// forever while the full file sat in its buffer).
+    pub bytes_consumed: u64,
+}
+
+/// A `Cursor` that remembers the furthest byte position any read reached —
+/// the decoder's real truncation point, for `DecodedPrefix::bytes_consumed`.
+struct TrackedCursor<'a> {
+    inner: std::io::Cursor<&'a [u8]>,
+    max: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl TrackedCursor<'_> {
+    fn note(&self) {
+        self.max.set(self.max.get().max(self.inner.position()));
+    }
+}
+
+impl std::io::Read for TrackedCursor<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.note();
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for TrackedCursor<'_> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = self.inner.seek(pos)?;
+        self.note();
+        Ok(position)
+    }
+}
+
+impl std::io::BufRead for TrackedCursor<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let filled = self.inner.fill_buf()?;
+        // Seeing the bytes is not reading them; the position advances
+        // only on `consume`, noted there.
+        Ok(filled)
+    }
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+        self.note();
+    }
 }
 
 /// Tries to decode as many complete frames as possible from `bytes` (the
@@ -44,7 +97,9 @@ pub fn try_decode_progressive(bytes: &[u8]) -> Result<Option<DecodedPrefix>, Str
     // both over a plain `&[u8]` with no copy, and `bytes` is already
     // exactly "the available prefix" (no `Take`/length-limiting wrapper
     // needed the way the old file-backed version required).
-    let decoder = match GifDecoder::new(std::io::Cursor::new(bytes)) {
+    let max_read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let tracked = TrackedCursor { inner: std::io::Cursor::new(bytes), max: std::rc::Rc::clone(&max_read) };
+    let decoder = match GifDecoder::new(tracked) {
         Ok(decoder) => decoder,
         // A truncated header (not enough bytes yet for even the fixed
         // GIF signature/logical screen descriptor) surfaces as
@@ -82,7 +137,7 @@ pub fn try_decode_progressive(bytes: &[u8]) -> Result<Option<DecodedPrefix>, Str
     if frames.is_empty() {
         return Ok(None);
     }
-    Ok(Some(DecodedPrefix { frames, complete }))
+    Ok(Some(DecodedPrefix { frames, complete, bytes_consumed: max_read.get() }))
 }
 
 /// Whether an `ImageError` from the GIF decoder means "the available

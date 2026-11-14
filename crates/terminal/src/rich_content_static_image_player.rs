@@ -18,7 +18,11 @@
 pub fn decode_complete(bytes: &[u8]) -> Result<crate::rich_content_gif_player::DecodedPrefix, String> {
     let image = image::load_from_memory(bytes).map_err(|e| format!("decoding image: {e}"))?;
     let frame = image::Frame::new(image.to_rgba8());
-    Ok(crate::rich_content_gif_player::DecodedPrefix { frames: vec![frame], complete: true })
+    Ok(crate::rich_content_gif_player::DecodedPrefix {
+        frames: vec![frame],
+        complete: true,
+        bytes_consumed: bytes.len() as u64,
+    })
 }
 
 #[cfg(test)]

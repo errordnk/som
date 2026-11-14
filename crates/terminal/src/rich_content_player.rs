@@ -45,7 +45,7 @@ impl RichContentPlayer {
     /// Builds a player from an already-decoded prefix — used both for the
     /// initial creation (see [`refresh_or_create`]) and to reuse the same
     /// struct shape after a later re-decode.
-    fn from_prefix(mut prefix: rich_content_gif_player::DecodedPrefix, decoded_through: u64) -> Self {
+    fn from_prefix(mut prefix: rich_content_gif_player::DecodedPrefix) -> Self {
         // `image::Frame`/the `gif` crate's decoder only ever produce RGBA
         // pixel data, but `gpui::RenderImage` requires BGRA (see that
         // type's own doc comment) — without this swap, red and blue are
@@ -64,7 +64,15 @@ impl RichContentPlayer {
         let render_image = Arc::new(RenderImage::new(SmallVec::from_vec(prefix.frames)));
         Self {
             render_image,
-            decoded_through,
+            // The bytes the DECODER actually consumed — the truncation
+            // point — NOT the transfer's watermark: the two diverge when
+            // the buffer was re-anchored by a catch-up reply (it holds a
+            // prefix of the file, far less than the watermark claims).
+            // Trusting the watermark here made `is_up_to_date` report the
+            // player as current forever, and a placement that had decoded
+            // only a mid-buffer prefix froze on it for good (observed
+            // live: 9 frames of 47 while the full file sat in the buffer).
+            decoded_through: prefix.bytes_consumed,
             complete: prefix.complete,
             current_frame: Cell::new(0),
             last_advance: Cell::new(None),
@@ -187,7 +195,7 @@ pub fn refresh_or_create(
     };
 
     match decoded {
-        Ok(Some(prefix)) => Some(RichContentPlayer::from_prefix(prefix, contiguous_len)),
+        Ok(Some(prefix)) => Some(RichContentPlayer::from_prefix(prefix)),
         // Not enough data yet, or a real decode error — either way, no
         // usable player. A genuine format error (not just "too early")
         // is silently dropped rather than surfaced: a single

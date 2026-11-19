@@ -896,159 +896,63 @@ impl TerminalPanel {
                 }
             }
             tabs_in_db_order.sort_by_key(|(db_index, ..)| *db_index);
-            // Move the tab db.json marked active to the end of the queue.
-            // Phase 2 below activates each tab it splits (a real, visible
-            // focus change — see the comment above that loop), so whichever
-            // tab is processed LAST is what's on screen once Phase 2 ends.
-            // Without this, an earlier-in-db-order tab that also has splits
-            // would flash into view after the active tab's real content
-            // already landed, only for the final correction block further
-            // down to snap focus back — a visible wrong-tab flicker on every
-            // restore where a non-active tab happens to have splits too.
-            if let Some(active_pos) = tabs_in_db_order
-                .iter()
-                .position(|(db_index, ..)| *db_index == active_tab)
-            {
-                let active_entry = tabs_in_db_order.remove(active_pos);
-                tabs_in_db_order.push(active_entry);
-            }
             window_handle
                 .update(cx, |_, _, cx| {
                     workspace.update(cx, |workspace, cx| {
-                        // Nothing moved position, but `active_item_index`
-                        // is still worth resyncing defensively here (e.g. a
-                        // placeholder whose tab the user closed mid-restore
-                        // before its real content ever arrived) — same
-                        // safety net the old reorder-based flow already had.
+                        // `active_item_index` is worth resyncing defensively
+                        // here (e.g. a placeholder whose tab the user closed
+                        // mid-restore before its real content ever arrived).
                         workspace.som_resync_active_tab_index(cx);
                     })
                 })
                 .ok();
 
-            // Phase 2: for each tab, add its split panes. Splits within one
-            // tab must stay sequential (level 1 splits level 0, which must
-            // already exist), and tabs are handled one at a time here too —
-            // `som_split_active_pane_awaited` works through `Workspace`'s
-            // single shared `active_pane`/`som_split_panes`, so two tabs
-            // creating splits at the same time would race on that shared
-            // state and corrupt each other's layout.
-            //
-            // Each tab must be made the active tab before splitting it —
-            // `som_split_active_pane_awaited` always splits whatever tab is
-            // currently active. Every tab's position has been stable since
-            // Phase 0, but this still looks each one up by `EntityId`
-            // rather than assuming `position` holds, since splitting an
-            // EARLIER tab in this same loop shifts later ones' indices.
+            // Phase 2: for each tab, create its split panes directly in the
+            // PARKED state (`Workspace::som_restore_parked_splits`) — no tab
+            // is switched to, so a background tab's splits never appear on
+            // the screen showing the active tab. The old flow had to
+            // activate every split-bearing tab and split it live (a visible
+            // phantom slideshow of other tabs' panes on launch), because
+            // `som_split_active_pane_awaited` can only split whatever tab
+            // is active. A tab's splits stay sequential (each terminal
+            // spawns and reattaches before the next begins), and tabs are
+            // handled one at a time, as before — concurrent pane creation
+            // at launch was the original ssh-MOTD duplication bug. The
+            // active tab's parked splits are unparked by the final
+            // activation block below (`som_unpark_splits_for`).
             for (_db_index, split_panes, item_id) in tabs_in_db_order.into_iter() {
                 if split_panes.is_empty() {
                     continue;
                 }
-
-                let real_index = window_handle
-                    .update(cx, |_, _, cx| {
+                let split_task = window_handle
+                    .update(cx, |_, window, cx| {
                         workspace.update(cx, |workspace, cx| {
-                            workspace
-                                .panes()
-                                .first()
-                                .and_then(|p| p.read(cx).index_for_item_id(item_id))
+                            workspace.som_restore_parked_splits(item_id, split_panes, window, cx)
                         })
                     })
                     .ok()
-                    .and_then(|r| r.ok())
-                    .flatten();
-                let Some(real_index) = real_index else {
-                    // Item vanished (closed mid-restore?) — nothing to split.
-                    continue;
-                };
-
-                window_handle
-                    .update(cx, |_, window, cx| {
-                        workspace.update(cx, |workspace, cx| {
-                            if let Some(main_pane) = workspace.panes().first().cloned() {
-                                main_pane.update(cx, |pane, cx| {
-                                    pane.activate_item(real_index, true, true, window, cx);
-                                });
-                            }
-                        })
-                    })
-                    .ok();
-
-                // `activate_item` above only *emits* `pane::Event::ActivateItem`;
-                // GPUI dispatches that event (and the park/unpark handling that
-                // updates `Workspace::active_pane`) on a later effect flush, not
-                // synchronously within this `update` call. Without waiting for
-                // that to land, the split below would clone whatever pane was
-                // active *before* this activation (e.g. a previous tab), not
-                // the tab we just switched to. Poll until the main pane's
-                // active item actually reflects the tab we just activated.
-                let mut activated = false;
-                for _ in 0..50 {
-                    let is_active = window_handle
-                        .update(cx, |_, _, cx| {
-                            workspace.update(cx, |workspace, cx| {
-                                workspace
-                                    .panes()
-                                    .first()
-                                    .map(|p| p.read(cx).active_item_index() == real_index)
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or(false);
-                    if is_active {
-                        activated = true;
-                        break;
-                    }
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(5))
-                        .await;
-                }
-                if !activated {
-                    // Something's very wrong (item removed mid-restore?) — skip
-                    // this tab's splits rather than risk cloning the wrong pane.
-                    continue;
-                }
-
-                // Each split reattaches to the session named by its UUID:
-                // the workspace hands the UUID to the terminal the split
-                // creates (`Item::clone_on_split_as`).
-                for split_pane in split_panes {
-                    let split_task = window_handle
-                        .update(cx, |_, window, cx| {
-                            workspace.update(cx, |workspace, cx| {
-                                workspace.set_som_next_split_pane_uuid(Some(split_pane));
-                                workspace.som_split_active_pane_awaited(window, cx)
-                            })
-                        })
-                        .ok()
-                        .and_then(|r| r.ok());
-                    if let Some(split_task) = split_task {
-                        split_task.await;
-                    }
-                    // A split that did not happen must not leave its UUID
-                    // to the next one.
-                    window_handle
-                        .update(cx, |_, _, cx| {
-                            workspace.update(cx, |workspace, _| workspace.set_som_next_split_pane_uuid(None))
-                        })
-                        .ok();
+                    .and_then(|r| r.ok());
+                if let Some(split_task) = split_task {
+                    split_task.await;
                 }
             }
 
             // All tabs (and their splits) exist now — focus the tab db.json
-            // marked active. Activating it also unparks its split panes via
-            // the existing tab-switch handler if they aren't already live
-            // (they are live only for the last tab created above).
+            // marked active. Phase 2 left every tab's splits parked and no
+            // tab was ever switched away from the one Phase 0 activated, so
+            // the active tab's splits are unparked here directly
+            // (`som_unpark_splits_for` — the switch handler's own unpark
+            // only runs on a real tab switch; a no-op if the activation
+            // below already triggered it).
             //
             // `som_park_current_split_panes` is called unconditionally first:
             // `pane::Event::ActivateItem` (and the parking it triggers) only
-            // fires below if `current != db_state.active_tab`. If the last
-            // split-creating tab in the loop above happens to already be the
-            // one db.json marked active, `activate_item` would be a no-op and
-            // that tab's splits would never be parked — leaving them visible
-            // on screen while a *different* tab (per active_item_index) is
-            // considered active.
+            // fires below if `current != db_state.active_tab`. If live
+            // splits somehow still belong to another tab (nothing in Phase 2
+            // creates any any more — a leftover from a user split pressed
+            // mid-restore), they must be parked before the switch, or they
+            // would stay visible on screen while a different tab (per
+            // active_item_index) is considered active.
             //
             // Once that tab is confirmed active, focus its `active_pane`
             // (0 = main pane, 1..=3 = a split level) explicitly — there is no
@@ -1146,6 +1050,11 @@ impl TerminalPanel {
             window_handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
+                        // The active tab's splits are still parked (Phase 2
+                        // parks every tab's splits, and no switch happened
+                        // unless `needs_activation` above did it — in which
+                        // case this finds nothing left and does nothing).
+                        workspace.som_unpark_splits_for(active_tab, active_tab, window, cx);
                         workspace.som_focus_pane_by_index(active_pane_index, window, cx);
                         // Every tab is real now: `db.json` is written from them.
                         workspace.set_som_restoring(false, cx);

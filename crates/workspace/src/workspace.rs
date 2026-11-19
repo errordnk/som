@@ -4544,7 +4544,12 @@ impl Workspace {
         cx.notify();
     }
 
-    fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+    /// A new `Pane` entity with none of `add_pane`'s live-layout side
+    /// effects: not in `self.panes`, not in the center, not focused, no
+    /// `PaneAdded` event. The pane a parked split lives in is made of this
+    /// (see `som_restore_parked_splits`); `add_pane` builds on it for the
+    /// ordinary, visible case.
+    fn new_pane_detached(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(
                 self.weak_handle(),
@@ -4561,6 +4566,11 @@ impl Workspace {
         });
         cx.subscribe_in(&pane, window, Self::handle_pane_event)
             .detach();
+        pane
+    }
+
+    fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        let pane = self.new_pane_detached(window, cx);
         self.panes.push(pane.clone());
 
         window.focus(&pane.focus_handle(cx), cx);
@@ -5561,40 +5571,7 @@ impl Workspace {
                     } else {
                         new_tab_index
                     };
-                    if let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&parked_key) {
-                        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
-                        let mut prev: Option<Entity<Pane>> = None;
-                        for (i, p) in parked.iter().enumerate() {
-                            let split_from = prev.as_ref().unwrap_or_else(|| self.panes.first().unwrap());
-                            let dir = directions[i.min(2)];
-                            self.center.split(split_from, p, dir, cx);
-                            self.panes.push(p.clone());
-                            prev = Some(p.clone());
-                        }
-                        som_apply_flexes(&self.center.root, &saved_flexes);
-                        // Update flexes map for new tab and persist all tabs
-                        self.som_tab_flexes.insert(new_tab_index, saved_flexes);
-                        self.som_split_panes = parked.iter().map(|p| p.downgrade()).collect();
-                        // Lock levels for all restored panels
-                        self.som_level_locked = [false; 3];
-                        for i in 0..self.som_split_panes.len().min(3) {
-                            self.som_level_locked[i] = true;
-                        }
-                        self.som_persist_tab_state(cx);
-                        // Restore last-focused pane for this tab (may be a split pane)
-                        let weak_active = self.som_tab_active_pane.get(&new_tab_index).cloned();
-                        cx.notify();
-                        if let Some(weak_active) = weak_active {
-                            cx.spawn_in(window, async move |this, cx| {
-                                this.update_in(cx, |ws, window, cx| {
-                                    if let Some(p) = weak_active.upgrade() {
-                                        ws.set_active_pane(&p, window, cx);
-                                        p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
-                                    }
-                                }).log_err();
-                            }).detach();
-                        }
-                    }
+                    self.som_unpark_splits_for(parked_key, new_tab_index, window, cx);
                 }
             }
             pane::Event::UserSavedItem { item, save_intent } => {
@@ -6161,6 +6138,120 @@ impl Workspace {
         let main = self.panes.first().cloned().unwrap_or(self.active_pane.clone());
         self.set_active_pane(&main, window, cx);
         cx.notify();
+    }
+
+    /// Re-inserts a tab's parked split panes into the live center layout —
+    /// the unpark half of tab switching (`ActivateItem` on the main pane),
+    /// extracted so launch-time restore can call it for the tab it ends on
+    /// without staging a switch (restore creates every tab's splits parked,
+    /// and the switch handler's own unpark only runs on a real switch).
+    /// `at` is where the panes are parked (may be a pre-tab-removal index,
+    /// see the caller); `tab_index` is whose bookkeeping (flexes, saved
+    /// focus) the panes go back to. A no-op when nothing is parked there.
+    pub fn som_unpark_splits_for(&mut self, at: usize, tab_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((parked, saved_flexes, _saved_active)) = self.som_parked_splits.remove(&at) else { return; };
+        let directions = [SplitDirection::Right, SplitDirection::Down, SplitDirection::Right];
+        let mut prev: Option<Entity<Pane>> = None;
+        for (i, p) in parked.iter().enumerate() {
+            let split_from = prev.as_ref().unwrap_or_else(|| self.panes.first().unwrap());
+            let dir = directions[i.min(2)];
+            self.center.split(split_from, p, dir, cx);
+            self.panes.push(p.clone());
+            prev = Some(p.clone());
+        }
+        som_apply_flexes(&self.center.root, &saved_flexes);
+        // Update flexes map for new tab and persist all tabs
+        self.som_tab_flexes.insert(tab_index, saved_flexes);
+        self.som_split_panes = parked.iter().map(|p| p.downgrade()).collect();
+        // Lock levels for all restored panels
+        self.som_level_locked = [false; 3];
+        for i in 0..self.som_split_panes.len().min(3) {
+            self.som_level_locked[i] = true;
+        }
+        self.som_persist_tab_state(cx);
+        // Restore last-focused pane for this tab (may be a split pane)
+        let weak_active = self.som_tab_active_pane.get(&tab_index).cloned();
+        cx.notify();
+        if let Some(weak_active) = weak_active {
+            cx.spawn_in(window, async move |this, cx| {
+                this.update_in(cx, |ws, window, cx| {
+                    if let Some(p) = weak_active.upgrade() {
+                        ws.set_active_pane(&p, window, cx);
+                        p.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                    }
+                }).log_err();
+            }).detach();
+        }
+    }
+
+    /// Creates a tab's split panes directly in the PARKED state, for
+    /// launch-time restore: the panes and their terminals are made (each
+    /// reattaching to the session named by its UUID, exactly as a live
+    /// split would), but they never enter the center layout — no tab has
+    /// to be activated, so a background tab's splits never flash on the
+    /// screen that is showing the active tab (the old restore switched to
+    /// every split-bearing tab and split it live: a visible phantom
+    /// slideshow of other tabs' panes on launch). The tab is found by the
+    /// `EntityId` of its main terminal (the item restore put in the main
+    /// pane); the splits take `split_uuids` in order, each terminal
+    /// spawning and reattaching before the next begins (concurrent pane
+    /// creation at launch was the original ssh-MOTD duplication bug).
+    /// The caller unparks the tab that ends up active
+    /// (`som_unpark_splits_for`) once every tab is done.
+    pub fn som_restore_parked_splits(
+        &mut self,
+        tab_item_id: EntityId,
+        split_uuids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let Some(main_pane) = self.panes.first().cloned() else { return Task::ready(()) };
+        let Some(tab_index) = main_pane.read(cx).index_for_item_id(tab_item_id) else { return Task::ready(()) };
+        let Some(item) = main_pane.read(cx).items().nth(tab_index).map(|item| item.boxed_clone()) else { return Task::ready(()) };
+        if split_uuids.is_empty() || !item.can_split(cx) {
+            return Task::ready(());
+        }
+        let workspace_id = self.database_id();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut panes: Vec<Entity<Pane>> = Vec::with_capacity(split_uuids.len());
+            for uuid in &split_uuids {
+                // Each split's terminal is awaited before the next begins,
+                // as the old activate-and-split flow did.
+                let clone = match this.update_in(cx, |_, window, cx| {
+                    item.clone_on_split_as(workspace_id, Some(uuid.clone()), window, cx)
+                }) {
+                    Ok(task) => task.await,
+                    Err(_) => None,
+                };
+                let Some(clone) = clone else { continue };
+                // `activate_pane` and `focus_item` false: the item still
+                // becomes the pane's active item (its UUID is what db.json
+                // persists), but the off-screen pane must not become the
+                // workspace's `active_pane` (the ActivateItem event's
+                // `local: true` would set it) or steal the window's focus
+                // from the visible tab.
+                let pane = this.update_in(cx, |this, window, cx| {
+                    let pane = this.new_pane_detached(window, cx);
+                    pane.update(cx, |pane, cx| {
+                        pane.set_nav_history(main_pane.read(cx).fork_nav_history(), cx);
+                        pane.add_item(clone, false, false, None, window, cx);
+                    });
+                    pane
+                });
+                if let Ok(pane) = pane {
+                    panes.push(pane);
+                }
+            }
+            // Park whatever splits came to be under the tab, with the equal
+            // flexes a fresh split layout has (`som_unpark_splits_for`
+            // applies them when the tab is switched to).
+            let _ = this.update_in(cx, |this, _window, _cx| {
+                if !panes.is_empty() {
+                    let flexes = vec![1.0; panes.len() + 1];
+                    this.som_parked_splits.insert(tab_index, (panes, flexes, None));
+                }
+            });
+        })
     }
 
     fn som_snapshot_active_tab_flexes(&mut self) {

@@ -595,8 +595,10 @@ pub enum SrvRequest {
     /// connection has already closed, same tolerance every other best-
     /// effort message in this protocol already has.
     ///
-    /// `total_rows` is the document's real laid-out row count right now
-    /// (capped at the placeholder table's length). It can go DOWN (a wider
+    /// `total_rows` is the document's real height in CELL rows right now
+    /// (a heading paints taller than one cell, so this is the sum of the
+    /// rows' real heights rounded up, not the laid-out line count; capped
+    /// at the placeholder table's length). It can go DOWN (a wider
     /// window wraps the text into fewer rows), and it survives Som
     /// forgetting how many rows it asked for (a placement that leaves the
     /// screen and comes back is counted afresh). A client that shows a

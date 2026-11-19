@@ -3075,7 +3075,18 @@ fn paint_rich_content_markdown_widget(
     let mut line_wrapper = window.text_system().line_wrapper(prose_font.clone(), base_font_size);
     let laid_out = crate::markdown_styling::layout_markdown_with_nested(rendered_text, Some((&mut line_wrapper, wrap_width)), &nested);
     let placement_rows = laid_out.len().max(1) as i32;
-    *real_row_count = Some(laid_out.len() as u32);
+    // The document's height in CELL rows, not laid-out rows: a heading
+    // paints taller than one row (`markdown_heading_scale` below), so the
+    // physical height the document occupies on the grid — what a window
+    // scrolling over it (farsh's viewer, Scroll Lock here) must be able to
+    // reach, and what the placeholder grid must reserve — is the sum of
+    // the real row heights, rounded up to whole cells. Reporting the
+    // laid-out count instead left the document's tail unreachable by
+    // exactly the headings' accumulated extra (confirmed live: the last
+    // paragraph of a sectioned markdown never scrolled into view).
+    *real_row_count = Some(
+        laid_out.iter().map(|line| markdown_heading_scale(line.heading_level)).sum::<f32>().ceil() as u32,
+    );
     // Records this paint's own `laid_out[i].source_range` alongside the
     // exact `rendered_text` it was computed from, keyed by `host` — see
     // `Terminal::copy`'s own doc comment for why a mouse selection over
@@ -3138,9 +3149,17 @@ fn paint_rich_content_markdown_widget(
     // `scroll_offset_lines` shifts which lines of `laid_out` map to
     // `first_visible_row`, independent of the placement's on-screen
     // position — Scroll Lock moves this without touching `display_line`.
+    // `skip` counts CELL rows (the band and the offset are grid rows), but
+    // `laid_out` has fewer rows than the document has cells once headings'
+    // extra height accumulates — a window so deep that its first cell is
+    // past the last laid-out row still shows the document's TAIL here
+    // (pinned to the band's bottom, as the scroll clamps intend), not an
+    // empty band: `start` backs up to keep one full window of rows.
     let skip = scroll_offset_lines as usize + first_visible_row as usize;
-    let visible_rows = &laid_out[skip.min(laid_out.len())..(skip + visible_row_count as usize).min(laid_out.len())];
-    let visible_row_heights = &row_heights[skip.min(row_heights.len())..(skip + visible_row_count as usize).min(row_heights.len())];
+    let start = skip.min(laid_out.len().saturating_sub(visible_row_count as usize));
+    let end = (start + visible_row_count as usize).min(laid_out.len());
+    let visible_rows = &laid_out[start..end];
+    let visible_row_heights = &row_heights[start..end];
     // Real total painted height of what's actually on screen right now —
     // NOT `visible_row_count as f32 * line_height`, which undershoots the
     // fill whenever a visible heading is taller than one base row (the

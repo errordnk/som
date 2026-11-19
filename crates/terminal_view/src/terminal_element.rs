@@ -2026,6 +2026,11 @@ fn paint_rich_content_placements(
         luminance > 0.5
     };
     let mut row_bands: std::collections::HashMap<(u32, u32), (u32, u32)> = std::collections::HashMap::new();
+    // The same placements' on-screen line ranges (grid-absolute), for the
+    // markdown widget's clip — see the `Seen` fields below for why the
+    // clip is built of screen lines rather than of anything derived from
+    // the cells' decoded document rows.
+    let mut screen_bands: std::collections::HashMap<(u32, u32), (i32, i32)> = std::collections::HashMap::new();
     let (origins, placements, audio_placements, markdown_placements, video_placements, max_columns_seen, max_rows_seen, pending_image_drops) =
         terminal.update(cx, |terminal, _cx| {
         // For each (session_id, file_id) group, remember the grid position
@@ -2074,6 +2079,17 @@ fn paint_rich_content_placements(
             /// the last, the band of rows a program (farsh's viewer window)
             /// really covers with placeholder cells.
             min_row: u32,
+            /// The first and last SCREEN line the placement's cells occupy.
+            /// Mid-redraw of a scrolled window (farsh's viewer), the same
+            /// screen lines briefly carry BOTH the old and the new marks
+            /// (old and new document-row numbers), so anything derived from
+            /// the decoded rows — the origin, `min_row`/`max_row` — is then
+            /// a mix of the two windows, offset by the scroll step. The
+            /// screen lines are the same for old and new marks alike, so a
+            /// clip built of them holds the widget to the placement's real
+            /// rectangle through the whole redraw.
+            min_line: i32,
+            max_line: i32,
         }
         let mut seen: Vec<Seen> = Vec::new();
         let mut last_seen: usize = 0;
@@ -2113,7 +2129,15 @@ fn paint_rich_content_placements(
                 // top-left corner), so the first cell seen for an id wins.
                 let origin_line = indexed_cell.point.line.0 - row as i32;
                 let origin_column = indexed_cell.point.column.0 as i32 - cell_col_in_image as i32;
-                seen.push(Seen { key, origin: (origin_line, origin_column), max_column: 0, max_row: 0, min_row: row });
+                seen.push(Seen {
+                    key,
+                    origin: (origin_line, origin_column),
+                    max_column: 0,
+                    max_row: 0,
+                    min_row: row,
+                    min_line: indexed_cell.point.line.0,
+                    max_line: indexed_cell.point.line.0,
+                });
                 seen.len() - 1
             };
             last_seen = index;
@@ -2121,11 +2145,14 @@ fn paint_rich_content_placements(
             entry.max_column = entry.max_column.max(cell_col_in_image);
             entry.max_row = entry.max_row.max(row);
             entry.min_row = entry.min_row.min(row);
+            entry.min_line = entry.min_line.min(indexed_cell.point.line.0);
+            entry.max_line = entry.max_line.max(indexed_cell.point.line.0);
         }
         for entry in seen {
             let (session_id, file_id) = entry.key;
             origins.insert(entry.key, entry.origin);
             row_bands.insert(entry.key, (entry.min_row, entry.max_row));
+            screen_bands.insert(entry.key, (entry.min_line, entry.max_line));
             // The placement's real column count can't be recomputed from
             // the image's own pixel size at paint time (see `Terminal::
             // record_rich_content_max_column_seen`'s doc comment): the
@@ -2254,14 +2281,25 @@ fn paint_rich_content_placements(
             let mut embedded_controls_bounds: Vec<(String, Bounds<Pixels>, Option<Bounds<Pixels>>)> = Vec::new();
             let mut any_nested_loading = false;
             let sel_range = terminal.read(cx).selection_line_range().map(|(start, end)| (start.0, end.0));
-            // the document is clipped to the rectangle its placeholder cells cover (a
-            // heading is taller than a row: without the clip it would run over what
-            // is around a window of the document)
-            let clip = row_bands.get(&(session_id, file_id)).map(|&(first, last)| {
-                let top = origin.y + (geometry.origin_line + layout.display_offset as i32 + first as i32) as f32 * layout.dimensions.line_height;
+            // The document is clipped to the rectangle its placeholder cells
+            // occupy ON SCREEN. The rectangle is built of the cells' screen
+            // lines, never of anything derived from their decoded document
+            // rows (the origin, the row band): mid-redraw of a scrolled
+            // window (farsh's viewer), the same screen lines briefly carry
+            // BOTH the old and the new marks, and row-derived geometry is
+            // then a mix of the two windows, offset by the scroll step — a
+            // clip built of it let the document run over what is above or
+            // below the placement for a frame (farsh's status bar and key
+            // bar flashed away on every scroll). The screen lines are the
+            // same for old and new marks alike, so this clip holds through
+            // the whole redraw — and it still matters in the steady state,
+            // because a heading paints taller than a row and would
+            // otherwise run over what is below the placement.
+            let clip = screen_bands.get(&(session_id, file_id)).map(|&(top_line, bottom_line)| {
+                let top = origin.y + (top_line + layout.display_offset as i32) as f32 * layout.dimensions.line_height;
                 Bounds::new(
                     point(origin.x, top),
-                    gpui::size(layout.dimensions.num_columns() as f32 * layout.dimensions.cell_width, layout.dimensions.line_height * (last - first + 1) as f32),
+                    gpui::size(layout.dimensions.num_columns() as f32 * layout.dimensions.cell_width, layout.dimensions.line_height * (bottom_line - top_line + 1) as f32),
                 )
             });
             let painted = match clip {
@@ -2309,6 +2347,10 @@ fn paint_rich_content_placements(
             ),
             };
             if let Some(bounds) = painted {
+                // What the clip holds the painting to is also all that is
+                // clickable: a click outside the placement's rectangle is
+                // the host's cell, not this widget's.
+                let bounds = clip.map(|clip| bounds.intersect(&clip)).unwrap_or(bounds);
                 terminal.read(cx).record_rich_content_placement_bounds(session_id, file_id, bounds);
             }
             any_markdown_embedded_image_loading |= any_nested_loading;

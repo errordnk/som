@@ -558,6 +558,11 @@ struct GrowingFileStream {
     /// stuck read re-issue it after [`STUCK_REQUEST_RETRY_INTERVAL`]
     /// instead of waiting forever on a reply that may never land.
     last_requested_at: Option<Instant>,
+    /// The end of the last READ-AHEAD window (`start + len`) — read-ahead
+    /// refires only once the reader has nearly consumed it. Dedupe by
+    /// exact start re-downloaded the same overlapping window many times a
+    /// second and froze playback for seconds at a stretch.
+    last_requested_end: Option<u64>,
 }
 
 impl GrowingFileStream {
@@ -577,6 +582,7 @@ impl GrowingFileStream {
             request_byte_range,
             last_requested_position: None,
             last_requested_at: None,
+            last_requested_end: None,
         })
     }
 }
@@ -631,6 +637,36 @@ impl std::io::Read for GrowingFileStream {
                     self.position += n as u64;
                     self.srv_state.advance_consumed_up_to(self.position);
                     self.last_requested_position = None;
+                    // Read-ahead: when the demuxer is close to the edge of
+                    // what's readable, fetch the next stretch BEFORE it is
+                    // needed — otherwise every 4MB window ends in a
+                    // block-recover cycle and playback visibly stutters
+                    // (the old whole-file catch-up flood kept `contiguous`
+                    // so far ahead no read ever blocked; on-demand-only
+                    // delivery needs its own head start).
+                    const READ_AHEAD_MARK: u64 = 8 * 1024 * 1024;
+                    const READ_AHEAD_LEN: u64 = 32 * 1024 * 1024;
+                    // Refire only when the reader has consumed into the
+                    // last fetched window's tail (2MB of headroom left) —
+                    // deduping by exact start re-downloaded the SAME
+                    // overlapping window many times a second (every chunk
+                    // arrival moves `readable_up_to` forward a little,
+                    // which a start-only comparison read as a new range),
+                    // saturating the pipe and freezing playback for
+                    // seconds.
+                    if let Some(request_byte_range) = self.request_byte_range.as_ref()
+                        && total_size > 0
+                        && self.position + READ_AHEAD_MARK >= readable_up_to.min(total_size)
+                        && readable_up_to < total_size
+                        && self
+                            .last_requested_end
+                            .map(|end| readable_up_to + READ_AHEAD_MARK >= end)
+                            .unwrap_or(true)
+                    {
+                        self.srv_state.mark_expected_range(readable_up_to, READ_AHEAD_LEN);
+                        request_byte_range(readable_up_to, READ_AHEAD_LEN);
+                        self.last_requested_end = Some(readable_up_to + READ_AHEAD_LEN);
+                    }
                     if diag_slept {
                         log::debug!("DIAG: GrowingFileStream::read unblocked after {:?}", diag_wait_started_at.elapsed());
                     }
@@ -671,7 +707,12 @@ impl std::io::Read for GrowingFileStream {
                 // stalled on a black widget no matter how many times the
                 // range requests were re-sent).
                 const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
-                log::warn!("DIAG-READ: stuck at pos={} contiguous={contiguous_len} tail_from={tail_available_from} total={total_size}", self.position);
+                // Mark the window (NOT a buffer reset — clearing would
+                // throw away the other readers' bytes) so the out-of-order
+                // store protects exactly these chunks from eviction while
+                // a catch-up flood (a late-subscriber whole-file re-send)
+                // pushes everything else through.
+                self.srv_state.mark_expected_range(self.position, ON_DEMAND_RANGE_LEN);
                 request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
                 self.last_requested_position = Some(self.position);
                 self.last_requested_at = Some(Instant::now());
@@ -2752,6 +2793,182 @@ mod tests {
     /// open reproduces the same bug without needing a live transfer.
     /// Skipped (not failed) if the specific movie file isn't present on
     /// this machine.
+    // ---- The data-delivery nuance suite: every test here reproduces a
+    // ---- stall or a stutter this pipeline really had. All of them drive
+    // ---- a real `RichContentVideoPlayer` (its own decode thread) over a
+    // ---- synthetic `SrvProgressState`, capturing the byte-range
+    // ---- requests the reader issues.
+
+    type CapturedRequests = std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+
+    /// A player over a synthetic state, with every `RequestByteRange`
+    /// the reader fires recorded into `captured`. `total` is the file's
+    /// declared size (nothing else arrives unless the test pushes it).
+    /// The extension is announced, so the decode thread does not wait
+    /// for it at the start.
+    fn open_player_with_request_capture(
+        srv_state: Arc<crate::rich_content_srv_channel::SrvProgressState>,
+        captured: CapturedRequests,
+    ) -> RichContentVideoPlayer {
+        let total = srv_state.total_size();
+        let progress = Arc::new(VideoTransferProgress::new());
+        progress.update(srv_state.contiguous_len(), srv_state.tail_available_from(), Vec::new(), total);
+        let request_byte_range: RequestByteRange = {
+            let captured = captured.clone();
+            Arc::new(move |offset, len| captured.lock().unwrap().push((offset, len)))
+        };
+        RichContentVideoPlayer::open(srv_state, progress, None, Some(request_byte_range))
+    }
+
+    #[test]
+    fn a_stuck_read_refires_its_request_after_the_retry_interval() {
+        // The once-per-position-forever dedupe turned a single lost reply
+        // into a permanent black-widget stall — the read must ask again
+        // (after the 2s retry interval), not give up silently.
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.set_extension_for_test("mkv");
+        let total = 64u64 * 1024 * 1024;
+        // nothing arrives at all: the very first read of the probe is stuck
+        let captured: CapturedRequests = Default::default();
+        let player = open_player_with_request_capture(srv_state.clone(), captured.clone());
+
+        std::thread::sleep(Duration::from_millis(700));
+        let fired_early = captured.lock().unwrap().len();
+        assert!(fired_early >= 1, "the stuck read fires its first request at once");
+        std::thread::sleep(Duration::from_millis(1200));
+        let fired_within = captured.lock().unwrap().len();
+        assert_eq!(fired_within, fired_early, "no refire inside the 2s retry interval");
+        std::thread::sleep(Duration::from_millis(1500));
+        let fired_late = captured.lock().unwrap().len();
+        assert!(fired_late > fired_within, "the stuck read re-issues its request after the retry interval");
+        let _ = player;
+    }
+
+    #[test]
+    fn a_lost_range_reply_does_not_stall_the_read_forever() {
+        // The reply to a stuck read's request lands, the read unblocks —
+        // even when the reply arrived only after the reader had re-fired
+        // the request (the lost-reply shape that used to be permanent).
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.set_extension_for_test("mkv");
+        let total = 8u64 * 1024 * 1024;
+        // the front announces, the run anchors at 0; the first 256KB are
+        // readable, everything past that must come from a range reply
+        srv_state.append_piece_for_test(0, &[1u8; 256 * 1024], total);
+        let captured: CapturedRequests = Default::default();
+        let player = open_player_with_request_capture(srv_state.clone(), captured.clone());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!captured.lock().unwrap().is_empty(), "the read past the announce fires a request");
+
+        // the reply arrives late — and the read still proceeds
+        let reply_offset = 256 * 1024;
+        srv_state.append_piece_for_test(reply_offset, &[2u8; 4 * 1024 * 1024], total);
+        std::thread::sleep(Duration::from_millis(500));
+        let mut buf = [0u8; 8];
+        assert_eq!(srv_state.read_buffered(reply_offset, &mut buf), 8, "the reply is served");
+        assert_eq!(buf, [2u8; 8]);
+        let _ = player;
+    }
+
+    #[test]
+    fn read_ahead_fires_once_per_window_not_once_per_read() {
+        // Dedupe by exact start re-downloaded the SAME overlapping window
+        // many times a second (every chunk arrival nudges `readable_up_to`
+        // forward, which a start-only comparison read as a new range) —
+        // eight identical forwards a second, saturating the pipe and
+        // freezing playback for seconds. One window = one request.
+        let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+        srv_state.set_extension_for_test("mkv");
+        let total = 1024u64 * 1024 * 1024;
+        // the front announces; everything past 256KB must be requested
+        srv_state.append_piece_for_test(0, &[1u8; 256 * 1024], total);
+        let captured: CapturedRequests = Default::default();
+        let player = open_player_with_request_capture(srv_state.clone(), captured.clone());
+
+        std::thread::sleep(Duration::from_millis(1500));
+        let big_requests = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(_, len)| len == 32 * 1024 * 1024)
+            .count();
+        assert!(big_requests >= 1, "read-ahead fires for the first window");
+        assert_eq!(big_requests, 1, "read-ahead fires ONCE per window, not once per read (got {big_requests})");
+        let _ = player;
+    }
+
+    // ---- Codec/size matrix: real decodes over real generated fixtures.
+    // ---- Each fixture is generated by the system ffmpeg on first use
+    // ---- and cached under target; a machine without ffmpeg skips these.
+
+    /// The system ffmpeg CLI, if one is on PATH — the codec-matrix
+    /// fixtures are generated with it, and the whole matrix test skips
+    /// cleanly where there is none.
+    fn ffmpeg_cli_path() -> Option<std::path::PathBuf> {
+        let on_path = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join("ffmpeg.exe"))
+            .find(|candidate| candidate.is_file())?;
+        Some(on_path)
+    }
+
+    fn generated_fixture(name: &str, codec_args: &[&str]) -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(std::env::var("CARGO_TARGET_TMPDIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+        let ffmpeg = ffmpeg_cli_path()?;
+        // The source is ffmpeg's own synthetic pattern — no fixture file
+        // has to exist for the matrix to run.
+        let status = std::process::Command::new(&ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x180:rate=24"])
+            .args(codec_args)
+            .arg(&path)
+            .status()
+            .ok()?;
+        if !status.success() || !path.is_file() {
+            eprintln!("skipping: ffmpeg could not generate {}", name);
+            return None;
+        }
+        Some(path)
+    }
+
+    #[test]
+    fn decode_produces_a_frame_for_each_container_and_codec() {
+        // The matrix this machine's library realistically plays: both
+        // containers (MP4/MKV) × both video codecs (H264/HEVC), HEVC in
+        // its 10-bit variant included, one small file (≈1s, a few hundred
+        // KB) and one bigger (≈5s, a few MB) per shape.
+        let cases: &[(&str, &[&str])] = &[
+            ("gen-h264-mp4-small.mp4", &["-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ("gen-h264-mp4-big.mp4", &["-t", "5", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-b:v", "2M"]),
+            ("gen-h264-mkv-small.mkv", &["-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p"]),
+            ("gen-hevc-mp4-small.mp4", &["-t", "1", "-c:v", "libx265", "-pix_fmt", "yuv420p", "-tag:v", "hvc1"]),
+            ("gen-hevc-10bit-mkv-small.mkv", &["-t", "1", "-c:v", "libx265", "-pix_fmt", "yuv420p10le"]),
+            ("gen-hevc-10bit-mkv-big.mkv", &["-t", "5", "-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-b:v", "2M"]),
+        ];
+        for &(name, args) in cases {
+            let Some(path) = generated_fixture(name, args) else { continue };
+            let data = std::fs::read(&path).unwrap();
+            eprintln!("fixture {}: {} KB", name, data.len() / 1024);
+            let srv_state = Arc::new(crate::rich_content_srv_channel::SrvProgressState::default());
+            srv_state.seed_whole_file_for_test(&data, path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+            let total_size = data.len() as u64;
+            let progress = Arc::new(VideoTransferProgress::new());
+            progress.update(total_size, 0, Vec::new(), total_size);
+            let player = RichContentVideoPlayer::open(srv_state, progress, None, None);
+            assert!(
+                wait_for_decode_with_attempts(&player, 250),
+                "decode never produced a frame for {name}"
+            );
+            let frame = player.current_frame(false).expect("a decoded frame for {name}");
+            assert!(frame.size(0).width.0 > 0 && frame.size(0).height.0 > 0, "{name}: a real frame");
+        }
+    }
+
     #[test]
     fn seek_near_end_of_large_local_file_completes_quickly() {
         let path = std::path::PathBuf::from(

@@ -73,7 +73,7 @@ const LIVE_CONSUMED_RETENTION: u64 = 4 * 1024 * 1024;
 /// video's proactive tail (4MB) plus a couple of on-demand fetch windows
 /// (4MB each) fit comfortably; anything past this evicts the smallest
 /// offsets first.
-const MAX_OUT_OF_ORDER_BYTES: usize = 24 * 1024 * 1024;
+const MAX_OUT_OF_ORDER_BYTES: usize = 64 * 1024 * 1024;
 
 /// How far back [`SrvProgressState::transfer_speed`] looks when it diffs
 /// the byte counters — long enough to smooth a chunk arriving in bursts,
@@ -410,6 +410,16 @@ impl SrvProgressState {
         *self.info_shown_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
     }
 
+    /// Records a range a reader is actively blocked on — the out-of-order
+    /// store keeps chunks inside it from being evicted (a catch-up flood
+    /// pushing gigabytes through would otherwise always evict the small
+    /// range the stuck reader waits for: smallest offsets go first, and
+    /// the stuck position is by definition far behind the flood).
+    /// Single-slot: the latest stuck window wins, the old one is unmarked.
+    pub fn mark_expected_range(&self, position: u64, len: u64) {
+        *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some((position, len));
+    }
+
     /// Hides the info line right away (an `i` press with `enabled=false`,
     /// or the 10s window having expired).
     pub fn hide_info(&self) {
@@ -601,6 +611,14 @@ impl SrvProgressState {
     /// gradually with real sleeps between pieces, the same "still
     /// arriving" shape a real SRP transfer has, without needing `append_
     /// chunk` itself (private to this module) to be public.
+    /// Ages the info line past its whole [`INFO_LINE_DURATION`] window
+    /// without a test having to sleep for ten seconds.
+    #[cfg(test)]
+    pub fn expire_info_for_test(&self) {
+        let expired = std::time::Instant::now() - INFO_LINE_DURATION - std::time::Duration::from_secs(1);
+        *self.info_shown_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(expired);
+    }
+
     #[cfg(test)]
     pub fn append_piece_for_test(&self, chunk_offset: u64, data: &[u8], total_size: u64) {
         self.total_size.store(total_size, Ordering::Release);
@@ -701,9 +719,17 @@ impl SrvProgressState {
     /// length of the range about to be requested — the reply's chunks
     /// are accepted anywhere inside `[position, position + len)` (see
     /// `pending_seek_target`'s own doc comment).
+    ///
+    /// NON-destructive on purpose: this buffer is shared by TWO readers
+    /// (the video demuxer and the embedded-audio decoder), and clearing
+    /// it threw away the OTHER reader's read-ahead along with the
+    /// bytes being replaced — confirmed live as a whole class of
+    /// stutters. The out-of-order store now serves any position the
+    /// cleared run used to, so only the window mark matters here; the
+    /// buffer is left for whoever owns it. (Marked-window eviction
+    /// protection in `append_chunk` keeps the reply's chunks alive even
+    /// if a catch-up flood is passing through.)
     pub fn reset_buffer_for_seek(&self, position: u64, len: u64) {
-        let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        buffer.clear();
         *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some((position, len));
     }
 
@@ -772,13 +798,21 @@ impl SrvProgressState {
                     _ => break,
                 }
             }
+            if at != start {
+                // the store doesn't bridge the gap to the run's start —
+                // the file is incomplete, and a mid-file-starting slice
+                // would decode to garbage
+                return bytes;
+            }
             let buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-            let skip = (start - at).min(buffer.len() as u64) as usize;
+            // `len` is the RUN's own contribution here (it was computed as
+            // contiguous_len - start against the run), independent of how
+            // many front bytes the store already added above.
             let (front, back) = buffer.as_slices();
-            let from_front = front.len().saturating_sub(skip).min(len);
-            bytes.extend_from_slice(&front[skip..skip + from_front]);
+            let from_front = front.len().min(len);
+            bytes.extend_from_slice(&front[..from_front]);
             if len > from_front {
-                bytes.extend_from_slice(&back[..(len - from_front).min(back.len())]);
+                bytes.extend_from_slice(&back[..len - from_front]);
             }
             return bytes;
         }
@@ -844,6 +878,15 @@ impl SrvProgressState {
     pub fn request_whole_range_once_if_needed(&self, session_id: u32, file_id: u32) {
         let contiguous_len = self.contiguous_len();
         if contiguous_len == 0 {
+            return;
+        }
+        // A catch-up re-send of a MULTIGIGABYTE file through a 24MB store
+        // helps no one — the front is evicted before any reader reaches it
+        // — and starves every marked window (a stuck video read) behind
+        // it. Whole-file catch-up is for pictures/documents (small files);
+        // a big file's late subscriber gets its bytes through the same
+        // on-demand 4MB windows everything else uses.
+        if self.total_size() > 64 * 1024 * 1024 {
             return;
         }
         let buffer_len = self.buffer.lock().unwrap_or_else(|p| p.into_inner()).len() as u64;
@@ -1505,6 +1548,181 @@ fn send(connection: &SrvConnection, message: &SrvRequest) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    /// The whole transport-nuance suite for the video widget's data path.
+    /// Every test here reproduces a shape a real transfer had on this
+    /// machine; the names say which end of the pipe they stress.
+
+    #[test]
+    fn a_video_s_proactive_tail_survives_a_front_anchored_run_and_serves_the_end() {
+        // A 100MB file: the front announce (256KB) arrives, then the
+        // sender's proactive tail (the last 4MB). FFmpeg's MKV probe
+        // reads exactly there.
+        let state = SrvProgressState::default();
+        let total = 100u64 * 1024 * 1024;
+        state.set_extension_for_test("mkv");
+        state.append_piece_for_test(0, &[1u8; 256 * 1024], total);
+        let tail_offset = total - 4 * 1024 * 1024;
+        state.append_piece_for_test(tail_offset, &[2u8; 4 * 1024 * 1024], total);
+
+        // the tail bytes are readable straight away (the last probe read
+        // sits 2287 bytes before EOF, exactly the Cues-ending shape that
+        // used to stall forever)
+        let mut buf = [0u8; 16];
+        let at = total - 2287 - 8;
+        assert_eq!(state.read_buffered(at, &mut buf), 16, "the proactive tail is served");
+        assert_eq!(buf, [2u8; 16]);
+        // and so is the front, from the main run
+        assert_eq!(state.read_buffered(0, &mut buf), 16, "the front run serves too");
+        assert_eq!(buf, [1u8; 16]);
+    }
+
+    #[test]
+    fn a_probe_interleaving_front_and_tail_reads_is_served_from_both_regions() {
+        // FFmpeg's MKV probing genuinely alternates: header/clusters at
+        // the front, then the Cues near the end, then back. Neither
+        // region may disappear while the other is being served.
+        let state = SrvProgressState::default();
+        let total = 64u64 * 1024 * 1024;
+        state.set_extension_for_test("mkv");
+        state.append_piece_for_test(0, &[1u8; 256 * 1024], total);
+        state.append_piece_for_test(total - 1024 * 1024, &[2u8; 1024 * 1024], total);
+
+        let mut buf = [0u8; 8];
+        for _ in 0..10 {
+            assert_eq!(state.read_buffered(0, &mut buf), 8);
+            assert_eq!(buf, [1u8; 8]);
+            assert_eq!(state.read_buffered(total - 8, &mut buf), 8);
+            assert_eq!(buf, [2u8; 8]);
+        }
+    }
+
+    #[test]
+    fn catchup_front_chunks_of_a_late_subscriber_are_assembled_in_file_order() {
+        // Som subscribed mid-stream: the first chunk it saw anchored the
+        // run at 4MB. The late-subscriber catch-up re-delivers the file
+        // from 0 — below the run's start — and `bytes_received_so_far`
+        // (the image/gif decode's data source) must assemble front + run
+        // in FILE order, not run order.
+        let state = SrvProgressState::default();
+        let total = 8u64 * 1024 * 1024;
+        state.set_extension_for_test("png");
+        let front = vec![1u8; 4 * 1024 * 1024];
+        let rest = vec![2u8; 4 * 1024 * 1024];
+        state.append_piece_for_test(4 * 1024 * 1024, &rest, total);
+        // the front arrives piece by piece, as the catch-up sends it —
+        // enough of it to bridge the gap between 0 and the run's start
+        for (index, piece) in front.chunks(64 * 1024).enumerate() {
+            state.append_piece_for_test((index * 64 * 1024) as u64, piece, total);
+        }
+
+        let bytes = state.bytes_received_so_far();
+        assert_eq!(bytes.len(), total as usize, "front + run assembled");
+        assert_eq!(&bytes[..8], &[1u8; 8], "the file starts with the front's bytes");
+        assert_eq!(&bytes[4 * 1024 * 1024..4 * 1024 * 1024 + 8], &[2u8; 8], "the run's bytes follow at their file offset");
+    }
+
+    #[test]
+    fn a_flood_does_not_evict_the_window_a_stuck_reader_waits_for() {
+        // A late-subscriber catch-up of a multigigabyte file pushes
+        // hundreds of megabytes through the store; the marked window of
+        // a stuck reader (here: 196608, a real stuck position from an
+        // 8GB MKV) must survive the flood, or the read starves forever.
+        let state = SrvProgressState::default();
+        let total = 8u64 * 1024 * 1024 * 1024;
+        state.set_extension_for_test("mkv");
+        state.append_piece_for_test(0, &[9u8; 64 * 1024], total);
+        state.mark_expected_range(196608, 4 * 1024 * 1024);
+        state.append_piece_for_test(196608, &[7u8; 65536], total);
+
+        // the flood: far more than the store's cap, all ahead of tail
+        let mut offset = 512u64 * 1024 * 1024;
+        let piece = vec![0u8; 1024 * 1024];
+        while offset < 512 * 1024 * 1024 + 200 * 1024 * 1024 {
+            state.append_piece_for_test(offset, &piece, total);
+            offset += piece.len() as u64;
+        }
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_buffered(196608, &mut buf), 8, "the marked window survived the flood");
+        assert_eq!(buf, [7u8; 8]);
+    }
+
+    #[test]
+    fn the_audio_reader_s_window_mark_does_not_destroy_the_video_s_run() {
+        // Two readers share one state: the video demuxer holds the front
+        // run, the embedded-audio decoder gets stuck far ahead and marks
+        // its own window. The old destructive reset cleared the WHOLE
+        // buffer — the video's bytes included — and the video read
+        // starved. Nothing may be dropped here now.
+        let state = SrvProgressState::default();
+        let total = 8u64 * 1024 * 1024 * 1024;
+        state.set_extension_for_test("mkv");
+        state.append_piece_for_test(0, &[1u8; 256 * 1024], total);
+
+        state.reset_buffer_for_seek(50 * 1024 * 1024, 4 * 1024 * 1024);
+        state.append_piece_for_test(50 * 1024 * 1024, &[5u8; 65536], total);
+
+        let mut buf = [0u8; 8];
+        assert_eq!(state.read_buffered(0, &mut buf), 8, "the video's front run survived the audio reader's mark");
+        assert_eq!(buf, [1u8; 8]);
+        assert_eq!(state.read_buffered(50 * 1024 * 1024, &mut buf), 8, "the audio's reply is served from the store");
+        assert_eq!(buf, [5u8; 8]);
+    }
+
+    #[test]
+    fn the_info_line_shows_at_playback_start_expires_and_comes_back_on_i() {
+        let state = SrvProgressState::default();
+        state.set_extension_for_test("mkv");
+
+        // playback start: shown, then gone after the 10s window
+        state.show_info();
+        assert!(state.info_visible_now(), "the info line is shown at playback start");
+        state.expire_info_for_test();
+        assert!(!state.info_visible_now(), "the info line expires after 10 seconds");
+
+        // an i press (the sender's enabled=true push) shows it again
+        state.show_info();
+        assert!(state.info_visible_now(), "i shows the line again");
+
+        // an explicit hide (enabled=false) removes it at once
+        state.hide_info();
+        assert!(!state.info_visible_now(), "enabled=false hides the line at once");
+    }
+
+    #[test]
+    fn the_source_path_of_a_placement_is_kept_for_the_info_line() {
+        let state = SrvProgressState::default();
+        assert_eq!(state.source_path(), None, "nothing announced yet");
+        let path = "F:\\Начало (2010) BDRip 1080p [HEVC] 10 bit.mkv";
+        state.set_source_path(path.to_string());
+        assert_eq!(state.source_path().as_deref(), Some(path));
+    }
+
+    #[test]
+    fn transfer_size_trios_tiny_medium_huge_are_all_served_below_the_run_s_start() {
+        // The late-subscriber shape at three file sizes: the run anchors
+        // wherever the first seen chunk landed, the catch-up front (all
+        // below the start) must serve at position 0 in every case.
+        for &(total, anchor, front_len) in &[
+            (16u64 * 1024, 8 * 1024, 4 * 1024),
+            (64 * 1024 * 1024, 60 * 1024 * 1024, 1024 * 1024),
+            (8 * 1024 * 1024 * 1024, 7 * 1024 * 1024 * 1024, 512 * 1024),
+        ] {
+            let state = SrvProgressState::default();
+            state.set_extension_for_test("mkv");
+            let rest = vec![2u8; (total - anchor) as usize];
+            state.append_piece_for_test(anchor, &rest, total);
+            let front = vec![1u8; front_len as usize];
+            state.append_piece_for_test(0, &front, total);
+
+            let mut buf = [0u8; 4];
+            assert_eq!(state.read_buffered(0, &mut buf), 4, "front served at 0 (total={total})");
+            assert_eq!(buf, [1u8; 4]);
+            assert_eq!(state.read_buffered(anchor, &mut buf), 4, "run served at its anchor (total={total})");
+            assert_eq!(buf, [2u8; 4]);
+        }
+    }
+
     #[test]
     fn a_chunk_below_the_buffer_s_start_is_kept_and_served_from_the_store() {
         // Som subscribed late: the first chunk it saw was from the middle.

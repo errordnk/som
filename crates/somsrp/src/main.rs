@@ -991,9 +991,27 @@ fn spawn_ctrlc_watcher() {
                     _ => {},
                 }
             }
+            if byte == b'i' {
+                // `i`: the placement's info line in Som — transfer speed
+                // and lost-frame counters. Fire-and-forget on its own
+                // short connection, same as every other one-shot control
+                // message this process sends.
+                if let Some(&(session_id, file_id)) = SRP_IDS.get() {
+                    let enabled = !INFO_VISIBLE.fetch_not(std::sync::atomic::Ordering::AcqRel);
+                    if let Ok(channel) = srv_channel::connect() {
+                        let _ = channel.send(&somsrv::protocol::SrvRequest::AnnounceInfo { session_id, file_id, enabled });
+                    }
+                }
+            }
         }
     });
 }
+
+/// The ids of the single video/audio placement this process is feeding —
+/// set once per transfer, read by the `i` key handler.
+static SRP_IDS: std::sync::OnceLock<SrpIds> = std::sync::OnceLock::new();
+/// The info line's current state, toggled by `i`.
+static INFO_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How long the key watcher waits for the rest of an escape sequence after `ESC`.
 const ESC_SEQUENCE_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
@@ -1350,6 +1368,26 @@ fn stream_file_from_disk(
     // that handshake. See `spawn_ctrlc_watcher`'s own doc comment for why
     // this couldn't just start at the top of `main` instead.
     spawn_ctrlc_watcher();
+    let _ = SRP_IDS.set(ids);
+    // Announce the placement: its source path travels to Som (the video
+    // widget's info line shows it, and a click on the line copies it),
+    // along with the playlist position (a lone file, no list). Best
+    // effort — a titleless widget never stopped the stream itself.
+    if let Ok(channel) = srv_channel::connect() {
+        let title = std::path::Path::new(path).file_stem().map(|stem| stem.to_string_lossy().into_owned());
+        let _ = channel.send(&somsrv::protocol::SrvRequest::AnnounceTrack {
+            session_id: ids.0,
+            file_id: ids.1,
+            title,
+            index: 0,
+            len: 1,
+            target: path.to_string(),
+            tags: None,
+            looping: false,
+            current: None,
+            next: None,
+        });
+    }
 
     let total_size = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?.len();
     let file = std::fs::File::open(path).map_err(|e| format!("opening {path}: {e}"))?;

@@ -605,6 +605,7 @@ impl TerminalBuilder {
             rich_content_picture_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_info_strip_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -980,6 +981,7 @@ impl TerminalBuilder {
             rich_content_picture_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
                 rich_content_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_stop_icon_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rich_content_info_strip_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             rich_content_image_copied_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_seek_bar_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
             markdown_embedded_controls_bounds: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1262,6 +1264,12 @@ pub enum EmbeddedMediaStatus {
         elapsed: std::time::Duration,
         duration: std::time::Duration,
         position_fraction: f32,
+        /// The placement's info line (the sender's `i` toggle): transfer
+        /// speed, bytes received, frames decoded/lost — `None` while the
+        /// toggle is off. `Some("")` when on but the numbers aren't known
+        /// yet (the widget paints the line either way, so the toggle has
+        /// visible feedback immediately).
+        info: Option<String>,
     },
     /// A `![alt](nested.md)` embed's raw fetched TEXT (not yet laid out —
     /// `Terminal` (this crate) cannot depend on `terminal_view`'s
@@ -1729,6 +1737,10 @@ pub struct Terminal {
     /// reasoning as `rich_content_seek_bar_bounds` above, just for the
     /// stop icon instead of the seek bar.
     rich_content_stop_icon_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
+    /// Where each video placement's info line (path + speed + fps + drop)
+    /// was painted last — clicks inside it copy the file path (with a
+    /// "Copied" toast), the same deal the image widget's picture has.
+    rich_content_info_strip_bounds: std::cell::RefCell<std::collections::HashMap<(u32, u32), Bounds<Pixels>>>,
     /// The `Instant` a plain image/GIF placement's picture was last
     /// clicked-to-copy — see `Terminal::copy_rich_content_image_to_
     /// clipboard`'s own doc comment. Present in this map means "show the
@@ -3588,6 +3600,8 @@ impl Terminal {
                             elapsed: player.elapsed(),
                             duration: player.duration(),
                             position_fraction: player.position_fraction(),
+                            // Embedded video has no SRP sender to toggle it.
+                            info: None,
                         },
                     ));
                 },
@@ -4683,7 +4697,7 @@ impl Terminal {
         // image's contrast should track THAT color specifically, wherever
         // it's computed from.
         widget_bg_is_light: bool,
-    ) -> Vec<(u32, u32, Option<std::sync::Arc<gpui::RenderImage>>, bool, f32, std::time::Duration, std::time::Duration, bool)> {
+    ) -> Vec<(u32, u32, Option<std::sync::Arc<gpui::RenderImage>>, bool, f32, std::time::Duration, std::time::Duration, bool, Option<String>)> {
         let mut players = self.rich_content_video_players.borrow_mut();
         let mut out = Vec::new();
         for (session_id, file_id) in self.rich_content_cache.all_known_ids() {
@@ -4818,6 +4832,30 @@ impl Terminal {
             // the display) — the control widget (play glyph, 00:00:00,
             // an empty seek bar) still needs to paint so the user can
             // press play again; only the picture itself disappears.
+            // The info line: the file's path (or URL), transfer speed,
+            // the stream's frame rate and the lost-frame count. Shown for
+            // the first 10 seconds of playback and again for 10 seconds
+            // after every `i` press (`SrvProgressState::show_info`) — the
+            // window simply expires, nothing needs to push a hide.
+            if just_opened {
+                if let Some(state) = self.rich_content_srv_progress.borrow().get(&key) {
+                    state.show_info();
+                }
+            }
+            let info = self
+                .rich_content_srv_progress
+                .borrow()
+                .get(&key)
+                .filter(|state| state.info_visible_now())
+                .map(|state| {
+                    let (_, lost) = player.frame_stats();
+                    let fps = player.fps().map(|fps| format!("{fps:.0}")).unwrap_or_else(|| "?".into());
+                    let path = state.source_path().unwrap_or_else(|| "?".into());
+                    format!(
+                        "{path} Speed: {}/s FPS: {fps} Drop: {lost}",
+                        format_bytes(state.transfer_speed()),
+                    )
+                });
             out.push((
                 session_id,
                 file_id,
@@ -4827,6 +4865,7 @@ impl Terminal {
                 player.elapsed(),
                 player.duration(),
                 player.is_stopped(),
+                info,
             ));
         }
         out
@@ -4989,6 +5028,16 @@ impl Terminal {
         self.rich_content_stop_icon_bounds.borrow_mut().insert((session_id, file_id), bounds);
     }
 
+    /// See `rich_content_info_strip_bounds`'s own doc comment.
+    pub fn record_rich_content_info_strip_bounds(&self, session_id: u32, file_id: u32, bounds: Bounds<Pixels>) {
+        self.rich_content_info_strip_bounds.borrow_mut().insert((session_id, file_id), bounds);
+    }
+
+    /// See `rich_content_info_strip_bounds`'s own doc comment.
+    pub fn rich_content_info_strip_bounds(&self, session_id: u32, file_id: u32) -> Option<Bounds<Pixels>> {
+        self.rich_content_info_strip_bounds.borrow().get(&(session_id, file_id)).copied()
+    }
+
     /// The last-painted stop-icon bounds for placement `(session_id,
     /// file_id)`, if recorded.
     pub fn rich_content_stop_icon_bounds(&self, session_id: u32, file_id: u32) -> Option<Bounds<Pixels>> {
@@ -5033,12 +5082,29 @@ impl Terminal {
         if self.handle_audio_widget_click(position) {
             return true;
         }
-        // a click on a video's picture plays or pauses it
+        // a click on a video's picture plays or pauses it — unless it
+        // landed on the info line, which copies the file's path instead
+        // (with the same "Copied" toast the image widget shows).
         #[cfg(target_os = "windows")]
         if let Some((session_id, file_id)) = self.video_picture_at(position)
             && self.rich_content_video_players.borrow().contains_key(&(session_id, file_id))
             && !self.rich_content_placement_bounds(session_id, file_id).is_some_and(|controls| controls.contains(&position))
         {
+            if let Some(strip) = self.rich_content_info_strip_bounds(session_id, file_id)
+                && strip.contains(&position)
+            {
+                let path = self
+                    .rich_content_srv_progress
+                    .borrow()
+                    .get(&(session_id, file_id))
+                    .and_then(|state| state.source_path());
+                if let Some(path) = path {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+                    self.rich_content_image_copied_at.borrow_mut().insert((session_id, file_id), std::time::Instant::now());
+                    cx.notify();
+                }
+                return true;
+            }
             self.toggle_rich_content_video_playback(session_id, file_id);
             return true;
         }
@@ -7513,6 +7579,21 @@ fn rgb_for_index(i: u8) -> (u8, u8, u8) {
     let g = ((i % 36) - (i % 6)) / 6;
     let b = (i % 36) % 6;
     (r, g, b)
+}
+
+/// A byte count as a compact human string for the info line: `512 B`,
+/// `1.5 MB`, `7.9 GB` — one decimal only above the byte range, so the
+/// readout never changes width mid-playback by more than a digit.
+pub fn format_bytes(bytes: u64) -> String {
+    const KI: u64 = 1024;
+    const MI: u64 = 1024 * 1024;
+    const GI: u64 = 1024 * 1024 * 1024;
+    match bytes {
+        0..KI => format!("{bytes} B"),
+        KI..MI => format!("{:.0} KB", bytes as f64 / KI as f64),
+        MI..GI => format!("{:.1} MB", bytes as f64 / MI as f64),
+        _ => format!("{:.2} GB", bytes as f64 / GI as f64),
+    }
 }
 
 pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
@@ -10475,7 +10556,7 @@ mod tests {
             terminal.update(cx, |term, _| term.poll_rich_content_srv_subscriptions());
 
             let placements = terminal.update(cx, |term, _| term.rich_content_video_placements(false));
-            if let Some((session_id, _file_id, Some(render_image), _is_playing, _position_fraction, _elapsed, _duration, _is_stopped)) =
+            if let Some((session_id, _file_id, Some(render_image), _is_playing, _position_fraction, _elapsed, _duration, _is_stopped, _info)) =
                 placements.into_iter().next()
             {
                 saw_placement = true;

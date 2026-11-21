@@ -508,6 +508,14 @@ pub enum SrvRequest {
     /// — see this plan's own doc comment for why that's an accepted gap,
     /// not a new failure mode.
     RequestByteRange { session_id: u32, file_id: u32, offset: u64, len: u64 },
+    /// Sent by the sender (`somsrp`, farsh's viewer) when its user toggles
+    /// the placement's info line — the `i` key. The daemon broadcasts
+    /// [`SrvResponse::InfoVisible`] to the placement's subscribers, so the
+    /// widget shows/hides the transfer speed and the lost-frame counters
+    /// live, without restarting the playback the way a fresh announce
+    /// would. A no-op (not an error) when nothing is subscribed yet — the
+    /// same tolerance every other fire-and-forget control message here has.
+    AnnounceInfo { session_id: u32, file_id: u32, enabled: bool },
     /// Sent by `somsrp` (never by Som) on a SECOND connection, separate
     /// from whichever one is sending the sequential `PutChunk` stream for
     /// this `(session_id, file_id)` — registers THIS connection as the
@@ -976,6 +984,12 @@ pub enum SrvResponse {
     /// a DIFFERENT client's `SrvRequest::StopPlayback` for the same
     /// `(session_id, file_id)` — see that variant's own doc comment.
     StopPlayback { session_id: u32, file_id: u32 },
+    /// Pushed to every `SubscribeProgress` subscriber of `(session_id,
+    /// file_id)` in reply to a sender's [`SrvRequest::AnnounceInfo`] — the
+    /// user toggled the placement's info line (`i`). `enabled` is the new
+    /// state: the widget shows the transfer speed and the lost-frame
+    /// counters while it is on.
+    InfoVisible { session_id: u32, file_id: u32, enabled: bool },
     /// Pushed on a `SubscribeProgress` connection in direct reply to that
     /// SAME connection's own `SrvRequest::UnsubscribeProgress` — see that
     /// variant's own doc comment for why this exists (unblocking a
@@ -1045,6 +1059,12 @@ pub enum SrvResponse {
     /// - see `SrvRequest::AnnounceCue`. Also replayed to a late
     /// subscriber.
     CueSheet { session_id: u32, file_id: u32, sheet: CueSheet },
+    /// Pushed to subscribers with the source of this placement — the path
+    /// or URL the sender announced (`SrvRequest::AnnounceTrack`'s own
+    /// `target`), replayed to a late subscriber like the other announce
+    /// state. The video widget's info line shows it so the user can see
+    /// exactly which file is playing.
+    SourcePath { session_id: u32, file_id: u32, target: String },
     /// A change to the view of an instance this connection is attached to.
     PluginView { instance: String, op: crate::plugin::ViewOp },
     /// A `som.*` call of the plugin; Som answers with

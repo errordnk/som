@@ -515,6 +515,9 @@ fn handle_srv_request(
             SrvRequest::StopPlayback { session_id, file_id } => {
                 cache.notify_stop_playback(session_id, file_id);
             }
+            SrvRequest::AnnounceInfo { session_id, file_id, enabled } => {
+                cache.set_info_visible(session_id, file_id, enabled);
+            }
             SrvRequest::UnsubscribeProgress { session_id, file_id } => {
                 cache.unsubscribe(session_id, file_id);
             }
@@ -567,6 +570,7 @@ fn handle_srv_request(
             SrvRequest::AnnounceTrack { session_id, file_id, title, index, len, target, tags, looping, current, next } => {
                 let lookup_pending = crate::now_playing::station_for_url(&target).is_some();
                 cache.set_playlist(session_id, file_id, title, index, len, looping, lookup_pending);
+                cache.set_source_path(session_id, file_id, target.clone());
                 cache.set_announced_next(session_id, file_id, next.clone());
                 if let Some(tags) = tags {
                     crate::now_playing::announce_file_tags(cache.clone(), session_id, file_id, tags);

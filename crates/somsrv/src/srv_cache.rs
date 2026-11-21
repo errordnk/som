@@ -177,6 +177,8 @@ struct Inner {
     playlists: HashMap<CacheKey, (u32, u32, Option<String>, bool)>,
     /// The CUE sheet a key plays (`set_cue_sheet`).
     cue_sheets: HashMap<CacheKey, somsrv::protocol::CueSheet>,
+    /// What a key plays — the sender's announce target (`set_source_path`).
+    source_paths: HashMap<CacheKey, String>,
     /// `(liked, track_wave, wave_label)` the radio widget shows for a key
     /// (`set_radio_state`).
     radio_states: HashMap<CacheKey, (bool, bool, Option<String>, Option<somsrv::protocol::RadioStation>)>,
@@ -309,6 +311,14 @@ impl SrvCache {
         let tail_available_from = entry.tail_available_from;
         let pending_ranges = entry.pending_ranges.clone();
         let total_size = entry.total_size;
+        if contiguous_len >= total_size && total_size > 0 {
+            log::warn!(
+                "DIAG-CACHE: contiguous reached total {} after chunk offset={offset} len={} chunk_end={chunk_end} pending={:?}",
+                total_size,
+                data.len(),
+                entry.pending_ranges
+            );
+        }
         if let Some(subscribers) = inner.subscribers.get(&key) {
             for subscriber in subscribers {
                 let _ = subscriber(SrvResponse::Progress {
@@ -409,6 +419,9 @@ impl SrvCache {
         if let Some(sheet) = inner.cue_sheets.get(&key).cloned() {
             let _ = send(SrvResponse::CueSheet { session_id, file_id, sheet });
         }
+        if let Some(target) = inner.source_paths.get(&key).cloned() {
+            let _ = send(SrvResponse::SourcePath { session_id, file_id, target });
+        }
         // the stop that came before this subscriber (see `Inner::stopped`)
         if inner.stopped.contains(&key) {
             let _ = send(SrvResponse::StopPlayback { session_id, file_id });
@@ -491,6 +504,21 @@ impl SrvCache {
             }
         }
         inner.cue_sheets.insert(key, sheet);
+    }
+
+    /// Records what `(session_id, file_id)` plays — `SrvRequest::
+    /// AnnounceTrack`'s own target — and pushes it to the key's
+    /// subscribers (replayed to a late one, like every other announce
+    /// state here).
+    pub fn set_source_path(&self, session_id: u32, file_id: u32, target: String) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, file_id);
+        inner.source_paths.insert(key, target.clone());
+        if let Some(subscribers) = inner.subscribers.get(&key) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::SourcePath { session_id, file_id, target: target.clone() });
+            }
+        }
     }
 
     /// Records what the radio icons show for `(session_id, file_id)` and
@@ -596,6 +624,20 @@ impl SrvCache {
         if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
             for subscriber in subscribers {
                 let _ = subscriber(SrvResponse::StopPlayback { session_id, file_id });
+            }
+        }
+    }
+
+    /// Records `enabled` as the placement's info-line state and pushes
+    /// [`SrvResponse::InfoVisible`] to every subscriber — a sender's `i`
+    /// toggle (see [`SrvRequest::AnnounceInfo`]). A silent no-op with no
+    /// subscriber, same as every other fire-and-forget control push here.
+    pub fn set_info_visible(&self, session_id: u32, file_id: u32, enabled: bool) {
+        log::warn!("DIAG-INFO: AnnounceInfo {}:{} enabled={}", session_id, file_id, enabled);
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(subscribers) = inner.subscribers.get(&(session_id, file_id)) {
+            for subscriber in subscribers {
+                let _ = subscriber(SrvResponse::InfoVisible { session_id, file_id, enabled });
             }
         }
     }
@@ -728,13 +770,16 @@ impl SrvCache {
             && let Some(route) = inner.range_response_routes.get(&key)
             && route(request.clone()).is_ok()
         {
+            log::warn!("DIAG-ROUTE: forwarded RequestByteRange {offset}+{len} to range responder");
             return;
         }
         if let Some(route) = inner.sender_routes.get(&key)
             && route(request).is_ok()
         {
+            log::warn!("DIAG-ROUTE: forwarded RequestByteRange {offset}+{len} to sender route");
             return;
         }
+        log::warn!("DIAG-ROUTE: RequestByteRange {offset}+{len} had NO live route — serving from recent bytes");
         // No live sender left to ask — answer directly from the trailing
         // in-memory window if the request falls inside it, exactly as if
         // a real sender had replied with an ordinary out-of-order

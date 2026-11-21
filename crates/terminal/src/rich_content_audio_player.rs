@@ -137,7 +137,7 @@ impl std::io::Read for GrowingSrvStream {
                 && now.duration_since(since) >= STUCK_GRACE
                 && self.last_requested_at.is_none_or(|at| now.duration_since(at) >= STUCK_RETRY)
             {
-                self.srv_state.reset_buffer_for_seek(self.position);
+                self.srv_state.reset_buffer_for_seek(self.position, ON_DEMAND_RANGE_LEN);
                 request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
                 self.last_requested_at = Some(now);
             }

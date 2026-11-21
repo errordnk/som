@@ -69,6 +69,21 @@ const CONSUMED_RETENTION_WINDOW: u64 = 256 * 1024 * 1024;
 /// would fill with hours of a station's audio and stay resident.
 const LIVE_CONSUMED_RETENTION: u64 = 4 * 1024 * 1024;
 
+/// Cap on the out-of-order store (`SrvProgressState::out_of_order`) — a
+/// video's proactive tail (4MB) plus a couple of on-demand fetch windows
+/// (4MB each) fit comfortably; anything past this evicts the smallest
+/// offsets first.
+const MAX_OUT_OF_ORDER_BYTES: usize = 24 * 1024 * 1024;
+
+/// How far back [`SrvProgressState::transfer_speed`] looks when it diffs
+/// the byte counters — long enough to smooth a chunk arriving in bursts,
+/// short enough that the info line feels live.
+const RX_SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the video widget's info line stays on screen: from playback
+/// start, and again after each `i` press.
+pub const INFO_LINE_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shared, thread-safe state for one `(session_id, file_id)` placement's
 /// `somsrv` side-channel connection — see this module's own doc comment
 /// for the full reasoning.
@@ -132,6 +147,32 @@ pub struct SrvProgressState {
     /// a backward-looking window either.
     buffer: Mutex<VecDeque<u8>>,
     buffer_start_offset: AtomicU64,
+    /// Chunks that arrived AHEAD of the main run's tail, kept (unlike the
+    /// previous drop behavior) keyed by their absolute offset — a video's
+    /// proactive tail push, or an on-demand fetch's reply, both land here
+    /// whenever the main run is anchored somewhere else at the time.
+    /// Bounded by [`MAX_OUT_OF_ORDER_BYTES`], smallest offsets evicted
+    /// first (bytes the reader has already consumed can never be behind
+    /// it, so the oldest range is the safest to lose).
+    out_of_order: Mutex<std::collections::BTreeMap<u64, Vec<u8>>>,
+    /// Total bytes this process has actually buffered, over every chunk
+    /// push (main run and out-of-order store alike) — the info line's
+    /// transfer speed and received-so-far figure read this.
+    bytes_received: AtomicU64,
+    /// `(instant, cumulative bytes_received)` samples, kept over a small
+    /// sliding window — `transfer_speed` diffs its ends.
+    rx_samples: Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
+    /// The placement's info line (the sender's `i` toggle, pushed as
+    /// `SrvResponse::InfoVisible`) — the video widget reads this on paint.
+    info_visible: AtomicBool,
+    /// What this placement plays — the sender's announce target (`SrvResponse::
+    /// SourcePath`): the video widget's info line shows it, and a click on
+    /// the line copies it.
+    source_path: Mutex<Option<String>>,
+    /// When the info line was last shown (playback start, or the sender's
+    /// `i`): it shows for [`INFO_LINE_DURATION`] from this instant. `None`
+    /// once expired (or never shown).
+    info_shown_at: Mutex<Option<std::time::Instant>>,
     /// The offset of the most recent outstanding on-demand `RequestByteRange`
     /// fetch, or `None` if none is in flight — set by `GrowingFileStream::
     /// read` right before it calls `request_byte_range` (and clears the
@@ -146,7 +187,17 @@ pub struct SrvProgressState {
     /// position), so the seek target's bytes get silently dropped as
     /// "ahead of tail" and the reader blocks forever waiting for bytes
     /// that already arrived and were discarded.
-    pending_seek_target: Mutex<Option<u64>>,
+    ///
+    /// Holds the whole requested WINDOW `(offset, len)`, not just the
+    /// first byte: the reply's chunks can land anywhere inside it (the
+    /// sender clamps the range's end to the file's real end, so the LAST
+    /// chunk of a tail-hugging request is shorter than the rest), and
+    /// `append_chunk` must re-anchor on any chunk overlapping the window.
+    /// Confirmed live: an MKV whose Cues end 2287 bytes before EOF made
+    /// the probe read at `total - 2287`; a reply matched only by exact
+    /// offset could be dropped as "ahead of tail" once another stuck
+    /// position stole the target, stalling playback forever.
+    pending_seek_target: Mutex<Option<(u64, u64)>>,
     /// The source file's own extension (no leading dot), from the FIRST
     /// `Progress` push's `ContentMetadata::Video::extension`/`Audio::
     /// extension` — unlike `metadata` above (a one-shot `Option` that
@@ -273,70 +324,222 @@ impl SrvProgressState {
 
     /// Copies up to `buf.len()` bytes starting at absolute file `position`
     /// into `buf`, returning how many bytes were actually available —
-    /// `0` if `position` isn't covered by the buffer at all (either not
-    /// arrived yet, or already evicted by an earlier [`Self::advance_
-    /// consumed_up_to`]/[`Self::reset_buffer_for_seek`] call). Never
-    /// blocks or waits — the caller ([`crate::rich_content_video_player::
-    /// GrowingFileStream`]/the audio decoder's equivalent) already owns
-    /// the retry-sleep loop that decides what to do with a `0` result
+    /// `0` if `position` isn't covered by anything buffered (the main
+    /// contiguous run, or the out-of-order store — see `append_chunk`).
+    /// Never blocks or waits — the caller ([`crate::rich_content_video_
+    /// player::GrowingFileStream`]/the audio decoder's equivalent) already
+    /// owns the retry-sleep loop that decides what to do with a `0` result
     /// (request more bytes, wait, or seek).
     pub fn read_buffered(&self, position: u64, buf: &mut [u8]) -> usize {
-        let buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        let start = self.buffer_start_offset.load(Ordering::Acquire);
-        if position < start || buf.is_empty() {
+        if buf.is_empty() {
             return 0;
         }
-        let skip = (position - start) as usize;
-        if skip >= buffer.len() {
+        {
+            let buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+            let start = self.buffer_start_offset.load(Ordering::Acquire);
+            if position >= start {
+                let skip = (position - start) as usize;
+                if skip < buffer.len() {
+                    let available = (buffer.len() - skip).min(buf.len());
+                    for (i, byte) in buffer.iter().skip(skip).take(available).enumerate() {
+                        buf[i] = *byte;
+                    }
+                    return available;
+                }
+            }
+        }
+        // Not covered by the main run — serve from the out-of-order store
+        // (a seek target's fetched range, the proactive tail of a video,
+        // or both at once: an MKV probe genuinely interleaves reads
+        // between the clusters at the front and the Cues at the end, so
+        // both regions must stay readable simultaneously).
+        let store = self.out_of_order.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((&range_start, _)) = store.range(..=position).next_back() else {
+            return 0;
+        };
+        if position >= range_start + store[&range_start].len() as u64 {
             return 0;
         }
-        let available = (buffer.len() - skip).min(buf.len());
-        for (i, byte) in buffer.iter().skip(skip).take(available).enumerate() {
-            buf[i] = *byte;
+        let mut copied = 0usize;
+        let mut at = position;
+        let mut cur = range_start;
+        while copied < buf.len() {
+            let Some(data) = store.get(&cur) else { break };
+            let into = (at - cur) as usize;
+            if into >= data.len() {
+                break;
+            }
+            let n = (data.len() - into).min(buf.len() - copied);
+            buf[copied..copied + n].copy_from_slice(&data[into..into + n]);
+            copied += n;
+            at += n as u64;
+            cur = at;
         }
-        available
+        copied
+    }
+
+    /// Bytes this process has buffered so far, over every chunk push.
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Acquire)
+    }
+
+    /// Bytes per second over the recent window (`RX_SAMPLE_WINDOW`) —
+    /// `0` until at least two samples exist. The info line's speed.
+    pub fn transfer_speed(&self) -> u64 {
+        let samples = self.rx_samples.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(&(oldest_at, oldest_bytes)), Some(&(newest_at, newest_bytes))) = (samples.front(), samples.back()) else {
+            return 0;
+        };
+        let elapsed = newest_at.duration_since(oldest_at);
+        if elapsed.is_zero() {
+            return 0;
+        }
+        newest_bytes.saturating_sub(oldest_bytes) / elapsed.as_secs().max(1)
+    }
+
+    /// The placement's info line (`i`) — shown by the widget while on.
+    pub fn info_visible(&self) -> bool {
+        self.info_visible.load(Ordering::Acquire)
+    }
+
+    /// Shows the info line for [`INFO_LINE_DURATION`] — at playback start
+    /// and again on every `i` press (the sender's `SrvResponse::InfoVisible`
+    /// push with `enabled=true` lands here).
+    pub fn show_info(&self) {
+        self.info_visible.store(true, Ordering::Release);
+        *self.info_shown_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// Hides the info line right away (an `i` press with `enabled=false`,
+    /// or the 10s window having expired).
+    pub fn hide_info(&self) {
+        self.info_visible.store(false, Ordering::Release);
+        *self.info_shown_at.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Whether the info line should be on screen right now: within
+    /// [`INFO_LINE_DURATION`] of the last show. Auto-expiring — no push
+    /// is needed to hide it, the paint path simply stops asking.
+    pub fn info_visible_now(&self) -> bool {
+        let shown_at = *self.info_shown_at.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(shown_at) = shown_at else { return false };
+        if shown_at.elapsed() >= INFO_LINE_DURATION {
+            self.hide_info();
+            return false;
+        }
+        true
+    }
+
+    /// What this placement plays (its announce target), for the info line
+    /// and the click-to-copy.
+    pub fn set_source_path(&self, target: String) {
+        *self.source_path.lock().unwrap_or_else(|p| p.into_inner()) = Some(target);
+    }
+
+    /// See [`Self::set_source_path`].
+    pub fn source_path(&self) -> Option<String> {
+        self.source_path.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Where readable bytes past `position` run out, if the out-of-order
+    /// store covers `position` — the fourth readability source alongside
+    /// `contiguous_len`/`tail_available_from`/daemon `pending_ranges`
+    /// (those three describe what the DAEMON has; this one describes what
+    /// THIS process actually holds, which is the only thing that can't
+    /// lie to the reader — see `append_chunk`'s own doc comment for the
+    /// confirmed-live stall the difference once caused).
+    pub fn out_of_order_readable_end(&self, position: u64) -> Option<u64> {
+        let store = self.out_of_order.lock().unwrap_or_else(|p| p.into_inner());
+        let (&range_start, _) = store.range(..=position).next_back()?;
+        if position >= range_start + store[&range_start].len() as u64 {
+            return None;
+        }
+        let mut end = range_start + store[&range_start].len() as u64;
+        while let Some((&next_start, data)) = store.range(end..).next() {
+            if next_start != end {
+                break;
+            }
+            end += data.len() as u64;
+        }
+        Some(end)
     }
 
     /// Appends one chunk's bytes at `chunk_offset` — called by [`run`]
     /// for every `SrvResponse::Progress` push, mirroring exactly what
     /// `somsrv`'s own `SrvCache::put_chunk` forwards. Chunks that land
-    /// contiguously at (or behind) the buffer's own current tail are
-    /// appended normally. A chunk landing AHEAD of the tail is normally
-    /// dropped (an ordinary sequential chunk racing ahead of where this
-    /// buffer's contiguous run has reached has nowhere correct to go yet
-    /// — [`Self::read_buffered`] only ever serves a contiguous run
-    /// starting at `buffer_start_offset`) — EXCEPT when `chunk_offset`
-    /// matches [`Self::pending_seek_target`]: that's the answer to an
-    /// on-demand `RequestByteRange` fetch a reader is actively blocked
-    /// waiting on, so it re-anchors the buffer here instead of being
-    /// dropped — see `pending_seek_target`'s own doc comment for the race
-    /// this closes (a concurrent sequential-arrival chunk refilling a
-    /// just-cleared buffer before this reply lands). A brand new (empty)
-    /// buffer accepts whatever offset arrives first, becoming that
-    /// offset's own starting point.
+    /// contiguously at the main run's tail extend it. A chunk landing
+    /// AHEAD of the tail is kept in the out-of-order store instead of
+    /// being dropped, and [`Self::read_buffered`] serves from both.
+    /// Dropping was confirmed live as a playback-killer: a video's
+    /// proactive tail (an MKV's Cues live there) arrived while the main
+    /// run was still at the front, was dropped as "ahead of tail", and
+    /// the format probe's seek to that tail then stalled forever on a
+    /// black widget — the watermarks said the bytes were there, but this
+    /// process had thrown them away, and the on-demand re-fetch's reply
+    /// was dropped in turn once the probe seeked back to the front
+    /// (single-run buffering cannot hold BOTH ends of a file at once,
+    /// and nothing ever re-requested the lost range).
     fn append_chunk(&self, chunk_offset: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
+        // Stats first: the info line counts every byte that reached this
+        // process, whatever region it lands in.
+        let received = self.bytes_received.fetch_add(data.len() as u64, Ordering::AcqRel) + data.len() as u64;
+        {
+            let mut samples = self.rx_samples.lock().unwrap_or_else(|p| p.into_inner());
+            let now = std::time::Instant::now();
+            samples.push_back((now, received));
+            while let Some(&(at, _)) = samples.front() {
+                if now.duration_since(at) <= RX_SAMPLE_WINDOW {
+                    break;
+                }
+                samples.pop_front();
+            }
+        }
         let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         let tail = self.buffer_start_offset.load(Ordering::Acquire) + buffer.len() as u64;
-        let is_pending_seek_reply = *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) == Some(chunk_offset);
         if buffer.is_empty() {
             self.buffer_start_offset.store(chunk_offset, Ordering::Release);
             buffer.extend(data.iter().copied());
         } else if chunk_offset == tail {
             buffer.extend(data.iter().copied());
-        } else if is_pending_seek_reply {
-            buffer.clear();
-            self.buffer_start_offset.store(chunk_offset, Ordering::Release);
-            buffer.extend(data.iter().copied());
-        } else if chunk_offset > tail {
-            // Out-of-order/ahead-of-tail chunk — see this method's own
-            // doc comment for why it's dropped rather than stored.
+        } else if chunk_offset > tail || chunk_offset < self.buffer_start_offset.load(Ordering::Acquire) {
+
+            // A chunk the main run can't take: ahead of its tail (a
+            // proactive video tail, or an on-demand fetch's reply), or
+            // BELOW its start (the main run is anchored at the tail
+            // region because this process subscribed after the sender's
+            // front announce had already gone by — the late-subscriber
+            // catch-up stream then re-delivers the whole front, and
+            // calling that "a retransmit of bytes we have" silently
+            // discarded it forever: the watermarks grew, the reader
+            // stalled at position 0). Either way a reader needs these
+            // bytes — keep them (bounded), possibly for later, after as
+            // many probe seek-flips as FFmpeg feels like.
+            drop(buffer);
+            let mut store = self.out_of_order.lock().unwrap_or_else(|p| p.into_inner());
+            store.insert(chunk_offset, data.to_vec());
+            let mut total: usize = store.values().map(|bytes| bytes.len()).sum();
+            while total > MAX_OUT_OF_ORDER_BYTES {
+                // The window of the outstanding on-demand fetch is
+                // protected: a reader is actively blocked on it, and an
+                // eviction racing its reply would drop exactly the bytes
+                // about to be read.
+                let pending = *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner());
+                let Some((&oldest, bytes)) = store
+                    .iter()
+                    .find(|entry| {
+                        let (&start, bytes) = *entry;
+                        !matches!(pending, Some((target, len)) if start + bytes.len() as u64 > target && start < target + len)
+                    })
+                else { break };
+                total -= bytes.len();
+                store.remove(&oldest);
+            }
         }
-        // `chunk_offset < tail` (a retransmit of already-buffered bytes,
-        // or bytes already evicted as consumed) needs no action either
-        // way — the buffer already has (or no longer needs) this data.
+        // `chunk_offset` inside `[buffer_start, tail]` — a retransmit of
+        // bytes the main run already holds: no action.
     }
 
     /// Drops bytes more than [`CONSUMED_RETENTION_WINDOW`] behind
@@ -494,11 +697,14 @@ impl SrvProgressState {
     /// next, it doesn't request anything itself. Setting `pending_seek_
     /// target` here (not as a separate call) is deliberate — see that
     /// field's own doc comment for the race this closes between this
-    /// reset and a concurrent sequential-arrival chunk.
-    pub fn reset_buffer_for_seek(&self, position: u64) {
+    /// reset and a concurrent sequential-arrival chunk. `len` is the
+    /// length of the range about to be requested — the reply's chunks
+    /// are accepted anywhere inside `[position, position + len)` (see
+    /// `pending_seek_target`'s own doc comment).
+    pub fn reset_buffer_for_seek(&self, position: u64, len: u64) {
         let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
         buffer.clear();
-        *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some(position);
+        *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some((position, len));
     }
 
     /// Takes the pending `(ContentType, ContentMetadata)` out, if any has
@@ -546,6 +752,36 @@ impl SrvProgressState {
         // Two slice copies, not a byte-by-byte walk of the ring buffer.
         let (front, back) = buffer.as_slices();
         let mut bytes = Vec::with_capacity(len);
+        // A late subscriber's buffer is anchored mid-file; the file's own
+        // front (the catch-up stream's reply) lives in the out-of-order
+        // store. A decode needs the file from byte 0, so the two regions
+        // are assembled in file order — and if the store doesn't hold a
+        // contiguous run from 0 to `start`, the front comes out short and
+        // the decode fails on it, same as when the bytes were missing
+        // entirely.
+        if start > 0 {
+            drop(buffer);
+            let store = self.out_of_order.lock().unwrap_or_else(|p| p.into_inner());
+            let mut at = 0u64;
+            while at < start {
+                match store.range(at..).next() {
+                    Some((&at2, data)) if at2 == at => {
+                        bytes.extend_from_slice(data);
+                        at += data.len() as u64;
+                    },
+                    _ => break,
+                }
+            }
+            let buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+            let skip = (start - at).min(buffer.len() as u64) as usize;
+            let (front, back) = buffer.as_slices();
+            let from_front = front.len().saturating_sub(skip).min(len);
+            bytes.extend_from_slice(&front[skip..skip + from_front]);
+            if len > from_front {
+                bytes.extend_from_slice(&back[..(len - from_front).min(back.len())]);
+            }
+            return bytes;
+        }
         let from_front = front.len().min(len);
         bytes.extend_from_slice(&front[..from_front]);
         if len > from_front {
@@ -625,7 +861,7 @@ impl SrvProgressState {
         if buffer_len > 0 {
             // The reply starts at 0, behind the buffer's own start: it is
             // let in to re-anchor the buffer there (see `append_chunk`).
-            *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some(0);
+            *self.pending_seek_target.lock().unwrap_or_else(|p| p.into_inner()) = Some((0, u64::MAX));
         }
         let total_size = self.total_size().max(contiguous_len);
         request_byte_range(session_id, file_id, 0, total_size);
@@ -1164,6 +1400,20 @@ fn run(session_id: u32, file_id: u32, state: &SrvProgressState) -> anyhow::Resul
             {
                 state.stop_playback_requested.store(true, Ordering::Release);
             },
+            SrvResponse::InfoVisible { session_id: response_session, file_id: response_file, enabled }
+                if response_session == session_id && response_file == file_id =>
+            {
+                if enabled {
+                    state.show_info();
+                } else {
+                    state.hide_info();
+                }
+            },
+            SrvResponse::SourcePath { session_id: response_session, file_id: response_file, target }
+                if response_session == session_id && response_file == file_id =>
+            {
+                state.set_source_path(target);
+            },
             SrvResponse::NowPlaying(info) if info.session_id == session_id && info.file_id == file_id => {
                 *state.now_playing.lock().unwrap_or_else(|p| p.into_inner()) = Some((info, std::time::Instant::now()));
                 state.now_playing_generation.fetch_add(1, Ordering::AcqRel);
@@ -1256,19 +1506,23 @@ fn send(connection: &SrvConnection, message: &SrvRequest) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_buffer_that_began_mid_file_is_re_anchored_by_the_reply_for_the_whole_file() {
+    fn a_chunk_below_the_buffer_s_start_is_kept_and_served_from_the_store() {
         // Som subscribed late: the first chunk it saw was from the middle.
         let state = SrvProgressState::default();
         state.append_chunk(500, &[7u8; 100]);
         assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 500, "the first chunk seen anchors the buffer");
 
-        // The whole-file reply (offset 0) is let in only once asked for.
+        // A chunk behind the buffer's start (the late-subscriber catch-up
+        // stream re-delivering the front) is NOT a retransmit of bytes we
+        // hold — it was never seen. It lands in the out-of-order store,
+        // and a read there is served from it.
         state.append_chunk(0, &[1u8; 600]);
-        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 500, "an unasked-for chunk behind the start is ignored");
-        *state.pending_seek_target.lock().unwrap() = Some(0);
-        state.append_chunk(0, &[1u8; 600]);
-        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 0, "the reply for the whole file re-anchors the buffer");
-        assert_eq!(state.buffer.lock().unwrap().len(), 600);
+        let mut buf = [0u8; 10];
+        assert_eq!(state.read_buffered(0, &mut buf), 10, "the front chunk is served from the store");
+        assert_eq!(buf, [1u8; 10]);
+        assert_eq!(state.out_of_order_readable_end(0), Some(600));
+        assert_eq!(state.buffer_start_offset.load(Ordering::Acquire), 500, "the main run stays anchored at the middle");
+        assert_eq!(state.read_buffered(500, &mut buf), 10, "the main run still serves its own region");
     }
 
     use super::*;

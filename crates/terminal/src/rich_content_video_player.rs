@@ -421,6 +421,58 @@ impl VideoTransferProgress {
 /// [`crate::rich_content_audio_player::DECODE_RETRY_INTERVAL`].
 const DECODE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Per-playback decode counters the info line shows: frames that reached
+/// the picture slot, and frames the decode path threw away (a seek landed
+/// mid-pacing, a hardware transfer or scale failed). Atomic — the decode
+/// thread writes, the paint thread reads.
+#[derive(Default)]
+pub struct FrameStats {
+    pub decoded: AtomicU64,
+    pub lost: AtomicU64,
+    /// `(instant, cumulative decoded)` samples over a small sliding
+    /// window — [`Self::measured_fps`] diffs its ends. This is the FPS
+    /// ACTUALLY DECoded (pipeline delays, dropped frames and all), not
+    /// the rate declared in the container's header.
+    samples: Mutex<std::collections::VecDeque<(std::time::Instant, u64)>>,
+}
+
+impl FrameStats {
+    /// Frames per second actually decoded over the recent window —
+    /// `None` until two samples exist. Unlike the container's declared
+    /// frame rate this reflects reality: a decode pipeline that can't
+    /// keep up shows a smaller number, and every lost frame lowers it.
+    pub fn measured_fps(&self) -> Option<f64> {
+        let mut samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        samples.push_back((now, self.decoded.load(Ordering::Acquire)));
+        while let Some(&(at, _)) = samples.front() {
+            if now.duration_since(at) <= MEASURED_FPS_WINDOW {
+                break;
+            }
+            samples.pop_front();
+        }
+        let (first_at, first_count) = *samples.front()?;
+        let (last_at, last_count) = *samples.back()?;
+        let elapsed = last_at.duration_since(first_at);
+        if elapsed.as_secs_f64() <= 0.0 {
+            return None;
+        }
+        Some((last_count - first_count) as f64 / elapsed.as_secs_f64())
+    }
+}
+
+/// The window [`FrameStats::measured_fps`] averages over — long enough
+/// to smooth frame-time jitter, short enough that the readout reacts
+/// within seconds.
+const MEASURED_FPS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a stuck `GrowingFileStream::read` waits before re-firing its
+/// `RequestByteRange` for the SAME position. Generous — a healthy reply
+/// over the local daemon pipe lands in single-digit milliseconds — but
+/// bounded, unlike the previous once-per-position-forever dedupe that
+/// turned any single lost reply into a permanent black-widget stall.
+const STUCK_REQUEST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// The most recently decoded frame, already scaled to BGRA (what
 /// `gpui::RenderImage` requires) — `Mutex`-guarded since the decode
 /// thread writes it and the paint path reads it from a different thread
@@ -502,6 +554,10 @@ struct GrowingFileStream {
     /// bytes arrive any faster, just adds needless socket traffic).
     request_byte_range: Option<RequestByteRange>,
     last_requested_position: Option<u64>,
+    /// When the last request for `last_requested_position` fired — lets a
+    /// stuck read re-issue it after [`STUCK_REQUEST_RETRY_INTERVAL`]
+    /// instead of waiting forever on a reply that may never land.
+    last_requested_at: Option<Instant>,
 }
 
 impl GrowingFileStream {
@@ -520,6 +576,7 @@ impl GrowingFileStream {
             position: 0,
             request_byte_range,
             last_requested_position: None,
+            last_requested_at: None,
         })
     }
 }
@@ -551,6 +608,8 @@ impl std::io::Read for GrowingFileStream {
             } else if total_size > 0 && self.position >= tail_available_from {
                 total_size
             } else if let Some((_, end)) = self.progress.pending_range_covering(self.position) {
+                end
+            } else if let Some(end) = self.srv_state.out_of_order_readable_end(self.position) {
                 end
             } else {
                 0
@@ -587,31 +646,35 @@ impl std::io::Read for GrowingFileStream {
             // doc comment for why the guessed window frequently misses:
             // `avformat_seek_file`'s internal keyframe/index hunt for
             // this container can land anywhere, not just near the linear
-            // fraction-based estimate. Only fires once per stuck
-            // position (`last_requested_position` dedupes across this
-            // loop's own 100ms retry-sleep iterations) — the request is
-            // already in flight; resending it doesn't make bytes arrive
-            // faster.
+            // fraction-based estimate. Re-fires for the same stuck
+            // position every [`STUCK_REQUEST_RETRY_INTERVAL`] (not just
+            // once — `last_requested_position` + `last_requested_at`
+            // suppress re-requesting only WITHIN that window):
+            // a single lost/mis-anchored reply used to stall playback
+            // forever on a black widget (confirmed live on an 8GB MKV
+            // whose Cues end 2287 bytes before EOF — the probe's one
+            // tail request was answered, the reply never landed, and
+            // the once-per-position dedupe made every later iteration
+            // a silent wait for bytes nothing would ever resend).
             if let Some(request_byte_range) = self.request_byte_range.as_ref()
-                && self.last_requested_position != Some(self.position)
+                && (self.last_requested_position != Some(self.position)
+                    || self.last_requested_at.map(|at| at.elapsed() >= STUCK_REQUEST_RETRY_INTERVAL).unwrap_or(true))
             {
-                // The buffer has nothing usable for `self.position` (that's
-                // why we're here) and the answer to this request will land
-                // at `self.position`, arbitrarily far ahead of whatever the
-                // buffer's current tail is — `append_chunk`'s own doc
-                // comment is explicit that an ahead-of-tail chunk is
-                // otherwise silently DROPPED, not queued, so without this
-                // reset the fetched bytes would vanish the moment they
-                // arrive and this read would block forever. Clearing here
-                // (immediately before the request that will need the
-                // fresh anchor) rather than from `Seek::seek` itself keeps
-                // FFmpeg's own frequent probe-time seeks within the
-                // already-buffered region cheap — only a seek that's
-                // ACTUALLY unreachable from what's buffered pays this cost.
-                self.srv_state.reset_buffer_for_seek(self.position);
+                // The reply lands in the out-of-order store (`append_
+                // chunk` keeps ahead-of-tail chunks now), so no buffer
+                // reset is needed or wanted here — resetting (clearing)
+                // the main run would throw away the OTHER end of the
+                // file: an MKV probe genuinely interleaves reads between
+                // the clusters at the front and the Cues at the end, and
+                // a reset per seek-flip made the two ends destroy each
+                // other's data forever (confirmed live: 8GB MKV, probe
+                // stalled on a black widget no matter how many times the
+                // range requests were re-sent).
                 const ON_DEMAND_RANGE_LEN: u64 = 4 * 1024 * 1024;
+                log::warn!("DIAG-READ: stuck at pos={} contiguous={contiguous_len} tail_from={tail_available_from} total={total_size}", self.position);
                 request_byte_range(self.position, ON_DEMAND_RANGE_LEN);
                 self.last_requested_position = Some(self.position);
+                self.last_requested_at = Some(Instant::now());
             }
             // Caught up to what's currently buffered, but more is still
             // coming — block (StreamIo's own doc comment requires a
@@ -819,6 +882,9 @@ fn run_decode_loop(
     progress: Arc<VideoTransferProgress>,
     stop: Arc<AtomicBool>,
     time_base: Arc<(AtomicI64, AtomicI64)>,
+    // The video stream's declared frame rate as (numerator, denominator)
+    // (both 0 = unknown) — the info line's FPS.
+    fps: Arc<(AtomicU64, AtomicU64)>,
     duration_us: Arc<AtomicI64>,
     seek_request: Arc<Mutex<Option<f32>>>,
     seek_generation: Arc<AtomicU64>,
@@ -826,6 +892,8 @@ fn run_decode_loop(
     playing: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     shared_audio: Arc<SharedAudio>,
+    // Frames decoded vs thrown away — the info line's numbers.
+    stats: Arc<FrameStats>,
     // Overrides FFmpeg's own `best()` heuristic for which audio stream
     // to decode — `somsrp`'s `-a <N>` CLI flag, carried here via
     // `ContentMetadata::Video::audio_stream_index` (see that field's own
@@ -855,6 +923,7 @@ fn run_decode_loop(
     // no longer persists chunks to disk at all).
     let extension = loop {
         if stop.load(Ordering::Relaxed) {
+            log::warn!("DIAG-PROBE: stopped while waiting for extension");
             return;
         }
         if let Some(extension) = srv_state.extension() {
@@ -862,6 +931,7 @@ fn run_decode_loop(
         }
         std::thread::sleep(DECODE_RETRY_INTERVAL);
     };
+    log::warn!("DIAG-PROBE: extension = {extension:?}, opening stream");
     let filename_owned = format!("placement.{extension}");
 
     let Ok(stream) = GrowingFileStream::open(
@@ -871,9 +941,11 @@ fn run_decode_loop(
         seek_request.clone(),
         request_byte_range.clone(),
     ) else {
+        log::warn!("DIAG-PROBE: GrowingFileStream::open failed");
         return;
     };
     let Ok(stream_io) = ffmpeg::format::context::StreamIo::from_read_seek(stream) else {
+        log::warn!("DIAG-PROBE: StreamIo::from_read_seek failed");
         return;
     };
     // `filename` is passed through to ffmpeg's own probe purely as an
@@ -928,8 +1000,10 @@ fn run_decode_loop(
         let _ = &interrupt_handled_seek_generation;
         interrupt_seek_request.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }) else {
+        log::warn!("DIAG-PROBE: avformat open (probe) FAILED");
         return;
     };
+    log::warn!("DIAG-PROBE: probe OK, duration={:?}", ictx.duration());
 
     // The container's own overall duration, in AV_TIME_BASE (microsecond)
     // units — usually resolvable from the header alone (`moov`/segment
@@ -946,14 +1020,23 @@ fn run_decode_loop(
     }
 
     let Some(input) = best_video_stream(&ictx) else {
+        log::warn!("DIAG-PROBE: no video stream found");
         return; // No video track at all — never will be one.
     };
+    log::warn!("DIAG-PROBE: video stream #{} picked", input.index());
     let video_stream_index = input.index();
     let stream_time_base = input.time_base();
     time_base.0.store(stream_time_base.numerator() as i64, Ordering::Release);
     time_base.1.store(stream_time_base.denominator() as i64, Ordering::Release);
+    // The stream's own frame rate as the container states it — the info
+    // line's FPS readout. `0/0` (an unset rational) means "unknown": the
+    // line then shows `?` rather than a made-up number.
+    let stream_fps = input.avg_frame_rate();
+    fps.0.store(stream_fps.numerator().max(0) as u64, Ordering::Release);
+    fps.1.store(stream_fps.denominator().max(0) as u64, Ordering::Release);
 
     let Ok(mut context_decoder) = ffmpeg::codec::context::Context::from_parameters(input.parameters()) else {
+        log::warn!("DIAG-PROBE: Context::from_parameters failed");
         return;
     };
     // Zero-copy GPU decode, step 1: attempt D3D11VA hardware decode
@@ -969,8 +1052,10 @@ fn run_decode_loop(
     #[cfg(windows)]
     hwaccel::try_attach_d3d11va(unsafe { context_decoder.as_mut_ptr() });
     let Ok(mut decoder) = context_decoder.decoder().video() else {
+        log::warn!("DIAG-PROBE: decoder().video() failed");
         return;
     };
+    log::warn!("DIAG-PROBE: decoder opened, entering packet loop");
 
     // Audio track — genuinely optional, unlike the video one above: a
     // video with no embedded sound (`ictx.streams().best(Audio)` returns
@@ -1150,6 +1235,7 @@ fn run_decode_loop(
     let mut receive_and_store = |decoder: &mut ffmpeg::decoder::Video, scaler: &mut Option<ffmpeg::software::scaling::context::Context>, pace_anchor: &mut Option<(Instant, i64)>| {
         while decoder.receive_frame(&mut decoded).is_ok() {
             if decoded.format() == ffmpeg::format::Pixel::None || decoded.width() == 0 || decoded.height() == 0 {
+                stats.lost.fetch_add(1, Ordering::AcqRel);
                 continue;
             }
             let pts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0);
@@ -1173,6 +1259,9 @@ fn run_decode_loop(
                         return;
                     }
                     if seek_request.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                        // The seek discards this decoded-but-not-yet-shown
+                        // frame — a lost frame to the info line.
+                        stats.lost.fetch_add(1, Ordering::AcqRel);
                         return;
                     }
                     let elapsed = anchor_at.elapsed().as_secs_f64();
@@ -1193,6 +1282,7 @@ fn run_decode_loop(
             #[cfg(windows)]
             let source_frame = if hwaccel::is_hw_frame(&decoded) {
                 if !hwaccel::transfer_to_system_memory(&decoded, &mut hw_transferred) {
+                    stats.lost.fetch_add(1, Ordering::AcqRel);
                     continue;
                 }
                 &hw_transferred
@@ -1214,12 +1304,14 @@ fn run_decode_loop(
                         source_frame.height(),
                         ffmpeg::software::scaling::flag::Flags::BILINEAR,
                     ) else {
+                        stats.lost.fetch_add(1, Ordering::AcqRel);
                         continue;
                     };
                     scaler.insert(built)
                 },
             };
             if scaler.run(source_frame, &mut scaled).is_err() {
+                stats.lost.fetch_add(1, Ordering::AcqRel);
                 continue;
             }
             let width = scaled.width();
@@ -1232,9 +1324,11 @@ fn run_decode_loop(
                 buf.extend_from_slice(&src[start..start + width as usize * 4]);
             }
             let Some(rgba) = image::RgbaImage::from_raw(width, height, buf) else {
+                stats.lost.fetch_add(1, Ordering::AcqRel);
                 continue;
             };
             *shared.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((rgba, pts));
+            stats.decoded.fetch_add(1, Ordering::AcqRel);
         }
     };
 
@@ -1607,6 +1701,7 @@ fn run_decode_loop(
                             progress,
                             stop,
                             time_base,
+                            fps,
                             duration_us,
                             seek_request,
                             seek_generation,
@@ -1614,6 +1709,7 @@ fn run_decode_loop(
                             playing,
                             finished,
                             shared_audio,
+                            stats,
                             audio_stream_index_override,
                             request_byte_range,
                         );
@@ -1790,6 +1886,9 @@ pub struct RichContentVideoPlayer {
     /// re-anchor until `shared.slot` actually shows something ELSE,
     /// guaranteeing the anchor is built from the real post-seek frame.
     pending_seek_from_pts: Arc<Mutex<Option<i64>>>,
+    /// The video stream's declared frame rate (`numerator`/`denominator`,
+    /// both 0 = unknown) — the info line's FPS readout reads this.
+    fps: Arc<(AtomicU64, AtomicU64)>,
     /// The container's own overall duration in microseconds — see
     /// `run_decode_loop`'s own doc comment on where this comes from.
     /// `0` (the initial value) means "not yet known" (or genuinely
@@ -1902,6 +2001,8 @@ pub struct RichContentVideoPlayer {
     /// `open()` again.
     #[allow(dead_code)]
     shared_audio: Arc<SharedAudio>,
+    /// Frames decoded vs thrown away — the info line reads these.
+    stats: Arc<FrameStats>,
 }
 
 impl Drop for RichContentVideoPlayer {
@@ -1938,8 +2039,10 @@ impl RichContentVideoPlayer {
         request_byte_range: Option<RequestByteRange>,
     ) -> Self {
         let shared = Arc::new(LatestFrame { slot: Mutex::new(None) });
+        let stats = Arc::new(FrameStats::default());
         let decode_stop = Arc::new(AtomicBool::new(false));
         let time_base = Arc::new((AtomicI64::new(0), AtomicI64::new(1)));
+        let fps = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
         let duration_us = Arc::new(AtomicI64::new(0));
         let seek_request = Arc::new(Mutex::new(None));
         let seek_generation = Arc::new(AtomicU64::new(0));
@@ -1956,6 +2059,7 @@ impl RichContentVideoPlayer {
             let shared = shared.clone();
             let decode_stop = decode_stop.clone();
             let time_base = time_base.clone();
+            let fps = fps.clone();
             let duration_us = duration_us.clone();
             let seek_request = seek_request.clone();
             let seek_generation = seek_generation.clone();
@@ -1963,6 +2067,7 @@ impl RichContentVideoPlayer {
             let playing = playing.clone();
             let finished = finished.clone();
             let shared_audio = shared_audio.clone();
+            let stats = stats.clone();
             std::thread::spawn(move || {
                 run_decode_loop(
                     srv_state,
@@ -1970,6 +2075,7 @@ impl RichContentVideoPlayer {
                     progress,
                     decode_stop,
                     time_base,
+                    fps,
                     duration_us,
                     seek_request,
                     seek_generation,
@@ -1977,6 +2083,7 @@ impl RichContentVideoPlayer {
                     playing,
                     finished,
                     shared_audio,
+                    stats,
                     audio_stream_index,
                     request_byte_range,
                 )
@@ -1985,8 +2092,10 @@ impl RichContentVideoPlayer {
 
         Self {
             shared,
+            stats,
             decode_stop,
             time_base,
+            fps,
             playing,
             playback_started_at: Arc::new(Mutex::new(None)),
             pending_seek_from_pts: Arc::new(Mutex::new(None)),
@@ -2000,6 +2109,18 @@ impl RichContentVideoPlayer {
             stopped: Arc::new(AtomicBool::new(false)),
             shared_audio,
         }
+    }
+
+    /// Frames decoded vs thrown away so far — the info line's counters.
+    pub fn frame_stats(&self) -> (u64, u64) {
+        (self.stats.decoded.load(Ordering::Acquire), self.stats.lost.load(Ordering::Acquire))
+    }
+
+    /// The frame rate actually decoded, over the recent window — not the
+    /// rate declared in the container. `None` while too few frames have
+    /// landed to measure.
+    pub fn fps(&self) -> Option<f64> {
+        self.stats.measured_fps()
     }
 
     pub fn is_playing(&self) -> bool {

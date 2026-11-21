@@ -2188,6 +2188,7 @@ fn paint_rich_content_placements(
             std::time::Duration,
             std::time::Duration,
             bool,
+            Option<String>,
         )> = Vec::new();
         #[cfg(target_os = "windows")]
         let pending_image_drops = terminal.take_pending_video_image_drops();
@@ -2481,7 +2482,7 @@ fn paint_rich_content_placements(
         // `paint_rich_content_media_widget` audio already uses — one
         // shared control-row implementation for both content types.
         let video_match = video_placements.iter().find(|(sid, fid, ..)| *sid == session_id && *fid == file_id);
-        if let Some((_, _, render_image, is_playing, position_fraction, elapsed, duration, is_stopped)) = video_match {
+        if let Some((_, _, render_image, is_playing, position_fraction, elapsed, duration, is_stopped, info)) = video_match {
             let max_column_seen = max_columns_seen.get(&key).copied();
             let max_row_seen = max_rows_seen.get(&key).copied();
             let picture_rows = max_row_seen.map(|r| r.max(1) - 1).unwrap_or(0);
@@ -2564,6 +2565,67 @@ fn paint_rich_content_placements(
                         // metadata alone before the real frame arrived.
                         let fit = fit_into_box(image_size, picture_bounds);
                         window.paint_image(fit, gpui::Corners::all(Pixels::ZERO), render_image.clone(), 0, false).log_err();
+                    }
+                }
+            }
+
+            // The info line (the sender's `i` toggle) — a translucent
+            // strip across the top of the picture area: transfer speed,
+            // bytes received against the file's total, frames decoded
+            // and lost.
+            if let Some(info) = info {
+                // The placement's top row may be scrolled above the
+                // viewport (a tall video widget on a small screen) — the
+                // strip is an overlay, so it clamps to the first visible
+                // row instead of disappearing with the row it belongs to.
+                let strip_line = (origin_line + layout.display_offset as i32).max(0);
+                if strip_line < num_lines {
+                    // Centered over the picture: the placement's full
+                    // width (columns x cell) minus the strip's own, split
+                    // into two side margins.
+                    let placement_width = max_column_seen
+                        .map(|c| (c + 1) as f32 * cell_width)
+                        .unwrap_or_else(|| cell_width * 20.0);
+                    let strip_position = point(
+                        origin.x + origin_column as f32 * cell_width,
+                        origin.y + strip_line as f32 * line_height,
+                    );
+                    let mut text_style = layout.base_text_style.clone();
+                    text_style.color = gpui::white();
+                    let run = gpui::TextRun {
+                        len: info.len(),
+                        font: text_style.font(),
+                        color: text_style.color,
+                        ..Default::default()
+                    };
+                    let line = window.text_system().shape_line(
+                        info.to_string().into(),
+                        text_style.font_size.to_pixels(window.rem_size()),
+                        &[run],
+                        None,
+                    );
+                    let strip_width = (line.width + cell_width * 2.0).min(placement_width);
+                    let strip_bounds = Bounds::new(
+                        point(strip_position.x + (placement_width - strip_width) / 2.0, strip_position.y),
+                        gpui::size(strip_width, line_height),
+                    );
+                    window.paint_quad(fill(strip_bounds, gpui::rgba(0x000000cc)));
+                    terminal.read(cx).record_rich_content_info_strip_bounds(session_id, file_id, strip_bounds);
+                    line.paint(
+                        point(strip_bounds.origin.x + cell_width, strip_position.y),
+                        line_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                    // The "Copied" toast after a click on the strip — same
+                    // transient pill the image widget shows (it shares the
+                    // same per-key toast map, so the same plumbing works).
+                    if terminal.read(cx).rich_content_image_copied_toast_active(session_id, file_id) {
+                        any_animating = true;
+                        paint_copied_toast(strip_bounds, layout, window, cx);
                     }
                 }
             }
@@ -3331,7 +3393,7 @@ fn paint_rich_content_markdown_widget(
                     );
                     shaped.paint(label_position, line_height, gpui::TextAlign::Left, None, window, cx).log_err();
                 },
-                Some(terminal::EmbeddedMediaStatus::ReadyVideo { render_image, is_playing, elapsed, duration, position_fraction }) => {
+                Some(terminal::EmbeddedMediaStatus::ReadyVideo { render_image, is_playing, elapsed, duration, position_fraction, info: _ }) => {
                     // Picture band: reuse the exact same letterbox-into-
                     // box_bounds approach the Image branch above uses, via
                     // `fit_into_box` — identical shape, just an optional
@@ -3686,7 +3748,10 @@ fn paint_rich_content_media_widget(
     shape_and_paint(nf_stop, stop_position, window, cx);
     if paint_time_readouts {
         paint_time(elapsed, current_time_position, window, cx);
-        paint_time(duration, total_time_position, window, cx);
+        // The right readout shows how much is LEFT, not the total — what every
+        // real player does (00:00:00 when the video ends): left + right
+        // always add up to the full duration.
+        paint_time(duration.saturating_sub(elapsed), total_time_position, window, cx);
     }
 
     let mut bar_bounds_out = None;
@@ -3868,7 +3933,10 @@ fn paint_top_level_audio_widget(
     shape_and_paint(nf_stop, stop_position, window, cx);
     if paint_time_readouts {
         paint_time(elapsed, current_time_position, window, cx);
-        paint_time(duration, total_time_position, window, cx);
+        // The right readout shows how much is LEFT, not the total — what every
+        // real player does (00:00:00 when the video ends): left + right
+        // always add up to the full duration.
+        paint_time(duration.saturating_sub(elapsed), total_time_position, window, cx);
     }
 
     let mut bar_bounds_out = None;
@@ -4384,7 +4452,10 @@ fn paint_embedded_media_controls_row(
 
     if bar_end_x > bar_start_x {
         paint_time(elapsed, current_time_position, window, cx);
-        paint_time(duration, total_time_position, window, cx);
+        // The right readout shows how much is LEFT, not the total — what every
+        // real player does (00:00:00 when the video ends): left + right
+        // always add up to the full duration.
+        paint_time(duration.saturating_sub(elapsed), total_time_position, window, cx);
         let bar_bounds = Bounds::new(
             point(bar_start_x, row_bounds.origin.y + line_height * 0.4),
             gpui::size(bar_end_x - bar_start_x, line_height * 0.2),
